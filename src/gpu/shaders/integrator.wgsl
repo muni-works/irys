@@ -900,15 +900,22 @@ fn sample_sun(
 // neighbours this frame — so a pixel's one shadow ray is spent on a light
 // that hundreds of samples agreed was worth testing.
 //
-// Scope. Only the primary hit, and only the area panels and the sun. Indirect
-// bounces and the environment keep the one-light NEE they had: a reservoir is
-// per *pixel*, and there is no pixel behind a second bounce.
+// Scope. Only the primary hit, and only the area panels. Indirect bounces and
+// the environment keep the one-light NEE they had: a reservoir is per *pixel*,
+// and there is no pixel behind a second bounce.
+//
+// The sun keeps its own next-event sample at every depth, resampled or not.
+// It went into the reservoir first, as one strategy among the panels, and
+// that was wrong in the way that matters: the court is a room lit through
+// clerestory openings *by the sun*, and folding it into an eleven-way pick
+// meant ten pixels in eleven got no sun sample at all that frame. Sixty live
+// frames came out visibly darker and three times specklier than the same
+// frames without ReSTIR. A 0.6° disc is one light with a good importance
+// sampler already; resampling is for choosing among many.
 //
 // Measure. A panel's sample is a point, carried in area measure, so
 // reconnecting it to a different surface has a Jacobian of 1 — which is the
-// whole reason the paper resamples points rather than directions. The sun's
-// sample is a direction with G = 1, an infinite light, for which the
-// reconnection Jacobian is also 1. The two therefore share one reservoir.
+// whole reason the paper resamples points rather than directions.
 //
 // Storage. The reservoirs ride in the spare planes of `depth_normal_buffer`
 // rather than in storage buffers of their own: the ten this shader binds are
@@ -1109,16 +1116,6 @@ fn restir_load_surface(slot: u32, idx: u32) -> RSurface {
 
 // ── the light set, as one resampling domain ──────────────────────────────
 
-// The sun's share of the candidate budget. One strategy among the panels
-// rather than a coin flip, so a rig of ten panels and a sun spends a
-// candidate in eleven on the sun.
-fn restir_pick_sun() -> f32 {
-    if !sun_enabled() {
-        return 0.0;
-    }
-    return 1.0 / f32(render_state.light_count + 1u);
-}
-
 // A sample resolved against a surface: the direction to it, what it emits,
 // the geometry term, the source PDF the candidate was drawn with, and the
 // solid-angle PDF the *BSDF-hits-an-emitter* branch would attribute to it —
@@ -1147,27 +1144,6 @@ fn restir_resolve(p: vec3<f32>, y_pos: vec3<f32>, y_light: u32) -> RSample {
         return o;
     }
     if y_light >= render_state.light_count {
-        // The sun. `y_pos` is a direction, the light is at infinity, G = 1.
-        if !sun_enabled() {
-            return o;
-        }
-        let pick = restir_pick_sun();
-        if pick <= 0.0 {
-            return o;
-        }
-        o.wi = normalize(y_pos);
-        // A sun that moved leaves the stored direction outside its disc, and
-        // the sample dies here rather than lighting the pixel from a place
-        // the sun no longer is.
-        if dot(o.wi, render_state.sun_direction.xyz) < render_state.sun_direction.w {
-            return o;
-        }
-        o.le = render_state.sun_radiance.rgb;
-        o.dist = MAX_T;
-        o.geom = 1.0;
-        o.src_pdf = render_state.sun_radiance.w * pick;
-        o.mis_pdf = render_state.sun_radiance.w;
-        o.ok = true;
         return o;
     }
     let l = lights[y_light];
@@ -1210,12 +1186,10 @@ fn restir_resolve(p: vec3<f32>, y_pos: vec3<f32>, y_light: u32) -> RSample {
     o.le = l.emission.rgb;
     o.dist = d;
     o.geom = cos_light / (d * d);
-    // Area measure: pick the panel set, pick this panel by power, then a
-    // point on it uniformly.
-    o.src_pdf = (1.0 - restir_pick_sun()) * l.center.w / area;
-    // Solid-angle measure, and *without* the panel-set factor — this is
-    // exactly the PDF `path_trace` reconstructs when a BSDF ray lands on the
-    // panel, and MIS pairs the two.
+    // Area measure: pick this panel by power, then a point on it uniformly.
+    o.src_pdf = l.center.w / area;
+    // Solid-angle measure — exactly the PDF `path_trace` reconstructs when a
+    // BSDF ray lands on the panel, and MIS pairs the two.
     o.mis_pdf = l.center.w * d * d / (cos_light * area);
     o.ok = true;
     return o;
@@ -1264,33 +1238,25 @@ struct RCandidate {
     src_pdf: f32,
 }
 
-fn restir_candidate(p: vec3<f32>, pixel: vec2<u32>, seed: u32) -> RCandidate {
+fn restir_candidate(pixel: vec2<u32>, seed: u32) -> RCandidate {
     var c: RCandidate;
     c.y_pos = vec3<f32>(0.0);
     c.y_light = RESTIR_NONE;
     c.src_pdf = 0.0;
-    let r0 = rand_uniform(pixel, seed * 4u + 0u);
-    let r1 = rand_uniform(pixel, seed * 4u + 1u);
-    let r2 = rand_uniform(pixel, seed * 4u + 2u);
-    let r3 = rand_uniform(pixel, seed * 4u + 3u);
-    let p_sun = restir_pick_sun();
-    if r0 < p_sun {
-        c.y_light = render_state.light_count;
-        c.y_pos = sun_sample_dir(r2, r3);
-        c.src_pdf = render_state.sun_radiance.w * p_sun;
-        return c;
-    }
     if render_state.light_count == 0u {
         return c;
     }
+    let r1 = rand_uniform(pixel, seed * 4u + 1u);
+    let r2 = rand_uniform(pixel, seed * 4u + 2u);
+    let r3 = rand_uniform(pixel, seed * 4u + 3u);
     let idx = pick_light(r1);
     let l = lights[idx];
-    if l.center.w <= 0.0 {
+    if l.center.w <= 0.0 || light_area(l) <= 0.0 {
         return c;
     }
     c.y_light = idx;
     c.y_pos = l.center.xyz + l.u.xyz * (2.0 * r2 - 1.0) + l.v.xyz * (2.0 * r3 - 1.0);
-    c.src_pdf = (1.0 - p_sun) * l.center.w / light_area(l);
+    c.src_pdf = l.center.w / light_area(l);
     return c;
 }
 
@@ -1426,14 +1392,9 @@ fn restir_direct(
     if max3(e.value) <= 0.0 {
         return vec3<f32>(0.0);
     }
-    // The frame's one shadow ray, spent on the sample M candidates and two
-    // rounds of reuse agreed was worth testing. Unbounded towards the sun,
-    // which is at infinity.
-    var max_dist = rs.dist;
-    if r.y_light >= render_state.light_count {
-        max_dist = MAX_T;
-    }
-    let tr = shadow_transmittance(offset_origin(p, n), rs.wi, max_dist);
+    // The frame's one shadow ray, spent on the sample M candidates and the
+    // reuse agreed was worth testing.
+    let tr = shadow_transmittance(offset_origin(p, n), rs.wi, rs.dist);
     if tr < 0.0 {
         return vec3<f32>(0.0);
     }
@@ -1724,17 +1685,17 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
         }
 
         // Next-event estimation. At the primary hit, with ReSTIR on, the
-        // panels and the sun come out of the pixel's reservoir instead — one
+        // panels come out of the pixel's reservoir instead — one
         // shadow ray already spent, on a light M candidates and two kinds of
         // reuse agreed was the one worth testing. Everything deeper keeps the
         // one-light NEE: a reservoir is a per-pixel object and there is no
         // pixel behind a second bounce.
-        var direct = sample_environment(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth);
+        var direct = sample_environment(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth)
+            + sample_sun(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth);
         if restir_on() && depth == 0u {
             direct += restir_direct(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel);
         } else {
-            direct += sample_lights(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth)
-                + sample_sun(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth);
+            direct += sample_lights(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth);
         }
         if depth > 0u && render_state.firefly_clamp > 0.0 {
             direct = min(direct, vec3<f32>(render_state.firefly_clamp));
@@ -2460,7 +2421,7 @@ fn restir_initial(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // RIS over M candidates. No rays: p̂ is the unshadowed integrand.
     let m = restir_m();
     for (var i = 0u; i < m; i = i + 1u) {
-        let c = restir_candidate(surface.point, pixel, 4099u + i * 7u);
+        let c = restir_candidate(pixel, 4099u + i * 7u);
         var w = 0.0;
         var p_hat = 0.0;
         if c.src_pdf > 0.0 && c.y_light != RESTIR_NONE {
