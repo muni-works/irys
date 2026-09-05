@@ -86,6 +86,11 @@ struct RenderState {
     env_zenith: vec4<f32>,
     env_horizon: vec4<f32>,
     env_ground: vec4<f32>,
+    // The sun: direction towards it in .xyz, cos(angular radius) in .w.
+    sun_direction: vec4<f32>,
+    // The sun's radiance in .rgb and its NEE PDF (1 / solid angle) in .w.
+    // A .w of zero means there is no sun.
+    sun_radiance: vec4<f32>,
 }
 
 // A rectangular area light. Layout must match GpuAreaLight in buffers.rs,
@@ -701,6 +706,84 @@ fn sample_environment(
     return e.value * es.radiance * (w / es.pdf);
 }
 
+// ─── the sun ──────────────────────────────────────────────────────────────
+//
+// A directional light of finite angular size, mirroring `pathtrace::Sun`. It
+// is its own MIS strategy: NEE samples the cone uniformly, and a BSDF ray
+// that escapes into the cone picks the same radiance up under the balance
+// heuristic. Without the cone sample a 1-degree disc is found by BSDF
+// sampling roughly once in ten thousand rays, which is the entire reason
+// daylight needs this and not an area light placed very far away.
+
+fn sun_enabled() -> bool {
+    return render_state.sun_radiance.w > 0.0;
+}
+
+// Radiance arriving from `d`: the disc, or nothing.
+fn sun_radiance_in(d: vec3<f32>) -> vec3<f32> {
+    if !sun_enabled() {
+        return vec3<f32>(0.0);
+    }
+    if dot(normalize(d), render_state.sun_direction.xyz) >= render_state.sun_direction.w {
+        return render_state.sun_radiance.rgb;
+    }
+    return vec3<f32>(0.0);
+}
+
+fn sun_pdf(d: vec3<f32>) -> f32 {
+    if !sun_enabled() {
+        return 0.0;
+    }
+    if dot(normalize(d), render_state.sun_direction.xyz) >= render_state.sun_direction.w {
+        return render_state.sun_radiance.w;
+    }
+    return 0.0;
+}
+
+// Uniform sample of the cone, matching `Sun::sample` term for term.
+fn sun_sample_dir(r1: f32, r2: f32) -> vec3<f32> {
+    let cos_max = render_state.sun_direction.w;
+    let cos_theta = 1.0 - r1 * (1.0 - cos_max);
+    let sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
+    let phi = 2.0 * PI * r2;
+    let w = render_state.sun_direction.xyz;
+    let f = build_tangent_frame(w);
+    return normalize(f * vec3<f32>(sin_theta * cos(phi), sin_theta * sin(phi), cos_theta));
+}
+
+// Next-event estimation against the sun, MIS-weighted against BSDF sampling.
+// Mirrors `pathtrace::Scene::sample_sun`.
+fn sample_sun(
+    p: vec3<f32>,
+    frame: mat3x3<f32>,
+    n: vec3<f32>,
+    wo_local: vec3<f32>,
+    m: GpuMaterial,
+    pixel: vec2<u32>,
+    depth: u32,
+) -> vec3<f32> {
+    if !sun_enabled() {
+        return vec3<f32>(0.0);
+    }
+    let r = rand_uniform2(pixel, 811u + depth * 13u);
+    let wi_world = sun_sample_dir(r.x, r.y);
+    let pdf = render_state.sun_radiance.w;
+    let wi_local = to_local(frame, wi_world);
+    if wi_local.z <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    let e = bsdf_eval(m, wo_local, wi_local);
+    if max3(e.value) <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    // The sun is at infinity, so the shadow ray is unbounded.
+    if occluded(offset_origin(p, n), wi_world, MAX_T) {
+        return vec3<f32>(0.0);
+    }
+    let w = power_heuristic(pdf, e.pdf);
+    return e.value * render_state.sun_radiance.rgb * (w / pdf);
+}
+
 // ─── integrator ───────────────────────────────────────────────────────────
 
 // Unidirectional path tracer: multi-bounce GI with throughput accumulation,
@@ -781,6 +864,17 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
                 w = power_heuristic(prev_bsdf_pdf, epdf);
             }
             l += throughput * env_radiance(ray_d) * w;
+            // The sun disc, if this ray landed in it. NEE samples the same
+            // cone, so the two strategies share the direction under the
+            // balance heuristic; a specular chain had no other way in.
+            let sl = sun_radiance_in(ray_d);
+            if max3(sl) > 0.0 {
+                var ws = 1.0;
+                if !specular_chain {
+                    ws = power_heuristic(prev_bsdf_pdf, sun_pdf(ray_d));
+                }
+                l += throughput * sl * ws;
+            }
             break;
         }
 
@@ -817,7 +911,8 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
 
         // Next-event estimation.
         var direct = sample_lights(surf.point, frame, n, wo_local, surf.material, pixel, depth)
-            + sample_environment(surf.point, frame, n, wo_local, surf.material, pixel, depth);
+            + sample_environment(surf.point, frame, n, wo_local, surf.material, pixel, depth)
+            + sample_sun(surf.point, frame, n, wo_local, surf.material, pixel, depth);
         if depth > 0u && render_state.firefly_clamp > 0.0 {
             direct = min(direct, vec3<f32>(render_state.firefly_clamp));
         }

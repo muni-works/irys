@@ -472,6 +472,16 @@ impl EnvMap {
         })
     }
 
+    /// Width in texels.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Height in texels.
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
     /// Scale every sample by `k`.
     pub fn with_intensity(mut self, k: f32) -> Self {
         self.intensity = k;
@@ -698,6 +708,119 @@ impl Environment {
     }
 }
 
+
+/// A directional light of finite angular size: the sun.
+///
+/// An [`AreaLight`] cannot express this — it is at a finite distance and its
+/// solid angle falls off with it — and the analytic [`GradientEnv`] has no
+/// disc in it at all. Daylight through a window is a very small, very bright
+/// cone, which is exactly the case that needs its own sampling strategy: BSDF
+/// sampling finds a cone of 0.5° by accident once in fifty thousand rays.
+///
+/// The sun joins MIS as a strategy of its own, on the same footing as the
+/// area lights and the environment CDF: next-event estimation samples the
+/// cone uniformly, a BSDF ray that escapes *into* the cone picks up the same
+/// radiance under the balance-heuristic weight, and the two sum to one.
+#[derive(Debug, Clone, Copy)]
+pub struct Sun {
+    /// Unit direction **towards** the sun.
+    pub direction: Vec3,
+    /// Angular radius of the disc, in radians. The real sun is 0.00465;
+    /// larger values soften the shadow terminator.
+    pub angular_radius: f64,
+    /// Irradiance on a surface facing the sun square-on, linear RGB.
+    ///
+    /// Stated as irradiance rather than radiance so that changing
+    /// `angular_radius` softens the shadows without changing the exposure —
+    /// the radiance is `irradiance / solid_angle`.
+    pub irradiance: [f32; 3],
+}
+
+impl Default for Sun {
+    fn default() -> Self {
+        // Midday sun through clear air, in the same arbitrary units the
+        // studio rig's softboxes use.
+        Self {
+            direction: Vec3::new(-0.35, -0.55, 0.76),
+            angular_radius: 0.02,
+            irradiance: [3.0, 2.9, 2.7],
+        }
+    }
+}
+
+impl Sun {
+    /// A sun of the given irradiance shining from `direction` (towards it).
+    pub fn new(direction: Vec3, angular_radius: f64, irradiance: [f32; 3]) -> Self {
+        Self {
+            direction: direction.normalize(),
+            angular_radius: angular_radius.clamp(1e-5, core::f64::consts::FRAC_PI_2),
+            irradiance,
+        }
+    }
+
+    /// Cosine of the disc's angular radius.
+    #[inline]
+    pub fn cos_radius(&self) -> f64 {
+        self.angular_radius.cos()
+    }
+
+    /// Solid angle of the disc, steradians.
+    #[inline]
+    pub fn solid_angle(&self) -> f64 {
+        core::f64::consts::TAU * (1.0 - self.cos_radius())
+    }
+
+    /// Radiance within the disc: irradiance spread over its solid angle.
+    #[inline]
+    pub fn radiance(&self) -> [f32; 3] {
+        let w = self.solid_angle().max(1e-12) as f32;
+        [
+            self.irradiance[0] / w,
+            self.irradiance[1] / w,
+            self.irradiance[2] / w,
+        ]
+    }
+
+    /// Radiance arriving from `d`, which is zero outside the disc.
+    #[inline]
+    pub fn radiance_in(&self, d: Vec3) -> [f32; 3] {
+        if d.normalize().dot(self.direction.normalize()) >= self.cos_radius() {
+            self.radiance()
+        } else {
+            [0.0; 3]
+        }
+    }
+
+    /// Solid-angle PDF of the NEE strategy for `d`: uniform over the disc.
+    #[inline]
+    pub fn pdf(&self, d: Vec3) -> f32 {
+        if d.normalize().dot(self.direction.normalize()) >= self.cos_radius() {
+            (1.0 / self.solid_angle().max(1e-12)) as f32
+        } else {
+            0.0
+        }
+    }
+
+    /// Sample a direction uniformly within the disc.
+    ///
+    /// Returns the direction, the radiance along it, and the PDF.
+    pub fn sample(&self, r1: f64, r2: f64) -> (Vec3, [f32; 3], f32) {
+        let cos_max = self.cos_radius();
+        let cos_theta = 1.0 - r1 * (1.0 - cos_max);
+        let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+        let phi = core::f64::consts::TAU * r2;
+        let w = self.direction.normalize();
+        let (u, v) = onb(w);
+        let d = u * (sin_theta * phi.cos()) + v * (sin_theta * phi.sin()) + w * cos_theta;
+        (
+            d.normalize(),
+            self.radiance(),
+            (1.0 / self.solid_angle().max(1e-12)) as f32,
+        )
+    }
+}
+
+
 /// An infinite ground plane at a fixed Z, used as a studio sweep.
 #[derive(Debug, Clone, Copy)]
 pub struct Ground {
@@ -756,6 +879,11 @@ pub struct Scene<G> {
     pub lights: Vec<AreaLight>,
     /// Analytic sky, or a lat-long HDR environment map.
     pub env: Environment,
+    /// An optional directional light of finite angular size — daylight.
+    ///
+    /// `None` is the historical behaviour: the environment and the area
+    /// lights are the whole of the illumination.
+    pub sun: Option<Sun>,
     /// Optional studio floor.
     pub ground: Option<Ground>,
 }
@@ -1646,6 +1774,42 @@ impl<G: Geometry> Scene<G> {
         let w = power_heuristic(env_pdf, bsdf_pdf);
         scale3(mul3(f, li), w / env_pdf)
     }
+
+    /// Next-event estimation against the sun disc, MIS-weighted against BSDF
+    /// sampling — the same three-line shape as the area lights, over a cone
+    /// at infinity instead of a rectangle at a distance.
+    fn sample_sun(
+        &self,
+        accel: &SceneAccel<G>,
+        p: Point3,
+        frame: &Frame,
+        wo_local: Vec3,
+        m: &Pbr,
+        rng: &mut Rng,
+    ) -> [f32; 3] {
+        let Some(sun) = &self.sun else {
+            return [0.0; 3];
+        };
+        let Frame { t, b, n } = *frame;
+        let (wi_world, li, sun_pdf) = sun.sample(rng.f64(), rng.f64());
+        if !sun_pdf.is_finite() || sun_pdf <= 0.0 || max3(li) <= 0.0 {
+            return [0.0; 3];
+        }
+        let wi_local = to_local(t, b, n, wi_world);
+        if wi_local.z <= 0.0 {
+            return [0.0; 3];
+        }
+        let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local);
+        if max3(f) <= 0.0 {
+            return [0.0; 3];
+        }
+        // The sun is at infinity, so the shadow ray is unbounded.
+        if self.occluded(accel, p + n * 1e-5, wi_world, f64::INFINITY) {
+            return [0.0; 3];
+        }
+        let w = power_heuristic(sun_pdf, bsdf_pdf);
+        scale3(mul3(f, li), w / sun_pdf)
+    }
 }
 
 // ─── integrator ───────────────────────────────────────────────────────────
@@ -1704,6 +1868,21 @@ fn radiance<G: Geometry>(
                     power_heuristic(prev_bsdf_pdf, scene.env.pdf(dir))
                 };
                 l = add3(l, scale3(mul3(throughput, env), w));
+                // The sun disc, if this ray happened to land in it. NEE
+                // samples the same cone, so the two strategies share the
+                // direction under the balance heuristic; a specular chain
+                // (the primary ray included) had no other way to find it.
+                if let Some(sun) = &scene.sun {
+                    let li = sun.radiance_in(dir);
+                    if max3(li) > 0.0 {
+                        let ws = if specular_chain {
+                            1.0
+                        } else {
+                            power_heuristic(prev_bsdf_pdf, sun.pdf(dir))
+                        };
+                        l = add3(l, scale3(mul3(throughput, li), ws));
+                    }
+                }
                 break;
             }
             Landing::Light {
@@ -1768,8 +1947,11 @@ fn radiance<G: Geometry>(
                 // Next-event estimation: explicit lights, plus the
                 // environment when it is importance-sampled.
                 let direct = add3(
-                    scene.sample_lights(accel, point, &frame, wo_local, &material, rng),
-                    scene.sample_environment(accel, point, &frame, wo_local, &material, rng),
+                    add3(
+                        scene.sample_lights(accel, point, &frame, wo_local, &material, rng),
+                        scene.sample_environment(accel, point, &frame, wo_local, &material, rng),
+                    ),
+                    scene.sample_sun(accel, point, &frame, wo_local, &material, rng),
                 );
                 let direct = match opts.firefly_clamp {
                     Some(c) if depth > 0 => [direct[0].min(c), direct[1].min(c), direct[2].min(c)],
@@ -2449,6 +2631,7 @@ mod tests {
             )],
             lights: studio_rig(Point3::new(5.0, 5.0, 5.0), 9.0),
             env: Environment::default(),
+            sun: None,
             ground: None,
         }
     }
@@ -2595,6 +2778,7 @@ mod tests {
             objects: Vec::new(),
             lights,
             env: Environment::default(),
+            sun: None,
             ground: None,
         }
     }
@@ -2908,6 +3092,7 @@ mod tests {
                 // signal this test reads.
                 lights: Vec::new(),
                 env: Environment::default(),
+                sun: None,
                 ground: None,
             };
             let film = render(
@@ -3481,6 +3666,7 @@ mod tests {
             // or light sampling would mask a bad environment PDF.
             lights: Vec::new(),
             env,
+            sun: None,
             ground: None,
         };
         let cam = test_camera();
@@ -3506,4 +3692,91 @@ mod tests {
              at {analytic} — the environment PDF conversion is off"
         );
     }
+
+    /// A sun-lit Lambertian plane must receive exactly `E·cos(theta)`.
+    ///
+    /// The analytic answer is the whole point of a directional light with a
+    /// finite disc: irradiance is the integral of radiance times cosine over
+    /// the cone, which for a small cone is `E·cos(theta)` to within the
+    /// disc's own width. A perfectly white Lambertian surface with `ior = 1`
+    /// (so the specular lobe's F0 vanishes) reflects `E·cos(theta)/pi`, so
+    /// the render inverts back to the irradiance directly.
+    #[test]
+    fn a_sunlit_plane_matches_the_analytic_irradiance() {
+        for theta_deg in [0.0f64, 30.0, 60.0] {
+            let theta = theta_deg.to_radians();
+            let sun = Sun::new(
+                Vec3::new(theta.sin(), 0.0, theta.cos()),
+                0.01,
+                [2.0, 2.0, 2.0],
+            );
+            let e = sun.irradiance[0] as f64;
+
+            let scene = Scene::<TriMesh> {
+                objects: Vec::new(),
+                lights: Vec::new(),
+                env: Environment::constant([0.0, 0.0, 0.0]),
+                sun: Some(sun),
+                ground: Some(Ground {
+                    z: 0.0,
+                    material: Pbr {
+                        base_color: [1.0, 1.0, 1.0],
+                        metallic: 0.0,
+                        roughness: 1.0,
+                        clearcoat: 0.0,
+                        ior: 1.0,
+                        ..Default::default()
+                    },
+                    shadow_catcher: false,
+                }),
+            };
+            let cam = Camera::look_at(
+                Point3::new(0.0, 0.0, 4.0),
+                Point3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                30.0,
+            );
+            let opts = PathTraceOptions {
+                spp: 4096,
+                max_depth: 1,
+                denoise: false,
+                firefly_clamp: None,
+                seed: 7,
+                ..Default::default()
+            };
+            let film = render(&scene, &cam, 8, 8, &opts);
+            let n = (film.width * film.height) as usize;
+            let mean: f64 = (0..n).map(|i| film.rgb[i * 3] as f64).sum::<f64>() / n as f64;
+            let measured = mean * core::f64::consts::PI;
+            let expected = e * theta.cos();
+            let rel = (measured - expected).abs() / expected;
+            assert!(
+                rel < 0.01,
+                "theta={theta_deg}: irradiance {measured} vs analytic {expected} ({:.2}% off)",
+                rel * 100.0
+            );
+        }
+    }
+
+    /// The sun's two strategies must sum to one: NEE plus the BSDF ray that
+    /// lands in the disc has to give the same answer as either alone would
+    /// with the other switched off.
+    #[test]
+    fn the_sun_disc_is_visible_to_a_ray_that_finds_it() {
+        let sun = Sun::new(Vec3::new(0.0, 0.0, 1.0), 0.05, [1.0, 1.0, 1.0]);
+        // Radiance times solid angle is irradiance, by construction.
+        let l = sun.radiance()[0] as f64;
+        assert!((l * sun.solid_angle() - 1.0).abs() < 1e-6);
+        assert_eq!(sun.radiance_in(Vec3::new(0.0, 0.0, 1.0))[0], sun.radiance()[0]);
+        assert_eq!(sun.radiance_in(Vec3::new(1.0, 0.0, 0.0))[0], 0.0);
+        assert!(sun.pdf(Vec3::new(0.0, 0.0, 1.0)) > 0.0);
+        assert_eq!(sun.pdf(Vec3::new(0.0, 1.0, 0.0)), 0.0);
+        // Every sample must land inside the cone.
+        for k in 0..64 {
+            let (d, _, pdf) = sun.sample(k as f64 / 64.0, (k * 7 % 64) as f64 / 64.0);
+            assert!(d.z >= sun.cos_radius() - 1e-12, "sample outside the cone: {d:?}");
+            assert!(((pdf as f64) * sun.solid_angle() - 1.0).abs() < 1e-5);
+        }
+    }
+
 }

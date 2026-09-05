@@ -333,6 +333,17 @@ pub struct GpuRenderState {
     /// Radiance straight down under the analytic gradient — the bounce off the
     /// studio floor. See [`GpuRenderState::env_zenith`].
     pub env_ground: [f32; 4],
+    /// The sun: unit direction **towards** it in `.xyz`, the cosine of its
+    /// angular radius in `.w`.
+    ///
+    /// Mirrors [`crate::pathtrace::Sun`]. A zero `sun_radiance.w` (the PDF)
+    /// means there is no sun, which is the default — a caller who says
+    /// nothing gets exactly the lighting it always had.
+    pub sun_direction: [f32; 4],
+    /// The sun's radiance in `.rgb` (irradiance over its solid angle), and
+    /// the solid-angle PDF of the NEE strategy — `1 / solid_angle` — in `.w`.
+    /// `.w <= 0` disables the sun.
+    pub sun_radiance: [f32; 4],
 }
 
 /// Default silhouette line color: near-black, slightly cool.
@@ -500,6 +511,8 @@ impl GpuRenderState {
             env_zenith: rgba(DEFAULT_GRADIENT.zenith),
             env_horizon: rgba(DEFAULT_GRADIENT.horizon),
             env_ground: rgba(DEFAULT_GRADIENT.ground),
+            sun_direction: [0.0, 0.0, 1.0, 1.0],
+            sun_radiance: [0.0; 4],
         }
     }
 
@@ -517,6 +530,24 @@ impl GpuRenderState {
         self.env_zenith = rgba(g.zenith);
         self.env_horizon = rgba(g.horizon);
         self.env_ground = rgba(g.ground);
+    }
+
+    /// Light the scene with a directional sun, as
+    /// [`crate::pathtrace::Scene::sun`] does on the CPU. Pass `None` to
+    /// remove it.
+    pub fn set_sun(&mut self, sun: Option<&crate::pathtrace::Sun>) {
+        match sun {
+            None => {
+                self.sun_direction = [0.0, 0.0, 1.0, 1.0];
+                self.sun_radiance = [0.0; 4];
+            }
+            Some(s) => {
+                let d = s.direction.normalize();
+                self.sun_direction = [d.x as f32, d.y as f32, d.z as f32, s.cos_radius() as f32];
+                let r = s.radiance();
+                self.sun_radiance = [r[0], r[1], r[2], (1.0 / s.solid_angle().max(1e-12)) as f32];
+            }
+        }
     }
 
     /// Restrict the pass to `[x, y, w, h]` in pixels.
@@ -672,6 +703,8 @@ impl GpuRenderState {
             env_zenith: rgba(DEFAULT_GRADIENT.zenith),
             env_horizon: rgba(DEFAULT_GRADIENT.horizon),
             env_ground: rgba(DEFAULT_GRADIENT.ground),
+            sun_direction: [0.0, 0.0, 1.0, 1.0],
+            sun_radiance: [0.0; 4],
         }
     }
 
