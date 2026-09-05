@@ -29,6 +29,7 @@ pub mod gpu;
 
 pub mod analytic;
 pub mod bvh;
+pub mod caustics;
 pub mod env;
 pub mod geometry;
 pub mod heightfield;

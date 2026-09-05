@@ -31,8 +31,9 @@
 use std::sync::Arc;
 
 use crate::bvh::Bvh;
+use crate::caustics::CausticMap;
 use crate::geometry::Geometry;
-use crate::math::{Point3, Transform, Vec3};
+use crate::math::{Aabb, Point3, Transform, Vec3};
 use crate::ray::Ray;
 use crate::tlas::{Instance, InstanceHit, Tlas};
 
@@ -531,13 +532,13 @@ pub struct AreaLight {
 impl AreaLight {
     /// Unit normal of the emitting face.
     #[inline]
-    fn normal(&self) -> Vec3 {
+    pub(crate) fn normal(&self) -> Vec3 {
         self.u.cross(self.v).normalize()
     }
 
     /// Area of the rectangle in world units.
     #[inline]
-    fn area(&self) -> f64 {
+    pub(crate) fn area(&self) -> f64 {
         4.0 * self.u.cross(self.v).norm()
     }
 
@@ -572,7 +573,7 @@ impl AreaLight {
     }
 
     /// Uniformly sample a point on the rectangle.
-    fn sample(&self, r1: f64, r2: f64) -> Point3 {
+    pub(crate) fn sample(&self, r1: f64, r2: f64) -> Point3 {
         self.center + self.u * (2.0 * r1 - 1.0) + self.v * (2.0 * r2 - 1.0)
     }
 }
@@ -623,7 +624,7 @@ impl GradientEnv {
 
 /// Relative luminance, the scalar the environment CDF is built over.
 #[inline]
-fn luminance(c: [f32; 3]) -> f32 {
+pub(crate) fn luminance(c: [f32; 3]) -> f32 {
     0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
 }
 
@@ -1439,7 +1440,39 @@ pub struct PathTraceOptions {
     /// Depth at which Russian roulette begins.
     pub rr_start: u32,
     /// Clamp on indirect radiance, to kill fireflies. `None` disables.
+    ///
+    /// An *absolute* cap, in radiance units: any direct-lighting estimate at
+    /// depth > 0 is truncated to it. Cheap and effective, and biased in a way
+    /// that does not matter for a studio render — but it is a fixed number
+    /// against a quantity whose scale is the scene's, so a bright scene has
+    /// its highlights shaved and a dim one keeps its fireflies.
+    ///
+    /// A caustic is exactly the case where that bias is *not* acceptable: a
+    /// focused spot is legitimately many times the surrounding radiance, and
+    /// an absolute cap is indistinguishable from throwing the caustic away.
+    /// Contributions read out of a [`crate::caustics::CausticMap`] are
+    /// therefore never clamped — they are a density estimate, not a Monte
+    /// Carlo spike, and they have no long tail to cut.
     pub firefly_clamp: Option<f32>,
+    /// Clamp on indirect radiance *relative to what the pixel has already
+    /// measured*, replacing [`Self::firefly_clamp`] when set.
+    ///
+    /// The number is a multiple of the pixel's running mean luminance: `8.0`
+    /// lets any sample through that is within eight times the brightness the
+    /// pixel has settled on so far, and cuts the ones past it. Scale-free, so
+    /// the same value works on a sunlit court and a dim pool, and it adapts to
+    /// the pixel rather than to the scene — a pixel inside a caustic has a
+    /// high running mean and keeps its energy, a pixel in shadow does not.
+    ///
+    /// The first few samples have no mean to speak of, so the clamp does not
+    /// engage until [`Self::firefly_clamp_warmup`] samples have landed.
+    ///
+    /// `None` — the default — leaves the absolute clamp in charge and every
+    /// render that predates this field bit-identical.
+    pub firefly_clamp_relative: Option<f32>,
+    /// Samples a pixel must take before [`Self::firefly_clamp_relative`]
+    /// engages.
+    pub firefly_clamp_warmup: u32,
     /// Render the environment behind the subject rather than leaving it clear.
     pub show_background: bool,
     /// Random seed.
@@ -1477,6 +1510,8 @@ impl Default for PathTraceOptions {
             max_depth: 6,
             rr_start: 3,
             firefly_clamp: Some(12.0),
+            firefly_clamp_relative: None,
+            firefly_clamp_warmup: 16,
             show_background: true,
             seed: 0x5eed_1234,
             filter: PixelFilter::Box,
@@ -1493,11 +1528,11 @@ impl Default for PathTraceOptions {
 
 /// Small, fast, deterministic PRNG (PCG-XSH-RR style).
 #[derive(Clone, Copy)]
-struct Rng(u64);
+pub(crate) struct Rng(u64);
 
 impl Rng {
     #[inline]
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         // Mix so neighbouring pixel seeds decorrelate immediately.
         let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         s ^= s >> 29;
@@ -1519,7 +1554,7 @@ impl Rng {
 
     /// Uniform in [0, 1).
     #[inline]
-    fn f64(&mut self) -> f64 {
+    pub(crate) fn f64(&mut self) -> f64 {
         (self.next_u32() as f64) * (1.0 / 4294967296.0)
     }
 }
@@ -1567,7 +1602,7 @@ fn smoothstep(t: f32) -> f32 {
 }
 
 /// Orthonormal basis around a unit normal (Duff et al., branchless).
-fn onb(n: Vec3) -> (Vec3, Vec3) {
+pub(crate) fn onb(n: Vec3) -> (Vec3, Vec3) {
     let sign = if n.z >= 0.0 { 1.0 } else { -1.0 };
     let a = -1.0 / (sign + n.z);
     let b = n.x * n.y * a;
@@ -1626,7 +1661,7 @@ fn to_world(t: Vec3, b: Vec3, n: Vec3, w: Vec3) -> Vec3 {
 }
 
 /// Cosine-weighted hemisphere sample in local space (+Z up).
-fn cosine_hemisphere(r1: f64, r2: f64) -> Vec3 {
+pub(crate) fn cosine_hemisphere(r1: f64, r2: f64) -> Vec3 {
     let r = r1.sqrt();
     let phi = 2.0 * std::f64::consts::PI * r2;
     Vec3::new(r * phi.cos(), r * phi.sin(), (1.0 - r1).max(0.0).sqrt())
@@ -3180,6 +3215,176 @@ impl<G: Geometry> Scene<G> {
     }
 }
 
+// ─── the caustic pass's half of the integrator ────────────────────────────
+
+/// The acceleration structure the caustic pass traces against, built once.
+///
+/// A thin wrapper so [`crate::caustics`] can hold the TLAS without the
+/// integrator's internals leaking out of this module.
+pub(crate) struct CausticContext<G> {
+    accel: SceneAccel<G>,
+}
+
+impl<G: Geometry> CausticContext<G> {
+    pub(crate) fn new(scene: &Scene<G>) -> Self {
+        Self {
+            accel: SceneAccel::build(scene),
+        }
+    }
+}
+
+/// Centre and bounding radius of the scene's *refracting* geometry, or `None`
+/// when there is none.
+///
+/// This is what the caustic pass aims at. Aiming is importance sampling and
+/// not a cheat — the emitted power carries the solid angle of the cone — but
+/// it is the difference between a caustic in seconds and a caustic never.
+pub(crate) fn caustic_bounds<G: Geometry>(scene: &Scene<G>) -> Option<(Point3, f64)> {
+    let mut bounds: Option<Aabb> = None;
+    for obj in &scene.objects {
+        if !crate::caustics::is_caustic_refractor(&obj.material) {
+            continue;
+        }
+        let Some(inst) = Instance::new(Arc::clone(&obj.bvh), obj.transform.clone(), 0) else {
+            continue;
+        };
+        let b = inst.world_aabb();
+        match &mut bounds {
+            Some(acc) => acc.include(&b),
+            None => bounds = Some(b),
+        }
+    }
+    let b = bounds?;
+    let c = b.center();
+    let r: f64 = 0.5 * (b.max - b.min).norm();
+    if !r.is_finite() || r <= 0.0 {
+        return None;
+    }
+    Some((c, r))
+}
+
+/// Follow one photon from a light until it lands on a diffuse surface.
+///
+/// Returns the landing point, the surface normal there and the power the
+/// photon still carries — or `None` if it was absorbed, escaped, or reached a
+/// diffuse surface without ever having been refracted by a *solid*.
+///
+/// That last condition is the whole of the double-counting rule: light that
+/// only ever passed through a thin pane already belongs to next-event
+/// estimation (see `sheet_transmittance`), so a photon carrying it is dropped
+/// here rather than added twice.
+///
+/// The BSDF is the camera path's BSDF, unmodified. It can be, because
+/// [`dielectric_eval`]'s transmission branch already cancels Walter's `η_t²`
+/// against the `1/η²` radiance compression — so what it returns is the
+/// symmetric quantity a photon wants, and importance transport needs no
+/// correction factor here.
+pub(crate) fn trace_photon<G: Geometry>(
+    scene: &Scene<G>,
+    ctx: &CausticContext<G>,
+    origin: Point3,
+    dir: Vec3,
+    power: [f32; 3],
+    max_bounces: u32,
+    rng: &mut Rng,
+) -> Option<(Point3, Vec3, [f32; 3])> {
+    let accel = &ctx.accel;
+    let mut ray = Ray::new(origin, dir);
+    let mut power = power;
+    let mut lambda_nm: Option<f64> = None;
+    let mut medium: Option<Pbr> = None;
+    let mut refracted_by_a_solid = false;
+
+    for _ in 0..max_bounces {
+        let landing = scene.intersect(accel, &ray);
+        // Absorb along the segment just travelled, if it was inside glass.
+        if let Some(med) = &medium {
+            let sigma = med.extinction();
+            if let Landing::Surface { point, .. } = &landing
+                && max3(sigma) > 0.0
+            {
+                {
+                    let d = (*point - ray.origin).norm() as f32;
+                    power = mul3(
+                        power,
+                        [
+                            (-sigma[0] * d).exp(),
+                            (-sigma[1] * d).exp(),
+                            (-sigma[2] * d).exp(),
+                        ],
+                    );
+                }
+            }
+        }
+        let Landing::Surface {
+            point,
+            normal,
+            tangent,
+            material,
+        } = landing
+        else {
+            // Off into the sky, or onto a light's back: no deposit.
+            return None;
+        };
+
+        let wo_world = -ray.direction.into_inner();
+        let entering = normal.dot(wo_world) >= 0.0;
+        let n = if normal.dot(wo_world) < 0.0 {
+            -normal
+        } else {
+            normal
+        };
+
+        if material.transmission <= 0.0 {
+            // A diffuse receiver. Deposit only if the light got here the way
+            // the path tracer cannot follow.
+            return if refracted_by_a_solid && max3(power) > 0.0 {
+                Some((point, n, power))
+            } else {
+                None
+            };
+        }
+
+        if lambda_nm.is_none() && material.is_dispersive() {
+            let nm = crate::spectrum::sample_lambda_nm(rng.f64());
+            lambda_nm = Some(nm);
+            power = mul3(power, crate::spectrum::hero_weight(nm));
+        }
+        let n_glass = material.index_at(lambda_nm).max(1e-3);
+        let eta = if material.thin_walled || entering {
+            n_glass
+        } else {
+            1.0 / n_glass
+        };
+        let hero = lambda_nm.unwrap_or(0.0) as f32;
+
+        let frame = shading_frame(n, tangent);
+        let wo_local = to_local(frame.t, frame.b, n, wo_world);
+        if wo_local.z <= 0.0 {
+            return None;
+        }
+        let Some(Sampled::Surface(wi_local, f, pdf)) =
+            bsdf_sample(&material, wo_local, eta, hero, rng)
+        else {
+            return None;
+        };
+        power = mul3(power, scale3(f, 1.0 / pdf));
+        if max3(power) <= 1e-12 {
+            return None;
+        }
+
+        let transmitted = wi_local.z < 0.0;
+        if transmitted && !material.thin_walled {
+            refracted_by_a_solid = true;
+            medium = if entering { Some(material) } else { None };
+        }
+        let wi_world = to_world(frame.t, frame.b, n, wi_local);
+        let offset = if transmitted { -n } else { n };
+        ray = Ray::new(point + offset * 1e-5, wi_world);
+    }
+    None
+}
+
 // ─── integrator ───────────────────────────────────────────────────────────
 
 /// What the primary ray of a path found at depth 0.
@@ -3201,10 +3406,13 @@ struct Primary {
 
 /// Trace one path and return its radiance estimate, plus what its primary ray
 /// landed on (for alpha and for the denoiser's guide buffers).
+#[allow(clippy::too_many_arguments)]
 fn radiance<G: Geometry>(
     scene: &Scene<G>,
     accel: &SceneAccel<G>,
     opts: &PathTraceOptions,
+    caustics: Option<&CausticMap>,
+    clamp_scale: Option<f32>,
     ray: Ray,
     rng: &mut Rng,
 ) -> ([f32; 3], Primary) {
@@ -3387,11 +3595,36 @@ fn radiance<G: Geometry>(
                         accel, point, &frame, wo_local, &material, eta, hero, rng,
                     ),
                 );
-                let direct = match opts.firefly_clamp {
-                    Some(c) if depth > 0 => [direct[0].min(c), direct[1].min(c), direct[2].min(c)],
-                    _ => direct,
+                let direct = if depth > 0 {
+                    // The relative clamp, when armed, takes over from the
+                    // absolute one; otherwise nothing about this changed.
+                    match (clamp_scale, opts.firefly_clamp) {
+                        (Some(c), _) | (None, Some(c)) => {
+                            [direct[0].min(c), direct[1].min(c), direct[2].min(c)]
+                        }
+                        (None, None) => direct,
+                    }
+                } else {
+                    direct
                 };
                 l = add3(l, mul3(throughput, direct));
+
+                // The caustic map's share: light that arrived here by
+                // refraction through a solid, which next-event estimation
+                // could not have found and which the shadow rays above
+                // therefore did not count. Added *outside* the firefly clamp
+                // — it is a density estimate with no long tail, and clamping
+                // it is indistinguishable from deleting the caustic.
+                if let Some(map) = caustics.filter(|_| material.transmission <= 0.0) {
+                    let rho = material.diffuse_albedo();
+                    if max3(rho) > 0.0 {
+                        let e = map.irradiance(point, n);
+                        if max3(e) > 0.0 {
+                            let k = 1.0 / std::f32::consts::PI;
+                            l = add3(l, mul3(throughput, scale3(mul3(rho, e), k)));
+                        }
+                    }
+                }
 
                 // Continue the path.
                 let Some(sampled) = bsdf_sample(&material, wo_local, eta, hero, rng) else {
@@ -3533,6 +3766,7 @@ struct PixelOut<'a> {
 fn trace_pixel<G: Geometry>(
     scene: &Scene<G>,
     accel: &SceneAccel<G>,
+    caustics: Option<&CausticMap>,
     cam: &Camera,
     opts: &PathTraceOptions,
     width: u32,
@@ -3561,7 +3795,18 @@ fn trace_pixel<G: Geometry>(
         let (lu, lv) = concentric_disc(rng.f64(), rng.f64());
 
         let ray = cam.ray(sx, sy, aspect, lu, lv);
-        let (l, primary) = radiance(scene, accel, opts, ray, &mut rng);
+        // The relative clamp's threshold, from what this pixel has measured
+        // so far. It is deliberately a *running* mean and not a two-pass
+        // estimate: a pixel is its own scale, and one pass is what keeps the
+        // integrator streaming.
+        let clamp_scale = opts.firefly_clamp_relative.and_then(|k| {
+            if s >= opts.firefly_clamp_warmup && s > 0 {
+                Some((k * lsum / s as f32).max(1e-6))
+            } else {
+                None
+            }
+        });
+        let (l, primary) = radiance(scene, accel, opts, caustics, clamp_scale, ray, &mut rng);
         acc = add3(acc, l);
         let ls = luminance(l);
         lsum += ls;
@@ -3618,6 +3863,25 @@ pub fn render<G: Geometry + Send + Sync>(
     height: u32,
     opts: &PathTraceOptions,
 ) -> Film {
+    render_with_caustics(scene, cam, width, height, opts, None)
+}
+
+/// [`render`], plus a caustic map read as direct light at every diffuse hit.
+///
+/// The map is built once by [`crate::caustics::trace`] and handed in here.
+/// It is a separate argument rather than a field on [`Scene`] or
+/// [`PathTraceOptions`] because it is neither: the scene does not own it (it
+/// is derived from the scene) and the options are `Copy`.
+///
+/// Passing `None` is exactly [`render`], to the bit.
+pub fn render_with_caustics<G: Geometry + Send + Sync>(
+    scene: &Scene<G>,
+    cam: &Camera,
+    width: u32,
+    height: u32,
+    opts: &PathTraceOptions,
+    caustics: Option<&CausticMap>,
+) -> Film {
     #[cfg(not(target_arch = "wasm32"))]
     #[cfg(not(target_arch = "wasm32"))]
     use rayon::prelude::*;
@@ -3652,7 +3916,9 @@ pub fn render<G: Geometry + Send + Sync>(
                 variance: vrow,
             };
             for px in 0..width as usize {
-                trace_pixel(scene, &accel, cam, opts, width, height, px, py, &mut out);
+                trace_pixel(
+                    scene, &accel, caustics, cam, opts, width, height, px, py, &mut out,
+                );
             }
         });
 
@@ -3703,6 +3969,20 @@ pub fn render_into<G: Geometry + Send + Sync>(
     opts: &PathTraceOptions,
     rects: &[[u32; 4]],
 ) {
+    render_into_with_caustics(scene, cam, film, opts, rects, None)
+}
+
+/// [`render_into`] with a caustic map, the patch-render counterpart of
+/// [`render_with_caustics`].
+#[allow(clippy::too_many_arguments)]
+pub fn render_into_with_caustics<G: Geometry + Send + Sync>(
+    scene: &Scene<G>,
+    cam: &Camera,
+    film: &mut Film,
+    opts: &PathTraceOptions,
+    rects: &[[u32; 4]],
+    caustics: Option<&CausticMap>,
+) {
     #[cfg(not(target_arch = "wasm32"))]
     #[cfg(not(target_arch = "wasm32"))]
     use rayon::prelude::*;
@@ -3747,7 +4027,9 @@ pub fn render_into<G: Geometry + Send + Sync>(
                     variance: vrow,
                 };
                 for px in x0..x1 {
-                    trace_pixel(scene, &accel, cam, opts, width, height, px, py, &mut out);
+                    trace_pixel(
+                    scene, &accel, caustics, cam, opts, width, height, px, py, &mut out,
+                );
                 }
             });
     }
