@@ -34,6 +34,7 @@ pub mod env;
 pub mod geometry;
 pub mod heightfield;
 pub mod math;
+pub mod neural;
 pub mod optics;
 pub mod pathtrace;
 pub mod splats;

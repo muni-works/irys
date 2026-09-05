@@ -31,6 +31,10 @@ pub const INTEGRATOR_SHADER: &str = include_str!("integrator.wgsl");
 /// prefix.
 pub const HISTORY_SHADER: &str = include_str!("history.wgsl");
 
+/// The learned denoiser: three convolutions, a softmax and a 5x5 apply,
+/// standing where the à-trous chain stands. See [`super::neural`].
+pub const NEURAL_SHADER: &str = include_str!("neural.wgsl");
+
 /// Put the renderer's prelude in front of a body, and the BSDF in front of
 /// that. For shader harnesses that shade but do not trace.
 pub fn compose(body: &str) -> String {
