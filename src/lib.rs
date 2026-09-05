@@ -27,6 +27,7 @@
 #[cfg(feature = "gpu")]
 pub mod gpu;
 
+pub mod analytic;
 pub mod bvh;
 pub mod env;
 pub mod geometry;
@@ -41,6 +42,7 @@ mod sah;
 mod tables;
 pub mod tlas;
 
+pub use analytic::{Analytic, Frame, Prim};
 pub use bvh::{Bvh, BvhNode, FlatBvhNode};
 pub use env::{BuiltinEnv, generate as generate_env, parse_hdr};
 pub use geometry::{Geometry, TriMesh, TriangleHit, intersect_triangle};
