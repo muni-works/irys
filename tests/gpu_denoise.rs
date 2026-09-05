@@ -83,7 +83,14 @@ impl Fixture {
 }
 
 fn camera() -> GpuCamera {
-    GpuCamera::new([5.0, -5.0, 3.5], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], 0.7, W, H)
+    GpuCamera::new(
+        [5.0, -5.0, 3.5],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+        0.7,
+        W,
+        H,
+    )
 }
 
 /// Path trace only: no edge overlay, no stylisation.
@@ -367,4 +374,365 @@ fn rmse(a: &[u8], b: &[u8]) -> f64 {
         }
     }
     (s / (n * 3) as f64).sqrt()
+}
+
+// ─── the split: accumulate per box, denoise once ──────────────────────────
+
+/// A tiling of the 64x64 frame into four boxes on deliberately unaligned
+/// seams.
+///
+/// 27 and 20 are not multiples of the 8x8 workgroup, so three of the four
+/// boxes start mid-workgroup and all four end mid-workgroup. That is the case
+/// the dispatch origin has to get right: the accumulate pass covers the box's
+/// workgroups rather than the frame's, so its invocation ids are shifted, and
+/// a shift that is off by anything at all folds the sample into the wrong
+/// pixels.
+const TILING: [[u32; 4]; 4] = [
+    [0, 0, 27, 20],
+    [27, 0, 37, 20],
+    [0, 20, 27, 44],
+    [27, 20, 37, 44],
+];
+
+/// `k` boxes accumulated and denoised once is one full-frame pass, byte for
+/// byte, when the boxes tile the frame.
+///
+/// This is the whole claim the split rests on. `accumulate_resident` folds a
+/// sample into the pixels of one box and `denoise_and_resolve_resident` runs
+/// the filter chain over the frame afterwards, so `k` dirty rectangles cost
+/// `k` traces and *one* denoise rather than `k` of each. If that is really
+/// only a regrouping of the same work, tiling the frame with boxes has to
+/// land on the same frame the fused call produces — not close, identical: the
+/// same raw samples fold into the same pixels in the same order and the same
+/// filter runs over the result.
+#[test]
+#[ignore = "requires GPU"]
+fn boxes_that_tile_the_frame_are_one_full_pass() {
+    let Some(ctx) = ctx_or_skip("boxes_that_tile_the_frame_are_one_full_pass") else {
+        return;
+    };
+    let fx = Fixture::new();
+    let pipeline = RayTracePipeline::new(ctx, &AnalyticGeometry::module()).expect("pipeline");
+    let history = HistoryPipeline::new(ctx).expect("history pipeline");
+    let denoise = GpuDenoiseParams::default();
+
+    // The reference: one unscissored fused pass.
+    let mut whole = pipeline.resident_scene(ctx, fx.scene(), W, H);
+    let whole_target = Target::new(ctx, W, H);
+    pipeline
+        .accumulate_and_denoise_resident(
+            ctx,
+            &history,
+            &mut whole,
+            &camera(),
+            state(1),
+            &[],
+            &denoise,
+            &whole_target.view,
+        )
+        .expect("full pass");
+    let want = whole_target.pixels(ctx);
+
+    // The split: the same frame index for every box, so every box traces the
+    // sample the full pass would have traced for its pixels, then one denoise
+    // over the lot.
+    let mut tiled = pipeline.resident_scene(ctx, fx.scene(), W, H);
+    let tiled_target = Target::new(ctx, W, H);
+    for rect in TILING {
+        let mut s = state(1);
+        s.set_scissor(rect);
+        pipeline
+            .accumulate_resident(ctx, &history, &mut tiled, &camera(), s, &[], None)
+            .expect("box accumulate");
+    }
+    pipeline
+        .denoise_and_resolve_resident(ctx, &history, &mut tiled, &denoise, &tiled_target.view)
+        .expect("denoise");
+    let got = tiled_target.pixels(ctx);
+
+    assert!(
+        want.chunks(4).any(|p| p[0] > 8),
+        "the reference frame is black — nothing was rendered",
+    );
+    let differing = got
+        .chunks(4)
+        .zip(want.chunks(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        differing,
+        0,
+        "{differing} of {} pixels differ between four tiling boxes and one full \
+         pass. The split is not a regrouping of the same work — check the \
+         accumulate dispatch's origin against its scissor.",
+        (W * H) as usize,
+    );
+}
+
+/// A box accumulate touches its box and nothing else.
+///
+/// The scissor already stopped the *fold* outside the rectangle; what is new
+/// is that the dispatch does not cover the frame at all, and a dispatch origin
+/// that is wrong by a workgroup would quietly fold this pass's sample into
+/// somebody else's pixels. Counting samples is the sharpest way to see it: a
+/// pixel outside the box must still be on one sample after a second pass, and
+/// its mean must be the float it already held.
+#[test]
+#[ignore = "requires GPU"]
+fn a_box_accumulate_leaves_the_rest_of_the_frame_alone() {
+    let Some(ctx) = ctx_or_skip("a_box_accumulate_leaves_the_rest_of_the_frame_alone") else {
+        return;
+    };
+    let fx = Fixture::new();
+    let pipeline = RayTracePipeline::new(ctx, &AnalyticGeometry::module()).expect("pipeline");
+    let history = HistoryPipeline::new(ctx).expect("history pipeline");
+    let mut res = pipeline.resident_scene(ctx, fx.scene(), W, H);
+
+    // One full pass, so every pixel has exactly one sample.
+    pipeline
+        .accumulate_resident(ctx, &history, &mut res, &camera(), state(1), &[], None)
+        .expect("full accumulate");
+    let before = pollster::block_on(pipeline.read_history(ctx, &mut res))
+        .expect("read")
+        .expect("a history");
+    assert!(
+        before.count.iter().all(|&c| c == 1),
+        "the first pass did not leave every pixel on one sample",
+    );
+
+    // A second pass over one unaligned box.
+    let rect = [11u32, 7, 29, 23];
+    let mut s = state(2);
+    s.set_scissor(rect);
+    pipeline
+        .accumulate_resident(ctx, &history, &mut res, &camera(), s, &[], None)
+        .expect("box accumulate");
+    let after = pollster::block_on(pipeline.read_history(ctx, &mut res))
+        .expect("read")
+        .expect("a history");
+
+    let inside = |x: u32, y: u32| {
+        x >= rect[0] && x < rect[0] + rect[2] && y >= rect[1] && y < rect[1] + rect[3]
+    };
+    let mut wrong_in = 0usize;
+    let mut wrong_out = 0usize;
+    let mut moved_out = 0usize;
+    for y in 0..H {
+        for x in 0..W {
+            let i = (y * W + x) as usize;
+            if inside(x, y) {
+                if after.count[i] != 2 {
+                    wrong_in += 1;
+                }
+            } else {
+                if after.count[i] != 1 {
+                    wrong_out += 1;
+                }
+                if after.rgb[i * 3..i * 3 + 3] != before.rgb[i * 3..i * 3 + 3] {
+                    moved_out += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        wrong_in, 0,
+        "{wrong_in} pixels inside the box did not take the sample"
+    );
+    assert_eq!(
+        wrong_out, 0,
+        "{wrong_out} pixels outside the box took a sample they were not offered",
+    );
+    assert_eq!(
+        moved_out, 0,
+        "{moved_out} pixels outside the box had their running mean moved",
+    );
+}
+
+/// What the split is worth: four boxes of a tenth of the frame each, against
+/// four full passes, at the viewer's own size.
+///
+/// A measurement, not an assertion — the numbers are the point. Three ways of
+/// spending a frame:
+///
+/// * four fused full-frame calls, which is what a viewer with no scissor pays;
+/// * four fused *box* calls, which is what it paid before this split: the
+///   trace shrank to the box but the whole denoise chain ran four times;
+/// * four box accumulates and one denoise, which is the split.
+#[test]
+#[ignore = "requires GPU"]
+fn measure_the_box_split() {
+    let Some(ctx) = ctx_or_skip("measure_the_box_split") else {
+        return;
+    };
+    const TW: u32 = 512;
+    const TH: u32 = 288;
+    // Four boxes of about a tenth of the frame each: 162x91 is 14 742 px
+    // against the frame's 147 456.
+    const BOXES: [[u32; 4]; 4] = [
+        [10, 10, 162, 91],
+        [200, 40, 162, 91],
+        [60, 150, 162, 91],
+        [330, 180, 162, 91],
+    ];
+
+    let fx = Fixture::new();
+    let pipeline = RayTracePipeline::new(ctx, &AnalyticGeometry::module()).expect("pipeline");
+    let history = HistoryPipeline::new(ctx).expect("history pipeline");
+    let denoise = GpuDenoiseParams::default();
+    let cam = GpuCamera::new(
+        [5.0, -5.0, 3.5],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+        0.7,
+        TW,
+        TH,
+    );
+    let target = Target::new(ctx, TW, TH);
+
+    let wait = || {
+        ctx.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll")
+    };
+
+    // Everything is timed after a warm-up pass, so no pipeline compile or
+    // first-touch allocation lands inside a measurement.
+    let mut res = pipeline.resident_scene(ctx, fx.scene(), TW, TH);
+    for frame in 1..=2 {
+        pipeline
+            .accumulate_and_denoise_resident(
+                ctx,
+                &history,
+                &mut res,
+                &cam,
+                state(frame),
+                &[],
+                &denoise,
+                &target.view,
+            )
+            .expect("warm-up");
+    }
+    wait();
+
+    let time = |f: &mut dyn FnMut()| {
+        let t = std::time::Instant::now();
+        for _ in 0..REPEATS {
+            f();
+        }
+        wait();
+        t.elapsed().as_secs_f64() * 1e3 / REPEATS as f64
+    };
+    const REPEATS: u32 = 20;
+
+    let mut frame = 100u32;
+    let full = time(&mut || {
+        for _ in 0..4 {
+            frame += 1;
+            pipeline
+                .accumulate_and_denoise_resident(
+                    ctx,
+                    &history,
+                    &mut res,
+                    &cam,
+                    state(frame),
+                    &[],
+                    &denoise,
+                    &target.view,
+                )
+                .expect("full pass");
+        }
+    });
+
+    let fused_boxes = time(&mut || {
+        for rect in BOXES {
+            frame += 1;
+            let mut s = state(frame);
+            s.set_scissor(rect);
+            pipeline
+                .accumulate_and_denoise_resident(
+                    ctx,
+                    &history,
+                    &mut res,
+                    &cam,
+                    s,
+                    &[],
+                    &denoise,
+                    &target.view,
+                )
+                .expect("fused box pass");
+        }
+    });
+
+    let split = time(&mut || {
+        for rect in BOXES {
+            frame += 1;
+            let mut s = state(frame);
+            s.set_scissor(rect);
+            pipeline
+                .accumulate_resident(ctx, &history, &mut res, &cam, s, &[], None)
+                .expect("box accumulate");
+        }
+        pipeline
+            .denoise_and_resolve_resident(ctx, &history, &mut res, &denoise, &target.view)
+            .expect("denoise");
+    });
+
+    eprintln!(
+        "{TW}x{TH}, four boxes of 10%: {full:.2} ms four full fused passes, \
+         {fused_boxes:.2} ms four fused box passes, {split:.2} ms four box \
+         accumulates and one denoise ({:.2}x the fused boxes, {:.2}x the full \
+         passes)",
+        fused_boxes / split,
+        full / split,
+    );
+
+    // Again with the fade off. Everything above ran on a history hundreds of
+    // samples deep, where `atrous_iters_for` has already faded the filter out
+    // and each of its five iterations is a read and a write rather than 25
+    // taps — so four denoise chains were four cheap chains. `--shot` turns the
+    // fade off (`CourtGpu::always_denoise`), and a viewport that has just been
+    // orbited is near enough the same thing: every pixel back at a full
+    // budget. That is where paying for the chain once instead of four times is
+    // worth what it sounds like it should be worth.
+    let hot = GpuDenoiseParams {
+        count_cutoff: u32::MAX,
+        ..denoise
+    };
+    let hot_fused = time(&mut || {
+        for rect in BOXES {
+            frame += 1;
+            let mut s = state(frame);
+            s.set_scissor(rect);
+            pipeline
+                .accumulate_and_denoise_resident(
+                    ctx,
+                    &history,
+                    &mut res,
+                    &cam,
+                    s,
+                    &[],
+                    &hot,
+                    &target.view,
+                )
+                .expect("fused box pass");
+        }
+    });
+    let hot_split = time(&mut || {
+        for rect in BOXES {
+            frame += 1;
+            let mut s = state(frame);
+            s.set_scissor(rect);
+            pipeline
+                .accumulate_resident(ctx, &history, &mut res, &cam, s, &[], None)
+                .expect("box accumulate");
+        }
+        pipeline
+            .denoise_and_resolve_resident(ctx, &history, &mut res, &hot, &target.view)
+            .expect("denoise");
+    });
+    eprintln!(
+        "{TW}x{TH}, the same boxes with the fade off: {hot_fused:.2} ms fused, \
+         {hot_split:.2} ms split ({:.2}x)",
+        hot_fused / hot_split,
+    );
 }

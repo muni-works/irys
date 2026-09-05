@@ -22,6 +22,22 @@
 //! know, from a re-pose to a region the caller wants re-converged. An empty
 //! slice is all-1.
 //!
+//! # One denoise a frame, not one a box
+//!
+//! [`RayTracePipeline::accumulate_and_denoise_resident`] is the whole of a
+//! pass in one call, and for a host with one dirty rectangle a frame that is
+//! the right shape. A host with several is a different matter: the trace and
+//! the fold scissor down to a box, but the denoise chain cannot — the filter
+//! reaches 32 pixels off a box's edge and the resolve has to leave the target
+//! texture whole — so `k` boxes through the fused call is `k` full-frame
+//! filters to show one frame.
+//!
+//! [`RayTracePipeline::accumulate_resident`] and
+//! [`RayTracePipeline::denoise_and_resolve_resident`] are the two halves on
+//! their own: call the first once per box and the second once, and the chain
+//! runs once. The fused calls are thin wrappers over the pair, so a host with
+//! one box needs to know none of this.
+//!
 //! **Reprojection** used to be on that list, and a host without one had only
 //! the blunt instrument: upload an all-zero mask on a camera move and watch
 //! every pixel of an orbit restart from a single sample, most of them the
@@ -76,9 +92,18 @@ pub fn atrous_iters_for(count: f32, iters: u32, count_cutoff: u32) -> u32 {
     (iters as f32 * t).ceil() as u32
 }
 
-/// Uniform slots: one per à-trous iteration, plus one shared by the
-/// accumulate, demodulate and resolve passes.
-const PARAM_SLOTS: u32 = MAX_DENOISE_ITERS + 1;
+/// Uniform slots: one per à-trous iteration, one shared by the accumulate,
+/// demodulate and resolve passes, and one for the reprojection.
+///
+/// The reprojection needs a slot of its own because it is the one pass that
+/// always covers the whole frame: an accumulate scissored to a box drives
+/// slot 0 with the box's dispatch origin, and the reprojection cannot inherit
+/// that origin.
+const PARAM_SLOTS: u32 = MAX_DENOISE_ITERS + 2;
+
+/// The parameter slot [`RayTracePipeline::accumulate_resident`] drives the
+/// reprojection from; see [`PARAM_SLOTS`].
+const REPROJECT_SLOT: u32 = MAX_DENOISE_ITERS + 1;
 
 /// Uniform buffer offsets must be a multiple of this on every backend we
 /// target, so each parameter slot is padded out to it.
@@ -150,7 +175,12 @@ struct HistoryParams {
     view_params: [f32; 4],
     reprojected: u32,
     iter_index: u32,
-    _pad_reproj: [u32; 2],
+    // The frame-space pixel the dispatch's (0, 0) invocation stands on.
+    // `accumulate` dispatches over its scissor box's workgroups rather than
+    // the frame's, so its invocation ids have to be shifted onto the box's
+    // corner; every other pass covers the frame and leaves these zero.
+    origin_x: u32,
+    origin_y: u32,
 }
 
 /// The camera basis the shader's ray generator derives from a [`GpuCamera`],
@@ -237,6 +267,11 @@ pub struct HistoryBuffers {
     /// Scratch for widening the caller's `u8` mask, kept so a per-frame
     /// upload allocates nothing.
     keep_staging: Vec<u32>,
+    /// A 1x1 storage texture standing in for the resolve target on the passes
+    /// that have no target and never write one. The bind group layout demands
+    /// a texture at binding 8; `accumulate_resident` has no business asking
+    /// its caller for one.
+    placeholder: wgpu::TextureView,
 }
 
 impl HistoryBuffers {
@@ -269,7 +304,30 @@ impl HistoryBuffers {
             }),
             readback: None,
             keep_staging: Vec::new(),
+            placeholder: ctx
+                .device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("History Placeholder Target"),
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default()),
         }
+    }
+
+    /// The stand-in bound where the resolve target goes on a pass that has
+    /// none; see `placeholder`.
+    fn placeholder_view(&self) -> &wgpu::TextureView {
+        &self.placeholder
     }
 
     /// The frame size this history is allocated for.
@@ -402,15 +460,508 @@ impl HistoryPipeline {
     }
 }
 
+/// One history compute pass: bind the parameter slot and dispatch `groups`
+/// workgroups.
+fn dispatch(
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    group: &wgpu::BindGroup,
+    slot: u32,
+    groups: (u32, u32),
+    label: &str,
+) {
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some(label),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, group, &[(PARAM_STRIDE * slot as u64) as u32]);
+    pass.dispatch_workgroups(groups.0.max(1), groups.1.max(1), 1);
+}
+
+/// The history passes' one bind group, over a chosen scratch source and
+/// destination so the wavelet iterations can ping-pong under a fixed layout.
+///
+/// `target` is the resolve pass's output texture. The accumulate half of a
+/// frame never touches it and has none to hand over, so it passes `None` and
+/// gets the scene's own output view bound in its place — a binding the passes
+/// it dispatches do not write.
+#[allow(clippy::too_many_arguments)]
+fn history_bind_group(
+    ctx: &GpuContext,
+    history_pipeline: &HistoryPipeline,
+    hist: &HistoryBuffers,
+    raw: &wgpu::Buffer,
+    guides: &wgpu::Buffer,
+    src: &wgpu::Buffer,
+    dst: &wgpu::Buffer,
+    target: Option<&wgpu::TextureView>,
+    label: &str,
+) -> wgpu::BindGroup {
+    let placeholder;
+    let view = match target {
+        Some(v) => v,
+        None => {
+            placeholder = hist.placeholder_view();
+            placeholder
+        }
+    };
+    ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout: &history_pipeline.layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &hist.params,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(std::mem::size_of::<HistoryParams>() as u64),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: raw.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: guides.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: hist.mean.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: hist.stats.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: hist.keep.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: src.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: dst.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: hist.prev_guides.as_entire_binding(),
+            },
+        ],
+    })
+}
+
 impl RayTracePipeline {
+    /// Trace one pass into the device-side history, scissored to one box.
+    ///
+    /// The first half of [`RayTracePipeline::accumulate_and_denoise_resident`],
+    /// split out so a caller with several dirty rectangles pays for the
+    /// denoise chain once rather than once per rectangle. Call it once per
+    /// box, then [`RayTracePipeline::denoise_and_resolve_resident`] once, and
+    /// the result is what the fused call would have produced from the same
+    /// boxes — byte for byte, when the boxes tile the frame.
+    ///
+    /// Everything here is **scissored to the box** that `state` carries (see
+    /// `GpuRenderState::set_scissor`): the trace dispatches only over the
+    /// rectangle, the accumulate dispatch covers only the rectangle's
+    /// workgroups rather than the frame's, and the keep mask upload is only
+    /// the rows the rectangle touches. Every pixel outside keeps the mean, the
+    /// sample count and the variance it already had. With no scissor the box
+    /// is the whole frame, which is the fused call's behaviour exactly.
+    ///
+    /// `keep` is still indexed over the **whole frame** — one byte per pixel,
+    /// row-major, 1 keeps that pixel's history and 0 restarts it — so the same
+    /// mask can be handed to every box of a pass. Only the entries the box
+    /// covers are read, and only the rows it touches are uploaded. An empty
+    /// slice is read as all-1 and still costs the (small) upload, because the
+    /// resident mask may hold a previous pass's zeros.
+    ///
+    /// `prev_view` runs the device-side reprojection, and is a **once per
+    /// frame** thing: the pass gathers over the whole frame into the scratch
+    /// pair and every later box in the same frame reads that gather, so pass
+    /// the previous camera on the first box only and `None` on the rest.
+    /// Passing it on a later box would re-gather from a history that has
+    /// already been folded into. See
+    /// [`RayTracePipeline::accumulate_and_denoise_resident_reprojected`] for
+    /// what the reprojection tests.
+    ///
+    /// `state` is forced into raw-sample mode with its refinement pass off,
+    /// exactly as [`RayTracePipeline::render_resident_linear`] forces them.
+    ///
+    /// The work is submitted and this returns immediately.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accumulate_resident(
+        &self,
+        ctx: &GpuContext,
+        history_pipeline: &HistoryPipeline,
+        res: &mut ResidentScene,
+        camera: &GpuCamera,
+        state: GpuRenderState,
+        keep: &[u8],
+        prev_view: Option<&GpuCamera>,
+    ) -> Result<(), GpuError> {
+        let (w, h) = res.size();
+        let n = (w as usize) * (h as usize);
+        if !keep.is_empty() && keep.len() != n {
+            return Err(GpuError::InvalidInput(format!(
+                "keep mask has {} entries, expected {w}x{h} = {n}",
+                keep.len(),
+            )));
+        }
+
+        res.ensure_history(ctx, w, h);
+
+        // The box, clamped to the frame. A zero-size scissor means the whole
+        // frame, which is what an unscissored state carries.
+        let (bx, by, bw, bh) = match state.scissor() {
+            Some([x, y, sw, sh]) => {
+                let x = x.min(w);
+                let y = y.min(h);
+                (x, y, sw.min(w - x), sh.min(h - y))
+            }
+            None => (0, 0, w, h),
+        };
+        if bw == 0 || bh == 0 {
+            return Ok(());
+        }
+
+        // The two views the reprojection pass works between. With no previous
+        // view the pass is not dispatched and these are inert.
+        let cur = view_basis(camera);
+        let prev = view_basis(prev_view.unwrap_or(camera));
+
+        {
+            let hist = res.history_mut().expect("history was just ensured");
+
+            // Widen the caller's mask, for the rows this box touches only.
+            // WGSL has no 8-bit storage type, and one word per pixel is a
+            // 590 KB upload at 512x288 for a whole frame — a box worth a
+            // tenth of it pays about a tenth of that. Whole rows rather than
+            // the exact rectangle: a buffer is row-major, so a sub-rectangle
+            // is `bh` separate writes where a row range is one, and the extra
+            // words are never read.
+            let row_lo = (by as usize) * (w as usize);
+            let row_hi = ((by + bh) as usize) * (w as usize);
+            hist.keep_staging.clear();
+            hist.keep_staging.reserve(row_hi - row_lo);
+            if keep.is_empty() {
+                hist.keep_staging.resize(row_hi - row_lo, 1);
+            } else {
+                hist.keep_staging
+                    .extend(keep[row_lo..row_hi].iter().map(|&b| u32::from(b)));
+            }
+            ctx.queue.write_buffer(
+                &hist.keep,
+                (row_lo * 4) as u64,
+                bytemuck::cast_slice(hist.keep_staging.as_slice()),
+            );
+
+            // Slot 0 drives reproject and accumulate here; the denoise call
+            // rewrites it for demodulate and resolve. Only the fields those
+            // two passes read matter, and the denoise parameters are not
+            // among them.
+            let base = HistoryParams {
+                width: w,
+                height: h,
+                // Placeholders: `resolve` is the only pass that reads these
+                // and it runs out of the denoise call's slot 0.
+                count_cutoff: 1,
+                iters: 0,
+                sigma_lum: 0.0,
+                sigma_depth: 0.0,
+                sigma_normal: 0.0,
+                exposure: 1.0,
+                stride: 1,
+                src_is_b: 0,
+                // Straight from the trace pass's own state, so the two can
+                // never disagree about which pixels this pass refreshed.
+                scissor_xy: state.scissor_xy,
+                scissor_wh: state.scissor_wh,
+                cur_eye: cur.0,
+                cur_right: cur.1,
+                cur_up: cur.2,
+                cur_forward: cur.3,
+                prev_eye: prev.0,
+                prev_right: prev.1,
+                prev_up: prev.2,
+                prev_forward: prev.3,
+                view_params: [cur.4, cur.5, prev.4, prev.5],
+                reprojected: u32::from(prev_view.is_some()),
+                iter_index: 0,
+                // `accumulate` runs over the box's workgroups only, so its
+                // invocation ids start at the box's corner rather than the
+                // frame's.
+                origin_x: bx,
+                origin_y: by,
+            };
+            ctx.queue
+                .write_buffer(&hist.params, 0, bytemuck::bytes_of(&base));
+            // The reprojection gathers over the whole frame — a pixel inside
+            // the box may have been outside it last frame — so it gets a slot
+            // of its own with no origin. `REPROJECT_SLOT` is otherwise an
+            // à-trous slot the denoise call rewrites, and the two calls never
+            // read it at the same time.
+            if prev_view.is_some() {
+                let full = HistoryParams {
+                    origin_x: 0,
+                    origin_y: 0,
+                    ..base
+                };
+                ctx.queue.write_buffer(
+                    &hist.params,
+                    PARAM_STRIDE * REPROJECT_SLOT as u64,
+                    bytemuck::bytes_of(&full),
+                );
+            }
+        }
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("History Accumulate Encoder"),
+            });
+
+        // One raw sample into the resident scene's own accumulation buffer,
+        // with the guide planes filled.
+        let mut state = state;
+        state.set_raw_sample(true);
+        state.refine_sample_count = 0;
+        self.encode_raw_sample_into(ctx, res, camera, state, &mut encoder);
+
+        let (raw, guides) = res.raw_and_guide_buffers();
+        let hist = res.history().expect("history was just ensured");
+        let ab = history_bind_group(
+            ctx,
+            history_pipeline,
+            hist,
+            raw,
+            guides,
+            &hist.scratch_a,
+            &hist.scratch_b,
+            None,
+            "History Bind Group A->B",
+        );
+
+        // Before anything is folded in: carry what the previous view already
+        // knew about each pixel onto this view's pixel grid.
+        // `accumulate` picks the gather up out of the scratch pair.
+        if prev_view.is_some() {
+            dispatch(
+                &mut encoder,
+                &history_pipeline.reproject,
+                &ab,
+                REPROJECT_SLOT,
+                (w.div_ceil(8), h.div_ceil(8)),
+                "History Reproject",
+            );
+        }
+        dispatch(
+            &mut encoder,
+            &history_pipeline.accumulate,
+            &ab,
+            0,
+            (bw.div_ceil(8), bh.div_ceil(8)),
+            "History Accumulate",
+        );
+
+        // Keep this pass's depth/normal plane for the next one to reproject
+        // against, for the rows the trace just refreshed — outside them the
+        // copy would put back what is already there. Guide plane 1 starts one
+        // plane into the depth/normal buffer; plane 0 is the shader's own
+        // edge-detection copy.
+        let plane = (w as u64) * (h as u64) * 16;
+        let row = (w as u64) * 16;
+        encoder.copy_buffer_to_buffer(
+            guides,
+            plane + row * by as u64,
+            &hist.prev_guides,
+            row * by as u64,
+            row * bh as u64,
+        );
+
+        ctx.queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+
+    /// Denoise the running mean and tonemap it into `target` — the second
+    /// half of [`RayTracePipeline::accumulate_and_denoise_resident`], run
+    /// **once per frame** however many boxes were accumulated into it.
+    ///
+    /// Demodulate, `denoise.iters` à-trous iterations and resolve, all over
+    /// the whole frame: the filter reaches up to 32 pixels off a box's edge
+    /// and the resolve has to leave the target texture whole, so neither can
+    /// be scissored to a box the way the accumulate can. What the split buys
+    /// is that this chain runs once for `k` boxes rather than `k` times.
+    ///
+    /// The à-trous pass is not, though, the same cost every frame: a pixel's
+    /// iteration budget falls with its history length (see
+    /// [`atrous_iters_for`]) and reaches zero at `denoise.count_cutoff`, at
+    /// which point the pass writes the pixel through and does none of its 25
+    /// taps. A converged frame with one small moving box therefore still
+    /// dispatches over the frame — every workgroup runs, and every invocation
+    /// does its one read and one write — but only the box and its
+    /// neighbourhood pay for the taps.
+    ///
+    /// `target` must be a view of an `Rgba8Unorm` texture with
+    /// `STORAGE_BINDING` usage, at least the resident scene's size.
+    pub fn denoise_and_resolve_resident(
+        &self,
+        ctx: &GpuContext,
+        history_pipeline: &HistoryPipeline,
+        res: &mut ResidentScene,
+        denoise: &GpuDenoiseParams,
+        target: &wgpu::TextureView,
+    ) -> Result<(), GpuError> {
+        let (w, h) = res.size();
+        res.ensure_history(ctx, w, h);
+        let iters = denoise.iters.min(MAX_DENOISE_ITERS);
+
+        {
+            let hist = res.history().expect("history was just ensured");
+            // Slot 0 is shared by demodulate and resolve; slots 1..=iters
+            // carry each wavelet iteration's tap stride. The accumulate calls
+            // wrote slot 0 for their own passes; this overwrites it, and the
+            // fields they cared about — the scissor, the reprojection flag,
+            // the dispatch origin — are ones neither pass here reads.
+            let base = HistoryParams {
+                width: w,
+                height: h,
+                count_cutoff: denoise.count_cutoff.max(1),
+                iters,
+                sigma_lum: denoise.sigma_lum,
+                sigma_depth: denoise.sigma_depth,
+                sigma_normal: denoise.sigma_normal,
+                exposure: denoise.exposure,
+                stride: 1,
+                // The final iteration lands in scratch_b when the count is
+                // odd, since iteration 0 reads A and writes B.
+                src_is_b: u32::from(iters % 2 == 1),
+                scissor_xy: 0,
+                scissor_wh: 0,
+                cur_eye: [0.0; 4],
+                cur_right: [0.0; 4],
+                cur_up: [0.0; 4],
+                cur_forward: [0.0; 4],
+                prev_eye: [0.0; 4],
+                prev_right: [0.0; 4],
+                prev_up: [0.0; 4],
+                prev_forward: [0.0; 4],
+                view_params: [0.0; 4],
+                reprojected: 0,
+                iter_index: 0,
+                origin_x: 0,
+                origin_y: 0,
+            };
+            ctx.queue
+                .write_buffer(&hist.params, 0, bytemuck::bytes_of(&base));
+            for it in 0..iters {
+                let p = HistoryParams {
+                    stride: 1u32 << it,
+                    iter_index: it,
+                    ..base
+                };
+                ctx.queue.write_buffer(
+                    &hist.params,
+                    PARAM_STRIDE * (1 + it) as u64,
+                    bytemuck::bytes_of(&p),
+                );
+            }
+        }
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("History Denoise Encoder"),
+            });
+
+        let (raw, guides) = res.raw_and_guide_buffers();
+        let hist = res.history().expect("history was just ensured");
+
+        // Two bind groups differing only in which scratch buffer is the
+        // source, so the wavelet iterations can ping-pong under a fixed
+        // layout.
+        let ab = history_bind_group(
+            ctx,
+            history_pipeline,
+            hist,
+            raw,
+            guides,
+            &hist.scratch_a,
+            &hist.scratch_b,
+            Some(target),
+            "History Bind Group A->B",
+        );
+        let ba = history_bind_group(
+            ctx,
+            history_pipeline,
+            hist,
+            raw,
+            guides,
+            &hist.scratch_b,
+            &hist.scratch_a,
+            Some(target),
+            "History Bind Group B->A",
+        );
+
+        let groups = (w.div_ceil(8), h.div_ceil(8));
+        if iters > 0 {
+            dispatch(
+                &mut encoder,
+                &history_pipeline.demodulate,
+                &ab,
+                0,
+                groups,
+                "History Demodulate",
+            );
+            for it in 0..iters {
+                // Iteration 0 reads A and writes B, so even iterations use the
+                // A->B group and odd ones B->A.
+                let group = if it % 2 == 0 { &ab } else { &ba };
+                dispatch(
+                    &mut encoder,
+                    &history_pipeline.atrous,
+                    group,
+                    1 + it,
+                    groups,
+                    "History A-Trous",
+                );
+            }
+        }
+        dispatch(
+            &mut encoder,
+            &history_pipeline.resolve,
+            &ab,
+            0,
+            groups,
+            "History Resolve",
+        );
+
+        ctx.queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+
     /// Trace one pass, fold it into the device-side history, denoise the
     /// running mean, and tonemap the result into `target` — with no readback
     /// at all.
     ///
-    /// This is the whole of a progressive viewport's per-frame work. Call it
-    /// once per pass with an increasing `state.frame_index`; the shader's
-    /// jitter and RNG are driven by that index, so successive passes are
-    /// independent samples of the same picture and the running mean converges.
+    /// This is the whole of a progressive viewport's per-frame work, in one
+    /// call. It is exactly [`RayTracePipeline::accumulate_resident`] over one
+    /// box followed by [`RayTracePipeline::denoise_and_resolve_resident`]; a
+    /// caller with several dirty rectangles per frame wants those two
+    /// directly, so the denoise chain runs once rather than once per
+    /// rectangle.
+    ///
+    /// Call it once per pass with an increasing `state.frame_index`; the
+    /// shader's jitter and RNG are driven by that index, so successive passes
+    /// are independent samples of the same picture and the running mean
+    /// converges.
     ///
     /// `keep` is one byte per pixel in row-major order, the same length as the
     /// frame: **1 keeps that pixel's history, 0 restarts it** at this pass's
@@ -418,17 +969,17 @@ impl RayTracePipeline {
     /// know — a camera move (upload zeros), a reprojection that found a valid
     /// history for some pixels and not others, a region the caller wants to
     /// re-converge. Pass an all-1 mask for a still frame. An empty slice is
-    /// read as all-1, which is the common case and costs no upload.
+    /// read as all-1, which is the common case.
     ///
     /// A **scissor** set on `state` (see `GpuRenderState::set_scissor`) is
-    /// honoured all the way through: the trace pass dispatches only over the
-    /// rectangle, and the accumulate pass folds a sample in only for the
-    /// pixels inside it. Every pixel outside keeps the mean, the sample count
-    /// and the variance it already had — nothing stale is counted as fresh.
-    /// The resolve pass still covers the frame, so the target texture stays
-    /// whole; it simply re-resolves the untouched pixels from their unchanged
-    /// history. That is what lets a viewer trace only the part of the frame
-    /// that moved and keep the rest.
+    /// honoured through the trace and the fold: the trace pass dispatches only
+    /// over the rectangle, and the accumulate pass folds a sample in only for
+    /// the pixels inside it. Every pixel outside keeps the mean, the sample
+    /// count and the variance it already had — nothing stale is counted as
+    /// fresh. The resolve pass still covers the frame, so the target texture
+    /// stays whole; it simply re-resolves the untouched pixels from their
+    /// unchanged history. That is what lets a viewer trace only the part of
+    /// the frame that moved and keep the rest.
     ///
     /// `target` must be a view of an `Rgba8Unorm` texture with
     /// `STORAGE_BINDING` usage, at least the resident scene's size.
@@ -479,8 +1030,8 @@ impl RayTracePipeline {
     /// `None` skips the pass entirely and is exactly
     /// [`RayTracePipeline::accumulate_and_denoise_resident`]. Pass `None` on
     /// a still frame too: reprojecting a view onto itself is a no-op that
-    /// still costs two dispatches, and passing the *same* camera is
-    /// harmless but pointless.
+    /// still costs a dispatch, and passing the *same* camera is harmless but
+    /// pointless.
     ///
     /// The keep mask still applies, and applies *after* the reprojection: a
     /// caller that reprojects on the device wants an empty (all-keep) mask
@@ -505,203 +1056,8 @@ impl RayTracePipeline {
         target: &wgpu::TextureView,
         prev_view: Option<&GpuCamera>,
     ) -> Result<(), GpuError> {
-        let (w, h) = res.size();
-        let n = (w as usize) * (h as usize);
-        if !keep.is_empty() && keep.len() != n {
-            return Err(GpuError::InvalidInput(format!(
-                "keep mask has {} entries, expected {w}x{h} = {n}",
-                keep.len(),
-            )));
-        }
-
-        res.ensure_history(ctx, w, h);
-        let iters = denoise.iters.min(MAX_DENOISE_ITERS);
-
-        // Widen the caller's mask. WGSL has no 8-bit storage type, and one
-        // word per pixel is a 590 KB upload at 512x288 — an order of magnitude
-        // less than the frame it saves reading back.
-        // The two views the reprojection pass works between. With no
-        // previous view the pass is not dispatched and these are inert.
-        let cur = view_basis(camera);
-        let prev = view_basis(prev_view.unwrap_or(camera));
-
-        {
-            let hist = res.history_mut().expect("history was just ensured");
-            hist.keep_staging.clear();
-            hist.keep_staging.reserve(n);
-            if keep.is_empty() {
-                hist.keep_staging.resize(n, 1);
-            } else {
-                hist.keep_staging.extend(keep.iter().map(|&b| u32::from(b)));
-            }
-            ctx.queue.write_buffer(
-                &hist.keep,
-                0,
-                bytemuck::cast_slice(hist.keep_staging.as_slice()),
-            );
-
-            // Slot 0 is shared by accumulate, demodulate and resolve; slots
-            // 1..=iters carry each wavelet iteration's tap stride.
-            let base = HistoryParams {
-                width: w,
-                height: h,
-                count_cutoff: denoise.count_cutoff.max(1),
-                iters,
-                sigma_lum: denoise.sigma_lum,
-                sigma_depth: denoise.sigma_depth,
-                sigma_normal: denoise.sigma_normal,
-                exposure: denoise.exposure,
-                stride: 1,
-                // The final iteration lands in scratch_b when the count is
-                // odd, since iteration 0 reads A and writes B.
-                src_is_b: u32::from(iters % 2 == 1),
-                // Straight from the trace pass's own state, so the two can
-                // never disagree about which pixels this pass refreshed.
-                scissor_xy: state.scissor_xy,
-                scissor_wh: state.scissor_wh,
-                cur_eye: cur.0,
-                cur_right: cur.1,
-                cur_up: cur.2,
-                cur_forward: cur.3,
-                prev_eye: prev.0,
-                prev_right: prev.1,
-                prev_up: prev.2,
-                prev_forward: prev.3,
-                view_params: [cur.4, cur.5, prev.4, prev.5],
-                reprojected: u32::from(prev_view.is_some()),
-                iter_index: 0,
-                _pad_reproj: [0; 2],
-            };
-            ctx.queue
-                .write_buffer(&hist.params, 0, bytemuck::bytes_of(&base));
-            for it in 0..iters {
-                let p = HistoryParams {
-                    stride: 1u32 << it,
-                    iter_index: it,
-                    ..base
-                };
-                ctx.queue.write_buffer(
-                    &hist.params,
-                    PARAM_STRIDE * (1 + it) as u64,
-                    bytemuck::bytes_of(&p),
-                );
-            }
-        }
-
-        let mut encoder = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("History Encoder"),
-            });
-
-        // One raw sample into the resident scene's own accumulation buffer,
-        // with the guide planes filled.
-        let mut state = state;
-        state.set_raw_sample(true);
-        state.refine_sample_count = 0;
-        self.encode_raw_sample_into(ctx, res, camera, state, &mut encoder);
-
-        let (raw, guides) = res.raw_and_guide_buffers();
-        let hist = res.history().expect("history was just ensured");
-
-        // Two bind groups differing only in which scratch buffer is the
-        // source, so the wavelet iterations can ping-pong under a fixed
-        // layout.
-        let bind = |src: &wgpu::Buffer, dst: &wgpu::Buffer, label: &str| {
-            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &history_pipeline.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &hist.params,
-                            offset: 0,
-                            size: wgpu::BufferSize::new(
-                                std::mem::size_of::<HistoryParams>() as u64
-                            ),
-                        }),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: raw.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: guides.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: hist.mean.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: hist.stats.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: hist.keep.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: src.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: dst.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 8,
-                        resource: wgpu::BindingResource::TextureView(target),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 9,
-                        resource: hist.prev_guides.as_entire_binding(),
-                    },
-                ],
-            })
-        };
-        let ab = bind(&hist.scratch_a, &hist.scratch_b, "History Bind Group A->B");
-        let ba = bind(&hist.scratch_b, &hist.scratch_a, "History Bind Group B->A");
-
-        let groups = (w.div_ceil(8), h.div_ceil(8));
-        let mut run =
-            |pipeline: &wgpu::ComputePipeline, group: &wgpu::BindGroup, slot: u32, label: &str| {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some(label),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, group, &[(PARAM_STRIDE * slot as u64) as u32]);
-                pass.dispatch_workgroups(groups.0, groups.1, 1);
-            };
-
-        // Before anything is folded in: carry what the previous view already
-        // knew about each pixel onto this view's pixel grid.
-        // `accumulate` picks the gather up out of the scratch pair.
-        if prev_view.is_some() {
-            run(&history_pipeline.reproject, &ab, 0, "History Reproject");
-        }
-        run(&history_pipeline.accumulate, &ab, 0, "History Accumulate");
-        if iters > 0 {
-            run(&history_pipeline.demodulate, &ab, 0, "History Demodulate");
-            for it in 0..iters {
-                // Iteration 0 reads A and writes B, so even iterations use the
-                // A->B group and odd ones B->A.
-                let group = if it % 2 == 0 { &ab } else { &ba };
-                run(&history_pipeline.atrous, group, 1 + it, "History A-Trous");
-            }
-        }
-        run(&history_pipeline.resolve, &ab, 0, "History Resolve");
-
-        // Keep this pass's depth/normal plane for the next one to reproject
-        // against. Guide plane 1 starts one plane into the depth/normal
-        // buffer; plane 0 is the shader's own edge-detection copy.
-        let plane = (w as u64) * (h as u64) * 16;
-        encoder.copy_buffer_to_buffer(guides, plane, &hist.prev_guides, 0, plane);
-
-        ctx.queue.submit(Some(encoder.finish()));
-        Ok(())
+        self.accumulate_resident(ctx, history_pipeline, res, camera, state, keep, prev_view)?;
+        self.denoise_and_resolve_resident(ctx, history_pipeline, res, denoise, target)
     }
 
     /// Read the device-side history back.
