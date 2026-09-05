@@ -35,6 +35,7 @@ pub mod optics;
 pub mod pathtrace;
 mod ray;
 mod sah;
+mod tables;
 pub mod tlas;
 
 pub use bvh::{Bvh, BvhNode, FlatBvhNode};

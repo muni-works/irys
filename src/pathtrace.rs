@@ -60,8 +60,24 @@ macro_rules! film_rows {
 
 /// A physically-based surface description.
 ///
-/// Follows the metallic-roughness convention (glTF / Disney-lite) with an
-/// added clearcoat layer.
+/// Disney's "principled" parameterisation (Burley 2012) with the corrections
+/// the field has settled on since, composed the way OpenPBR 1.0 composes them:
+///
+/// - **diffuse** — energy-preserving Oren-Nayar (d'Eon & Portsmouth et al.
+///   2024), driven by [`Self::diffuse_roughness`] (OpenPBR's
+///   `base_diffuse_roughness`), blended with Disney's Hanrahan-Krueger
+///   [`Self::subsurface`] lobe;
+/// - **specular** — anisotropic GGX with VNDF sampling and Turquin (2019)
+///   multiple-scattering compensation;
+/// - **sheen** — the multiple-scattering LTC fit of Zeltner, Burley and Chiang
+///   (2022) (OpenPBR calls this layer *fuzz*);
+/// - **coat** — Disney's GTR1 clearcoat at a fixed IOR of 1.5.
+///
+/// Every field added on top of the original metallic-roughness set defaults to
+/// a value that reduces the model to what it was: `diffuse_roughness = 0` is
+/// exactly Lambert, `subsurface = 0` and `sheen = 0` switch their lobes off
+/// entirely, and `specular = 0.5` with `ior = 1.5` is the same `F0 = 0.04` the
+/// IOR alone used to give.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pbr {
     /// Linear-space base colour. Albedo for dielectrics, F0 for metals.
@@ -70,6 +86,41 @@ pub struct Pbr {
     pub metallic: f32,
     /// Perceptual roughness in 0..1. Squared internally to get the GGX alpha.
     pub roughness: f32,
+    /// Roughness of the *diffuse* lobe — OpenPBR's `base_diffuse_roughness`,
+    /// the `sigma` of Oren-Nayar.
+    ///
+    /// Kept separate from [`Self::roughness`] because a surface's microscale
+    /// slope statistics and its subsurface scattering length are unrelated
+    /// facts: latex paint is diffusely rough and specularly smooth, a polished
+    /// marble is the reverse. `0` is exactly Lambert, which is the default and
+    /// why every scene that predates this field renders unchanged.
+    pub diffuse_roughness: f32,
+    /// Hanrahan-Krueger subsurface blend in 0..1 (Disney's `subsurface`).
+    ///
+    /// Flattens the diffuse falloff and brightens grazing angles, the way a
+    /// short mean free path under the surface does. Not a substitute for real
+    /// subsurface transport — it will not bleed light into shadows.
+    pub subsurface: f32,
+    /// Incident specular amount in Disney's normalised range — `0.5` means
+    /// `F0 = 0.04`. See [`Self::f0`] for how it and [`Self::ior`] combine.
+    pub specular: f32,
+    /// Tints the dielectric `F0` towards the hue of the base colour, 0..1.
+    ///
+    /// Disney's concession to art direction: grazing specular stays achromatic
+    /// either way, so this only colours the highlight's core.
+    pub specular_tint: f32,
+    /// Strength of the sheen (OpenPBR: *fuzz*) layer, 0 = none.
+    pub sheen: f32,
+    /// Colour of the sheen layer — OpenPBR's `fuzz_color`.
+    ///
+    /// Disney 2012 spelled this as a scalar `sheenTint` interpolating towards
+    /// the base hue; OpenPBR gives the layer its own colour outright, which is
+    /// strictly more expressive, so that is what this is. `[1, 1, 1]` is
+    /// white sheen.
+    pub sheen_color: [f32; 3],
+    /// Roughness of the sheen layer — OpenPBR's `fuzz_roughness`, and the
+    /// `alpha` axis of the Zeltner LTC fit.
+    pub sheen_roughness: f32,
     /// Directional bias of the specular lobe, in -1..1.
     ///
     /// `0` is isotropic and reduces exactly to a round GGX highlight.
@@ -83,8 +134,16 @@ pub struct Pbr {
     /// Strength of the clearcoat layer (0 = none, 1 = full).
     pub clearcoat: f32,
     /// Perceptual roughness of the clearcoat layer.
+    ///
+    /// Disney's parameter is `clearcoatGloss`, mapped onto the GTR1 alpha as
+    /// `alpha = mix(0.1, 0.001, gloss)`. This is the same layer spelled the
+    /// way the rest of this struct spells roughness — `alpha = roughness²`,
+    /// with `clearcoat_roughness ≈ sqrt(mix(0.1, 0.001, gloss))`, so Disney's
+    /// satin end (gloss 0) is `clearcoat_roughness ≈ 0.32` and its gloss end
+    /// (gloss 1) is `≈ 0.032`.
     pub clearcoat_roughness: f32,
-    /// Dielectric index of refraction, drives the base specular reflectance.
+    /// Dielectric index of refraction. See [`Self::f0`] for how it and
+    /// [`Self::specular`] combine.
     pub ior: f32,
     /// Linear emissive radiance.
     pub emissive: [f32; 3],
@@ -96,6 +155,13 @@ impl Default for Pbr {
             base_color: [0.62, 0.64, 0.67],
             metallic: 0.0,
             roughness: 0.4,
+            diffuse_roughness: 0.0,
+            subsurface: 0.0,
+            specular: 0.5,
+            specular_tint: 0.0,
+            sheen: 0.0,
+            sheen_color: [1.0; 3],
+            sheen_roughness: 0.3,
             anisotropy: 0.0,
             clearcoat: 0.0,
             clearcoat_roughness: 0.1,
@@ -177,21 +243,67 @@ impl Pbr {
         }
     }
 
-    /// GGX alpha for the clearcoat lobe.
+    /// GTR1 alpha for the clearcoat lobe.
     #[inline]
     fn coat_alpha(&self) -> f32 {
         (self.clearcoat_roughness * self.clearcoat_roughness).max(1e-4)
     }
 
+    /// The dielectric part of `F0`, before any tint.
+    ///
+    /// Two parameters describe the same number and both are useful, so the
+    /// precedence is fixed and stated rather than left to whichever the
+    /// caller happened to set last:
+    ///
+    /// - **`ior` wins whenever it is not the default `1.5`.** A caller who
+    ///   knows the index — 1.52 for soda-lime glass, 1.33 for water — has said
+    ///   something physical, and Fresnel's `((n-1)/(n+1))²` is what they meant.
+    /// - **Otherwise `specular` drives it**, through Disney's linear mapping
+    ///   `F0 = 0.08 · specular`, whose 0..1 range covers IOR 1.0..1.8 and
+    ///   whose midpoint 0.5 is IOR 1.5.
+    ///
+    /// The two agree exactly at the defaults — `0.08 × 0.5 = 0.04` and
+    /// `((1.5-1)/(1.5+1))² = 0.04` — so the rule has no seam at the point
+    /// where it switches, and every material that predates `specular`
+    /// renders bit-identically.
+    #[inline]
+    fn f0_dielectric(&self) -> f32 {
+        if self.ior == 1.5 {
+            0.08 * self.specular
+        } else {
+            ((self.ior - 1.0) / (self.ior + 1.0)).powi(2)
+        }
+    }
+
+    /// The base colour with its luminance divided out — Disney's `Ctint`, the
+    /// hue and saturation of the surface without its brightness.
+    ///
+    /// Used to tint specular and sheen towards the surface's own colour
+    /// without also darkening them.
+    #[inline]
+    fn tint(&self) -> [f32; 3] {
+        let l = luminance(self.base_color);
+        if l > 0.0 {
+            scale3(self.base_color, 1.0 / l)
+        } else {
+            [1.0; 3]
+        }
+    }
+
     /// Specular reflectance at normal incidence.
+    ///
+    /// Dielectric `F0` (optionally tinted towards the base hue) blended
+    /// towards the base colour by `metallic`, which is what makes a metal's
+    /// reflection carry its colour and a dielectric's not.
     #[inline]
     fn f0(&self) -> [f32; 3] {
-        let d = ((self.ior - 1.0) / (self.ior + 1.0)).powi(2);
-        [
-            lerp(d, self.base_color[0], self.metallic),
-            lerp(d, self.base_color[1], self.metallic),
-            lerp(d, self.base_color[2], self.metallic),
-        ]
+        let d = self.f0_dielectric();
+        let dielectric = if self.specular_tint > 0.0 {
+            mix3([d; 3], scale3(self.tint(), d), self.specular_tint)
+        } else {
+            [d; 3]
+        };
+        mix3(dielectric, self.base_color, self.metallic)
     }
 
     /// Diffuse albedo (metals have none).
@@ -1454,6 +1566,280 @@ fn fresnel(f0: [f32; 3], cos_theta: f32) -> [f32; 3] {
     ]
 }
 
+// ─── diffuse: energy-preserving Oren-Nayar ────────────────────────────────
+//
+// d'Eon, Portsmouth, Hill, Fascione, "EON: A practical energy-preserving
+// rough diffuse BRDF" (JCGT 14(1), 2025; arXiv:2410.18026).
+//
+// Lambert is only correct for a mirror-smooth interface over an isotropically
+// scattering half-space. A real matte surface is rough at the microscale, and
+// Oren-Nayar's qualitative model of that — v-cavities of Lambertian facets —
+// gives the flat, backscattering look of chalk, clay and unfinished plaster
+// that Lambert cannot. What Oren-Nayar (and Fujii's improved form, FON) does
+// not do is conserve energy: interreflection between the cavities is dropped,
+// so a white surface comes back grey. EON adds that back analytically, which
+// is what makes it safe to turn on by default: at albedo 1 it reflects 1.
+
+/// `0.5 - 2/(3pi)`, the constant in the FON normalisation `A_F`.
+const FON_C1: f32 = 0.5 - 2.0 / (3.0 * std::f32::consts::PI);
+/// `2/3 - 28/(15pi)`, the constant in the FON *average* albedo.
+const FON_C2: f32 = 2.0 / 3.0 - 28.0 / (15.0 * std::f32::consts::PI);
+
+/// FON's normalisation factor `A_F`.
+#[inline]
+fn fon_a(r: f32) -> f32 {
+    1.0 / (1.0 + FON_C1 * r)
+}
+
+/// Directional albedo of the FON lobe, `E_F(mu, r)` — the paper's exact form
+/// rather than its quartic fit, since we are not on a shader clock here and
+/// the exact one is only an `acos` more expensive.
+#[inline]
+fn e_fon(mu: f32, r: f32) -> f32 {
+    let mu = mu.clamp(1e-6, 1.0);
+    let a = fon_a(r);
+    let si = (1.0 - mu * mu).max(0.0).sqrt();
+    let g = si * (mu.acos() - si * mu)
+        + (2.0 / 3.0) * ((si / mu) * (1.0 - si * si * si) - si);
+    a + (a * r) * std::f32::consts::FRAC_1_PI * g
+}
+
+/// The EON diffuse BRDF (already multiplied by nothing — this is `f`, not
+/// `f·cos`).
+///
+/// `r == 0` short-circuits to Lambert. That is not only an optimisation: the
+/// multiple-scattering term is a `0/0` there, guarded in the paper by an
+/// epsilon that leaves a `1e-7`-scale residue behind. Returning `rho/pi`
+/// outright is both the exact limit and what keeps every pre-existing
+/// material bit-identical.
+fn eon_diffuse(rho: [f32; 3], r: f32, wo: Vec3, wi: Vec3) -> [f32; 3] {
+    if r <= 0.0 {
+        return scale3(rho, std::f32::consts::FRAC_1_PI);
+    }
+    let mu_i = wi.z as f32;
+    let mu_o = wo.z as f32;
+    // The Fujii single-scattering term. `s` is the azimuthal cosine times the
+    // two sines; dividing by the larger cosine is what gives the model its
+    // characteristic flat, edge-lit shape.
+    let s = (wi.dot(wo) as f32) - mu_i * mu_o;
+    let s_over_t = if s > 0.0 { s / mu_i.max(mu_o).max(1e-6) } else { s };
+    let a = fon_a(r);
+    let f_ss = scale3(rho, std::f32::consts::FRAC_1_PI * a * (1.0 + r * s_over_t));
+
+    // The multiple-scattering compensation: the energy the v-cavities would
+    // have passed between their walls, redistributed as a smooth lobe whose
+    // shape is `(1 - E(mu_o))(1 - E(mu_i))`, so it is zero where the single
+    // scattering already conserves and largest where it loses most.
+    let e_o = e_fon(mu_o, r);
+    let e_i = e_fon(mu_i, r);
+    let avg = a * (1.0 + FON_C2 * r);
+    const EPS: f32 = 1e-7;
+    let k = std::f32::consts::FRAC_1_PI * (1.0 - e_o).max(EPS) * (1.0 - e_i).max(EPS)
+        / (1.0 - avg).max(EPS);
+    let mut out = [0.0f32; 3];
+    for c in 0..3 {
+        let rho_ms = rho[c] * rho[c] * avg / (1.0 - rho[c] * (1.0 - avg)).max(EPS);
+        out[c] = f_ss[c] + rho_ms * k;
+    }
+    out
+}
+
+/// Disney's Hanrahan-Krueger-flavoured subsurface lobe (2012 notes, §5.3).
+///
+/// A thin-shell approximation to a short mean free path: the retroreflective
+/// `F_D90` of the base diffuse model is replaced by one built from
+/// `roughness·cos²(theta_d)`, and the whole thing is scaled by
+/// `1.25·(1/(mu_i + mu_o) - 0.5)` so it flattens near the terminator and
+/// brightens at grazing the way scattering under a surface does.
+fn hanrahan_krueger(rho: [f32; 3], roughness: f32, wo: Vec3, wi: Vec3) -> [f32; 3] {
+    let mu_i = (wi.z as f32).max(1e-6);
+    let mu_o = (wo.z as f32).max(1e-6);
+    let wh = (wo + wi).normalize();
+    let cos_d = wi.dot(wh).max(0.0) as f32;
+    let fss90 = roughness * cos_d * cos_d;
+    let schlick = |c: f32| (1.0 - c).clamp(0.0, 1.0).powi(5);
+    let fi = 1.0 + (fss90 - 1.0) * schlick(mu_i);
+    let fo = 1.0 + (fss90 - 1.0) * schlick(mu_o);
+    let fss = fi * fo;
+    let ss = 1.25 * (fss * (1.0 / (mu_i + mu_o) - 0.5) + 0.5);
+    scale3(rho, std::f32::consts::FRAC_1_PI * ss)
+}
+
+// ─── specular: multiple-scattering compensation ───────────────────────────
+
+/// Turquin's multiple-scattering compensation factor for the GGX lobe
+/// (Turquin 2019, "Practical multiple scattering compensation for microfacet
+/// models").
+///
+/// A single-scattering microfacet BRDF drops every path that leaves one facet
+/// and strikes another, and for a rough surface that is most of the energy:
+/// 5% missing at `alpha = 0.2`, 31% at `0.5`, 69% at `1.0`. Turquin's
+/// observation is that the *shape* of the missing lobe barely matters, so
+/// rather than model it, scale the single-scattering lobe by
+///
+/// ```text
+///     1 + F0 · (1 - E(mu_o)) / E(mu_o)
+/// ```
+///
+/// where `E` is the single-scattering directional albedo with `F = 1`, baked
+/// into [`crate::tables::GGX_E`]. The factor is per-channel through `F0`,
+/// which is what makes a coloured metal's multiple bounces saturate the way
+/// they should — each extra bounce multiplies by the metal's reflectance
+/// again. At `F0 = 1` the factor is exactly `1/E`, so a white furnace reads
+/// exactly 1 at every roughness; at a dielectric's `F0 = 0.04` it is a fraction
+/// of a percent and the lobe stays comfortably under 1.
+///
+/// The factor depends on the outgoing direction only, so it is not exactly
+/// reciprocal — that is the price of the closed form, and Turquin's point is
+/// that the error is far smaller than the energy it recovers. See
+/// `tests::the_layered_bsdf_is_reciprocal` for the bound it is held to.
+///
+/// Anisotropy enters only through `sqrt(at·ab)`, the alpha of the isotropic
+/// lobe of the same area. The table is one-dimensional in roughness and a
+/// stretched lobe loses very nearly the same total energy as the round one it
+/// came from, so a second axis would buy nothing.
+#[inline]
+fn ms_compensation(f0: [f32; 3], at: f32, ab: f32, mu_o: f32) -> [f32; 3] {
+    let alpha = (at * ab).max(0.0).sqrt();
+    let e = crate::tables::bilinear(&crate::tables::GGX_E, alpha, mu_o).clamp(1e-3, 1.0);
+    let k = (1.0 - e) / e;
+    [
+        1.0 + f0[0] * k,
+        1.0 + f0[1] * k,
+        1.0 + f0[2] * k,
+    ]
+}
+
+// ─── sheen: multiple-scattering LTC ───────────────────────────────────────
+//
+// Zeltner, Burley and Chiang, "Practical Multiple-Scattering Sheen Using
+// Linearly Transformed Cosines" (SIGGRAPH 2022 Talks). Disney's 2012 sheen was
+// a Schlick-weighted tint bolted onto the edge of the diffuse lobe; this is a
+// fit to the real thing — multiple scattering in a thin layer of normally
+// oriented fibres with an SGGX microflake phase function — summarised as a
+// linearly transformed cosine, which evaluates, integrates and importance-
+// samples in closed form.
+
+/// The LTC coefficients `(a_inv, b_inv, R)` for a view direction.
+#[inline]
+fn sheen_coeffs(m: &Pbr, mu_o: f32) -> [f32; 3] {
+    crate::tables::bilinear3(
+        &crate::tables::SHEEN_LTC,
+        m.sheen_roughness.clamp(0.0, 1.0),
+        mu_o,
+    )
+}
+
+/// Evaluate the LTC density for `wi` in the frame where `wo` lies in the
+/// x-z plane. This is both the sheen lobe's shape *and* its PDF — an LTC is
+/// a normalised distribution, which is the whole point of the representation.
+#[inline]
+fn sheen_ltc_density(wi_std: Vec3, coeffs: [f32; 3]) -> f32 {
+    let (a_inv, b_inv) = (coeffs[0] as f64, coeffs[1] as f64);
+    if a_inv <= 0.0 {
+        return 0.0;
+    }
+    let w = Vec3::new(a_inv * wi_std.x + b_inv * wi_std.z, a_inv * wi_std.y, wi_std.z);
+    let len = w.norm();
+    if len <= 0.0 {
+        return 0.0;
+    }
+    let cos_theta = (w.z / len).max(0.0) as f32;
+    let jacobian = (a_inv * a_inv / (len * len * len)) as f32;
+    cos_theta * std::f32::consts::FRAC_1_PI * jacobian
+}
+
+/// Rotate `w` about +Z so that `wo`'s azimuth becomes zero — the frame the
+/// LTC fit is defined in.
+#[inline]
+fn sheen_align(wo: Vec3, w: Vec3) -> Vec3 {
+    let len = (wo.x * wo.x + wo.y * wo.y).sqrt();
+    if len <= 0.0 {
+        return w;
+    }
+    let (c, s) = (wo.x / len, wo.y / len);
+    // Rotation by -phi_o.
+    Vec3::new(c * w.x + s * w.y, -s * w.x + c * w.y, w.z)
+}
+
+/// Undo [`sheen_align`].
+#[inline]
+fn sheen_unalign(wo: Vec3, w: Vec3) -> Vec3 {
+    let len = (wo.x * wo.x + wo.y * wo.y).sqrt();
+    if len <= 0.0 {
+        return w;
+    }
+    let (c, s) = (wo.x / len, wo.y / len);
+    Vec3::new(c * w.x - s * w.y, s * w.x + c * w.y, w.z)
+}
+
+/// The sheen lobe's `f · cos`, and its PDF.
+fn sheen_eval(m: &Pbr, wo: Vec3, wi: Vec3) -> ([f32; 3], f32) {
+    if m.sheen <= 0.0 {
+        return ([0.0; 3], 0.0);
+    }
+    let coeffs = sheen_coeffs(m, wo.z as f32);
+    let density = sheen_ltc_density(sheen_align(wo, wi), coeffs);
+    // The LTC carries the cosine, so `density` is already `f · cos`, scaled by
+    // the lobe's directional reflectance R and the artist's colour.
+    let k = density * coeffs[2] * m.sheen;
+    (scale3(m.sheen_color, k), density)
+}
+
+/// Directional reflectance of the sheen layer — what it takes away from
+/// everything beneath it.
+#[inline]
+fn sheen_albedo(m: &Pbr, mu_o: f32) -> f32 {
+    if m.sheen <= 0.0 {
+        return 0.0;
+    }
+    (sheen_coeffs(m, mu_o)[2] * m.sheen * max3(m.sheen_color)).clamp(0.0, 1.0)
+}
+
+// ─── clearcoat: GTR1 ──────────────────────────────────────────────────────
+
+/// Generalised-Trowbridge-Reitz with `gamma = 1` — Disney's clearcoat
+/// distribution.
+///
+/// GGX (`gamma = 2`) is already long-tailed; GTR1 is longer still, and that
+/// extra tail is exactly what a lacquer looks like — a tight core with a broad
+/// halo around it, rather than GGX's single soft blob.
+#[inline]
+fn d_gtr1(wh: Vec3, alpha: f32) -> f32 {
+    let a2 = alpha * alpha;
+    if a2 >= 1.0 {
+        return std::f32::consts::FRAC_1_PI;
+    }
+    // `a2·cos² + sin²` taken from the half-vector's components rather than
+    // from `1 - cos²`, for the reason spelled out at length on `d_ggx`: at
+    // retro-reflection `cos²` is 1 to within an f32 ulp and the subtraction
+    // cancels every digit that mattered.
+    let (hx, hy, hz) = (wh.x as f32, wh.y as f32, wh.z as f32);
+    let d = a2 * hz * hz + (hx * hx + hy * hy);
+    // `a2 - 1` and `ln(a2)` are both negative for a plausible coat, so the
+    // quotient is positive; written with both signs flipped so that clamping
+    // the denominator away from zero clamps it on the correct side.
+    (1.0 - a2) / (std::f32::consts::PI * (-a2.ln()) * d).max(1e-9)
+}
+
+/// Sample GTR1's normal distribution (Disney 2012, appendix B). Returns the
+/// half-vector in the local frame.
+fn sample_gtr1(alpha: f32, r1: f64, r2: f64) -> Vec3 {
+    let a2 = (alpha * alpha).clamp(1e-8, 0.999_999) as f64;
+    let cos2 = ((1.0 - a2.powf(1.0 - r1)) / (1.0 - a2)).clamp(0.0, 1.0);
+    let cos_t = cos2.sqrt();
+    let sin_t = (1.0 - cos2).max(0.0).sqrt();
+    let phi = std::f64::consts::TAU * r2;
+    Vec3::new(sin_t * phi.cos(), sin_t * phi.sin(), cos_t)
+}
+
+/// PDF of [`sample_gtr1`] in solid angle around `wi`.
+#[inline]
+fn gtr1_pdf(wo: Vec3, wh: Vec3, alpha: f32) -> f32 {
+    let o_dot_h = wo.dot(wh).max(1e-9) as f32;
+    d_gtr1(wh, alpha) * (wh.z.max(0.0) as f32) / (4.0 * o_dot_h)
+}
+
 /// Sample the GGX visible-normal distribution (Heitz 2018). `wo` is in local
 /// space with +Z the shading normal and +X the surface tangent; returns the
 /// sampled half-vector.
@@ -1494,13 +1880,19 @@ fn vndf_pdf(wo: Vec3, wh: Vec3, at: f32, ab: f32) -> f32 {
     d * g1 * o_dot_h / n_dot_v / (4.0 * o_dot_h)
 }
 
-/// Relative sampling weights of the three lobes for a given material.
-fn lobe_weights(m: &Pbr) -> (f32, f32, f32) {
+/// Relative sampling weights of the four lobes, in the order
+/// (diffuse, specular, sheen, coat).
+///
+/// Each is that lobe's approximate albedo, so a material spends its samples
+/// where its energy is: a mirror almost never draws a diffuse direction, a
+/// chalk wall almost always does.
+fn lobe_weights(m: &Pbr) -> [f32; 4] {
     let diff = max3(m.diffuse_albedo()).max(0.0);
     let spec = max3(m.f0()).max(0.0) + 0.08;
+    let sheen = (m.sheen * max3(m.sheen_color)).max(0.0);
     let coat = m.clearcoat * 0.25;
-    let total = (diff + spec + coat).max(1e-6);
-    (diff / total, spec / total, coat / total)
+    let total = (diff + spec + sheen + coat).max(1e-6);
+    [diff / total, spec / total, sheen / total, coat / total]
 }
 
 /// Evaluate the full BSDF and its sampling PDF for a given in/out pair.
@@ -1516,33 +1908,67 @@ fn bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3) -> ([f32; 3], f32) {
     let wh = (wo + wi).normalize();
     let o_dot_h = wo.dot(wh).max(0.0) as f32;
 
-    let (pd, ps, pc) = lobe_weights(m);
+    let w = lobe_weights(m);
 
-    // Diffuse.
-    let diffuse = scale3(m.diffuse_albedo(), std::f32::consts::FRAC_1_PI * n_dot_l);
+    // Diffuse: EON, blended towards Hanrahan-Krueger by `subsurface`. At the
+    // defaults (`diffuse_roughness = 0`, `subsurface = 0`) both branches
+    // collapse to `rho/pi` and this is Lambert to the last bit.
+    let rho = m.diffuse_albedo();
+    let diffuse_f = if m.subsurface > 0.0 {
+        mix3(
+            eon_diffuse(rho, m.diffuse_roughness, wo, wi),
+            hanrahan_krueger(rho, m.roughness, wo, wi),
+            m.subsurface,
+        )
+    } else {
+        eon_diffuse(rho, m.diffuse_roughness, wo, wi)
+    };
+    let diffuse = scale3(diffuse_f, n_dot_l);
     let pdf_d = n_dot_l * std::f32::consts::FRAC_1_PI;
 
     // Base specular. Anisotropy stretches the lobe along the local x axis,
-    // which the integrator has aligned with the surface tangent dP/du.
+    // which the integrator has aligned with the surface tangent dP/du; the
+    // compensation factor puts back the facet-to-facet bounces the single-
+    // scattering model drops.
     let (at, ab) = m.alpha_tb();
     let d = d_ggx_aniso(wh, at, ab);
     let vis = v_smith_aniso(wo, wi, at, ab);
-    let f = fresnel(m.f0(), o_dot_h);
-    let spec = scale3(f, d * vis * n_dot_l);
+    let f0 = m.f0();
+    let f = fresnel(f0, o_dot_h);
+    let spec = mul3(
+        scale3(f, d * vis * n_dot_l),
+        ms_compensation(f0, at, ab, n_dot_v),
+    );
     let pdf_s = vndf_pdf(wo, wh, at, ab);
 
-    // Clearcoat: a thin dielectric layer over everything else. It is a
-    // separate isotropic film — the grain lives in the substrate beneath it,
-    // not in the lacquer — so it never takes the anisotropy.
+    // Sheen, between the coat and the base: fibre fuzz, which is what makes
+    // velvet and a nylon net glow along their silhouettes.
+    let (sheen, pdf_sh) = sheen_eval(m, wo, wi);
+    // Albedo scaling for what the fuzz took. The geometric mean of the two
+    // directions' losses keeps the layering reciprocal, which a bare
+    // `1 - E(mu_o)` would not be.
+    let sheen_atten = if m.sheen > 0.0 {
+        ((1.0 - sheen_albedo(m, n_dot_v)) * (1.0 - sheen_albedo(m, n_dot_l))).max(0.0).sqrt()
+    } else {
+        1.0
+    };
+
+    // Clearcoat: a thin dielectric film over everything else, GTR1 at a fixed
+    // IOR of 1.5. It is isotropic — the grain lives in the substrate beneath
+    // it, not in the lacquer — so it never takes the anisotropy.
+    //
+    // Disney scale their coat by a further 0.25 because their `clearcoat`
+    // parameter is documented as covering [0, 0.25]; ours is a full-strength
+    // 0..1 layer weight, so the 0.25 lives in the caller's number instead.
     let (coat, pdf_c, coat_atten) = if m.clearcoat > 0.0 {
         let ca = m.coat_alpha();
-        let cd = d_ggx(wh, ca);
+        let cd = d_gtr1(wh, ca);
         let cv = v_smith(n_dot_v, n_dot_l, ca);
         let cf = fresnel([0.04, 0.04, 0.04], o_dot_h)[0] * m.clearcoat;
         let c = cd * cv * n_dot_l * cf;
         (
             [c, c, c],
-            vndf_pdf(wo, wh, ca, ca),
+            gtr1_pdf(wo, wh, ca),
             // Energy removed from the layers beneath.
             1.0 - cf,
         )
@@ -1550,9 +1976,10 @@ fn bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3) -> ([f32; 3], f32) {
         ([0.0; 3], 0.0, 1.0)
     };
 
-    let under = add3(diffuse, spec);
+    let base = scale3(add3(diffuse, spec), sheen_atten);
+    let under = add3(base, sheen);
     let value = add3(scale3(under, coat_atten), coat);
-    let pdf = pd * pdf_d + ps * pdf_s + pc * pdf_c;
+    let pdf = w[0] * pdf_d + w[1] * pdf_s + w[2] * pdf_sh + w[3] * pdf_c;
     (value, pdf.max(0.0))
 }
 
@@ -1570,14 +1997,14 @@ fn bsdf_sample(m: &Pbr, wo: Vec3, rng: &mut Rng) -> Option<(Vec3, [f32; 3], f32)
     if wo.z <= 0.0 {
         return None;
     }
-    let (pd, ps, _pc) = lobe_weights(m);
+    let w = lobe_weights(m);
     let u = rng.f64() as f32;
     let r1 = rng.f64();
     let r2 = rng.f64();
 
-    let wi = if u < pd {
+    let wi = if u < w[0] {
         cosine_hemisphere(r1, r2)
-    } else if u < pd + ps {
+    } else if u < w[0] + w[1] {
         let (at, ab) = m.alpha_tb();
         let wh = sample_vndf(wo, at, ab, r1, r2);
         let wi = reflect(-wo, wh);
@@ -1585,9 +2012,29 @@ fn bsdf_sample(m: &Pbr, wo: Vec3, rng: &mut Rng) -> Option<(Vec3, [f32; 3], f32)
             return None;
         }
         wi
+    } else if u < w[0] + w[1] + w[2] {
+        // The LTC is a linear transform of a cosine lobe, so sampling it is
+        // sampling the cosine and pushing the direction through the matrix.
+        let coeffs = sheen_coeffs(m, wo.z as f32);
+        let (a_inv, b_inv) = (coeffs[0] as f64, coeffs[1] as f64);
+        if a_inv <= 0.0 {
+            return None;
+        }
+        let c = cosine_hemisphere(r1, r2);
+        let wi_std = Vec3::new(
+            c.x / a_inv - c.z * b_inv / a_inv,
+            c.y / a_inv,
+            c.z,
+        )
+        .normalize();
+        let wi = sheen_unalign(wo, wi_std);
+        if wi.z <= 0.0 {
+            return None;
+        }
+        wi
     } else {
         let ca = m.coat_alpha();
-        let wh = sample_vndf(wo, ca, ca, r1, r2);
+        let wh = sample_gtr1(ca, r1, r2);
         let wi = reflect(-wo, wh);
         if wi.z <= 0.0 {
             return None;
@@ -3602,6 +4049,274 @@ mod tests {
             after >= before * 0.95,
             "silhouette contrast collapsed: {before} -> {after}"
         );
+    }
+
+    /// Stratified quadrature of `g` over the upper hemisphere in `d(cos) dphi`.
+    ///
+    /// Deterministic, so a furnace number is a number and not a number plus
+    /// Monte Carlo noise that has to be given slack in the bound.
+    fn integrate_hemisphere<F: Fn(Vec3) -> f32>(n: usize, g: F) -> f32 {
+        let dw = std::f64::consts::TAU / (n * n) as f64;
+        let mut acc = 0.0f64;
+        for i in 0..n {
+            let ct = (i as f64 + 0.5) / n as f64;
+            let st = (1.0 - ct * ct).max(0.0).sqrt();
+            for j in 0..n {
+                let phi = (j as f64 + 0.5) / n as f64 * std::f64::consts::TAU;
+                let wi = Vec3::new(st * phi.cos(), st * phi.sin(), ct);
+                acc += g(wi) as f64 * dw;
+            }
+        }
+        acc as f32
+    }
+
+    /// Directions at a spread of incidence angles, all with the same azimuth
+    /// so the anisotropic axis is exercised consistently.
+    fn view_directions() -> Vec<Vec3> {
+        [0.999f64, 0.9, 0.7, 0.5, 0.3, 0.15, 0.05]
+            .iter()
+            .map(|&mu| {
+                let s = (1.0 - mu * mu).max(0.0).sqrt();
+                Vec3::new(s, 0.0, mu)
+            })
+            .collect()
+    }
+
+    /// A white EON surface reflects (very nearly) all of the light it receives,
+    /// at every roughness and every incidence angle.
+    ///
+    /// This is the property Lambert has trivially and plain Oren-Nayar does
+    /// not: FON alone loses up to ~20% at `r = 1`, and the analytic
+    /// compensation term is what puts it back.
+    #[test]
+    fn the_eon_diffuse_lobe_passes_a_white_furnace() {
+        for r in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            for wo in view_directions() {
+                let e = integrate_hemisphere(180, |wi| {
+                    eon_diffuse([1.0; 3], r, wo, wi)[0] * wi.z as f32
+                });
+                assert!(
+                    (0.98..=1.0005).contains(&e),
+                    "EON albedo {e} at diffuse_roughness {r}, mu {}",
+                    wo.z
+                );
+            }
+        }
+    }
+
+    /// `f(wo, wi) == f(wi, wo)` for the diffuse lobe, which every term of it
+    /// is built to satisfy and none of which is obviously symmetric on sight.
+    #[test]
+    fn the_eon_diffuse_lobe_is_reciprocal() {
+        let dirs = [
+            Vec3::new(0.3, 0.15, 0.94).normalize(),
+            Vec3::new(0.85, 0.1, 0.52).normalize(),
+            Vec3::new(-0.4, 0.6, 0.69).normalize(),
+            Vec3::new(0.0, 0.0, 1.0),
+        ];
+        for r in [0.0, 0.4, 1.0] {
+            for a in dirs {
+                for b in dirs {
+                    let ab = eon_diffuse([0.7, 0.5, 0.3], r, a, b);
+                    let ba = eon_diffuse([0.7, 0.5, 0.3], r, b, a);
+                    for c in 0..3 {
+                        assert!(
+                            (ab[c] - ba[c]).abs() <= 1e-6,
+                            "EON not reciprocal at r={r}: {ab:?} vs {ba:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A perfectly reflective rough metal (`F0 = 1`) must return every photon.
+    ///
+    /// Single-scattering GGX does not: it keeps 0.947 of the energy at
+    /// `alpha = 0.2`, 0.687 at `0.5` and 0.307 at `1.0`, because it drops
+    /// every path that bounces from one microfacet to another. Turquin's
+    /// compensation factor is exactly `1/E` when `F0 = 1`, so with it the
+    /// furnace closes.
+    #[test]
+    fn a_rough_metal_furnace_closes_to_one_percent() {
+        for alpha in [0.2f32, 0.5, 1.0] {
+            let m = Pbr {
+                base_color: [1.0; 3],
+                metallic: 1.0,
+                roughness: alpha.sqrt(),
+                ..Default::default()
+            };
+            for wo in view_directions() {
+                let e = integrate_hemisphere(220, |wi| bsdf_eval(&m, wo, wi).0[0]);
+                assert!(
+                    (0.99..=1.01).contains(&e),
+                    "compensated GGX albedo {e} at alpha {alpha}, mu {}",
+                    wo.z
+                );
+            }
+        }
+    }
+
+    /// The compensation is a correction, not a licence to make light: a
+    /// dielectric's `F0 = 0.04` lobe stays well under 1.
+    #[test]
+    fn a_dielectric_specular_lobe_stays_under_one() {
+        for roughness in [0.1f32, 0.4, 0.7, 1.0] {
+            let m = Pbr {
+                base_color: [0.0; 3], // no diffuse: the specular lobe alone
+                metallic: 0.0,
+                roughness,
+                ..Default::default()
+            };
+            for wo in view_directions() {
+                let e = integrate_hemisphere(220, |wi| bsdf_eval(&m, wo, wi).0[0]);
+                assert!(
+                    (0.0..=1.0).contains(&e),
+                    "dielectric specular albedo {e} at roughness {roughness}"
+                );
+            }
+        }
+    }
+
+    /// Sheen is bounded, and it brightens towards grazing — which is the whole
+    /// reason the lobe exists, and the thing a plain diffuse term cannot do.
+    #[test]
+    fn the_sheen_lobe_is_bounded_and_brightens_at_grazing() {
+        for sheen_roughness in [0.15f32, 0.4, 0.8] {
+            let m = Pbr {
+                base_color: [0.0; 3],
+                sheen: 1.0,
+                sheen_roughness,
+                ..Default::default()
+            };
+            let albedo = |mu: f64| {
+                let s = (1.0 - mu * mu).max(0.0).sqrt();
+                let wo = Vec3::new(s, 0.0, mu);
+                integrate_hemisphere(220, |wi| sheen_eval(&m, wo, wi).0[0])
+            };
+            for mu in [0.999, 0.7, 0.3, 0.08] {
+                let e = albedo(mu);
+                assert!(
+                    (0.0..=1.0).contains(&e),
+                    "sheen albedo {e} out of range at mu {mu}, \
+                     sheen_roughness {sheen_roughness}"
+                );
+            }
+            assert!(
+                albedo(0.08) > albedo(0.999) * 1.2,
+                "sheen does not brighten at grazing (roughness {sheen_roughness}): \
+                 {} at normal, {} at grazing",
+                albedo(0.999),
+                albedo(0.08)
+            );
+        }
+    }
+
+    /// The whole BSDF is reciprocal, layering included — the coat's Fresnel
+    /// attenuation and the sheen's albedo scaling both had to be written
+    /// symmetrically for this to hold.
+    ///
+    /// One term is deliberately not: Turquin's compensation factor is a
+    /// function of the *outgoing* direction alone, which is the price of its
+    /// closed form and of the exact `1/E` furnace it buys. The residual is
+    /// bounded by how far `F0·(1-E)/E` can move between two angles, which for
+    /// anything short of a mirror-bright metal is a fraction of a percent —
+    /// hence the 1% tolerance here rather than the 1e-6 the diffuse lobe gets.
+    #[test]
+    fn the_layered_bsdf_is_reciprocal() {
+        let m = Pbr {
+            base_color: [0.7, 0.5, 0.3],
+            metallic: 0.2,
+            roughness: 0.35,
+            diffuse_roughness: 0.6,
+            subsurface: 0.3,
+            specular: 0.7,
+            specular_tint: 0.4,
+            sheen: 0.5,
+            sheen_color: [0.9, 0.85, 1.0],
+            sheen_roughness: 0.4,
+            clearcoat: 0.6,
+            clearcoat_roughness: 0.15,
+            ..Default::default()
+        };
+        let dirs = [
+            Vec3::new(0.3, 0.15, 0.94).normalize(),
+            Vec3::new(0.85, 0.1, 0.52).normalize(),
+            Vec3::new(-0.4, 0.6, 0.69).normalize(),
+        ];
+        for a in dirs {
+            for b in dirs {
+                // `bsdf_eval` returns f*cos, so divide the cosines back out
+                // before comparing: f(a,b) == f(b,a).
+                let ab = scale3(bsdf_eval(&m, a, b).0, 1.0 / b.z as f32);
+                let ba = scale3(bsdf_eval(&m, b, a).0, 1.0 / a.z as f32);
+                for c in 0..3 {
+                    let scale = ab[c].abs().max(ba[c].abs()).max(1e-3);
+                    assert!(
+                        (ab[c] - ba[c]).abs() <= 1e-2 * scale,
+                        "BSDF not reciprocal: {ab:?} vs {ba:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `E[f/pdf]` over the sampler lands on the albedo the evaluator's own
+    /// quadrature reports — the check that catches a sampling routine drawing
+    /// from a different distribution than its PDF claims, across every new
+    /// parameter.
+    #[test]
+    fn sampling_every_lobe_recovers_the_evaluated_albedo() {
+        let base = Pbr {
+            base_color: [0.75, 0.6, 0.45],
+            roughness: 0.35,
+            ..Default::default()
+        };
+        let cases: [(&str, Pbr); 6] = [
+            ("diffuse-rough", Pbr { diffuse_roughness: 0.9, ..base }),
+            ("subsurface", Pbr { subsurface: 0.8, diffuse_roughness: 0.4, ..base }),
+            ("sheen", Pbr { sheen: 0.8, sheen_roughness: 0.35, ..base }),
+            ("coat", Pbr { clearcoat: 0.9, clearcoat_roughness: 0.12, ..base }),
+            ("metal", Pbr { metallic: 1.0, roughness: 0.6, ..base }),
+            (
+                "everything",
+                Pbr {
+                    metallic: 0.4,
+                    diffuse_roughness: 0.7,
+                    subsurface: 0.3,
+                    specular: 0.9,
+                    specular_tint: 0.5,
+                    sheen: 0.6,
+                    sheen_roughness: 0.5,
+                    clearcoat: 0.5,
+                    anisotropy: 0.6,
+                    ..base
+                },
+            ),
+        ];
+        for (name, m) in cases {
+            for wo in [
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(0.6, 0.2, 0.77).normalize(),
+                Vec3::new(0.9, 0.1, 0.42).normalize(),
+            ] {
+                let reference = integrate_hemisphere(200, |wi| bsdf_eval(&m, wo, wi).0[0]);
+                let mut rng = Rng::new(29);
+                let n = 200_000;
+                let mut sum = 0.0f64;
+                for _ in 0..n {
+                    if let Some((_wi, f, pdf)) = bsdf_sample(&m, wo, &mut rng) {
+                        sum += (f[0] / pdf) as f64;
+                    }
+                }
+                let sampled = (sum / n as f64) as f32;
+                assert!(
+                    (sampled - reference).abs() <= 0.01 * reference.max(0.05),
+                    "{name}: sampler says {sampled}, evaluator says {reference} (mu {})",
+                    wo.z
+                );
+            }
+        }
     }
 
     /// A white furnace test: with no lights and a uniform environment, a

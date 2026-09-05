@@ -573,8 +573,14 @@ fn ground_material() -> GpuMaterial {
     m.clearcoat_roughness = 0.1;
     m.ior = 1.5;
     m.anisotropy = 0.0;
-    m._pad0 = 0.0;
-    m._pad1 = 0.0;
+    m.specular = 0.5;
+    m.specular_tint = 0.0;
+    m.diffuse_roughness = 0.0;
+    m.subsurface = 0.0;
+    m.sheen = 0.0;
+    m.sheen_roughness = 0.3;
+    m.sheen_color = vec3<f32>(1.0);
+    m._pad = 0.0;
     return m;
 }
 

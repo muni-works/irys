@@ -29,8 +29,22 @@ pub struct GpuMaterial {
     /// Signed anisotropy in -1..1: positive stretches the specular highlight
     /// along the local tangent, negative along the bitangent, 0 = isotropic.
     pub anisotropy: f32,
-    /// Padding for 16-byte alignment.
-    pub _pad: [f32; 2],
+    /// Incident specular amount, Disney's normalised parameter (0.5 = F0 0.04).
+    pub specular: f32,
+    /// Tint of the dielectric F0 towards the base hue, 0..1.
+    pub specular_tint: f32,
+    /// Roughness of the diffuse (EON) lobe. 0 is Lambert.
+    pub diffuse_roughness: f32,
+    /// Hanrahan-Krueger subsurface blend, 0..1.
+    pub subsurface: f32,
+    /// Strength of the sheen layer, 0 = none.
+    pub sheen: f32,
+    /// Roughness of the sheen layer, the alpha axis of the LTC fit.
+    pub sheen_roughness: f32,
+    /// Colour of the sheen layer.
+    pub sheen_color: [f32; 3],
+    /// Padding for 16-byte alignment. The struct is 80 bytes.
+    pub _pad: f32,
 }
 
 impl Default for GpuMaterial {
@@ -43,7 +57,14 @@ impl Default for GpuMaterial {
             clearcoat_roughness: 0.1,
             ior: 1.5,
             anisotropy: 0.0,
-            _pad: [0.0; 2],
+            specular: 0.5,
+            specular_tint: 0.0,
+            diffuse_roughness: 0.0,
+            subsurface: 0.0,
+            sheen: 0.0,
+            sheen_roughness: 0.3,
+            sheen_color: [1.0; 3],
+            _pad: 0.0,
         }
     }
 }
@@ -99,7 +120,14 @@ impl GpuMaterial {
             clearcoat_roughness: p.clearcoat_roughness,
             ior: p.ior,
             anisotropy: p.anisotropy,
-            _pad: [0.0; 2],
+            specular: p.specular,
+            specular_tint: p.specular_tint,
+            diffuse_roughness: p.diffuse_roughness,
+            subsurface: p.subsurface,
+            sheen: p.sheen,
+            sheen_roughness: p.sheen_roughness,
+            sheen_color: p.sheen_color,
+            _pad: 0.0,
         }
     }
 
@@ -114,6 +142,13 @@ impl GpuMaterial {
             clearcoat_roughness: self.clearcoat_roughness,
             ior: self.ior,
             anisotropy: self.anisotropy,
+            specular: self.specular,
+            specular_tint: self.specular_tint,
+            diffuse_roughness: self.diffuse_roughness,
+            subsurface: self.subsurface,
+            sheen: self.sheen,
+            sheen_roughness: self.sheen_roughness,
+            sheen_color: self.sheen_color,
             emissive: [0.0; 3],
         }
     }
