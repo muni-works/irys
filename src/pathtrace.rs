@@ -145,6 +145,51 @@ pub struct Pbr {
     /// Dielectric index of refraction. See [`Self::f0`] for how it and
     /// [`Self::specular`] combine.
     pub ior: f32,
+    /// Weight of the dielectric transmission lobe, 0..1 — OpenPBR's
+    /// `transmission_weight`.
+    ///
+    /// `0` is an opaque surface and the model is exactly what it was. `1` is
+    /// glass: the diffuse and opaque-specular lobes are switched off entirely
+    /// and replaced by one rough dielectric that both reflects and refracts,
+    /// split by the *exact* Fresnel equations at [`Self::ior`] rather than by
+    /// Schlick's fit — because at a glass/air interface Schlick's error near
+    /// grazing is the difference between a rim that glows and one that does
+    /// not, and because total internal reflection has to fall out of the same
+    /// formula that gave the split.
+    pub transmission: f32,
+    /// Abbe number `V_d = (n_d − 1)/(n_F − n_C)`, OpenPBR's dispersion knob.
+    /// `0` means no dispersion, which is the default and why nothing that
+    /// predates this field renders spectrally.
+    ///
+    /// Smaller is *more* dispersive: crown glass is about 60, dense flint
+    /// about 30, diamond 55 at a much higher index. Ignored when
+    /// [`Self::sellmeier`] is set.
+    pub abbe: f32,
+    /// A real glass's Sellmeier coefficients `(B, C)`, overriding
+    /// [`Self::abbe`] when present.
+    ///
+    /// An Abbe number is one number fitted through three Fraunhofer lines; a
+    /// Sellmeier triple pair *is* the datasheet. [`crate::spectrum::BK7_SELLMEIER`]
+    /// is the one the marble's own caustic tracer uses, so a material given
+    /// that pair and the caustic tracer disperse by the same curve.
+    pub sellmeier: Option<([f64; 3], [f64; 3])>,
+    /// Colour transmitted through one [`Self::attenuation_distance`] of the
+    /// interior — glTF's `attenuationColor`, Beer–Lambert's `exp(−σd)` written
+    /// the way a person picks a colour.
+    pub attenuation_color: [f32; 3],
+    /// Distance over which the interior attenuates to
+    /// [`Self::attenuation_color`]. Infinite (the default) is no absorption.
+    pub attenuation_distance: f32,
+    /// Treat the surface as an infinitely thin sheet rather than the boundary
+    /// of a volume.
+    ///
+    /// A window pane modelled as a single quad, or as a box far thinner than
+    /// its own refraction would be visible at, has no interior for a ray to
+    /// travel through. Thin-walled transmission refracts in and straight back
+    /// out: the direction is the incident one mirrored through the surface,
+    /// roughened by the same GGX lobe, with no lateral offset and no
+    /// absorption — which is what a pane of glass actually looks like.
+    pub thin_walled: bool,
     /// Linear emissive radiance.
     pub emissive: [f32; 3],
 }
@@ -166,6 +211,12 @@ impl Default for Pbr {
             clearcoat: 0.0,
             clearcoat_roughness: 0.1,
             ior: 1.5,
+            transmission: 0.0,
+            abbe: 0.0,
+            sellmeier: None,
+            attenuation_color: [1.0; 3],
+            attenuation_distance: f32::INFINITY,
+            thin_walled: false,
             emissive: [0.0; 3],
         }
     }
@@ -207,6 +258,84 @@ impl Pbr {
             anisotropy: anisotropy.clamp(-1.0, 1.0),
             ..Default::default()
         }
+    }
+
+    /// Clear glass: a full-strength dielectric transmission lobe at the given
+    /// index and roughness, with no dispersion and no absorption.
+    pub fn glass(ior: f32, roughness: f32) -> Self {
+        Self {
+            base_color: [1.0; 3],
+            metallic: 0.0,
+            roughness,
+            ior,
+            transmission: 1.0,
+            ..Default::default()
+        }
+    }
+
+    /// Give this material a real glass's dispersion curve.
+    pub fn with_sellmeier(mut self, coeffs: ([f64; 3], [f64; 3])) -> Self {
+        self.sellmeier = Some(coeffs);
+        self
+    }
+
+    /// Give this material Beer–Lambert absorption: the colour one
+    /// `distance` of interior transmits.
+    pub fn with_attenuation(mut self, color: [f32; 3], distance: f32) -> Self {
+        self.attenuation_color = color;
+        self.attenuation_distance = distance;
+        self
+    }
+
+    /// Whether this material's index varies with wavelength — the test that
+    /// decides whether a path has to become monochromatic.
+    ///
+    /// A material with no transmission has no index to disperse *through*: its
+    /// specular reflectance varies with `n` far too weakly to be worth a
+    /// spectral path, and OpenPBR ties dispersion to the transmission lobe for
+    /// the same reason.
+    #[inline]
+    pub fn is_dispersive(&self) -> bool {
+        self.transmission > 0.0 && (self.sellmeier.is_some() || self.abbe > 0.0)
+    }
+
+    /// Index of refraction at a wavelength, in nanometres.
+    ///
+    /// `None` — an RGB path — gets [`Self::ior`] flat, which is exactly what
+    /// every non-dispersive material has always used.
+    #[inline]
+    pub fn index_at(&self, lambda_nm: Option<f64>) -> f32 {
+        let Some(nm) = lambda_nm else {
+            return self.ior;
+        };
+        let um = nm * 1e-3;
+        if let Some((b, c)) = self.sellmeier {
+            crate::spectrum::sellmeier_index(b, c, um) as f32
+        } else if self.abbe > 0.0 {
+            crate::spectrum::cauchy_index(self.ior as f64, self.abbe as f64, um) as f32
+        } else {
+            self.ior
+        }
+    }
+
+    /// Beer–Lambert extinction per unit length: `ln(1/attenuation_color) /
+    /// attenuation_distance`, per channel.
+    ///
+    /// Zero whenever the distance is infinite or the colour is white, so the
+    /// interior of a default material costs an `is_finite` check and nothing
+    /// else.
+    #[inline]
+    pub fn extinction(&self) -> [f32; 3] {
+        let d = self.attenuation_distance;
+        if !d.is_finite() || d <= 0.0 {
+            return [0.0; 3];
+        }
+        let mut sigma = [0.0f32; 3];
+        for c in 0..3 {
+            let a = self.attenuation_color[c].clamp(1e-6, 1.0);
+            sigma[c] = -a.ln() / d;
+        }
+        sigma
     }
 
     /// GGX alpha for the base specular lobe, ignoring anisotropy.
@@ -307,9 +436,13 @@ impl Pbr {
     }
 
     /// Diffuse albedo (metals have none).
+    ///
+    /// A transmissive dielectric has none either: the light that would have
+    /// scattered diffusely went through instead, so `transmission` takes the
+    /// lobe away exactly as `metallic` does.
     #[inline]
     fn diffuse_albedo(&self) -> [f32; 3] {
-        let k = 1.0 - self.metallic;
+        let k = (1.0 - self.metallic) * (1.0 - self.transmission);
         [
             self.base_color[0] * k,
             self.base_color[1] * k,
@@ -1880,28 +2013,201 @@ fn vndf_pdf(wo: Vec3, wh: Vec3, at: f32, ab: f32) -> f32 {
     d * g1 * o_dot_h / n_dot_v / (4.0 * o_dot_h)
 }
 
-/// Relative sampling weights of the four lobes, in the order
-/// (diffuse, specular, sheen, coat).
+// ─── rough dielectric ─────────────────────────────────────────────────────
+//
+// Walter, Marschner, Li and Torrance (2007), "Microfacet Models for
+// Refraction through Rough Surfaces": the same GGX microsurface the specular
+// lobe already stands on, with the half-vector generalised so that a facet
+// can *refract* as well as reflect. It shares this material's alpha and its
+// VNDF sampling; only the half-vector, the Jacobian and the Fresnel split
+// differ.
+//
+// # Conventions, stated once
+//
+// - `eta` throughout is `n_transmitted / n_incident`. Entering glass from air
+//   that is `n_glass`; leaving it, `1/n_glass`. The integrator computes it
+//   from which side of the *geometric* normal the ray arrived on, so a
+//   non-nested solid needs no medium stack at all.
+// - The reflect/transmit split is the exact unpolarised Fresnel from
+//   [`crate::optics::fresnel`], not Schlick. Total internal reflection is not
+//   a special case: it is what that formula returns when Snell has no
+//   solution.
+// - **Radiance is scaled by `1/η²` on refraction.** A BSDF is not symmetric
+//   across a change of index, and which way the asymmetry goes depends on
+//   what the path carries. This is a camera path carrying importance, so the
+//   factor is `(η_i/η_t)²` — pbrt's "radiance mode". Walter's `η_t²`
+//   numerator and that `1/η²` cancel algebraically, which is why the
+//   expression below has no `eta²` in it anywhere.
+//
+//   The consequence to keep straight: a *single* interface therefore does not
+//   have unit throughput. Entering glass compresses radiance by `1/η²` and
+//   leaving expands it back by `η²`, so it is the **round trip** that is a
+//   no-op. `a_rough_glass_sphere_closes_the_furnace` takes the scaling back
+//   out to ask the energy question, and `a_slab_is_a_round_trip_no_op` asks
+//   the transport one; both have to hold.
+
+/// Smith `G1` for a direction that may be on either side of the surface.
+///
+/// The reflection path can assume `w.z > 0`; a refracted direction is below
+/// the surface by construction, and the shadowing term is a function of the
+/// *magnitude* of the slope, so this is the same Λ with `|z|`.
+#[inline]
+fn g1_smith_abs(w: Vec3, at: f32, ab: f32) -> f32 {
+    let z = (w.z.abs() as f32).max(1e-6);
+    let (x, y) = (w.x as f32, w.y as f32);
+    let lambda = (((at * x) * (at * x) + (ab * y) * (ab * y) + z * z).sqrt() / z - 1.0) * 0.5;
+    1.0 / (1.0 + lambda)
+}
+
+/// Exact unpolarised Fresnel reflectance for a dielectric, given the cosine
+/// against the (micro)normal and `eta = n_t / n_i`.
+///
+/// Returns `1.0` on total internal reflection, which is the physically right
+/// answer and not a guard.
+#[inline]
+fn fresnel_dielectric(cos_i: f32, eta: f32) -> f32 {
+    let cos_i = cos_i.clamp(0.0, 1.0);
+    let sin2_t = (1.0 - cos_i * cos_i) / (eta * eta);
+    if sin2_t >= 1.0 {
+        return 1.0;
+    }
+    let cos_t = (1.0 - sin2_t).max(0.0).sqrt();
+    crate::optics::fresnel(1.0f32, eta, cos_i, cos_t).clamp(0.0, 1.0)
+}
+
+/// The VNDF's density in the half-vector, before any reflect/refract
+/// Jacobian. [`vndf_pdf`] is this divided by `4·(wo·h)`.
+#[inline]
+fn vndf_density(wo: Vec3, wh: Vec3, at: f32, ab: f32) -> f32 {
+    let n_dot_v = wo.z.max(1e-6) as f32;
+    let d = d_ggx_aniso(wh, at, ab);
+    let g1 = g1_smith_aniso(wo, at, ab);
+    let o_dot_h = wo.dot(wh).max(1e-9) as f32;
+    d * g1 * o_dot_h / n_dot_v
+}
+
+/// The dielectric lobe's contribution, evaluated for one direction pair.
+///
+/// Returns `(f·cos, pdf)` for the lobe alone, un-weighted; the caller scales
+/// by `m.transmission` and folds the PDF in with the others. `wi.z > 0` is the
+/// reflected branch and `wi.z < 0` the transmitted one, and both branches are
+/// driven by the same sampled facet, so their PDFs sum to the lobe's total.
+fn dielectric_eval(m: &Pbr, wo: Vec3, wi: Vec3, eta: f32) -> (f32, f32) {
+    let (at, ab) = m.alpha_tb();
+
+    if m.thin_walled {
+        // A sheet: refract in and straight back out. The exit direction is the
+        // entry direction, so the whole event is a *mirror through the
+        // surface* — the same GGX reflection lobe with its z flipped, which
+        // keeps the roughness (a frosted pane is still frosted) and adds no
+        // lateral offset. `eta` is always the outside-to-glass ratio here;
+        // there is no inside to be on the other side of.
+        let flipped = Vec3::new(wi.x, wi.y, -wi.z);
+        if flipped.z <= 0.0 || wo.z <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let wh = (wo + flipped).normalize();
+        let o_dot_h = wo.dot(wh).max(0.0) as f32;
+        let f = fresnel_dielectric(o_dot_h, m.ior.max(1.0));
+        let d = d_ggx_aniso(wh, at, ab);
+        let vis = v_smith_aniso(wo, flipped, at, ab);
+        let value = (1.0 - f) * d * vis * (flipped.z as f32);
+        let pdf = vndf_pdf(wo, wh, at, ab) * (1.0 - f);
+        return (value, pdf);
+    }
+
+    if wi.z > 0.0 {
+        // Reflection off the same microsurface, split by the exact Fresnel.
+        let wh = (wo + wi).normalize();
+        let o_dot_h = wo.dot(wh).max(0.0) as f32;
+        let f = fresnel_dielectric(o_dot_h, eta);
+        let d = d_ggx_aniso(wh, at, ab);
+        let vis = v_smith_aniso(wo, wi, at, ab);
+        let value = f * d * vis * (wi.z as f32);
+        let pdf = vndf_pdf(wo, wh, at, ab) * f;
+        return (value, pdf);
+    }
+
+    // Transmission. The generalised half-vector: `−(η_i·wo + η_t·wi)`, which
+    // with η_i factored out is `−(wo + η·wi)`, oriented into the upper
+    // hemisphere so it can be fed to the same D and G.
+    let eta = eta as f64;
+    let h = -(wo + wi * eta);
+    if h.norm() < 1e-9 {
+        return (0.0, 0.0);
+    }
+    let mut wh = h.normalize();
+    if wh.z < 0.0 {
+        wh = -wh;
+    }
+    let cos_o = wo.dot(wh) as f32;
+    let cos_i = wi.dot(wh) as f32;
+    // A facet the viewer cannot see, or one whose two sides are on the same
+    // side of it, transmits nothing.
+    if cos_o <= 0.0 || cos_i >= 0.0 {
+        return (0.0, 0.0);
+    }
+    let f = fresnel_dielectric(cos_o, eta as f32);
+    let d = d_ggx_aniso(wh, at, ab);
+    let g = g1_smith_abs(wo, at, ab) * g1_smith_abs(wi, at, ab);
+    let denom = {
+        let x = cos_o + (eta as f32) * cos_i;
+        (x * x).max(1e-12)
+    };
+    // `f·cos`, with Walter's η_t² already cancelled against the 1/η² radiance
+    // scaling — see the module note above.
+    let value = (1.0 - f) * d * g * (cos_o * cos_i).abs() / (wo.z.abs() as f32) / denom;
+    // dω_h/dω_i for refraction.
+    let jacobian = (eta as f32) * (eta as f32) * cos_i.abs() / denom;
+    let pdf = vndf_density(wo, wh, at, ab) * (1.0 - f) * jacobian;
+    (value.max(0.0), pdf.max(0.0))
+}
+
+/// Relative sampling weights of the five lobes, in the order
+/// (diffuse, specular, sheen, coat, dielectric).
 ///
 /// Each is that lobe's approximate albedo, so a material spends its samples
 /// where its energy is: a mirror almost never draws a diffuse direction, a
 /// chalk wall almost always does.
-fn lobe_weights(m: &Pbr) -> [f32; 4] {
+///
+/// `transmission` moves weight out of the diffuse and opaque-specular lobes
+/// and into the dielectric one — and because it also scales those two lobes'
+/// *values*, an opaque material (`transmission = 0`) gets the same four
+/// numbers it always did, to the bit.
+fn lobe_weights(m: &Pbr) -> [f32; 5] {
+    let opaque = 1.0 - m.transmission;
     let diff = max3(m.diffuse_albedo()).max(0.0);
-    let spec = max3(m.f0()).max(0.0) + 0.08;
+    let spec = (max3(m.f0()).max(0.0) + 0.08) * opaque;
     let sheen = (m.sheen * max3(m.sheen_color)).max(0.0);
     let coat = m.clearcoat * 0.25;
-    let total = (diff + spec + sheen + coat).max(1e-6);
-    [diff / total, spec / total, sheen / total, coat / total]
+    let diel = m.transmission.max(0.0);
+    let total = (diff + spec + sheen + coat + diel).max(1e-6);
+    [
+        diff / total,
+        spec / total,
+        sheen / total,
+        coat / total,
+        diel / total,
+    ]
 }
 
 /// Evaluate the full BSDF and its sampling PDF for a given in/out pair.
 ///
 /// Both vectors are in the local shading frame (+Z = normal) and point away
 /// from the surface. Returns `(f * cos, pdf)`.
-fn bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3) -> ([f32; 3], f32) {
-    if wi.z <= 0.0 || wo.z <= 0.0 {
+fn bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3, eta: f32) -> ([f32; 3], f32) {
+    if wo.z <= 0.0 {
         return ([0.0; 3], 0.0);
+    }
+    if wi.z <= 0.0 {
+        // Below the surface: only the dielectric lobe lives down here.
+        if m.transmission <= 0.0 {
+            return ([0.0; 3], 0.0);
+        }
+        let w = lobe_weights(m);
+        let (v, p) = dielectric_eval(m, wo, wi, eta);
+        let k = v * m.transmission;
+        return ([k, k, k], (w[4] * p).max(0.0));
     }
     let n_dot_l = wi.z as f32;
     let n_dot_v = wo.z as f32;
@@ -1935,11 +2241,24 @@ fn bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3) -> ([f32; 3], f32) {
     let vis = v_smith_aniso(wo, wi, at, ab);
     let f0 = m.f0();
     let f = fresnel(f0, o_dot_h);
-    let spec = mul3(
-        scale3(f, d * vis * n_dot_l),
-        ms_compensation(f0, at, ab, n_dot_v),
+    let spec = scale3(
+        mul3(
+            scale3(f, d * vis * n_dot_l),
+            ms_compensation(f0, at, ab, n_dot_v),
+        ),
+        1.0 - m.transmission,
     );
     let pdf_s = vndf_pdf(wo, wh, at, ab);
+
+    // The dielectric lobe's reflected half. Same facets, same alpha; the
+    // difference is that its split against transmission is the exact Fresnel,
+    // so grazing goes to 1 the way glass does and Schlick's fit does not.
+    let (diel, pdf_diel) = if m.transmission > 0.0 {
+        let (v, p) = dielectric_eval(m, wo, wi, eta);
+        ([v * m.transmission; 3], p)
+    } else {
+        ([0.0; 3], 0.0)
+    };
 
     // Sheen, between the coat and the base: fibre fuzz, which is what makes
     // velvet and a nylon net glow along their silhouettes.
@@ -1976,10 +2295,10 @@ fn bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3) -> ([f32; 3], f32) {
         ([0.0; 3], 0.0, 1.0)
     };
 
-    let base = scale3(add3(diffuse, spec), sheen_atten);
+    let base = scale3(add3(add3(diffuse, spec), diel), sheen_atten);
     let under = add3(base, sheen);
     let value = add3(scale3(under, coat_atten), coat);
-    let pdf = w[0] * pdf_d + w[1] * pdf_s + w[2] * pdf_sh + w[3] * pdf_c;
+    let pdf = w[0] * pdf_d + w[1] * pdf_s + w[2] * pdf_sh + w[3] * pdf_c + w[4] * pdf_diel;
     (value, pdf.max(0.0))
 }
 
@@ -1988,12 +2307,12 @@ fn bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3) -> ([f32; 3], f32) {
 /// Exposed so the WGSL port in `gpu/shaders/bsdf.wgsl` can be checked against
 /// this implementation — see `tests/bsdf_parity.rs`. Returns `(f * cos, pdf)`;
 /// the PDF is the one MIS must agree on across both renderers.
-pub fn reference_bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3) -> ([f32; 3], f32) {
-    bsdf_eval(m, wo, wi)
+pub fn reference_bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3, eta: f32) -> ([f32; 3], f32) {
+    bsdf_eval(m, wo, wi, eta)
 }
 
 /// Importance-sample the BSDF. Returns `(wi_local, f*cos, pdf)`.
-fn bsdf_sample(m: &Pbr, wo: Vec3, rng: &mut Rng) -> Option<(Vec3, [f32; 3], f32)> {
+fn bsdf_sample(m: &Pbr, wo: Vec3, eta: f32, rng: &mut Rng) -> Option<(Vec3, [f32; 3], f32)> {
     if wo.z <= 0.0 {
         return None;
     }
@@ -2032,7 +2351,7 @@ fn bsdf_sample(m: &Pbr, wo: Vec3, rng: &mut Rng) -> Option<(Vec3, [f32; 3], f32)
             return None;
         }
         wi
-    } else {
+    } else if u < w[0] + w[1] + w[2] + w[3] {
         let ca = m.coat_alpha();
         let wh = sample_gtr1(ca, r1, r2);
         let wi = reflect(-wo, wh);
@@ -2040,9 +2359,42 @@ fn bsdf_sample(m: &Pbr, wo: Vec3, rng: &mut Rng) -> Option<(Vec3, [f32; 3], f32)
             return None;
         }
         wi
+    } else {
+        // The dielectric lobe. One facet is drawn from the VNDF and the ray
+        // then either reflects off it or refracts through it, with the exact
+        // Fresnel as the branch probability — so total internal reflection is
+        // simply the case where that probability is 1, and no code path
+        // knows it is special.
+        let (at, ab) = m.alpha_tb();
+        let wh = sample_vndf(wo, at, ab, r1, r2);
+        if m.thin_walled {
+            let f = fresnel_dielectric(wo.dot(wh).max(0.0) as f32, m.ior.max(1.0));
+            let wi = reflect(-wo, wh);
+            if wi.z <= 0.0 {
+                return None;
+            }
+            // Reflect above, or mirror straight through below.
+            if (rng.f64() as f32) < f { wi } else { Vec3::new(wi.x, wi.y, -wi.z) }
+        } else {
+            let f = fresnel_dielectric(wo.dot(wh).max(0.0) as f32, eta);
+            if (rng.f64() as f32) < f {
+                let wi = reflect(-wo, wh);
+                if wi.z <= 0.0 {
+                    return None;
+                }
+                wi
+            } else {
+                let (wi, _, _) = crate::optics::refract(-wo, wh, 1.0, eta as f64)?;
+                let wi = wi.normalize();
+                if wi.z >= 0.0 {
+                    return None;
+                }
+                wi
+            }
+        }
     };
 
-    let (f, pdf) = bsdf_eval(m, wo, wi);
+    let (f, pdf) = bsdf_eval(m, wo, wi, eta);
     if pdf <= 1e-9 {
         return None;
     }
@@ -2295,6 +2647,7 @@ impl<G: Geometry> Scene<G> {
         frame: &Frame,
         wo_local: Vec3,
         m: &Pbr,
+        eta: f32,
         rng: &mut Rng,
     ) -> [f32; 3] {
         let Frame { t, b, n } = *frame;
@@ -2321,7 +2674,7 @@ impl<G: Geometry> Scene<G> {
             return [0.0; 3];
         }
 
-        let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local);
+        let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local, eta);
         if max3(f) <= 0.0 {
             return [0.0; 3];
         }
@@ -2355,6 +2708,7 @@ impl<G: Geometry> Scene<G> {
         frame: &Frame,
         wo_local: Vec3,
         m: &Pbr,
+        eta: f32,
         rng: &mut Rng,
     ) -> [f32; 3] {
         let Frame { t, b, n } = *frame;
@@ -2368,7 +2722,7 @@ impl<G: Geometry> Scene<G> {
         if wi_local.z <= 0.0 {
             return [0.0; 3];
         }
-        let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local);
+        let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local, eta);
         if max3(f) <= 0.0 {
             return [0.0; 3];
         }
@@ -2391,6 +2745,7 @@ impl<G: Geometry> Scene<G> {
         frame: &Frame,
         wo_local: Vec3,
         m: &Pbr,
+        eta: f32,
         rng: &mut Rng,
     ) -> [f32; 3] {
         let Some(sun) = &self.sun else {
@@ -2405,7 +2760,7 @@ impl<G: Geometry> Scene<G> {
         if wi_local.z <= 0.0 {
             return [0.0; 3];
         }
-        let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local);
+        let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local, eta);
         if max3(f) <= 0.0 {
             return [0.0; 3];
         }
@@ -2455,9 +2810,42 @@ fn radiance<G: Geometry>(
     // against light sampling when the new ray lands on an emitter.
     let mut prev_bsdf_pdf = 0.0f32;
     let mut specular_chain = true;
+    // The path's hero wavelength, in nanometres. `None` until the path meets
+    // a material whose index actually depends on it — an RGB path stays RGB,
+    // draws no extra random number, and renders bit-identically to what it
+    // did before dispersion existed.
+    let mut lambda_nm: Option<f64> = None;
+    // The medium the path is currently inside, for Beer–Lambert absorption.
+    // One slot, not a stack: this tracks a ray inside *a* solid, which is
+    // every glass in these scenes. Nested dielectrics (a bubble in glass, ice
+    // in a drink) would need a stack and would get the outer medium wrong
+    // here; that is the documented limit.
+    let mut medium: Option<Pbr> = None;
 
     for depth in 0..opts.max_depth {
-        match scene.intersect(accel, &ray) {
+        let landing = scene.intersect(accel, &ray);
+        // Absorb along the segment just travelled, if it was inside glass.
+        if let Some(med) = &medium {
+            let sigma = med.extinction();
+            if max3(sigma) > 0.0 {
+                let d = match &landing {
+                    Landing::Surface { point, .. } => (*point - ray.origin).norm() as f32,
+                    Landing::Light { distance, .. } => *distance as f32,
+                    Landing::Miss => 0.0,
+                };
+                if d > 0.0 {
+                    throughput = mul3(
+                        throughput,
+                        [
+                            (-sigma[0] * d).exp(),
+                            (-sigma[1] * d).exp(),
+                            (-sigma[2] * d).exp(),
+                        ],
+                    );
+                }
+            }
+        }
+        match landing {
             Landing::Miss => {
                 let dir = ray.direction.into_inner();
                 let env = scene.env.radiance(dir);
@@ -2530,11 +2918,35 @@ fn radiance<G: Geometry>(
                 material,
             } => {
                 let wo_world = -ray.direction.into_inner();
+                // Which side of the *geometric* normal the ray arrived on is
+                // the whole of the inside/outside bookkeeping: a front face is
+                // an entry, a back face an exit. Read before the face-forward
+                // that follows destroys the distinction.
+                let entering = normal.dot(wo_world) >= 0.0;
                 // Face-forward: interior faces (bore walls) must shade right.
                 let n = if normal.dot(wo_world) < 0.0 {
                     -normal
                 } else {
                     normal
+                };
+                // A dispersive material turns the path monochromatic, once.
+                // The draw is inside the `if` so a scene without dispersion
+                // consumes the RNG stream exactly as it always has.
+                if lambda_nm.is_none() && material.is_dispersive() {
+                    let nm = crate::spectrum::sample_lambda_nm(rng.f64());
+                    lambda_nm = Some(nm);
+                    throughput = mul3(throughput, crate::spectrum::hero_weight(nm));
+                }
+                // `eta` is n_transmitted / n_incident for this crossing.
+                let eta = if material.transmission > 0.0 {
+                    let n_glass = material.index_at(lambda_nm).max(1e-3);
+                    if material.thin_walled || entering {
+                        n_glass
+                    } else {
+                        1.0 / n_glass
+                    }
+                } else {
+                    1.0
                 };
                 if depth == 0 {
                     primary.hit = true;
@@ -2554,10 +2966,12 @@ fn radiance<G: Geometry>(
                 // environment when it is importance-sampled.
                 let direct = add3(
                     add3(
-                        scene.sample_lights(accel, point, &frame, wo_local, &material, rng),
-                        scene.sample_environment(accel, point, &frame, wo_local, &material, rng),
+                        scene.sample_lights(accel, point, &frame, wo_local, &material, eta, rng),
+                        scene.sample_environment(
+                            accel, point, &frame, wo_local, &material, eta, rng,
+                        ),
                     ),
-                    scene.sample_sun(accel, point, &frame, wo_local, &material, rng),
+                    scene.sample_sun(accel, point, &frame, wo_local, &material, eta, rng),
                 );
                 let direct = match opts.firefly_clamp {
                     Some(c) if depth > 0 => [direct[0].min(c), direct[1].min(c), direct[2].min(c)],
@@ -2566,15 +2980,23 @@ fn radiance<G: Geometry>(
                 l = add3(l, mul3(throughput, direct));
 
                 // Continue the path.
-                let Some((wi_local, f, pdf)) = bsdf_sample(&material, wo_local, rng) else {
+                let Some((wi_local, f, pdf)) = bsdf_sample(&material, wo_local, eta, rng) else {
                     break;
                 };
                 throughput = mul3(throughput, scale3(f, 1.0 / pdf));
                 prev_bsdf_pdf = pdf;
                 specular_chain = false;
 
+                // A transmitted ray leaves on the far side, so it is offset
+                // the other way — and, for a solid, it changes which medium
+                // the path is in.
+                let transmitted = wi_local.z < 0.0;
+                if transmitted && !material.thin_walled {
+                    medium = if entering { Some(material) } else { None };
+                }
                 let wi_world = to_world(frame.t, frame.b, n, wi_local);
-                ray = Ray::new(point + n * 1e-5, wi_world);
+                let offset = if transmitted { -n } else { n };
+                ray = Ray::new(point + offset * 1e-5, wi_world);
 
                 // Russian roulette.
                 if depth >= opts.rr_start {
@@ -3253,6 +3675,7 @@ mod tests {
         frame: &Frame,
         wo_local: Vec3,
         m: &Pbr,
+        eta: f32,
         rng: &mut Rng,
     ) -> [f32; 3] {
         let Frame { t, b, n } = *frame;
@@ -3273,7 +3696,7 @@ mod tests {
             if wi_local.z <= 0.0 {
                 continue;
             }
-            let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local);
+            let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local, eta);
             if max3(f) <= 0.0 {
                 continue;
             }
@@ -3328,6 +3751,7 @@ mod tests {
                     &frame,
                     wo_local,
                     &m,
+                    1.0,
                     &mut rng,
                 )
             } else {
@@ -3335,7 +3759,7 @@ mod tests {
                 for light in &scene.lights {
                     acc = add3(
                         acc,
-                        one_light_unweighted(light, 1.0, p, &frame, wo_local, &m, &mut rng),
+                        one_light_unweighted(light, 1.0, p, &frame, wo_local, &m, 1.0, &mut rng),
                     );
                 }
                 acc
@@ -3354,6 +3778,7 @@ mod tests {
         frame: &Frame,
         wo_local: Vec3,
         m: &Pbr,
+        eta: f32,
         rng: &mut Rng,
     ) -> [f32; 3] {
         let Frame { t, b, n } = *frame;
@@ -3372,7 +3797,7 @@ mod tests {
         if wi_local.z <= 0.0 {
             return [0.0; 3];
         }
-        let (f, _) = bsdf_eval(m, wo_local, wi_local);
+        let (f, _) = bsdf_eval(m, wo_local, wi_local, eta);
         let pdf = pick_pdf * (dist * dist / (cos_light * light.area())) as f32;
         if !pdf.is_finite() || pdf <= 0.0 {
             return [0.0; 3];
@@ -3474,6 +3899,7 @@ mod tests {
                 &frame,
                 wo_local,
                 &m,
+                1.0,
                 &mut rng,
             );
             let b = sample_all_lights_reference(
@@ -3483,6 +3909,7 @@ mod tests {
                 &frame,
                 wo_local,
                 &m,
+                1.0,
                 &mut rng,
             );
             for c in 0..3 {
@@ -3787,8 +4214,8 @@ mod tests {
                 ] {
                     let mut rng = Rng::new(7);
                     for _ in 0..256 {
-                        if let Some((wi, _f, pdf)) = bsdf_sample(&m, wo, &mut rng) {
-                            let (_f2, pdf2) = bsdf_eval(&m, wo, wi);
+                        if let Some((wi, _f, pdf)) = bsdf_sample(&m, wo, 1.0, &mut rng) {
+                            let (_f2, pdf2) = bsdf_eval(&m, wo, wi, 1.0);
                             assert!(
                                 (pdf - pdf2).abs() <= 1e-4 * pdf.max(1.0),
                                 "pdf mismatch at aniso={aniso} rough={roughness}: \
@@ -3853,15 +4280,15 @@ mod tests {
         let along = Vec3::new(0.25, 0.0, 1.0).normalize();
         let across = Vec3::new(0.0, 0.25, 1.0).normalize();
 
-        let (f_iso_a, _) = bsdf_eval(&rough(0.0), wo, along);
-        let (f_iso_b, _) = bsdf_eval(&rough(0.0), wo, across);
+        let (f_iso_a, _) = bsdf_eval(&rough(0.0), wo, along, 1.0);
+        let (f_iso_b, _) = bsdf_eval(&rough(0.0), wo, across, 1.0);
         assert!(
             (f_iso_a[0] - f_iso_b[0]).abs() < 1e-6,
             "isotropic lobe must be rotationally symmetric"
         );
 
-        let (f_pos_a, _) = bsdf_eval(&rough(0.8), wo, along);
-        let (f_pos_b, _) = bsdf_eval(&rough(0.8), wo, across);
+        let (f_pos_a, _) = bsdf_eval(&rough(0.8), wo, along, 1.0);
+        let (f_pos_b, _) = bsdf_eval(&rough(0.8), wo, across, 1.0);
         assert!(
             f_pos_a[0] > f_pos_b[0] * 1.5,
             "positive anisotropy should spread energy along the tangent: \
@@ -3870,8 +4297,8 @@ mod tests {
             f_pos_b[0]
         );
 
-        let (f_neg_a, _) = bsdf_eval(&rough(-0.8), wo, along);
-        let (f_neg_b, _) = bsdf_eval(&rough(-0.8), wo, across);
+        let (f_neg_a, _) = bsdf_eval(&rough(-0.8), wo, along, 1.0);
+        let (f_neg_b, _) = bsdf_eval(&rough(-0.8), wo, across, 1.0);
         assert!(
             f_neg_b[0] > f_neg_a[0] * 1.5,
             "negative anisotropy should spread energy across the tangent: \
@@ -4147,7 +4574,7 @@ mod tests {
                 ..Default::default()
             };
             for wo in view_directions() {
-                let e = integrate_hemisphere(220, |wi| bsdf_eval(&m, wo, wi).0[0]);
+                let e = integrate_hemisphere(220, |wi| bsdf_eval(&m, wo, wi, 1.0).0[0]);
                 assert!(
                     (0.99..=1.01).contains(&e),
                     "compensated GGX albedo {e} at alpha {alpha}, mu {}",
@@ -4169,7 +4596,7 @@ mod tests {
                 ..Default::default()
             };
             for wo in view_directions() {
-                let e = integrate_hemisphere(220, |wi| bsdf_eval(&m, wo, wi).0[0]);
+                let e = integrate_hemisphere(220, |wi| bsdf_eval(&m, wo, wi, 1.0).0[0]);
                 assert!(
                     (0.0..=1.0).contains(&e),
                     "dielectric specular albedo {e} at roughness {roughness}"
@@ -4248,8 +4675,8 @@ mod tests {
             for b in dirs {
                 // `bsdf_eval` returns f*cos, so divide the cosines back out
                 // before comparing: f(a,b) == f(b,a).
-                let ab = scale3(bsdf_eval(&m, a, b).0, 1.0 / b.z as f32);
-                let ba = scale3(bsdf_eval(&m, b, a).0, 1.0 / a.z as f32);
+                let ab = scale3(bsdf_eval(&m, a, b, 1.0).0, 1.0 / b.z as f32);
+                let ba = scale3(bsdf_eval(&m, b, a, 1.0).0, 1.0 / a.z as f32);
                 for c in 0..3 {
                     let scale = ab[c].abs().max(ba[c].abs()).max(1e-3);
                     assert!(
@@ -4265,6 +4692,373 @@ mod tests {
     /// quadrature reports — the check that catches a sampling routine drawing
     /// from a different distribution than its PDF claims, across every new
     /// parameter.
+    // ─── transmission ─────────────────────────────────────────────────────
+
+    fn smooth_glass(ior: f32, roughness: f32) -> Pbr {
+        Pbr {
+            transmission: 1.0,
+            ior,
+            roughness,
+            ..Default::default()
+        }
+    }
+
+    /// The reflect/transmit split is the exact Fresnel, so at normal
+    /// incidence it must be `((n−1)/(n+1))²` to the last digit an f32 has —
+    /// not Schlick's fit, which agrees there but nowhere near grazing.
+    #[test]
+    fn dielectric_fresnel_at_normal_incidence_is_the_textbook_number() {
+        for n in [1.33f32, 1.5, 1.52, 1.9, 2.42] {
+            let r = fresnel_dielectric(1.0, n);
+            let r0 = ((n - 1.0) / (n + 1.0)).powi(2);
+            assert!((r - r0).abs() < 1e-6, "n={n}: {r} vs {r0}");
+        }
+    }
+
+    /// At Brewster's angle the p-polarised reflectance vanishes, so the
+    /// unpolarised average is exactly half of the s-polarised one. That is a
+    /// property no Schlick approximation has, and it is the reason the exact
+    /// formula is worth carrying.
+    #[test]
+    fn brewsters_angle_halves_the_unpolarised_reflectance() {
+        let n = 1.5f32;
+        let theta_b = n.atan();
+        let cos_i = theta_b.cos();
+        let sin_t = theta_b.sin() / n;
+        let cos_t = (1.0 - sin_t * sin_t).sqrt();
+        let rs = ((cos_i - n * cos_t) / (cos_i + n * cos_t)).powi(2);
+        let r = fresnel_dielectric(cos_i, n);
+        assert!((r - 0.5 * rs).abs() < 1e-5, "{r} vs {}", 0.5 * rs);
+    }
+
+    /// Total internal reflection is not a branch: it is what the same
+    /// formula returns past the critical angle.
+    #[test]
+    fn past_the_critical_angle_everything_reflects() {
+        let eta = 1.0f32 / 1.5; // leaving glass
+        let critical = eta.asin();
+        let just_inside = (critical - 0.02f32).cos();
+        let just_outside = (critical + 0.02f32).cos();
+        assert!(fresnel_dielectric(just_inside, eta) < 1.0);
+        assert_eq!(fresnel_dielectric(just_outside, eta), 1.0);
+    }
+
+    /// A smooth glass surface refracts at Snell's angle. Sampled through the
+    /// full BSDF machinery — VNDF facet, Fresnel branch, Walter half-vector —
+    /// so this pins the lobe and not just `optics::refract`.
+    #[test]
+    fn a_smooth_slab_refracts_at_snells_angle() {
+        let m = smooth_glass(1.5, 0.001);
+        let mut rng = Rng::new(0x51a5);
+        for deg in [10.0f64, 30.0, 50.0, 70.0] {
+            let theta = deg.to_radians();
+            let wo = Vec3::new(theta.sin(), 0.0, theta.cos());
+            let expected_sin_t = theta.sin() / 1.5;
+            let mut n = 0;
+            for _ in 0..4000 {
+                let Some((wi, _, _)) = bsdf_sample(&m, wo, 1.5, &mut rng) else {
+                    continue;
+                };
+                if wi.z >= 0.0 {
+                    continue; // reflected
+                }
+                let sin_t = (wi.x * wi.x + wi.y * wi.y).sqrt();
+                assert!(
+                    (sin_t - expected_sin_t).abs() < 5e-3,
+                    "at {deg} deg: sin(theta_t) {sin_t} vs Snell {expected_sin_t}"
+                );
+                // Refraction stays in the plane of incidence, on the far side.
+                assert!(wi.x < 0.0 && wi.y.abs() < 5e-3);
+                n += 1;
+            }
+            assert!(n > 100, "at {deg} deg only {n} of 4000 samples transmitted");
+        }
+    }
+
+    /// White furnace on a rough dielectric: with no absorption, everything
+    /// that arrives must leave. Reflection and transmission together should
+    /// sum to 1 — under, because a single-scattering Smith G drops the
+    /// facet-to-facet bounces, and never over.
+    #[test]
+    fn a_rough_glass_sphere_closes_the_furnace() {
+        for roughness in [0.05f32, 0.1, 0.2, 0.3] {
+            let m = smooth_glass(1.5, roughness);
+            for deg in [15.0f64, 45.0, 70.0] {
+                let theta = deg.to_radians();
+                let wo = Vec3::new(theta.sin(), 0.0, theta.cos());
+                let mut rng = Rng::new(0xf00d + (deg as u64) * 31 + (roughness * 1e3) as u64);
+                let n = 200_000;
+                let mut sum = 0.0f64;
+                for _ in 0..n {
+                    if let Some((wi, f, pdf)) = bsdf_sample(&m, wo, 1.5, &mut rng) {
+                        // The lobe's *energy*, so the η² radiance-transport
+                        // scaling is taken back out on the transmitted half —
+                        // see the note on `dielectric_eval`. A furnace is a
+                        // statement about energy, not about the units a
+                        // camera path happens to carry it in.
+                        let undo = if wi.z < 0.0 { 1.5f32 * 1.5 } else { 1.0 };
+                        sum += (f[0] * undo / pdf) as f64;
+                    }
+                }
+                let albedo = sum / n as f64;
+                assert!(
+                    albedo <= 1.0 + 5e-3,
+                    "r={roughness} {deg}deg: furnace gained energy ({albedo})"
+                );
+                assert!(
+                    albedo >= 0.97,
+                    "r={roughness} {deg}deg: furnace lost energy ({albedo})"
+                );
+            }
+        }
+    }
+
+    /// The η² convention, checked where it matters: a ray that goes *into*
+    /// glass and back *out* comes back to unit throughput. Entering scales
+    /// radiance by 1/η² and leaving by η², and a slab is therefore a no-op —
+    /// which is what makes the scaling a convention rather than a leak.
+    #[test]
+    fn a_slab_is_a_round_trip_no_op() {
+        let m = smooth_glass(1.5, 0.08);
+        let mut rng = Rng::new(0x5_1ab);
+        let theta = 0.5f64;
+        let wo = Vec3::new(theta.sin(), 0.0, theta.cos());
+        let n = 200_000;
+        let (mut sum, mut hits) = (0.0f64, 0u32);
+        for _ in 0..n {
+            // In.
+            let Some((wi, f, pdf)) = bsdf_sample(&m, wo, 1.5, &mut rng) else {
+                continue;
+            };
+            if wi.z >= 0.0 {
+                continue;
+            }
+            let t1 = (f[0] / pdf) as f64;
+            // Out through the far face: the far face's own normal faces the
+            // other way, so the ray arrives at it from below and the local
+            // frame flips.
+            let wo2 = Vec3::new(-wi.x, -wi.y, -wi.z);
+            let Some((_, f2, pdf2)) = bsdf_sample(&m, wo2, 1.0 / 1.5, &mut rng) else {
+                continue;
+            };
+            sum += t1 * (f2[0] / pdf2) as f64;
+            hits += 1;
+        }
+        let round_trip = sum / hits as f64;
+        assert!(hits > n / 2, "only {hits} of {n} paths crossed both faces");
+        assert!(
+            (0.90..=1.0 + 5e-3).contains(&round_trip),
+            "a slab should be transparent, got {round_trip}"
+        );
+    }
+
+    /// Beer–Lambert, exactly: a material that transmits `c` over distance `d`
+    /// transmits `c^(t/d)` over distance `t`.
+    #[test]
+    fn absorption_is_beer_lambert_to_the_letter() {
+        let m = Pbr {
+            transmission: 1.0,
+            attenuation_color: [0.8, 0.9, 0.55],
+            attenuation_distance: 0.25,
+            ..Default::default()
+        };
+        let sigma = m.extinction();
+        for t in [0.0f32, 0.1, 0.25, 1.0, 3.0] {
+            for c in 0..3 {
+                let got = (-sigma[c] * t).exp();
+                let want = m.attenuation_color[c].powf(t / m.attenuation_distance);
+                assert!((got - want).abs() < 1e-6, "channel {c} at {t}: {got} vs {want}");
+            }
+        }
+        // One attenuation distance reproduces the colour that named it.
+        for c in 0..3 {
+            let got = (-sigma[c] * m.attenuation_distance).exp();
+            assert!((got - m.attenuation_color[c]).abs() < 1e-6);
+        }
+        // The default is transparent.
+        assert_eq!(Pbr::default().extinction(), [0.0; 3]);
+    }
+
+    /// A white beam through a 60° N-BK7 prism comes out spread, and the
+    /// spread is the one Snell gives for the F and C lines' indices.
+    ///
+    /// Traced through `bsdf_sample` at both wavelengths — two refractions,
+    /// each at the index `index_at` reports — so this pins the whole chain
+    /// from Sellmeier through `eta` to the Walter half-vector against the
+    /// two-surface analytic answer.
+    #[test]
+    fn a_bk7_prism_spreads_f_to_c_by_the_analytic_angle() {
+        let m = Pbr {
+            transmission: 1.0,
+            roughness: 0.001,
+            ior: 1.5168,
+            sellmeier: Some(crate::spectrum::BK7_SELLMEIER),
+            ..Default::default()
+        };
+        // Apex 60 degrees; the entry face normal is +Z locally.
+        let apex = 60f64.to_radians();
+        let incidence = 45f64.to_radians();
+
+        // Deviation through a prism of apex A at incidence i1:
+        //   r1 = asin(sin i1 / n),  r2 = A − r1,  i2 = asin(n sin r2)
+        //   D  = i1 + i2 − A
+        let analytic = |n: f64| {
+            let r1 = (incidence.sin() / n).asin();
+            let r2 = apex - r1;
+            let i2 = (n * r2.sin()).asin();
+            incidence + i2 - apex
+        };
+
+        // The same two refractions, but each one driven by the material's own
+        // sampled lobe.
+        let traced = |lambda_nm: f64| {
+            let n = m.index_at(Some(lambda_nm)) as f64;
+            let mut rng = Rng::new(0xbeef_0000 + lambda_nm as u64);
+            // Entry: air into glass.
+            let wo = Vec3::new(incidence.sin(), 0.0, incidence.cos());
+            let mut r1 = None;
+            for _ in 0..8000 {
+                if let Some((wi, _, _)) = bsdf_sample(&m, wo, n as f32, &mut rng) {
+                    if wi.z < 0.0 {
+                        r1 = Some((wi.x * wi.x + wi.y * wi.y).sqrt().asin());
+                        break;
+                    }
+                }
+            }
+            let r1 = r1.expect("the entry face transmitted nothing");
+            // Exit: glass into air, at the second face.
+            let r2 = apex - r1;
+            let wo2 = Vec3::new(r2.sin(), 0.0, r2.cos());
+            let mut i2 = None;
+            for _ in 0..8000 {
+                if let Some((wi, _, _)) = bsdf_sample(&m, wo2, (1.0 / n) as f32, &mut rng) {
+                    if wi.z < 0.0 {
+                        i2 = Some((wi.x * wi.x + wi.y * wi.y).sqrt().asin());
+                        break;
+                    }
+                }
+            }
+            incidence + i2.expect("the exit face transmitted nothing") - apex
+        };
+
+        let (f_nm, c_nm) = (486.13, 656.27);
+        let n_f = m.index_at(Some(f_nm)) as f64;
+        let n_c = m.index_at(Some(c_nm)) as f64;
+        // N-BK7's datasheet indices at the two lines.
+        assert!((n_f - 1.52238).abs() < 1e-3, "n_F = {n_f}");
+        assert!((n_c - 1.51432).abs() < 1e-3, "n_C = {n_c}");
+
+        let spread_analytic = analytic(n_f) - analytic(n_c);
+        let spread_traced = traced(f_nm) - traced(c_nm);
+        assert!(
+            spread_analytic > 0.0,
+            "blue must deviate more than red ({spread_analytic})"
+        );
+        assert!(
+            (spread_traced - spread_analytic).abs() < 2e-3,
+            "traced spread {} rad vs analytic {} rad",
+            spread_traced,
+            spread_analytic
+        );
+        // For the record: about 0.75 degrees of fan between the F and C lines.
+        assert!(
+            (spread_analytic.to_degrees() - 0.75).abs() < 0.1,
+            "{} deg",
+            spread_analytic.to_degrees()
+        );
+    }
+
+    /// The spread has to read as a rainbow in the right order: the long end
+    /// red, the short end violet-blue, with green between.
+    #[test]
+    fn the_hero_weights_run_red_to_violet() {
+        let red = crate::spectrum::hero_weight(650.0);
+        let green = crate::spectrum::hero_weight(540.0);
+        let blue = crate::spectrum::hero_weight(450.0);
+        assert!(red[0] > red[1] && red[0] > red[2], "650nm reads {red:?}");
+        assert!(
+            green[1] > green[0] && green[1] > green[2],
+            "540nm reads {green:?}"
+        );
+        assert!(blue[2] > blue[0] && blue[2] > blue[1], "450nm reads {blue:?}");
+    }
+
+    /// The invariant MIS depends on: the PDF `bsdf_sample` returns is the PDF
+    /// `bsdf_eval` reports for the direction it drew — on both sides of the
+    /// surface, transmission included.
+    #[test]
+    fn the_dielectric_sample_pdf_matches_its_eval_pdf() {
+        let mut rng = Rng::new(0x51de);
+        for roughness in [0.02f32, 0.15, 0.4] {
+            for thin in [false, true] {
+                let m = Pbr {
+                    transmission: 1.0,
+                    roughness,
+                    ior: 1.52,
+                    thin_walled: thin,
+                    ..Default::default()
+                };
+                for _ in 0..2000 {
+                    let theta = rng.f64() * 1.4;
+                    let wo = Vec3::new(theta.sin(), 0.0, theta.cos());
+                    let Some((wi, f, pdf)) = bsdf_sample(&m, wo, 1.52, &mut rng) else {
+                        continue;
+                    };
+                    let (f2, pdf2) = bsdf_eval(&m, wo, wi, 1.52);
+                    assert!(
+                        (pdf - pdf2).abs() <= 1e-4 * pdf.max(1.0),
+                        "r={roughness} thin={thin}: {pdf} vs {pdf2}"
+                    );
+                    assert!((f[0] - f2[0]).abs() <= 1e-4 * f[0].max(1.0));
+                }
+            }
+        }
+    }
+
+    /// A thin-walled sheet transmits straight through: no lateral offset, and
+    /// at low roughness the exit direction is the entry direction.
+    #[test]
+    fn a_thin_wall_transmits_straight_through() {
+        let m = Pbr {
+            transmission: 1.0,
+            roughness: 0.001,
+            ior: 1.52,
+            thin_walled: true,
+            ..Default::default()
+        };
+        let mut rng = Rng::new(0x7417);
+        let theta = 0.7f64;
+        let wo = Vec3::new(theta.sin(), 0.0, theta.cos());
+        let mut n = 0;
+        for _ in 0..4000 {
+            let Some((wi, _, _)) = bsdf_sample(&m, wo, 1.52, &mut rng) else {
+                continue;
+            };
+            if wi.z >= 0.0 {
+                continue;
+            }
+            assert!((wi.x + wo.x).abs() < 5e-3 && (wi.z + wo.z).abs() < 5e-3, "{wi:?}");
+            n += 1;
+        }
+        assert!(n > 3000, "a sheet should mostly transmit, got {n}/4000");
+    }
+
+    /// The whole point of the defaults: an opaque material's five lobe
+    /// weights are its old four, unchanged, and the fifth is zero.
+    #[test]
+    fn transmission_zero_leaves_the_opaque_weights_alone() {
+        for m in [
+            Pbr::default(),
+            Pbr::metal([0.9, 0.8, 0.5], 0.2),
+            Pbr::plastic([0.2, 0.4, 0.8], 0.3, 0.6),
+        ] {
+            let w = lobe_weights(&m);
+            assert_eq!(w[4], 0.0);
+            let s: f32 = w[0] + w[1] + w[2] + w[3];
+            assert!((s - 1.0).abs() < 1e-6);
+        }
+    }
+
     #[test]
     fn sampling_every_lobe_recovers_the_evaluated_albedo() {
         let base = Pbr {
@@ -4300,12 +5094,12 @@ mod tests {
                 Vec3::new(0.6, 0.2, 0.77).normalize(),
                 Vec3::new(0.9, 0.1, 0.42).normalize(),
             ] {
-                let reference = integrate_hemisphere(200, |wi| bsdf_eval(&m, wo, wi).0[0]);
+                let reference = integrate_hemisphere(200, |wi| bsdf_eval(&m, wo, wi, 1.0).0[0]);
                 let mut rng = Rng::new(29);
                 let n = 200_000;
                 let mut sum = 0.0f64;
                 for _ in 0..n {
-                    if let Some((_wi, f, pdf)) = bsdf_sample(&m, wo, &mut rng) {
+                    if let Some((_wi, f, pdf)) = bsdf_sample(&m, wo, 1.0, &mut rng) {
                         sum += (f[0] / pdf) as f64;
                     }
                 }
@@ -4343,7 +5137,7 @@ mod tests {
                 let n = 20000;
                 let mut sum = 0.0f32;
                 for _ in 0..n {
-                    if let Some((_wi, f, pdf)) = bsdf_sample(&m, wo, &mut rng) {
+                    if let Some((_wi, f, pdf)) = bsdf_sample(&m, wo, 1.0, &mut rng) {
                         sum += f[0] / pdf;
                     }
                 }
