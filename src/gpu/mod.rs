@@ -16,6 +16,13 @@ mod resident;
 mod scene;
 pub mod shaders;
 
+/// The `wgpu` this crate was built against.
+///
+/// Re-exported so a client — or one of this crate's own tests — can name a
+/// texture format or a buffer usage without pinning the same version itself
+/// and risking two `wgpu`s in the graph.
+pub use wgpu;
+
 pub use analytic::{AnalyticGeometry, AnalyticPrim};
 pub use buffers::{
     DEFAULT_ENV_INTENSITY, DEFAULT_FIREFLY_CLAMP, DEFAULT_MAX_DEPTH, DEFAULT_RR_START,
@@ -24,7 +31,9 @@ pub use buffers::{
 };
 pub use context::{GpuContext, GpuError};
 pub use geometry::{GeometryModule, GeometrySlab, GpuGeometry, storage_entry};
-pub use history::{GpuDenoiseParams, History, HistoryBuffers, HistoryPipeline, MAX_DENOISE_ITERS};
+pub use history::{
+    GpuDenoiseParams, History, HistoryBuffers, HistoryPipeline, MAX_DENOISE_ITERS, atrous_iters_for,
+};
 pub use pipeline::RayTracePipeline;
 pub use resident::ResidentScene;
 pub use scene::{NoGeometry, SceneRef};

@@ -88,11 +88,13 @@ struct HistoryParams {
     // `mean`/`stats`. Folding the write-back into `accumulate` rather than
     // giving it a dispatch of its own saves a full-frame round trip.
     reprojected: u32,
+    // Which à-trous iteration this slot drives, 0-based. `atrous` compares it
+    // against the per-pixel iteration budget below.
+    iter_index: u32,
     // Explicit u32 padding, not a vec3<u32>: a vec3 in WGSL is 16-byte
     // aligned and would put this struct's size 16 bytes past the Rust one.
     _pad_reproj0: u32,
     _pad_reproj1: u32,
-    _pad_reproj2: u32,
 }
 
 // How far this frame's surface point may lie off the plane the previous
@@ -377,6 +379,15 @@ fn demodulate(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ─── pass 3: one à-trous wavelet iteration ────────────────────────────────
 
+// Iterations a pixel with `count` samples of history still gets: the full
+// `params.iters` on its first sample, falling linearly to none at
+// `count_cutoff`. Mirrored in Rust as `gpu::history::atrous_iters_for`.
+fn atrous_iters_for(count: f32) -> u32 {
+    let cutoff = f32(max(params.count_cutoff, 1u));
+    let t = clamp((cutoff - count) / max(cutoff - 1.0, 1e-6), 0.0, 1.0);
+    return u32(ceil(f32(params.iters) * t));
+}
+
 fn b3(k: i32) -> f32 {
     if k == 0 || k == 4 {
         return B3_0;
@@ -402,9 +413,18 @@ fn atrous(@builtin(global_invocation_id) gid: vec3<u32>) {
         scratch_dst[p] = centre;
         return;
     }
-    // A pixel with a long enough history is already clean; leave it alone.
-    // This is what makes the filter cost fall away as the frame converges.
-    if stats[p].x >= f32(params.count_cutoff) {
+    // How many wavelet iterations *this* pixel still deserves.
+    //
+    // `resolve` already fades the filter's strength out as a pixel's history
+    // grows, but a faded filter costs exactly what a full one does: every
+    // pixel ran every iteration and the widest ones — stride 16, reaching a
+    // 65-pixel footprint — are the expensive ones, 25 scattered taps apiece.
+    // Letting the *count* fall too means a nearly-converged pixel does the
+    // first pass or two and drops out, and a fully converged one does none.
+    // The budget is full at a single sample, so a one-sample history is
+    // filtered exactly as `pathtrace::denoise` filters a `Film` — which is
+    // what the parity test pins.
+    if params.iter_index >= atrous_iters_for(stats[p].x) {
         scratch_dst[p] = centre;
         return;
     }

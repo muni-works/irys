@@ -62,6 +62,20 @@ use super::resident::ResidentScene;
 /// the tap stride each time, so the widest footprint is already 32 pixels.
 pub const MAX_DENOISE_ITERS: u32 = 8;
 
+/// How many à-trous iterations a pixel with `count` samples of history still
+/// gets: all `iters` of them on its first sample, falling linearly to none at
+/// `count_cutoff`.
+///
+/// The mirror of `atrous_iters_for` in `history.wgsl`, exposed so a caller can
+/// budget the pass and a test can pin the two together. Note what it gives at
+/// `count == 1`: the full count, so a one-sample history is filtered exactly
+/// as [`crate::pathtrace::denoise`] filters a `Film`.
+pub fn atrous_iters_for(count: f32, iters: u32, count_cutoff: u32) -> u32 {
+    let cutoff = count_cutoff.max(1) as f32;
+    let t = ((cutoff - count) / (cutoff - 1.0).max(1e-6)).clamp(0.0, 1.0);
+    (iters as f32 * t).ceil() as u32
+}
+
 /// Uniform slots: one per à-trous iteration, plus one shared by the
 /// accumulate, demodulate and resolve passes.
 const PARAM_SLOTS: u32 = MAX_DENOISE_ITERS + 1;
@@ -135,7 +149,8 @@ struct HistoryParams {
     prev_forward: [f32; 4],
     view_params: [f32; 4],
     reprojected: u32,
-    _pad_reproj: [u32; 3],
+    iter_index: u32,
+    _pad_reproj: [u32; 2],
 }
 
 /// The camera basis the shader's ray generator derives from a [`GpuCamera`],
@@ -554,13 +569,15 @@ impl RayTracePipeline {
                 prev_forward: prev.3,
                 view_params: [cur.4, cur.5, prev.4, prev.5],
                 reprojected: u32::from(prev_view.is_some()),
-                _pad_reproj: [0; 3],
+                iter_index: 0,
+                _pad_reproj: [0; 2],
             };
             ctx.queue
                 .write_buffer(&hist.params, 0, bytemuck::bytes_of(&base));
             for it in 0..iters {
                 let p = HistoryParams {
                     stride: 1u32 << it,
+                    iter_index: it,
                     ..base
                 };
                 ctx.queue.write_buffer(
