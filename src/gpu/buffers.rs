@@ -829,3 +829,20 @@ impl GpuCamera {
         }
     }
 }
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// The WGSL `GpuMaterial` is laid out by the same rules from the same field
+    /// list, and nothing checks that by inspection — a mismatched stride makes
+    /// every material after the first read someone else's bytes, which shades
+    /// plausibly and wrongly. `tests/gpu_bsdf.rs` would catch it on hardware;
+    /// this catches it without a GPU.
+    #[test]
+    fn the_material_stride_is_what_the_shader_expects() {
+        // vec4 color, twelve scalars, vec3 sheen_color (16-byte aligned) + pad.
+        assert_eq!(std::mem::size_of::<GpuMaterial>(), 80);
+        assert_eq!(std::mem::align_of::<GpuMaterial>(), 4);
+    }
+}
