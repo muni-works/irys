@@ -217,7 +217,6 @@ impl Pbr {
     }
 }
 
-
 // ─── lights & environment ─────────────────────────────────────────────────
 
 /// A rectangular area light ("softbox"), emitting from its front face only.
@@ -1326,11 +1325,7 @@ fn reflect(i: Vec3, n: Vec3) -> Vec3 {
 fn power_heuristic(a: f32, b: f32) -> f32 {
     let a2 = a * a;
     let b2 = b * b;
-    if a2 + b2 <= 0.0 {
-        0.0
-    } else {
-        a2 / (a2 + b2)
-    }
+    if a2 + b2 <= 0.0 { 0.0 } else { a2 / (a2 + b2) }
 }
 
 // ─── intersection ─────────────────────────────────────────────────────────
@@ -1396,11 +1391,7 @@ impl<G> SceneAccel<G> {
             Ok(i) | Err(i) => i.min(self.light_cdf.len() - 1),
         };
         let pdf = self.light_pick_pdf[i];
-        if pdf > 0.0 {
-            Some((i, pdf))
-        } else {
-            None
-        }
+        if pdf > 0.0 { Some((i, pdf)) } else { None }
     }
 }
 
@@ -1524,12 +1515,7 @@ impl<G: Geometry> Scene<G> {
     }
 
     /// Closest geometry hit past `t_min`, in world space.
-    fn tlas_hit(
-        &self,
-        accel: &SceneAccel<G>,
-        ray: &Ray,
-        t_min: f64,
-    ) -> Option<InstanceHit> {
+    fn tlas_hit(&self, accel: &SceneAccel<G>, ray: &Ray, t_min: f64) -> Option<InstanceHit> {
         accel.tlas.trace_closest_range(ray, t_min, f64::INFINITY)
     }
 
@@ -2435,8 +2421,14 @@ mod tests {
     fn cube_mesh() -> TriMesh {
         let p = |x, y, z| Point3::new(x, y, z);
         let positions = vec![
-            p(0.0, 0.0, 0.0), p(10.0, 0.0, 0.0), p(10.0, 10.0, 0.0), p(0.0, 10.0, 0.0),
-            p(0.0, 0.0, 10.0), p(10.0, 0.0, 10.0), p(10.0, 10.0, 10.0), p(0.0, 10.0, 10.0),
+            p(0.0, 0.0, 0.0),
+            p(10.0, 0.0, 0.0),
+            p(10.0, 10.0, 0.0),
+            p(0.0, 10.0, 0.0),
+            p(0.0, 0.0, 10.0),
+            p(10.0, 0.0, 10.0),
+            p(10.0, 10.0, 10.0),
+            p(0.0, 10.0, 10.0),
         ];
         let indices = [
             0, 2, 1, 0, 3, 2, // -z

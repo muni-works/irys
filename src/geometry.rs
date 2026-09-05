@@ -142,7 +142,11 @@ impl TriMesh {
     /// report the geometric face normal.
     pub fn new(positions: Vec<Point3>, normals: Vec<Vec3>, indices: &[u32]) -> Self {
         let vertex_count = positions.len();
-        let normals = if normals.len() == vertex_count { normals } else { Vec::new() };
+        let normals = if normals.len() == vertex_count {
+            normals
+        } else {
+            Vec::new()
+        };
 
         let tris: Vec<[u32; 3]> = (0..indices.len() / 3)
             .map(|i| [indices[i * 3], indices[i * 3 + 1], indices[i * 3 + 2]])
@@ -166,7 +170,11 @@ impl TriMesh {
             })
             .collect();
 
-        Self { positions, normals, tris }
+        Self {
+            positions,
+            normals,
+            tris,
+        }
     }
 
     /// The vertex positions.
@@ -229,7 +237,8 @@ impl Geometry for TriMesh {
     }
 
     fn intersect(&self, ray: &Ray, i: usize, t_min: f64, t_max: f64) -> Option<Hit> {
-        self.test(ray, i as u32).filter(|h| h.t > t_min && h.t < t_max)
+        self.test(ray, i as u32)
+            .filter(|h| h.t > t_min && h.t < t_max)
     }
 
     fn intersect_all(&self, ray: &Ray, i: usize, out: &mut Vec<Hit>) {
@@ -305,7 +314,10 @@ mod tests {
         let v0 = Point3::new(0.0, 0.0, 0.0);
         let v1 = Point3::new(s, 0.0, 0.0);
         let v2 = Point3::new(0.0, s, 0.0);
-        let ray = Ray::new(Point3::new(s / 4.0, s / 4.0, -1.0), Vec3::new(0.0, 0.0, 1.0));
+        let ray = Ray::new(
+            Point3::new(s / 4.0, s / 4.0, -1.0),
+            Vec3::new(0.0, 0.0, 1.0),
+        );
         assert!(intersect_triangle(&ray, v0, v1, v2).is_some());
     }
 

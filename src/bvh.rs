@@ -3,7 +3,7 @@
 use crate::geometry::Geometry;
 use crate::math::Aabb;
 use crate::ray::{Hit, Ray};
-use crate::sah::{item_bounds, sah_split, SahItem};
+use crate::sah::{SahItem, item_bounds, sah_split};
 
 /// A flattened node for GPU upload: `(AABB, is_leaf, left_or_first,
 /// right_or_count)`.
@@ -208,7 +208,10 @@ impl<G: Geometry> Bvh<G> {
                 for &prim in prims {
                     // `closest_t` is the upper bound the geometry may prune
                     // against: nothing further away can win.
-                    if let Some(hit) = self.geom.intersect(ray, prim as usize, t_min, f64::INFINITY) {
+                    if let Some(hit) = self
+                        .geom
+                        .intersect(ray, prim as usize, t_min, f64::INFINITY)
+                    {
                         if hit.t < *closest_t {
                             *closest_t = hit.t;
                             *closest = Some(hit);
@@ -316,8 +319,14 @@ mod tests {
     fn cube() -> TriMesh {
         let p = |x, y, z| Point3::new(x, y, z);
         let positions = vec![
-            p(0.0, 0.0, 0.0), p(1.0, 0.0, 0.0), p(1.0, 1.0, 0.0), p(0.0, 1.0, 0.0),
-            p(0.0, 0.0, 1.0), p(1.0, 0.0, 1.0), p(1.0, 1.0, 1.0), p(0.0, 1.0, 1.0),
+            p(0.0, 0.0, 0.0),
+            p(1.0, 0.0, 0.0),
+            p(1.0, 1.0, 0.0),
+            p(0.0, 1.0, 0.0),
+            p(0.0, 0.0, 1.0),
+            p(1.0, 0.0, 1.0),
+            p(1.0, 1.0, 1.0),
+            p(0.0, 1.0, 1.0),
         ];
         let indices = [
             0, 2, 1, 0, 3, 2, // -z

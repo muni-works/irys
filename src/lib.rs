@@ -24,6 +24,9 @@
 //! any other Kosm crate. It has to build for `wasm32-unknown-unknown`, so
 //! anything native-only is feature-gated or off the main path.
 
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
 pub mod bvh;
 pub mod geometry;
 pub mod math;
@@ -33,11 +36,11 @@ mod sah;
 pub mod tlas;
 
 pub use bvh::{Bvh, BvhNode, FlatBvhNode};
-pub use geometry::{intersect_triangle, Geometry, TriMesh, TriangleHit};
-pub use math::{transform_from_column_major, Aabb, Dir3, Point2, Point3, Transform, Vec2, Vec3};
+pub use geometry::{Geometry, TriMesh, TriangleHit, intersect_triangle};
+pub use math::{Aabb, Dir3, Point2, Point3, Transform, Vec2, Vec3, transform_from_column_major};
 pub use pathtrace::{
-    denoise, render, render_into, studio_rig, AreaLight, Camera, Environment, EnvMap, Film,
-    GradientEnv, Ground, Object, PathTraceOptions, Pbr, Scene,
+    AreaLight, Camera, EnvMap, Environment, Film, GradientEnv, Ground, Object, PathTraceOptions,
+    Pbr, Scene, denoise, render, render_into, studio_rig,
 };
 pub use ray::{Hit, Ray};
 pub use tlas::{FlatTlasNode, Instance, InstanceHit, Tlas};

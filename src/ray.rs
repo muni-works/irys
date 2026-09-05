@@ -26,7 +26,12 @@ impl Ray {
             if inv.y < 0.0 { 1 } else { 0 },
             if inv.z < 0.0 { 1 } else { 0 },
         ];
-        Self { origin, direction: dir, inv_direction: inv, sign }
+        Self {
+            origin,
+            direction: dir,
+            inv_direction: inv,
+            sign,
+        }
     }
 
     /// The point at parameter `t`: `origin + t * direction`.
@@ -110,7 +115,15 @@ pub struct Hit {
 impl Hit {
     /// A hit with no tangent.
     pub fn new(t: f64, point: Point3, normal: Dir3, uv: Point2, prim: u32) -> Self {
-        Self { t, point, normal, uv, prim, payload: 0, dpdu: None }
+        Self {
+            t,
+            point,
+            normal,
+            uv,
+            prim,
+            payload: 0,
+            dpdu: None,
+        }
     }
 
     /// Attach a surface tangent.

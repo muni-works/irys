@@ -40,32 +40,44 @@ pub struct Transform {
 impl Transform {
     /// The identity placement.
     pub fn identity() -> Self {
-        Self { matrix: tang::Mat4::identity() }
+        Self {
+            matrix: tang::Mat4::identity(),
+        }
     }
 
     /// Translation by `(dx, dy, dz)`.
     pub fn translation(dx: f64, dy: f64, dz: f64) -> Self {
-        Self { matrix: tang::Mat4::translation(dx, dy, dz) }
+        Self {
+            matrix: tang::Mat4::translation(dx, dy, dz),
+        }
     }
 
     /// Non-uniform scale by `(sx, sy, sz)`.
     pub fn scale(sx: f64, sy: f64, sz: f64) -> Self {
-        Self { matrix: tang::Mat4::scale(sx, sy, sz) }
+        Self {
+            matrix: tang::Mat4::scale(sx, sy, sz),
+        }
     }
 
     /// Rotation about the X axis, radians.
     pub fn rotation_x(angle: f64) -> Self {
-        Self { matrix: tang::Mat4::rotation_x(angle) }
+        Self {
+            matrix: tang::Mat4::rotation_x(angle),
+        }
     }
 
     /// Rotation about the Y axis, radians.
     pub fn rotation_y(angle: f64) -> Self {
-        Self { matrix: tang::Mat4::rotation_y(angle) }
+        Self {
+            matrix: tang::Mat4::rotation_y(angle),
+        }
     }
 
     /// Rotation about the Z axis, radians.
     pub fn rotation_z(angle: f64) -> Self {
-        Self { matrix: tang::Mat4::rotation_z(angle) }
+        Self {
+            matrix: tang::Mat4::rotation_z(angle),
+        }
     }
 
     /// Wrap a raw matrix.
@@ -75,7 +87,9 @@ impl Transform {
 
     /// Compose: `self` then `other` (`self * other`).
     pub fn then(&self, other: &Transform) -> Self {
-        Self { matrix: self.matrix * other.matrix }
+        Self {
+            matrix: self.matrix * other.matrix,
+        }
     }
 
     /// Transform a point.

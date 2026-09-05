@@ -30,9 +30,9 @@ use std::sync::Arc;
 
 use crate::bvh::Bvh;
 use crate::geometry::Geometry;
-use crate::math::{transform_aabb, Aabb, Dir3, Transform};
+use crate::math::{Aabb, Dir3, Transform, transform_aabb};
 use crate::ray::{Hit, Ray};
-use crate::sah::{item_bounds, sah_split, SahItem};
+use crate::sah::{SahItem, item_bounds, sah_split};
 
 /// One placed instance of a shared bottom-level hierarchy.
 #[derive(Debug, Clone)]
@@ -58,7 +58,13 @@ impl<G: Geometry> Instance<G> {
         let local_bounds = blas.bounds()?;
         let to_local = to_world.inverse()?;
         let world_aabb = transform_aabb(&local_bounds, &to_world);
-        Some(Self { blas, to_world, to_local, world_aabb, payload })
+        Some(Self {
+            blas,
+            to_world,
+            to_local,
+            world_aabb,
+            payload,
+        })
     }
 
     /// Place a shared tree at the identity.
@@ -110,7 +116,9 @@ impl<G: Geometry> Instance<G> {
     /// `t_world = t_local / len` holds on the way out.
     pub fn trace_closest(&self, ray: &Ray, t_min: f64, t_max: f64) -> Option<InstanceHit> {
         let (local, len) = self.local_ray(ray)?;
-        let local_hit = self.blas.trace_closest_range(&local, t_min * len, t_max * len)?;
+        let local_hit = self
+            .blas
+            .trace_closest_range(&local, t_min * len, t_max * len)?;
 
         let t = local_hit.t / len;
         let normal = self
@@ -164,8 +172,15 @@ pub struct InstanceHit {
 /// A node of the top level.
 #[derive(Debug, Clone)]
 enum TlasNode {
-    Leaf { aabb: Aabb, instances: Vec<u32> },
-    Internal { aabb: Aabb, left: Box<TlasNode>, right: Box<TlasNode> },
+    Leaf {
+        aabb: Aabb,
+        instances: Vec<u32>,
+    },
+    Internal {
+        aabb: Aabb,
+        left: Box<TlasNode>,
+        right: Box<TlasNode>,
+    },
 }
 
 impl TlasNode {
@@ -188,7 +203,10 @@ pub struct Tlas<G> {
 
 impl<G> Default for Tlas<G> {
     fn default() -> Self {
-        Self { root: None, instances: Vec::new() }
+        Self {
+            root: None,
+            instances: Vec::new(),
+        }
     }
 }
 
@@ -197,7 +215,10 @@ impl<G: Geometry> Tlas<G> {
     /// bottom level uses, applied to instance world boxes.
     pub fn build(instances: Vec<Instance<G>>) -> Self {
         if instances.is_empty() {
-            return Self { root: None, instances };
+            return Self {
+                root: None,
+                instances,
+            };
         }
 
         let mut items: Vec<SahItem<u32>> = instances
