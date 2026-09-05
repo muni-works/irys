@@ -1,0 +1,38 @@
+#![warn(missing_docs)]
+
+//! The light.
+//!
+//! Rays, acceleration structures and (eventually) an integrator, over
+//! anything that can be bounded and hit. The engine owns the renderer; the
+//! renderer owns no geometry.
+//!
+//! # The seam
+//!
+//! [`Geometry`] is the entire boundary. It says: how many primitives you
+//! have, where each one is, and what a ray finds when it meets one. Implement
+//! it and you get a [`Bvh`] over your primitives, a [`Tlas`] over placed
+//! instances of them, and everything above.
+//!
+//! vcad implements it with the trimmed analytic faces of a BRep solid; a
+//! phyz collider set or a splat cloud would implement the same three
+//! methods. Nothing in here knows the difference, which is the point.
+//!
+//! # The dependency rule
+//!
+//! `kosm-render` depends on [`tang`] (one scalar, one set of math types),
+//! `rayon`, and later `wgpu`/`bytemuck`. **Never** on `vcad-*`, `phyz-*`, or
+//! any other Kosm crate. It has to build for `wasm32-unknown-unknown`, so
+//! anything native-only is feature-gated or off the main path.
+
+pub mod bvh;
+pub mod geometry;
+pub mod math;
+mod ray;
+mod sah;
+pub mod tlas;
+
+pub use bvh::{Bvh, BvhNode, FlatBvhNode};
+pub use geometry::{intersect_triangle, Geometry, TriMesh, TriangleHit};
+pub use math::{transform_from_column_major, Aabb, Dir3, Point2, Point3, Transform, Vec2, Vec3};
+pub use ray::{Hit, Ray};
+pub use tlas::{FlatTlasNode, Instance, InstanceHit, Tlas};
