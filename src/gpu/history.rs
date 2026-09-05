@@ -47,6 +47,46 @@
 //! each pixel's mean and count across the move, restarting only what the move
 //! actually disoccluded. See [`HistoryBuffers`]' `prev_guides`.
 //!
+//! # What moved, per pixel rather than per rectangle
+//!
+//! A camera-only reprojection still leaves the host with the *world's* motion
+//! to express, and the only instrument for that was the keep mask: a rectangle
+//! around each moved object's old and new pose, every pixel inside it
+//! restarted from one sample. That rectangle is visible. It is a box of grain
+//! travelling with the ball, and it is grain over pixels — the ball itself,
+//! most of all — whose shading did not change at all.
+//!
+//! [`InstanceMotion`] replaces it. The host says which instance each of the
+//! geometry module's primitives belongs to and where each instance was last
+//! frame; the reprojection carries a pixel's world point back through its own
+//! instance's transform before projecting it, and validates on the hit's
+//! **identity** as well as its depth and normal. So the ball keeps its own
+//! shading while it flies, and the floor uncovered behind it — a different id
+//! at a different depth — is the only thing that restarts. There is no
+//! rectangle, so there is nothing to see the edge of.
+//!
+//! Two things finish it, because reprojection alone is not enough:
+//!
+//! * [`GpuDenoiseParams::history_cap`] bounds the fold. An unbounded running
+//!   mean over four hundred frames cannot be moved by what the pixel is
+//!   seeing now; an exponential moving average with a 1/64 floor converges
+//!   just as far and then keeps up.
+//! * [`GpuDenoiseParams::clamp_k`] catches what no geometric test can see —
+//!   lighting that went stale under a surface that did not move, which is
+//!   exactly the shadow a ball leaves behind on the floor. A pixel whose
+//!   history disagrees with this pass's neighbourhood by more than the error
+//!   bar on that neighbourhood has its history *shortened* to
+//!   [`GpuDenoiseParams::clamp_reset`], and the next few samples carry it the
+//!   rest of the way. Shortened, not overwritten: snapping the colour is the
+//!   usual TAA move and it is biased, and a hundred still passes of a biased
+//!   nudge is a tint.
+//!
+//! And [`GpuDenoiseParams::spatial_variance`] is what keeps the pixels that
+//! *do* restart from showing it: a pixel with fewer than four samples is
+//! given SVGF's 7x7 spatial variance instead of its own two temporal moments,
+//! so the à-trous filter is wide and correct on the frame the pixel appears
+//! rather than one convergence later.
+//!
 //! # Parity with the CPU filter
 //!
 //! [`HistoryBuffers::denoise_params`] defaults to
@@ -131,6 +171,40 @@ pub struct GpuDenoiseParams {
     pub count_cutoff: u32,
     /// Linear exposure applied before the tonemap curve.
     pub exposure: f32,
+    /// The longest history a pixel may hold, in samples.
+    ///
+    /// Past it the fold stops being a true mean and becomes an exponential
+    /// moving average with a fixed `1/history_cap` weight. A still picture
+    /// converges exactly as far — the estimator's floor is
+    /// `1/history_cap` of the noise, well under a display bit at 64 — and a
+    /// live one keeps up, because a pixel whose lighting changed is no longer
+    /// outvoted four hundred to one by frames that saw the old lighting.
+    ///
+    /// Zero is read as one. Set it very large for a `--shot`-style render
+    /// that is only ever going to converge.
+    pub history_cap: u32,
+    /// Neighbourhood colour clamping, in standard deviations of this pass's
+    /// raw 3x3 neighbourhood. Zero turns it off.
+    ///
+    /// This is the only thing that catches lighting that went stale *without*
+    /// the geometry moving under the pixel — a ball's shadow left behind on
+    /// the floor. The depth, normal and id gates all say the floor is still
+    /// the floor; the raw sample says it is not that colour any more.
+    pub clamp_k: f32,
+    /// The history length a clamped pixel drops to.
+    ///
+    /// Not one: a clamped pixel has been seen before and only needs its
+    /// brightness re-earned, and restarting it from a single sample puts the
+    /// grain back. Small enough that the à-trous filter widens there.
+    pub clamp_reset: u32,
+    /// Estimate a short-history pixel's variance from a 7x7 spatial
+    /// neighbourhood rather than from its own two temporal moments — SVGF's
+    /// spatiotemporal estimator.
+    ///
+    /// On (the default) a pixel with fewer than four samples is filtered as
+    /// wide as its neighbours say it needs on the frame it appears. Off
+    /// reproduces [`crate::pathtrace::denoise`] exactly.
+    pub spatial_variance: bool,
 }
 
 impl Default for GpuDenoiseParams {
@@ -143,6 +217,10 @@ impl Default for GpuDenoiseParams {
             sigma_lum: d.sigma_lum,
             count_cutoff: 32,
             exposure: 1.0,
+            history_cap: 64,
+            clamp_k: 4.0,
+            clamp_reset: 2,
+            spatial_variance: true,
         }
     }
 }
@@ -181,6 +259,14 @@ struct HistoryParams {
     // corner; every other pass covers the frame and leaves these zero.
     origin_x: u32,
     origin_y: u32,
+    history_cap: u32,
+    clamp_k: f32,
+    clamp_reset: u32,
+    motion_instances: u32,
+    motion_ids: u32,
+    spatial_variance: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 /// The camera basis the shader's ray generator derives from a [`GpuCamera`],
@@ -215,6 +301,78 @@ fn view_basis(cam: &GpuCamera) -> ([f32; 4], [f32; 4], [f32; 4], [f32; 4], f32, 
         (cam.fov * 0.5).tan(),
         cam.width as f32 / cam.height as f32,
     )
+}
+
+/// Per-instance object motion for one frame, packed for the reprojection
+/// pass.
+///
+/// The device-side reprojection can carry a pixel's history across a *camera*
+/// move on its own — it has this frame's depth and both views. It cannot
+/// carry it across an *object* move, because nothing on the device knows that
+/// the ball is somewhere else than it was. The host does: it placed the
+/// instance both times.
+///
+/// So the host hands over two things a frame:
+///
+/// * `instance_of_id` — the instance each of the geometry module's primitive
+///   ids belongs to, indexed by that id. [`InstanceMotion::STATIC`] for a
+///   primitive that did not move, which is most of a scene and costs nothing.
+/// * `transforms` — one 3x4 row-major matrix per instance, `prev_T · cur_T⁻¹`:
+///   given a world point where this frame put it, where the previous frame
+///   had it. The identity for an instance that did not move.
+///
+/// The reprojection then reads the hit id out of the guide planes, looks up
+/// the instance, moves the world point back, and projects *that* through the
+/// previous camera — so a ball in flight keeps its own shading and the floor
+/// revealed behind it restarts.
+#[derive(Debug, Clone, Default)]
+pub struct InstanceMotion {
+    packed: Vec<[f32; 4]>,
+    ids: u32,
+    instances: u32,
+}
+
+impl InstanceMotion {
+    /// The instance slot for a primitive with no motion of its own.
+    pub const STATIC: u32 = u32::MAX;
+
+    /// The 3x4 identity, for an instance that did not move this frame.
+    pub const IDENTITY: [f32; 12] = [
+        1.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0,
+    ];
+
+    /// Pack one frame's motion.
+    ///
+    /// `instance_of_id[id]` is the instance the geometry module's primitive
+    /// `id` belongs to, or [`InstanceMotion::STATIC`]. `transforms[k]` is
+    /// instance `k`'s `prev_T · cur_T⁻¹`, row-major 3x4.
+    pub fn new(instance_of_id: &[u32], transforms: &[[f32; 12]]) -> Self {
+        let table = instance_of_id.len().div_ceil(4);
+        let mut packed = Vec::with_capacity(table + transforms.len() * 3);
+        for chunk in instance_of_id.chunks(4) {
+            let mut v = [f32::from_bits(Self::STATIC); 4];
+            for (k, &id) in chunk.iter().enumerate() {
+                v[k] = f32::from_bits(id);
+            }
+            packed.push(v);
+        }
+        for m in transforms {
+            packed.push([m[0], m[1], m[2], m[3]]);
+            packed.push([m[4], m[5], m[6], m[7]]);
+            packed.push([m[8], m[9], m[10], m[11]]);
+        }
+        Self {
+            packed,
+            ids: instance_of_id.len() as u32,
+            instances: transforms.len() as u32,
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        bytemuck::cast_slice(self.packed.as_slice())
+    }
 }
 
 /// The running mean and sample count read back off the device.
@@ -256,7 +414,13 @@ pub struct HistoryBuffers {
     /// depth/normal buffer at the end of every pass, so the next pass's
     /// reprojection has something to test against. Zeroed until the first
     /// pass has run, which reads as "restart everything".
+    ///
+    /// Two planes, not one: plane 0 is (normal, depth) and plane 1 is
+    /// (albedo, biased hit id), because the reprojection validates on the id
+    /// as well as on the geometry.
     prev_guides: wgpu::Buffer,
+    /// One frame's packed [`InstanceMotion`], or a stub when nothing moved.
+    motion: wgpu::Buffer,
     /// (illumination, variance) ping-pong for the wavelet iterations.
     scratch_a: wgpu::Buffer,
     scratch_b: wgpu::Buffer,
@@ -293,7 +457,8 @@ impl HistoryBuffers {
             mean: mk("History Mean", n * 16),
             stats: mk("History Stats", n * 16),
             keep: mk("History Keep Mask", n * 4),
-            prev_guides: mk("History Previous Guides", n * 16),
+            prev_guides: mk("History Previous Guides", n * 32),
+            motion: mk("History Instance Motion", 64),
             scratch_a: mk("History Scratch A", n * 16),
             scratch_b: mk("History Scratch B", n * 16),
             params: ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -425,7 +590,8 @@ impl HistoryPipeline {
                         },
                         count: None,
                     },
-                    storage(9, true), // the previous pass's guide plane
+                    storage(9, true),  // the previous pass's guide planes
+                    storage(10, true), // per-instance object motion
                 ],
             });
 
@@ -554,6 +720,10 @@ fn history_bind_group(
                 binding: 9,
                 resource: hist.prev_guides.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: hist.motion.as_entire_binding(),
+            },
         ],
     })
 }
@@ -607,6 +777,51 @@ impl RayTracePipeline {
         keep: &[u8],
         prev_view: Option<&GpuCamera>,
     ) -> Result<(), GpuError> {
+        self.accumulate_resident_temporal(
+            ctx,
+            history_pipeline,
+            res,
+            camera,
+            state,
+            keep,
+            prev_view,
+            &GpuDenoiseParams::default(),
+            None,
+        )
+    }
+
+    /// [`RayTracePipeline::accumulate_resident`], told what moved.
+    ///
+    /// Two things the plain call cannot express:
+    ///
+    /// * `motion` — one frame's [`InstanceMotion`]. With it the reprojection
+    ///   follows a *moving object*: a pixel's world point is carried back
+    ///   through its own instance's transform before being projected into the
+    ///   previous view, so a ball in flight keeps its own shading rather than
+    ///   sampling whatever the floor behind it looked like. `None` is every
+    ///   surface static, which is exactly the camera-only reprojection.
+    ///
+    /// * `denoise` — `accumulate` reads the temporal knobs off it:
+    ///   [`GpuDenoiseParams::history_cap`], [`GpuDenoiseParams::clamp_k`] and
+    ///   [`GpuDenoiseParams::clamp_reset`]. The filter fields are the
+    ///   denoise call's business and are ignored here. Pass the same struct to
+    ///   both halves of the frame.
+    ///
+    /// `motion` is a **once per frame** thing for the same reason `prev_view`
+    /// is: the reprojection gathers over the whole frame on the first box.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accumulate_resident_temporal(
+        &self,
+        ctx: &GpuContext,
+        history_pipeline: &HistoryPipeline,
+        res: &mut ResidentScene,
+        camera: &GpuCamera,
+        state: GpuRenderState,
+        keep: &[u8],
+        prev_view: Option<&GpuCamera>,
+        denoise: &GpuDenoiseParams,
+        motion: Option<&InstanceMotion>,
+    ) -> Result<(), GpuError> {
         let (w, h) = res.size();
         let n = (w as usize) * (h as usize);
         if !keep.is_empty() && keep.len() != n {
@@ -636,6 +851,35 @@ impl RayTracePipeline {
         // view the pass is not dispatched and these are inert.
         let cur = view_basis(camera);
         let prev = view_basis(prev_view.unwrap_or(camera));
+        // The reprojection is worth a dispatch when *either* view moved or
+        // something in the scene did. A still camera over a moving ball is
+        // the second case: the pixel is where it was and the surface under it
+        // is not.
+        let reproject =
+            prev_view.is_some() || motion.map(|m| m.instances > 0).unwrap_or(false);
+
+        // The motion table. Grown rather than reallocated per frame: a scene's
+        // instance count barely moves, so after the first frame this is a
+        // write into a buffer that already fits.
+        let (motion_ids, motion_instances) = match motion {
+            Some(m) if m.instances > 0 => {
+                let bytes = m.bytes();
+                let hist = res.history_mut().expect("history was just ensured");
+                if (bytes.len() as u64) > hist.motion.size() {
+                    hist.motion = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("History Instance Motion"),
+                        size: (bytes.len() as u64).next_power_of_two(),
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_DST
+                            | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    });
+                }
+                ctx.queue.write_buffer(&hist.motion, 0, bytes);
+                (m.ids, m.instances)
+            }
+            _ => (0, 0),
+        };
 
         {
             let hist = res.history_mut().expect("history was just ensured");
@@ -693,13 +937,21 @@ impl RayTracePipeline {
                 prev_up: prev.2,
                 prev_forward: prev.3,
                 view_params: [cur.4, cur.5, prev.4, prev.5],
-                reprojected: u32::from(prev_view.is_some()),
+                reprojected: u32::from(reproject),
                 iter_index: 0,
                 // `accumulate` runs over the box's workgroups only, so its
                 // invocation ids start at the box's corner rather than the
                 // frame's.
                 origin_x: bx,
                 origin_y: by,
+                history_cap: denoise.history_cap.max(1),
+                clamp_k: denoise.clamp_k.max(0.0),
+                clamp_reset: denoise.clamp_reset.max(1),
+                motion_instances,
+                motion_ids,
+                spatial_variance: u32::from(denoise.spatial_variance),
+                _pad0: 0,
+                _pad1: 0,
             };
             ctx.queue
                 .write_buffer(&hist.params, 0, bytemuck::bytes_of(&base));
@@ -708,7 +960,7 @@ impl RayTracePipeline {
             // of its own with no origin. `REPROJECT_SLOT` is otherwise an
             // à-trous slot the denoise call rewrites, and the two calls never
             // read it at the same time.
-            if prev_view.is_some() {
+            if reproject {
                 let full = HistoryParams {
                     origin_x: 0,
                     origin_y: 0,
@@ -752,7 +1004,7 @@ impl RayTracePipeline {
         // Before anything is folded in: carry what the previous view already
         // knew about each pixel onto this view's pixel grid.
         // `accumulate` picks the gather up out of the scratch pair.
-        if prev_view.is_some() {
+        if reproject {
             dispatch(
                 &mut encoder,
                 &history_pipeline.reproject,
@@ -778,13 +1030,15 @@ impl RayTracePipeline {
         // edge-detection copy.
         let plane = (w as u64) * (h as u64) * 16;
         let row = (w as u64) * 16;
-        encoder.copy_buffer_to_buffer(
-            guides,
-            plane + row * by as u64,
-            &hist.prev_guides,
-            row * by as u64,
-            row * bh as u64,
-        );
+        for k in 0..2u64 {
+            encoder.copy_buffer_to_buffer(
+                guides,
+                plane * (k + 1) + row * by as u64,
+                &hist.prev_guides,
+                plane * k + row * by as u64,
+                row * bh as u64,
+            );
+        }
 
         ctx.queue.submit(Some(encoder.finish()));
         Ok(())
@@ -858,6 +1112,14 @@ impl RayTracePipeline {
                 iter_index: 0,
                 origin_x: 0,
                 origin_y: 0,
+                history_cap: denoise.history_cap.max(1),
+                clamp_k: denoise.clamp_k.max(0.0),
+                clamp_reset: denoise.clamp_reset.max(1),
+                motion_instances: 0,
+                motion_ids: 0,
+                spatial_variance: u32::from(denoise.spatial_variance),
+                _pad0: 0,
+                _pad1: 0,
             };
             ctx.queue
                 .write_buffer(&hist.params, 0, bytemuck::bytes_of(&base));
@@ -1056,7 +1318,53 @@ impl RayTracePipeline {
         target: &wgpu::TextureView,
         prev_view: Option<&GpuCamera>,
     ) -> Result<(), GpuError> {
-        self.accumulate_resident(ctx, history_pipeline, res, camera, state, keep, prev_view)?;
+        self.accumulate_and_denoise_resident_moving(
+            ctx,
+            history_pipeline,
+            res,
+            camera,
+            state,
+            keep,
+            denoise,
+            target,
+            prev_view,
+            None,
+        )
+    }
+
+    /// [`RayTracePipeline::accumulate_and_denoise_resident_reprojected`], told
+    /// what moved.
+    ///
+    /// The whole of a live frame in one call: trace, carry each pixel's
+    /// history across both the camera's move and its own instance's move,
+    /// clamp what has gone stale, filter what is short, tonemap. See
+    /// [`InstanceMotion`] for what `motion` is and
+    /// [`RayTracePipeline::accumulate_resident_temporal`] for the two halves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accumulate_and_denoise_resident_moving(
+        &self,
+        ctx: &GpuContext,
+        history_pipeline: &HistoryPipeline,
+        res: &mut ResidentScene,
+        camera: &GpuCamera,
+        state: GpuRenderState,
+        keep: &[u8],
+        denoise: &GpuDenoiseParams,
+        target: &wgpu::TextureView,
+        prev_view: Option<&GpuCamera>,
+        motion: Option<&InstanceMotion>,
+    ) -> Result<(), GpuError> {
+        self.accumulate_resident_temporal(
+            ctx,
+            history_pipeline,
+            res,
+            camera,
+            state,
+            keep,
+            prev_view,
+            denoise,
+            motion,
+        )?;
         self.denoise_and_resolve_resident(ctx, history_pipeline, res, denoise, target)
     }
 

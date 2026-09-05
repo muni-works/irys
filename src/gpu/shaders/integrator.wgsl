@@ -1635,7 +1635,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             g_albedo = mix(mat_diffuse_albedo(gm), mat_f0(gm), gm.metallic);
         }
         depth_normal_buffer[n_px + gi] = vec4<f32>(g_normal, g_depth);
-        depth_normal_buffer[2u * n_px + gi] = vec4<f32>(g_albedo, 0.0);
+        // Guide plane 2's `.w` was spare. It carries the hit's *identity*
+        // now — the geometry module's own primitive id, biased by one so 0
+        // stays "nothing here" — which is what the history pass's temporal
+        // reprojection validates against. Packed here rather than in a plane
+        // of its own because the storage-buffer budget has no room for one.
+        var g_id = 0.0;
+        if hit.face_idx != 0xFFFFFFFFu {
+            g_id = f32((hit.face_idx & 0x00FFFFFFu) + 1u);
+        }
+        depth_normal_buffer[2u * n_px + gi] = vec4<f32>(g_albedo, g_id);
     }
 
     // Progressive accumulation

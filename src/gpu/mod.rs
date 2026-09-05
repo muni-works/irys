@@ -32,7 +32,8 @@ pub use buffers::{
 pub use context::{GpuContext, GpuError};
 pub use geometry::{GeometryModule, GeometrySlab, GpuGeometry, storage_entry};
 pub use history::{
-    GpuDenoiseParams, History, HistoryBuffers, HistoryPipeline, MAX_DENOISE_ITERS, atrous_iters_for,
+    GpuDenoiseParams, History, HistoryBuffers, HistoryPipeline, InstanceMotion, MAX_DENOISE_ITERS,
+    atrous_iters_for,
 };
 pub use pipeline::RayTracePipeline;
 pub use resident::ResidentScene;
