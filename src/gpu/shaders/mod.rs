@@ -35,6 +35,18 @@ pub const HISTORY_SHADER: &str = include_str!("history.wgsl");
 /// standing where the à-trous chain stands. See [`super::neural`].
 pub const NEURAL_SHADER: &str = include_str!("neural.wgsl");
 
+/// The gradient-directed sample budget: which pixels this frame's rays go to.
+///
+/// A fragment, not a module — it reads [`HISTORY_SHADER`]'s bindings and its
+/// `params`, and is compiled behind it by [`history_shader`].
+pub const BUDGET_SHADER: &str = include_str!("budget.wgsl");
+
+/// The history module the device-side passes are compiled from: the history
+/// and denoise passes, then the budget passes that share their bindings.
+pub fn history_shader() -> String {
+    format!("{HISTORY_SHADER}\n{BUDGET_SHADER}")
+}
+
 /// Put the renderer's prelude in front of a body, and the BSDF in front of
 /// that. For shader harnesses that shade but do not trace.
 pub fn compose(body: &str) -> String {

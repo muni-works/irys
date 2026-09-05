@@ -7,6 +7,7 @@
 //! of that seam, and documents the binding split it implies.
 
 pub mod analytic;
+mod budget;
 mod buffers;
 mod context;
 pub mod geometry;
@@ -25,6 +26,7 @@ pub mod shaders;
 pub use wgpu;
 
 pub use analytic::{AnalyticGeometry, AnalyticPrim};
+pub use budget::{Budget, SampleBudget};
 pub use buffers::{
     DEFAULT_ENV_INTENSITY, DEFAULT_FIREFLY_CLAMP, DEFAULT_MAX_DEPTH, DEFAULT_RR_START,
     FLAG_CAMERA_VISIBLE_LIGHTS, FLAG_RAW_SAMPLE, GpuAreaLight, GpuCamera, GpuMaterial,

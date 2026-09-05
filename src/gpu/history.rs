@@ -145,9 +145,11 @@ const PARAM_SLOTS: u32 = MAX_DENOISE_ITERS + 2;
 /// reprojection from; see [`PARAM_SLOTS`].
 const REPROJECT_SLOT: u32 = MAX_DENOISE_ITERS + 1;
 
-/// Uniform buffer offsets must be a multiple of this on every backend we
-/// target, so each parameter slot is padded out to it.
-const PARAM_STRIDE: u64 = 256;
+/// Uniform buffer offsets must be a multiple of 256 on every backend we
+/// target, so each parameter slot is padded out to a multiple of it — and the
+/// slot has to be at least as big as [`HistoryParams`], which the budget
+/// fields carried past 256 bytes.
+pub(super) const PARAM_STRIDE: u64 = 512;
 
 /// Filter settings for [`RayTracePipeline::accumulate_and_denoise_resident`].
 ///
@@ -227,52 +229,93 @@ impl Default for GpuDenoiseParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct HistoryParams {
-    width: u32,
-    height: u32,
-    count_cutoff: u32,
-    iters: u32,
-    sigma_lum: f32,
-    sigma_depth: f32,
-    sigma_normal: f32,
-    exposure: f32,
-    stride: u32,
-    src_is_b: u32,
-    scissor_xy: u32,
-    scissor_wh: u32,
+pub(super) struct HistoryParams {
+    pub width: u32,
+    pub height: u32,
+    pub count_cutoff: u32,
+    pub iters: u32,
+    pub sigma_lum: f32,
+    pub sigma_depth: f32,
+    pub sigma_normal: f32,
+    pub exposure: f32,
+    pub stride: u32,
+    pub src_is_b: u32,
+    pub scissor_xy: u32,
+    pub scissor_wh: u32,
     // `reproject` only; zero elsewhere. Both views as the shader's ray
     // generator builds them, then (tan(fov/2), aspect) for each.
-    cur_eye: [f32; 4],
-    cur_right: [f32; 4],
-    cur_up: [f32; 4],
-    cur_forward: [f32; 4],
-    prev_eye: [f32; 4],
-    prev_right: [f32; 4],
-    prev_up: [f32; 4],
-    prev_forward: [f32; 4],
-    view_params: [f32; 4],
-    reprojected: u32,
-    iter_index: u32,
+    pub cur_eye: [f32; 4],
+    pub cur_right: [f32; 4],
+    pub cur_up: [f32; 4],
+    pub cur_forward: [f32; 4],
+    pub prev_eye: [f32; 4],
+    pub prev_right: [f32; 4],
+    pub prev_up: [f32; 4],
+    pub prev_forward: [f32; 4],
+    pub view_params: [f32; 4],
+    pub reprojected: u32,
+    pub iter_index: u32,
     // The frame-space pixel the dispatch's (0, 0) invocation stands on.
     // `accumulate` dispatches over its scissor box's workgroups rather than
     // the frame's, so its invocation ids have to be shifted onto the box's
     // corner; every other pass covers the frame and leaves these zero.
-    origin_x: u32,
-    origin_y: u32,
-    history_cap: u32,
-    clamp_k: f32,
-    clamp_reset: u32,
-    motion_instances: u32,
-    motion_ids: u32,
-    spatial_variance: u32,
-    _pad0: u32,
-    _pad1: u32,
+    pub origin_x: u32,
+    pub origin_y: u32,
+    pub history_cap: u32,
+    pub clamp_k: f32,
+    pub clamp_reset: u32,
+    pub motion_instances: u32,
+    pub motion_ids: u32,
+    pub spatial_variance: u32,
+    // Gradient-directed sampling; see `budget.wgsl` and [`SampleBudget`].
+    pub budget_enabled: u32,
+    pub budget_bias: f32,
+    pub budget_rounds: u32,
+    pub budget_round: u32,
+    pub rays_per_frame: f32,
+    pub budget_radius: u32,
+    pub budget_floor_k: u32,
+    pub budget_frame: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+    pub _pad3: u32,
+    pub _pad4: u32,
+    pub _pad5: u32,
+}
+
+/// Every [`HistoryParams`] field the budget passes read, defaulted off.
+///
+/// Written into the base parameter slot by both halves of a frame so that a
+/// caller who never asked for a budget gets exactly the uniform spend it
+/// always had.
+pub(super) const NO_BUDGET: BudgetFields = BudgetFields {
+    enabled: 0,
+    bias: 0.0,
+    rounds: 1,
+    round: 0,
+    rays_per_frame: 0.0,
+    radius: 0,
+    floor_k: 1,
+    frame: 0,
+};
+
+#[derive(Clone, Copy)]
+pub(super) struct BudgetFields {
+    pub enabled: u32,
+    pub bias: f32,
+    pub rounds: u32,
+    pub round: u32,
+    pub rays_per_frame: f32,
+    pub radius: u32,
+    pub floor_k: u32,
+    pub frame: u32,
 }
 
 /// The camera basis the shader's ray generator derives from a [`GpuCamera`],
 /// reproduced here so the reprojection pass can be told about a view it is
 /// not currently rendering.
-fn view_basis(cam: &GpuCamera) -> ([f32; 4], [f32; 4], [f32; 4], [f32; 4], f32, f32) {
+pub(super) fn view_basis(cam: &GpuCamera) -> ([f32; 4], [f32; 4], [f32; 4], [f32; 4], f32, f32) {
     let norm = |v: [f32; 3]| {
         let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
         [v[0] / l, v[1] / l, v[2] / l]
@@ -370,7 +413,17 @@ impl InstanceMotion {
         }
     }
 
-    fn bytes(&self) -> &[u8] {
+    /// How many primitive ids the table covers.
+    pub fn ids(&self) -> u32 {
+        self.ids
+    }
+
+    /// How many instances carry a transform.
+    pub fn instances(&self) -> u32 {
+        self.instances
+    }
+
+    pub(super) fn bytes(&self) -> &[u8] {
         bytemuck::cast_slice(self.packed.as_slice())
     }
 }
@@ -425,6 +478,19 @@ pub struct HistoryBuffers {
     prev_guides: wgpu::Buffer,
     /// One frame's packed [`InstanceMotion`], or a stub when nothing moved.
     motion: wgpu::Buffer,
+    /// The per-pixel sample budget: `(motion, history, image, b(p))`, one
+    /// vec4 per pixel, written by the budget passes in `budget.wgsl` and read
+    /// by `accumulate`. Zeroed until a budget pass has run, which reads as a
+    /// budget of nothing — so it is only ever consulted when the caller asked
+    /// for one.
+    budget: wgpu::Buffer,
+    /// Ping-pong for the budget's separable dilation.
+    budget_scratch: wgpu::Buffer,
+    /// Two atomic u32s: the frame's total weight and its total assigned
+    /// budget, in 1/128 units. Cleared at the head of every budget pass.
+    budget_total: wgpu::Buffer,
+    /// Staging for [`RayTracePipeline::read_budget`], allocated on first use.
+    budget_readback: Option<wgpu::Buffer>,
     /// (illumination, variance) ping-pong for the wavelet iterations.
     pub(super) scratch_a: wgpu::Buffer,
     pub(super) scratch_b: wgpu::Buffer,
@@ -463,6 +529,10 @@ impl HistoryBuffers {
             keep: mk("History Keep Mask", n * 4),
             prev_guides: mk("History Previous Guides", n * 32),
             motion: mk("History Instance Motion", 64),
+            budget: mk("Sample Budget", n * 16),
+            budget_scratch: mk("Sample Budget Scratch", n * 16),
+            budget_total: mk("Sample Budget Total", 8),
+            budget_readback: None,
             scratch_a: mk("History Scratch A", n * 16),
             scratch_b: mk("History Scratch B", n * 16),
             params: ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -499,6 +569,56 @@ impl HistoryBuffers {
         &self.placeholder
     }
 
+    pub(super) fn budget_buffers(&self) -> (&wgpu::Buffer, &wgpu::Buffer) {
+        (&self.budget, &self.budget_total)
+    }
+
+    pub(super) fn params_buffer(&self) -> &wgpu::Buffer {
+        &self.params
+    }
+
+    pub(super) fn scratch_a_buffer(&self) -> &wgpu::Buffer {
+        &self.scratch_a
+    }
+
+    pub(super) fn scratch_b_buffer(&self) -> &wgpu::Buffer {
+        &self.scratch_b
+    }
+
+    pub(super) fn budget_readback_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.budget_readback.as_ref()
+    }
+
+    /// Allocate the budget's readback staging on first use.
+    pub(super) fn ensure_budget_readback(&mut self, ctx: &GpuContext, size: u64) {
+        if self.budget_readback.is_none() {
+            self.budget_readback = Some(ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Sample Budget Readback"),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }));
+        }
+    }
+
+    /// Upload one frame's packed [`InstanceMotion`], growing the buffer if the
+    /// scene gained instances. Shared by the reprojection and the budget,
+    /// which read the same bytes for different reasons.
+    pub(super) fn upload_motion(&mut self, ctx: &GpuContext, m: &InstanceMotion) {
+        let bytes = m.bytes();
+        if (bytes.len() as u64) > self.motion.size() {
+            self.motion = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("History Instance Motion"),
+                size: (bytes.len() as u64).next_power_of_two(),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+        }
+        ctx.queue.write_buffer(&self.motion, 0, bytes);
+    }
+
     /// The frame size this history is allocated for.
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
@@ -520,6 +640,7 @@ impl HistoryBuffers {
         // is harmless, but forgetting the previous view too keeps "cleared"
         // meaning exactly one thing.
         enc.clear_buffer(&self.prev_guides, 0, None);
+        enc.clear_buffer(&self.budget, 0, None);
         ctx.queue.submit(Some(enc.finish()));
     }
 }
@@ -535,6 +656,13 @@ pub struct HistoryPipeline {
     demodulate: wgpu::ComputePipeline,
     atrous: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
+    /// The five gradient-directed sampling passes; see `budget.wgsl`.
+    pub(super) budget_weight: wgpu::ComputePipeline,
+    pub(super) budget_blur_x: wgpu::ComputePipeline,
+    pub(super) budget_blur_y: wgpu::ComputePipeline,
+    pub(super) budget_normalize: wgpu::ComputePipeline,
+    pub(super) budget_assigned: wgpu::ComputePipeline,
+    pub(super) budget_rescale: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
 }
 
@@ -545,7 +673,7 @@ impl HistoryPipeline {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("History Shader"),
-                source: wgpu::ShaderSource::Wgsl(super::shaders::HISTORY_SHADER.into()),
+                source: wgpu::ShaderSource::Wgsl(super::shaders::history_shader().into()),
             });
 
         let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
@@ -594,8 +722,11 @@ impl HistoryPipeline {
                         },
                         count: None,
                     },
-                    storage(9, true),  // the previous pass's guide planes
-                    storage(10, true), // per-instance object motion
+                    storage(9, true),   // the previous pass's guide planes
+                    storage(10, true),  // per-instance object motion
+                    storage(11, false), // the per-pixel sample budget
+                    storage(12, false), // the budget's dilation ping-pong
+                    storage(13, false), // the budget's atomic totals
                 ],
             });
 
@@ -625,6 +756,12 @@ impl HistoryPipeline {
             demodulate: mk("demodulate"),
             atrous: mk("atrous"),
             resolve: mk("resolve"),
+            budget_weight: mk("budget_weight"),
+            budget_blur_x: mk("budget_blur_x"),
+            budget_blur_y: mk("budget_blur_y"),
+            budget_normalize: mk("budget_normalize"),
+            budget_assigned: mk("budget_assigned"),
+            budget_rescale: mk("budget_rescale"),
             layout,
         })
     }
@@ -632,7 +769,7 @@ impl HistoryPipeline {
 
 /// One history compute pass: bind the parameter slot and dispatch `groups`
 /// workgroups.
-fn dispatch(
+pub(super) fn dispatch(
     encoder: &mut wgpu::CommandEncoder,
     pipeline: &wgpu::ComputePipeline,
     group: &wgpu::BindGroup,
@@ -657,7 +794,7 @@ fn dispatch(
 /// gets the scene's own output view bound in its place — a binding the passes
 /// it dispatches do not write.
 #[allow(clippy::too_many_arguments)]
-fn history_bind_group(
+pub(super) fn history_bind_group(
     ctx: &GpuContext,
     history_pipeline: &HistoryPipeline,
     hist: &HistoryBuffers,
@@ -727,6 +864,18 @@ fn history_bind_group(
             wgpu::BindGroupEntry {
                 binding: 10,
                 resource: hist.motion.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: hist.budget.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: hist.budget_scratch.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: hist.budget_total.as_entire_binding(),
             },
         ],
     })
@@ -826,6 +975,38 @@ impl RayTracePipeline {
         denoise: &GpuDenoiseParams,
         motion: Option<&InstanceMotion>,
     ) -> Result<(), GpuError> {
+        self.accumulate_resident_inner(
+            ctx,
+            history_pipeline,
+            res,
+            camera,
+            state,
+            keep,
+            prev_view,
+            denoise,
+            motion,
+            NO_BUDGET,
+        )
+    }
+
+    /// The body of every accumulate call, plus the budget fields the
+    /// gradient-directed path drives it with. See
+    /// [`RayTracePipeline::budget_frame`] and
+    /// [`RayTracePipeline::accumulate_resident_round`].
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn accumulate_resident_inner(
+        &self,
+        ctx: &GpuContext,
+        history_pipeline: &HistoryPipeline,
+        res: &mut ResidentScene,
+        camera: &GpuCamera,
+        state: GpuRenderState,
+        keep: &[u8],
+        prev_view: Option<&GpuCamera>,
+        denoise: &GpuDenoiseParams,
+        motion: Option<&InstanceMotion>,
+        bud: BudgetFields,
+    ) -> Result<(), GpuError> {
         let (w, h) = res.size();
         let n = (w as usize) * (h as usize);
         if !keep.is_empty() && keep.len() != n {
@@ -859,27 +1040,15 @@ impl RayTracePipeline {
         // something in the scene did. A still camera over a moving ball is
         // the second case: the pixel is where it was and the surface under it
         // is not.
-        let reproject =
-            prev_view.is_some() || motion.map(|m| m.instances > 0).unwrap_or(false);
+        let reproject = prev_view.is_some() || motion.map(|m| m.instances > 0).unwrap_or(false);
 
         // The motion table. Grown rather than reallocated per frame: a scene's
         // instance count barely moves, so after the first frame this is a
         // write into a buffer that already fits.
         let (motion_ids, motion_instances) = match motion {
             Some(m) if m.instances > 0 => {
-                let bytes = m.bytes();
                 let hist = res.history_mut().expect("history was just ensured");
-                if (bytes.len() as u64) > hist.motion.size() {
-                    hist.motion = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("History Instance Motion"),
-                        size: (bytes.len() as u64).next_power_of_two(),
-                        usage: wgpu::BufferUsages::STORAGE
-                            | wgpu::BufferUsages::COPY_DST
-                            | wgpu::BufferUsages::COPY_SRC,
-                        mapped_at_creation: false,
-                    });
-                }
-                ctx.queue.write_buffer(&hist.motion, 0, bytes);
+                hist.upload_motion(ctx, m);
                 (m.ids, m.instances)
             }
             _ => (0, 0),
@@ -954,8 +1123,20 @@ impl RayTracePipeline {
                 motion_instances,
                 motion_ids,
                 spatial_variance: u32::from(denoise.spatial_variance),
+                budget_enabled: bud.enabled,
+                budget_bias: bud.bias,
+                budget_rounds: bud.rounds,
+                budget_round: bud.round,
+                rays_per_frame: bud.rays_per_frame,
+                budget_radius: bud.radius,
+                budget_floor_k: bud.floor_k,
+                budget_frame: bud.frame,
                 _pad0: 0,
                 _pad1: 0,
+                _pad2: 0,
+                _pad3: 0,
+                _pad4: 0,
+                _pad5: 0,
             };
             ctx.queue
                 .write_buffer(&hist.params, 0, bytemuck::bytes_of(&base));
@@ -1122,8 +1303,20 @@ impl RayTracePipeline {
                 motion_instances: 0,
                 motion_ids: 0,
                 spatial_variance: u32::from(denoise.spatial_variance),
+                budget_enabled: NO_BUDGET.enabled,
+                budget_bias: NO_BUDGET.bias,
+                budget_rounds: NO_BUDGET.rounds,
+                budget_round: NO_BUDGET.round,
+                rays_per_frame: NO_BUDGET.rays_per_frame,
+                budget_radius: NO_BUDGET.radius,
+                budget_floor_k: NO_BUDGET.floor_k,
+                budget_frame: NO_BUDGET.frame,
                 _pad0: 0,
                 _pad1: 0,
+                _pad2: 0,
+                _pad3: 0,
+                _pad4: 0,
+                _pad5: 0,
             };
             ctx.queue
                 .write_buffer(&hist.params, 0, bytemuck::bytes_of(&base));
