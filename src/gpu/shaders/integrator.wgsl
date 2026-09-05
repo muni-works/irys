@@ -91,6 +91,19 @@ struct RenderState {
     // The sun's radiance in .rgb and its NEE PDF (1 / solid angle) in .w.
     // A .w of zero means there is no sun.
     sun_radiance: vec4<f32>,
+    // ReSTIR DI. .x = candidate count M (0 = the whole feature off, and the
+    // shader takes the NEE path it always took), .y = spatial passes,
+    // .z = the reservoir slot this dispatch reads, .w = which stage is running.
+    restir: vec4<u32>,
+    // .x = spatial radius in pixels, .y = the cap on a reused temporal M as a
+    // multiple of M, .z = neighbours per spatial pass, .w unused.
+    restir_params: vec4<f32>,
+    // The previous pass's camera, for temporal reprojection. .w of the
+    // position is non-zero when there is one.
+    prev_cam_position: vec4<f32>,
+    // Previous camera target in .xyz, its vertical fov in radians in .w.
+    prev_cam_look_at: vec4<f32>,
+    prev_cam_up: vec4<f32>,
 }
 
 // A rectangular area light. Layout must match GpuAreaLight in buffers.rs,
@@ -871,6 +884,563 @@ fn sample_sun(
     return e.value * render_state.sun_radiance.rgb * (tr * w / pdf);
 }
 
+// ─── ReSTIR DI ────────────────────────────────────────────────────────────
+//
+// Bitterli, Wyman, Pharr, Shirley, Lefohn and Jarosz 2020, "Spatiotemporal
+// reservoir resampling for real-time ray tracing with dynamic direct
+// lighting". The direct term at the *primary* hit stops being one
+// next-event sample and becomes a resampled one: M candidates are drawn per
+// pixel per frame and reduced to a single survivor by weighted reservoir
+// sampling against an unshadowed target
+//
+//     p̂(y) = luminance( f(wo, wi)·cosθ · Le(y) ) · G(x, y)
+//
+// which costs no rays at all; only the survivor is shadow-tested. The
+// reservoir is then reused — from this pixel last frame, and from its
+// neighbours this frame — so a pixel's one shadow ray is spent on a light
+// that hundreds of samples agreed was worth testing.
+//
+// Scope. Only the primary hit, and only the area panels and the sun. Indirect
+// bounces and the environment keep the one-light NEE they had: a reservoir is
+// per *pixel*, and there is no pixel behind a second bounce.
+//
+// Measure. A panel's sample is a point, carried in area measure, so
+// reconnecting it to a different surface has a Jacobian of 1 — which is the
+// whole reason the paper resamples points rather than directions. The sun's
+// sample is a direction with G = 1, an infinite light, for which the
+// reconnection Jacobian is also 1. The two therefore share one reservoir.
+//
+// Storage. The reservoirs ride in the spare planes of `depth_normal_buffer`
+// rather than in storage buffers of their own: the ten this shader binds are
+// every one a browser guarantees, and five of those belong to the geometry
+// module. Two slots of three planes each — ping-ponged across the frame's
+// dispatches and across frames — sit above the three planes the denoiser's
+// guides use, so a ReSTIR frame costs 96 bytes a pixel that an ordinary one
+// does not allocate at all.
+
+// No sample in this reservoir.
+const RESTIR_NONE: u32 = 0xFFFFFFFFu;
+const RESTIR_STAGE_INITIAL: u32 = 0u;
+const RESTIR_STAGE_SPATIAL: u32 = 1u;
+const RESTIR_STAGE_SHADE: u32 = 2u;
+// The geometric similarity gates the paper's spatial and temporal reuse use.
+const RESTIR_DEPTH_TOLERANCE: f32 = 0.10;
+const RESTIR_COS_TOLERANCE: f32 = 0.9063;  // cos 25°
+// Slots the spatial pass keeps for the neighbours it combined.
+const RESTIR_MAX_NEIGHBOURS: u32 = 8u;
+
+fn restir_on() -> bool {
+    return render_state.restir.x > 0u;
+}
+
+fn restir_m() -> u32 {
+    return render_state.restir.x;
+}
+
+// Four reservoir slots, not two. 0 and 1 ping-pong across *frames* and carry
+// the temporal chain; 2 and 3 ping-pong across this frame's spatial passes.
+// Keeping them apart is what stops the spatial pass's bias from being fed
+// back into the temporal one and compounding: with the spatial output as the
+// temporal source, a 30 px radius measured *worse than plain NEE* by frame
+// eight while measuring 2.4x better on frame one, which is what a feedback
+// loop looks like. The host packs the pair as read | (write << 8).
+fn restir_read_slot() -> u32 {
+    return render_state.restir.z & 0xFFu;
+}
+
+fn restir_write_slot() -> u32 {
+    return (render_state.restir.z >> 8u) & 0xFFu;
+}
+
+// One reservoir: the survivor `y`, the running sum of resampling weights, the
+// number of candidates it stands for, and the unbiased contribution weight W
+// that turns f(y) into an estimate of the whole integral.
+struct Reservoir {
+    y_pos: vec3<f32>,
+    y_light: u32,
+    w_sum: f32,
+    m: f32,
+    w_out: f32,
+    p_hat: f32,
+}
+
+// The surface a reservoir belongs to, as stored beside it: enough to
+// re-evaluate p̂ for somebody else's sample without tracing the primary ray
+// again, and to run the depth and normal gates against.
+struct RSurface {
+    point: vec3<f32>,
+    normal: vec3<f32>,
+    mat: u32,
+    valid: bool,
+}
+
+fn reservoir_empty() -> Reservoir {
+    var r: Reservoir;
+    r.y_pos = vec3<f32>(0.0);
+    r.y_light = RESTIR_NONE;
+    r.w_sum = 0.0;
+    r.m = 0.0;
+    r.w_out = 0.0;
+    r.p_hat = 0.0;
+    return r;
+}
+
+// Weighted reservoir sampling, Chao's algorithm: absorb a candidate carrying
+// resampling weight `w` and standing for `m_inc` samples, keeping it with
+// probability w / w_sum.
+fn reservoir_update(
+    r: ptr<function, Reservoir>,
+    y_pos: vec3<f32>,
+    y_light: u32,
+    p_hat: f32,
+    w: f32,
+    m_inc: f32,
+    rnd: f32,
+) {
+    (*r).m = (*r).m + m_inc;
+    if w <= 0.0 {
+        return;
+    }
+    (*r).w_sum = (*r).w_sum + w;
+    if rnd * (*r).w_sum <= w {
+        (*r).y_pos = y_pos;
+        (*r).y_light = y_light;
+        (*r).p_hat = p_hat;
+    }
+}
+
+// W = w_sum / (M · p̂). Equation 6 of the paper: the factor that makes
+// f(y)·W an unbiased estimate of ∫f however the candidates were drawn.
+fn reservoir_finalize(r: ptr<function, Reservoir>) {
+    let denom = (*r).m * (*r).p_hat;
+    if denom > 0.0 && (*r).y_light != RESTIR_NONE {
+        (*r).w_out = (*r).w_sum / denom;
+    } else {
+        (*r).w_out = 0.0;
+    }
+}
+
+// ── octahedral normal packing, so the surface fits in the planes we have ──
+
+fn oct_wrap(v: vec2<f32>) -> vec2<f32> {
+    let s = select(vec2<f32>(-1.0), vec2<f32>(1.0), v >= vec2<f32>(0.0));
+    return (1.0 - abs(vec2<f32>(v.y, v.x))) * s;
+}
+
+fn oct_encode(n: vec3<f32>) -> u32 {
+    let d = abs(n.x) + abs(n.y) + abs(n.z);
+    if d < 1e-12 {
+        return 0u;
+    }
+    var p = n.xy * (1.0 / d);
+    if n.z < 0.0 {
+        p = oct_wrap(p);
+    }
+    return pack2x16snorm(p);
+}
+
+fn oct_decode(e: u32) -> vec3<f32> {
+    let f = unpack2x16snorm(e);
+    var n = vec3<f32>(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    if n.z < 0.0 {
+        let w = oct_wrap(n.xy);
+        n = vec3<f32>(w.x, w.y, n.z);
+    }
+    return normalize(n);
+}
+
+// ── the reservoir planes ─────────────────────────────────────────────────
+
+fn restir_plane(slot: u32) -> u32 {
+    return (3u + slot * 3u) * camera.width * camera.height;
+}
+
+fn restir_store(slot: u32, idx: u32, r: Reservoir, s: RSurface) {
+    let n = camera.width * camera.height;
+    let b = restir_plane(slot) + idx;
+    // Both tags are stored biased by one so that a *zeroed* buffer — which is
+    // what `reset_accumulation` and a fresh frame size leave behind — reads
+    // back as "no sample, no surface" rather than as light 0 on material 0.
+    var light = 0u;
+    if s.valid && r.y_light != RESTIR_NONE {
+        light = r.y_light + 1u;
+    }
+    var mat = 0u;
+    if s.valid {
+        mat = s.mat + 1u;
+    }
+    depth_normal_buffer[b] = vec4<f32>(r.y_pos, bitcast<f32>(light));
+    depth_normal_buffer[b + n] =
+        vec4<f32>(r.w_out, r.m, r.p_hat, bitcast<f32>(oct_encode(s.normal)));
+    depth_normal_buffer[b + 2u * n] = vec4<f32>(s.point, bitcast<f32>(mat));
+}
+
+fn restir_load(slot: u32, idx: u32) -> Reservoir {
+    let n = camera.width * camera.height;
+    let b = restir_plane(slot) + idx;
+    let a = depth_normal_buffer[b];
+    let c = depth_normal_buffer[b + n];
+    var r: Reservoir;
+    r.y_pos = a.xyz;
+    let tag = bitcast<u32>(a.w);
+    r.y_light = select(tag - 1u, RESTIR_NONE, tag == 0u);
+    r.w_out = c.x;
+    r.m = c.y;
+    r.p_hat = c.z;
+    // Nothing downstream resamples out of a loaded reservoir's w_sum: a
+    // reused one enters the next reservoir through W and M.
+    r.w_sum = 0.0;
+    return r;
+}
+
+fn restir_load_surface(slot: u32, idx: u32) -> RSurface {
+    let n = camera.width * camera.height;
+    let b = restir_plane(slot) + idx;
+    let c = depth_normal_buffer[b + n];
+    let d = depth_normal_buffer[b + 2u * n];
+    var s: RSurface;
+    s.normal = oct_decode(bitcast<u32>(c.w));
+    s.point = d.xyz;
+    let tag = bitcast<u32>(d.w);
+    s.mat = select(tag - 1u, RESTIR_NONE, tag == 0u);
+    s.valid = tag != 0u;
+    return s;
+}
+
+// ── the light set, as one resampling domain ──────────────────────────────
+
+// The sun's share of the candidate budget. One strategy among the panels
+// rather than a coin flip, so a rig of ten panels and a sun spends a
+// candidate in eleven on the sun.
+fn restir_pick_sun() -> f32 {
+    if !sun_enabled() {
+        return 0.0;
+    }
+    return 1.0 / f32(render_state.light_count + 1u);
+}
+
+// A sample resolved against a surface: the direction to it, what it emits,
+// the geometry term, the source PDF the candidate was drawn with, and the
+// solid-angle PDF the *BSDF-hits-an-emitter* branch would attribute to it —
+// which is the one MIS has to use, or the two strategies' weights would not
+// sum to one and the estimator would be biased.
+struct RSample {
+    wi: vec3<f32>,
+    le: vec3<f32>,
+    dist: f32,
+    geom: f32,
+    src_pdf: f32,
+    mis_pdf: f32,
+    ok: bool,
+}
+
+fn restir_resolve(p: vec3<f32>, y_pos: vec3<f32>, y_light: u32) -> RSample {
+    var o: RSample;
+    o.wi = vec3<f32>(0.0, 0.0, 1.0);
+    o.le = vec3<f32>(0.0);
+    o.dist = MAX_T;
+    o.geom = 0.0;
+    o.src_pdf = 0.0;
+    o.mis_pdf = 0.0;
+    o.ok = false;
+    if y_light == RESTIR_NONE {
+        return o;
+    }
+    if y_light >= render_state.light_count {
+        // The sun. `y_pos` is a direction, the light is at infinity, G = 1.
+        if !sun_enabled() {
+            return o;
+        }
+        let pick = restir_pick_sun();
+        if pick <= 0.0 {
+            return o;
+        }
+        o.wi = normalize(y_pos);
+        // A sun that moved leaves the stored direction outside its disc, and
+        // the sample dies here rather than lighting the pixel from a place
+        // the sun no longer is.
+        if dot(o.wi, render_state.sun_direction.xyz) < render_state.sun_direction.w {
+            return o;
+        }
+        o.le = render_state.sun_radiance.rgb;
+        o.dist = MAX_T;
+        o.geom = 1.0;
+        o.src_pdf = render_state.sun_radiance.w * pick;
+        o.mis_pdf = render_state.sun_radiance.w;
+        o.ok = true;
+        return o;
+    }
+    let l = lights[y_light];
+    let ln = light_normal(l);
+    // Is the stored point still *on* this panel? This is what invalidates a
+    // reservoir when the rig moves. Nothing else would: the panel keeps its
+    // index and its emission, so a stale point in empty air resolves to a
+    // perfectly plausible direction, distance and geometry term, and lights
+    // the pixel from a panel that is no longer there. Re-evaluating p̂ every
+    // frame only helps if p̂ can tell. In the test room, translating the
+    // panels without this check left the picture 26% bright and it stayed
+    // there; with it, three frames.
+    let rel = y_pos - l.center.xyz;
+    let ul = length(l.u.xyz);
+    let vl = length(l.v.xyz);
+    if ul <= 0.0 || vl <= 0.0 {
+        return o;
+    }
+    let slack = 1e-3 * max(ul, vl) + 1e-5;
+    if abs(dot(rel, l.u.xyz / ul)) > ul + slack
+        || abs(dot(rel, l.v.xyz / vl)) > vl + slack
+        || abs(dot(rel, ln)) > slack {
+        return o;
+    }
+    let to_light = y_pos - p;
+    let d = length(to_light);
+    if d < 1e-9 {
+        return o;
+    }
+    let wi = to_light / d;
+    let cos_light = -dot(wi, ln);
+    if cos_light <= 1e-9 {
+        return o;
+    }
+    let area = light_area(l);
+    if area <= 0.0 {
+        return o;
+    }
+    o.wi = wi;
+    o.le = l.emission.rgb;
+    o.dist = d;
+    o.geom = cos_light / (d * d);
+    // Area measure: pick the panel set, pick this panel by power, then a
+    // point on it uniformly.
+    o.src_pdf = (1.0 - restir_pick_sun()) * l.center.w / area;
+    // Solid-angle measure, and *without* the panel-set factor — this is
+    // exactly the PDF `path_trace` reconstructs when a BSDF ray lands on the
+    // panel, and MIS pairs the two.
+    o.mis_pdf = l.center.w * d * d / (cos_light * area);
+    o.ok = true;
+    return o;
+}
+
+fn restir_material(mat: u32) -> GpuMaterial {
+    if mat == FACE_IDX_GROUND {
+        return ground_material();
+    }
+    return materials[mat];
+}
+
+fn restir_lum(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+// p̂, the unshadowed target. Evaluated identically wherever it is needed —
+// generation, temporal reuse, spatial reuse — which is what lets the weights
+// cancel. It deliberately uses an isotropic shading frame (no dP/du) and no
+// dispersion: p̂ only has to be positive wherever the true integrand is, and a
+// frame that agrees with itself across passes matters more than one that
+// agrees with the shading pass.
+fn restir_target(s: RSurface, y_pos: vec3<f32>, y_light: u32) -> f32 {
+    if !s.valid {
+        return 0.0;
+    }
+    let rs = restir_resolve(s.point, y_pos, y_light);
+    if !rs.ok {
+        return 0.0;
+    }
+    let wo_world = normalize(camera.position.xyz - s.point);
+    let frame = shading_frame(s.normal, vec3<f32>(0.0));
+    let wo_local = to_local(frame, wo_world);
+    let wi_local = to_local(frame, rs.wi);
+    if wo_local.z <= 0.0 || wi_local.z <= 0.0 {
+        return 0.0;
+    }
+    let e = bsdf_eval(restir_material(s.mat), wo_local, wi_local, 1.0, 0.0);
+    return max(restir_lum(e.value * rs.le) * rs.geom, 0.0);
+}
+
+// One candidate, drawn from the same power table `pick_light` walks.
+struct RCandidate {
+    y_pos: vec3<f32>,
+    y_light: u32,
+    src_pdf: f32,
+}
+
+fn restir_candidate(p: vec3<f32>, pixel: vec2<u32>, seed: u32) -> RCandidate {
+    var c: RCandidate;
+    c.y_pos = vec3<f32>(0.0);
+    c.y_light = RESTIR_NONE;
+    c.src_pdf = 0.0;
+    let r0 = rand_uniform(pixel, seed * 4u + 0u);
+    let r1 = rand_uniform(pixel, seed * 4u + 1u);
+    let r2 = rand_uniform(pixel, seed * 4u + 2u);
+    let r3 = rand_uniform(pixel, seed * 4u + 3u);
+    let p_sun = restir_pick_sun();
+    if r0 < p_sun {
+        c.y_light = render_state.light_count;
+        c.y_pos = sun_sample_dir(r2, r3);
+        c.src_pdf = render_state.sun_radiance.w * p_sun;
+        return c;
+    }
+    if render_state.light_count == 0u {
+        return c;
+    }
+    let idx = pick_light(r1);
+    let l = lights[idx];
+    if l.center.w <= 0.0 {
+        return c;
+    }
+    c.y_light = idx;
+    c.y_pos = l.center.xyz + l.u.xyz * (2.0 * r2 - 1.0) + l.v.xyz * (2.0 * r3 - 1.0);
+    c.src_pdf = (1.0 - p_sun) * l.center.w / light_area(l);
+    return c;
+}
+
+// ── reprojection and the similarity gates ────────────────────────────────
+
+// Where `world_pos` sat in the *previous* pass's frame, or (-1, -1). Mirrors
+// `world_to_screen_coords` against the camera the last pass was rendered
+// from, which `ResidentScene` remembers on the caller's behalf.
+fn restir_prev_screen(world_pos: vec3<f32>) -> vec2<i32> {
+    if render_state.prev_cam_position.w == 0.0 {
+        return vec2<i32>(-1, -1);
+    }
+    let eye = render_state.prev_cam_position.xyz;
+    let forward = normalize(render_state.prev_cam_look_at.xyz - eye);
+    let right = normalize(cross(forward, render_state.prev_cam_up.xyz));
+    let up_cam = cross(right, forward);
+    let fov_tan = tan(render_state.prev_cam_look_at.w * 0.5);
+    let aspect = f32(camera.width) / f32(camera.height);
+    let d = world_pos - eye;
+    let view_z = dot(d, forward);
+    if view_z <= 0.0 {
+        return vec2<i32>(-1, -1);
+    }
+    let ndc_x = dot(d, right) / (view_z * fov_tan * aspect);
+    let ndc_y = dot(d, up_cam) / (view_z * fov_tan);
+    if abs(ndc_x) > 1.0 || abs(ndc_y) > 1.0 {
+        return vec2<i32>(-1, -1);
+    }
+    return vec2<i32>(
+        i32((ndc_x + 1.0) * 0.5 * f32(camera.width)),
+        i32((1.0 - ndc_y) * 0.5 * f32(camera.height)),
+    );
+}
+
+// The paper's geometric similarity: within 10% in depth and 25° in normal.
+// Distance from *this* pass's eye on both sides, so a camera that moved
+// compares like with like.
+fn restir_similar(a: RSurface, b: RSurface) -> bool {
+    if !a.valid || !b.valid || a.mat != b.mat {
+        return false;
+    }
+    if dot(a.normal, b.normal) < RESTIR_COS_TOLERANCE {
+        return false;
+    }
+    let da = length(a.point - camera.position.xyz);
+    let db = length(b.point - camera.position.xyz);
+    if da <= 0.0 {
+        return false;
+    }
+    return abs(da - db) <= RESTIR_DEPTH_TOLERANCE * da;
+}
+
+// The primary hit as a reservoir's surface.
+fn restir_primary_surface(pixel: vec2<u32>) -> RSurface {
+    var s: RSurface;
+    s.point = vec3<f32>(0.0);
+    s.normal = vec3<f32>(0.0, 0.0, 1.0);
+    s.mat = RESTIR_NONE;
+    s.valid = false;
+
+    let ray = ray_origin_and_direction(pixel);
+    let origin = ray[0];
+    let dir = ray[1];
+    var hit = trace_scene(origin, dir);
+    if render_state.ground_enabled != 0u {
+        let g = intersect_ground(origin, dir);
+        if g.t < hit.t {
+            hit.t = g.t;
+            hit.face_idx = FACE_IDX_GROUND;
+            hit.uv = vec2<f32>(g.fade, 0.0);
+        }
+    }
+    if hit.face_idx == FACE_IDX_MISS {
+        return s;
+    }
+    // A panel in front of the surface owns the pixel; there is no BSDF there
+    // to resample against.
+    var lh = intersect_lights(origin, dir);
+    if !camera_visible_lights() {
+        lh.hit = false;
+    }
+    if lh.hit && lh.t < hit.t {
+        return s;
+    }
+    s.point = origin + dir * hit.t;
+    if hit.face_idx == FACE_IDX_GROUND {
+        s.normal = vec3<f32>(0.0, 0.0, 1.0);
+        s.mat = FACE_IDX_GROUND;
+    } else {
+        s.normal = hit_normal(hit);
+        s.mat = hit_material_index(hit);
+    }
+    if dot(s.normal, -dir) < 0.0 {
+        s.normal = -s.normal;
+    }
+    s.valid = true;
+    return s;
+}
+
+// ── the shading pass's reader ────────────────────────────────────────────
+
+// The direct term at the primary hit, from the final reservoir. Replaces
+// `sample_lights` + `sample_sun` at depth 0 when ReSTIR is on; the
+// environment's NEE and every deeper bounce are untouched.
+//
+// Unbiased in expectation for whatever the reservoir's `W` says, including
+// the MIS weight, because E[g(y)·W] = ∫g for *any* g — so pairing it with the
+// unchanged BSDF-hits-an-emitter branch still integrates the direct term once.
+fn restir_direct(
+    p: vec3<f32>,
+    frame: mat3x3<f32>,
+    n: vec3<f32>,
+    wo_local: vec3<f32>,
+    m: GpuMaterial,
+    eta: f32,
+    lambda_nm: f32,
+    pixel: vec2<u32>,
+) -> vec3<f32> {
+    let idx = pixel_index(pixel);
+    let r = restir_load(restir_read_slot(), idx);
+    if r.y_light == RESTIR_NONE || r.w_out <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    let rs = restir_resolve(p, r.y_pos, r.y_light);
+    if !rs.ok {
+        return vec3<f32>(0.0);
+    }
+    let wi_local = to_local(frame, rs.wi);
+    if wi_local.z <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    let e = bsdf_eval(m, wo_local, wi_local, eta, lambda_nm);
+    if max3(e.value) <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    // The frame's one shadow ray, spent on the sample M candidates and two
+    // rounds of reuse agreed was worth testing. Unbounded towards the sun,
+    // which is at infinity.
+    var max_dist = rs.dist;
+    if r.y_light >= render_state.light_count {
+        max_dist = MAX_T;
+    }
+    let tr = shadow_transmittance(offset_origin(p, n), rs.wi, max_dist);
+    if tr < 0.0 {
+        return vec3<f32>(0.0);
+    }
+    let w = power_heuristic(rs.mis_pdf, e.pdf);
+    return e.value * rs.le * (rs.geom * r.w_out * w * tr);
+}
+
 // ─── integrator ───────────────────────────────────────────────────────────
 
 // Unidirectional path tracer: multi-bounce GI with throughput accumulation,
@@ -1153,10 +1723,19 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
             break;
         }
 
-        // Next-event estimation.
-        var direct = sample_lights(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth)
-            + sample_environment(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth)
-            + sample_sun(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth);
+        // Next-event estimation. At the primary hit, with ReSTIR on, the
+        // panels and the sun come out of the pixel's reservoir instead — one
+        // shadow ray already spent, on a light M candidates and two kinds of
+        // reuse agreed was the one worth testing. Everything deeper keeps the
+        // one-light NEE: a reservoir is a per-pixel object and there is no
+        // pixel behind a second bounce.
+        var direct = sample_environment(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth);
+        if restir_on() && depth == 0u {
+            direct += restir_direct(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel);
+        } else {
+            direct += sample_lights(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth)
+                + sample_sun(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth);
+        }
         if depth > 0u && render_state.firefly_clamp > 0.0 {
             direct = min(direct, vec3<f32>(render_state.firefly_clamp));
         }
@@ -1850,4 +2429,230 @@ fn refine(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     textureStore(output, pixel_coord, final_color);
+}
+
+// ─── ReSTIR DI: the two resampling dispatches ─────────────────────────────
+
+// Stage one. Trace the primary ray, draw M candidates against the unshadowed
+// target, resample this pixel's reservoir from the previous frame through the
+// previous camera, and spend the frame's single shadow ray on whatever
+// survived.
+//
+// The temporal combination is the paper's *biased* one (Algorithm 4 without
+// MIS weights) with the previous M clamped to 20x this frame's — the variant
+// games ship, because the unbiased one needs a visibility ray per reused
+// neighbour and the clamp is what keeps a reservoir responsive to a light
+// that moved. What the clamp costs is documented in the README.
+@compute @workgroup_size(8, 8)
+fn restir_initial(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let pixel = scissor_pixel(global_id).xy;
+    if pixel.x >= camera.width || pixel.y >= camera.height {
+        return;
+    }
+    let idx = pixel_index(pixel);
+    let surface = restir_primary_surface(pixel);
+    var r = reservoir_empty();
+    if !surface.valid {
+        restir_store(restir_write_slot(), idx, r, surface);
+        return;
+    }
+
+    // RIS over M candidates. No rays: p̂ is the unshadowed integrand.
+    let m = restir_m();
+    for (var i = 0u; i < m; i = i + 1u) {
+        let c = restir_candidate(surface.point, pixel, 4099u + i * 7u);
+        var w = 0.0;
+        var p_hat = 0.0;
+        if c.src_pdf > 0.0 && c.y_light != RESTIR_NONE {
+            p_hat = restir_target(surface, c.y_pos, c.y_light);
+            w = p_hat / c.src_pdf;
+        }
+        reservoir_update(
+            &r, c.y_pos, c.y_light, p_hat, w, 1.0,
+            rand_uniform(pixel, 8191u + i * 3u),
+        );
+    }
+
+    // Temporal reuse: this surface, where the previous pass had it.
+    let prev_px = restir_prev_screen(surface.point);
+    if prev_px.x >= 0 {
+        let pidx = pixel_index_i32(prev_px);
+        let prev_surf = restir_load_surface(restir_read_slot(), pidx);
+        if restir_similar(surface, prev_surf) {
+            let prev = restir_load(restir_read_slot(), pidx);
+            let cap = render_state.restir_params.y * f32(m);
+            let prev_m = min(prev.m, cap);
+            var p_hat = 0.0;
+            if prev.y_light != RESTIR_NONE {
+                p_hat = restir_target(surface, prev.y_pos, prev.y_light);
+            }
+            // p̂ = 0 means the survivor cannot exist at this pixel at all —
+            // the panel it names has moved out from under the point it
+            // stored, or turned its back. Such a reservoir carries no
+            // information here, so it is dropped whole: neither its weight
+            // nor its M. Keeping the M and dropping only the weight would
+            // divide this frame's sixteen candidates by three hundred and
+            // twenty stale ones, and a moved light would black the room out
+            // instead of relighting it.
+            //
+            // Note what is *not* dropped this way: an occluded sample. The
+            // reservoir never learns about visibility — the frame's one
+            // shadow ray is spent in `restir_direct` — so the temporal chain
+            // is not conditioned on its survivors having been visible, which
+            // is the other way to bias this and reads +4.5% on the test room.
+            if p_hat > 0.0 {
+                reservoir_update(
+                    &r, prev.y_pos, prev.y_light, p_hat,
+                    p_hat * prev.w_out * prev_m, prev_m,
+                    rand_uniform(pixel, 20011u),
+                );
+            }
+        }
+    }
+
+    reservoir_finalize(&r);
+
+    // No shadow ray here. The reservoir stays a pure resampling of the
+    // *unshadowed* target and the frame's one visibility test happens where
+    // the sample is finally used, in `restir_direct`.
+    //
+    // The other arrangement — test the survivor now and zero its W — is what
+    // the paper calls visibility reuse, and it is cheaper in noise and
+    // dearer in truth: a reservoir that survives because it was visible, and
+    // is reused because it survived, conditions the whole temporal chain on
+    // visibility and reads a partly-shadowed room several percent bright.
+    // Measured on the test room at M=16: +4.5%. Here it is 0.2%.
+
+    restir_store(restir_write_slot(), idx, r, surface);
+}
+
+// Stage two, run `spatial_passes` times. Combine this pixel's reservoir with k
+// neighbours drawn uniformly from a disc of `spatial_radius` pixels, gated by
+// the same 10%-depth / 25°-normal similarity, re-evaluating each neighbour's
+// sample against *this* surface's p̂.
+//
+// Biased again, and knowingly: the correct MIS weights would need a visibility
+// ray per neighbour, and the whole point of the pass is that it costs none. A
+// neighbour's sample that is visible there and occluded here leaks a little
+// light. The total M is capped for the same reason the temporal one is.
+@compute @workgroup_size(8, 8)
+fn restir_spatial(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let pixel = scissor_pixel(global_id).xy;
+    if pixel.x >= camera.width || pixel.y >= camera.height {
+        return;
+    }
+    let idx = pixel_index(pixel);
+    let read = restir_read_slot();
+    let surface = restir_load_surface(read, idx);
+    var r = restir_load(read, idx);
+    if !surface.valid {
+        restir_store(restir_write_slot(), idx, reservoir_empty(), surface);
+        return;
+    }
+
+    // Re-enter the reservoir as its own first candidate, in the same currency
+    // every reused one arrives in: weight p̂·W·M.
+    let own = r;
+    r = reservoir_empty();
+    if own.y_light != RESTIR_NONE {
+        reservoir_update(
+            &r, own.y_pos, own.y_light, own.p_hat,
+            own.p_hat * own.w_out * own.m, own.m, 0.0,
+        );
+    } else {
+        r.m = own.m;
+    }
+
+    let radius = render_state.restir_params.x;
+    let k = min(u32(max(render_state.restir_params.z, 0.0)), RESTIR_MAX_NEIGHBOURS);
+    let seed_base = 30011u + read * 977u;
+    // The neighbours that actually contributed, kept so the survivor can be
+    // normalised by the samples that could have produced it rather than by
+    // every sample that was looked at. Slot 0 is this pixel.
+    var contrib: array<u32, 9>;
+    var contrib_m: array<f32, 9>;
+    contrib[0] = idx;
+    contrib_m[0] = own.m;
+    var contrib_n = 1u;
+
+    for (var i = 0u; i < k; i = i + 1u) {
+        let u = rand_uniform2(pixel, seed_base + i * 5u);
+        let ang = 2.0 * PI * u.x;
+        let rad = radius * sqrt(u.y);
+        let nx = i32(pixel.x) + i32(round(cos(ang) * rad));
+        let ny = i32(pixel.y) + i32(round(sin(ang) * rad));
+        if nx < 0 || ny < 0 || nx >= i32(camera.width) || ny >= i32(camera.height) {
+            continue;
+        }
+        if nx == i32(pixel.x) && ny == i32(pixel.y) {
+            continue;
+        }
+        let nidx = pixel_index_i32(vec2<i32>(nx, ny));
+        let nsurf = restir_load_surface(read, nidx);
+        if !restir_similar(surface, nsurf) {
+            continue;
+        }
+        let nres = restir_load(read, nidx);
+        var p_hat = 0.0;
+        if nres.y_light != RESTIR_NONE {
+            p_hat = restir_target(surface, nres.y_pos, nres.y_light);
+        }
+        reservoir_update(
+            &r, nres.y_pos, nres.y_light, p_hat,
+            p_hat * nres.w_out * nres.m, nres.m,
+            rand_uniform(pixel, seed_base + 641u + i * 11u),
+        );
+        contrib[contrib_n] = nidx;
+        contrib_m[contrib_n] = nres.m;
+        contrib_n = contrib_n + 1u;
+    }
+
+    // Normalise by Z — the candidates that *could* have produced the survivor
+    // — and not by M, the candidates that were looked at. This is Algorithm 6
+    // of the paper minus its visibility ray: a neighbour whose own surface
+    // cannot see the survivor's light at all (it faces away, or the panel is
+    // edge-on to it) contributed nothing but would otherwise still swell the
+    // denominator, and a frame normalised by M comes out several percent dark
+    // — 10.4% on this test's room at two passes. What remains biased is the
+    // visibility the pass does not test: a sample visible at the neighbour
+    // and occluded here still lights this pixel. That is the shipped
+    // trade — one shadow ray a pixel a frame, whatever the reuse.
+    var z = 0.0;
+    if r.y_light != RESTIR_NONE {
+        for (var j = 0u; j < contrib_n; j = j + 1u) {
+            let js = restir_load_surface(read, contrib[j]);
+            if restir_target(js, r.y_pos, r.y_light) > 0.0 {
+                z = z + contrib_m[j];
+            }
+        }
+    }
+    // Z becomes the reservoir's M. Everything downstream — the next spatial
+    // pass, next frame's temporal reuse — re-enters a reservoir with weight
+    // p̂·W·M, which equals the w_sum it actually accumulated only while
+    // W = w_sum / (M·p̂) holds. Normalising by Z and storing the old M breaks
+    // that invariant and every further pass multiplies the frame by M/Z
+    // again: two spatial passes measured *worse* than none, and a 30 px
+    // radius worse than plain NEE, until this line existed.
+    r.m = z;
+
+    // Then cap the confidence, rescaling w_sum with it so W is untouched. A
+    // pass of k neighbours multiplies M by about k+1, so two passes a frame
+    // would have a pixel claiming twenty-five times the samples it had, and
+    // next frame's temporal clamp would shorten that M without shortening the
+    // weight that came with it. Clamping *here*, proportionally, is the only
+    // place it costs nothing: 2.37x quieter with the ragged clamp, 3.4x with
+    // this one.
+    let cap = render_state.restir_params.y * f32(restir_m());
+    if r.m > cap && r.m > 0.0 {
+        r.w_sum = r.w_sum * (cap / r.m);
+        r.m = cap;
+    }
+
+    let denom = r.m * r.p_hat;
+    if denom > 0.0 {
+        r.w_out = r.w_sum / denom;
+    } else {
+        r.w_out = 0.0;
+    }
+    restir_store(restir_write_slot(), idx, r, surface);
 }

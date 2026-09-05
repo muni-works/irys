@@ -192,13 +192,13 @@ impl GpuMaterial {
             thin_walled: if p.thin_walled { 1.0 } else { 0.0 },
             has_sellmeier: if p.sellmeier.is_some() { 1.0 } else { 0.0 },
             _pad0: 0.0,
-            sellmeier_b: p.sellmeier.map_or([0.0; 3], |(b, _)| {
-                [b[0] as f32, b[1] as f32, b[2] as f32]
-            }),
+            sellmeier_b: p
+                .sellmeier
+                .map_or([0.0; 3], |(b, _)| [b[0] as f32, b[1] as f32, b[2] as f32]),
             _pad1: 0.0,
-            sellmeier_c: p.sellmeier.map_or([0.0; 3], |(_, c)| {
-                [c[0] as f32, c[1] as f32, c[2] as f32]
-            }),
+            sellmeier_c: p
+                .sellmeier
+                .map_or([0.0; 3], |(_, c)| [c[0] as f32, c[1] as f32, c[2] as f32]),
             thin_film_thickness: p.thin_film_thickness,
             thin_film_ior: p.thin_film_ior,
             _pad2: [0.0; 3],
@@ -494,7 +494,42 @@ pub struct GpuRenderState {
     /// the solid-angle PDF of the NEE strategy — `1 / solid_angle` — in `.w`.
     /// `.w <= 0` disables the sun.
     pub sun_radiance: [f32; 4],
+    /// ReSTIR DI: `[candidates M, spatial passes, slot to read, stage]`.
+    ///
+    /// `candidates == 0` — the default — is the old path: the shader takes the
+    /// `sample_lights` + `sample_sun` NEE branch at every depth and none of
+    /// the reservoir code runs. Set it with [`GpuRenderState::set_restir`].
+    /// `stage` is written by the renderer, not the caller: it names which of
+    /// the three ReSTIR dispatches is running (see `RESTIR_STAGE_*`).
+    pub restir: [u32; 4],
+    /// ReSTIR DI: `[spatial radius px, previous-M cap factor, neighbours k,
+    /// unused]`.
+    pub restir_params: [f32; 4],
+    /// The camera the *previous* pass was rendered from, for ReSTIR's temporal
+    /// reprojection: position in `.xyz`, and `.w` non-zero when there is one.
+    ///
+    /// Filled in by [`crate::gpu::ResidentScene`] from the camera it was handed
+    /// last pass — a caller never sets these, and cannot get them wrong.
+    pub prev_cam_position: [f32; 4],
+    /// The previous pass's camera target in `.xyz`, its vertical field of view
+    /// in radians in `.w`.
+    pub prev_cam_look_at: [f32; 4],
+    /// The previous pass's camera up vector in `.xyz`.
+    pub prev_cam_up: [f32; 4],
 }
+
+/// ReSTIR stage: generate candidates, resample temporally, test the survivor.
+pub const RESTIR_STAGE_INITIAL: u32 = 0;
+/// ReSTIR stage: one round of spatial reuse.
+pub const RESTIR_STAGE_SPATIAL: u32 = 1;
+/// ReSTIR stage: the shading pass reads the final reservoir.
+pub const RESTIR_STAGE_SHADE: u32 = 2;
+
+/// How much longer than this frame's own candidate count a reused temporal
+/// reservoir may claim to be. Bitterli et al. use 20x.
+pub const RESTIR_DEFAULT_M_CAP: f32 = 20.0;
+/// Neighbours drawn per spatial reuse pass.
+pub const RESTIR_DEFAULT_NEIGHBOURS: f32 = 4.0;
 
 /// Default silhouette line color: near-black, slightly cool.
 const DEFAULT_SILHOUETTE_COLOR: [f32; 4] = [0.08, 0.08, 0.10, 1.0];
@@ -663,7 +698,58 @@ impl GpuRenderState {
             env_ground: rgba(DEFAULT_GRADIENT.ground),
             sun_direction: [0.0, 0.0, 1.0, 1.0],
             sun_radiance: [0.0; 4],
+            restir: [0, 0, 0, RESTIR_STAGE_SHADE],
+            restir_params: [0.0, RESTIR_DEFAULT_M_CAP, RESTIR_DEFAULT_NEIGHBOURS, 0.0],
+            prev_cam_position: [0.0; 4],
+            prev_cam_look_at: [0.0; 4],
+            prev_cam_up: [0.0; 4],
         }
+    }
+
+    /// Light the direct term with ReSTIR DI (Bitterli et al. 2020) instead of
+    /// one next-event sample per pixel.
+    ///
+    /// `candidates` is M, the number of light samples resampled per pixel per
+    /// frame (8-32 is the paper's range); 0 — the default — turns the whole
+    /// thing off and leaves the shader on the path it has always taken, which
+    /// is why every existing test and `--shot` are unchanged by this landing.
+    /// `spatial_passes` is how many rounds of neighbour reuse to run (0-2) and
+    /// `spatial_radius` is their radius in pixels (~16 is a good default at
+    /// 512x288).
+    ///
+    /// Only the primary hit's direct lighting from the area lights and the sun
+    /// goes through the reservoir. Indirect bounces, and the environment at
+    /// every depth, keep the one-light NEE they had.
+    pub fn set_restir(&mut self, candidates: u32, spatial_passes: u32, spatial_radius: f32) {
+        self.restir[0] = candidates;
+        self.restir[1] = spatial_passes;
+        self.restir_params[0] = spatial_radius;
+    }
+
+    /// Whether [`GpuRenderState::set_restir`] asked for reservoirs.
+    pub fn restir_enabled(&self) -> bool {
+        self.restir[0] > 0
+    }
+
+    /// M, the candidate count per pixel per frame.
+    pub fn restir_candidates(&self) -> u32 {
+        self.restir[0]
+    }
+
+    /// How many spatial reuse passes each frame runs.
+    pub fn restir_spatial_passes(&self) -> u32 {
+        self.restir[1]
+    }
+
+    /// How many neighbours each spatial pass draws (k). Defaults to 4.
+    pub fn set_restir_neighbours(&mut self, k: u32) {
+        self.restir_params[2] = k as f32;
+    }
+
+    /// The cap on a reused temporal reservoir's M, as a multiple of this
+    /// frame's candidate count. Defaults to 20, as in the paper.
+    pub fn set_restir_m_cap(&mut self, cap: f32) {
+        self.restir_params[1] = cap;
     }
 
     /// Light the scene with `g`, the same analytic gradient the CPU renderer
@@ -873,6 +959,11 @@ impl GpuRenderState {
             env_ground: rgba(DEFAULT_GRADIENT.ground),
             sun_direction: [0.0, 0.0, 1.0, 1.0],
             sun_radiance: [0.0; 4],
+            restir: [0, 0, 0, RESTIR_STAGE_SHADE],
+            restir_params: [0.0, RESTIR_DEFAULT_M_CAP, RESTIR_DEFAULT_NEIGHBOURS, 0.0],
+            prev_cam_position: [0.0; 4],
+            prev_cam_look_at: [0.0; 4],
+            prev_cam_up: [0.0; 4],
         }
     }
 

@@ -33,7 +33,8 @@ use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
 
 use super::buffers::{
-    GpuAreaLight, GpuCamera, GpuMaterial, GpuRenderState, pack_light_power_table,
+    GpuAreaLight, GpuCamera, GpuMaterial, GpuRenderState, RESTIR_STAGE_SHADE,
+    pack_light_power_table,
 };
 use super::history::HistoryBuffers;
 use super::pipeline::{RayTracePipeline, read_back_f32, read_back_rgba};
@@ -316,6 +317,16 @@ pub struct ResidentScene {
     /// a caller's state cannot disagree with the buffers actually bound.
     light_count: u32,
     env_state: (u32, u32, u32, f32, f32, f32),
+    /// The camera the last pass was rendered from, which is what ReSTIR's
+    /// temporal reuse reprojects through. Kept here rather than asked of the
+    /// caller: a scene knows what it was last shown, and a caller that had to
+    /// remember could get it wrong.
+    prev_camera: Option<GpuCamera>,
+    /// Which of the two reservoir slots holds the finished reservoirs of the
+    /// last ReSTIR frame.
+    restir_slot: u32,
+    /// Whether `targets.depth_normal` has been grown to carry them.
+    restir_planes: bool,
 }
 
 impl ResidentScene {
@@ -353,6 +364,9 @@ impl ResidentScene {
             history: None,
             light_count: 0,
             env_state: (0, 0, 0, 0.0, 0.0, 0.0),
+            prev_camera: None,
+            restir_slot: 0,
+            restir_planes: false,
         };
         me.refresh_scene_state(scene);
         me
@@ -440,6 +454,35 @@ impl ResidentScene {
         self.bind_group = None;
         // A history is per-pixel; at a new size none of it means anything.
         self.history = None;
+        // Nor do the reservoirs, and the planes that carried them are gone
+        // with the buffer.
+        self.restir_planes = false;
+        self.prev_camera = None;
+    }
+
+    /// Grow `depth_normal` to carry ReSTIR's four reservoir slots.
+    ///
+    /// Twelve planes above the three the denoiser's guides use — 192 bytes a
+    /// pixel — allocated the first time a pass asks for reservoirs and never for a
+    /// scene that does not. They ride in this buffer rather than in storage
+    /// buffers of their own because the shader already binds all ten a browser
+    /// guarantees; see the `ReSTIR DI` block in `integrator.wgsl`.
+    fn ensure_restir_planes(&mut self, ctx: &GpuContext) {
+        if self.restir_planes {
+            return;
+        }
+        let per_pixel_vec4 = (self.targets.width as u64) * (self.targets.height as u64) * 16;
+        self.targets.depth_normal = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Resident Depth Normal Buffer (+ ReSTIR reservoirs)"),
+            size: per_pixel_vec4 * 15,
+            usage: STORAGE_RW.union(wgpu::BufferUsages::COPY_SRC),
+            mapped_at_creation: false,
+        });
+        self.restir_planes = true;
+        self.bind_group = None;
+        // Nothing reprojectable behind a buffer that did not exist a moment
+        // ago: the first ReSTIR frame generates candidates and reuses nothing.
+        self.prev_camera = None;
     }
 
     /// Allocate the device-side history if there isn't one at this size.
@@ -474,8 +517,12 @@ impl ResidentScene {
                 label: Some("Resident Accumulation Reset"),
             });
         encoder.clear_buffer(&self.targets.accum, 0, None);
+        // Clears the reservoir planes with everything else, which is right:
+        // whatever invalidated the average invalidated them too. A zeroed
+        // reservoir reads back as "no sample, no surface" by construction.
         encoder.clear_buffer(&self.targets.depth_normal, 0, None);
         ctx.queue.submit(Some(encoder.finish()));
+        self.prev_camera = None;
     }
 
     /// Fill in the render-state fields that describe the buffers actually
@@ -576,7 +623,29 @@ impl RayTracePipeline {
         output: Option<&wgpu::TextureView>,
         encoder: &mut wgpu::CommandEncoder,
     ) {
-        let state = res.derive_state(state);
+        let mut state = res.derive_state(state);
+        // ReSTIR needs its planes, and it needs them before the bind group is
+        // built — growing the buffer invalidates the cached one.
+        let restir = state.restir_enabled() && state.scissor().is_none();
+        if restir {
+            res.ensure_restir_planes(ctx);
+            match res.prev_camera {
+                Some(prev) => {
+                    state.prev_cam_position =
+                        [prev.position[0], prev.position[1], prev.position[2], 1.0];
+                    state.prev_cam_look_at =
+                        [prev.target[0], prev.target[1], prev.target[2], prev.fov];
+                    state.prev_cam_up = [prev.up[0], prev.up[1], prev.up[2], 0.0];
+                }
+                None => {
+                    state.prev_cam_position = [0.0; 4];
+                }
+            }
+        } else {
+            // A scissored pass is a partial re-render, and reservoirs are a
+            // whole-frame object; take the pass the shader always took.
+            state.restir[0] = 0;
+        }
         ctx.queue
             .write_buffer(&res.camera_buffer, 0, bytemuck::bytes_of(camera));
         ctx.queue
@@ -617,6 +686,26 @@ impl RayTracePipeline {
             None => (res.targets.width, res.targets.height),
         };
 
+        // ReSTIR's resampling submits its own command buffers, and does so
+        // before `encoder` is submitted, so the shading pass below sees the
+        // reservoirs this frame's dispatches wrote.
+        if restir {
+            state.restir[2] = res.restir_slot;
+            let (temporal_slot, shade_slot) = self.encode_restir_stages(
+                ctx,
+                &state,
+                &res.render_state_buffer,
+                bind_group,
+                dw,
+                dh,
+            );
+            res.restir_slot = temporal_slot;
+            state.restir[2] = shade_slot;
+            state.restir[3] = RESTIR_STAGE_SHADE;
+            ctx.queue
+                .write_buffer(&res.render_state_buffer, 0, bytemuck::bytes_of(&state));
+        }
+
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Resident Ray Trace Pass"),
@@ -634,6 +723,10 @@ impl RayTracePipeline {
             pass.set_pipeline(self.refine_compute_pipeline());
             pass.set_bind_group(0, bind_group, &[]);
             pass.dispatch_workgroups(dw.div_ceil(8), dh.div_ceil(8), 1);
+        }
+
+        if restir {
+            res.prev_camera = Some(*camera);
         }
     }
 

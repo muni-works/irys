@@ -1,6 +1,8 @@
 //! wgpu compute pipeline for ray tracing.
 
-use super::buffers::{GpuCamera, GpuRenderState};
+use super::buffers::{
+    GpuCamera, GpuRenderState, RESTIR_STAGE_INITIAL, RESTIR_STAGE_SHADE, RESTIR_STAGE_SPATIAL,
+};
 use super::context::{GpuContext, GpuError};
 use super::geometry::GeometryModule;
 use super::scene::SceneRef;
@@ -14,6 +16,11 @@ pub struct RayTracePipeline {
     pipeline: wgpu::ComputePipeline,
     /// Second pass that refines edge pixels with additional stratified samples.
     refine_pipeline: wgpu::ComputePipeline,
+    /// ReSTIR DI: candidate generation, temporal reuse and the survivor's one
+    /// shadow ray.
+    restir_initial_pipeline: wgpu::ComputePipeline,
+    /// ReSTIR DI: one round of spatial reuse.
+    restir_spatial_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
 }
 
@@ -28,9 +35,92 @@ impl RayTracePipeline {
         &self.refine_pipeline
     }
 
+    /// ReSTIR's candidate-generation and temporal-reuse pass.
+    pub(super) fn restir_initial_compute_pipeline(&self) -> &wgpu::ComputePipeline {
+        &self.restir_initial_pipeline
+    }
+
+    /// ReSTIR's spatial-reuse pass.
+    pub(super) fn restir_spatial_compute_pipeline(&self) -> &wgpu::ComputePipeline {
+        &self.restir_spatial_pipeline
+    }
+
     /// The bind group layout both passes share.
     pub(super) fn layout(&self) -> &wgpu::BindGroupLayout {
         &self.bind_group_layout
+    }
+
+    /// Encode and submit ReSTIR's resampling dispatches for one frame.
+    ///
+    /// One `restir_initial` over the frame, then `spatial_passes` rounds of
+    /// `restir_spatial`, ping-ponging between the two reservoir slots. Each
+    /// stage is its own submission because they differ only in the render
+    /// state uniform, and a queue write applies to *every* command buffer in
+    /// the submission it precedes — four submissions a frame is a rounding
+    /// error against a path-traced pass, and a dynamic-offset uniform would
+    /// have changed the bind group layout every client shares.
+    ///
+    /// Returns `(temporal slot, shading slot)`: the reservoirs the *next*
+    /// frame's temporal reuse should read — the ones as they were before any
+    /// spatial reuse — and the ones this frame should shade with.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn encode_restir_stages(
+        &self,
+        ctx: &GpuContext,
+        state: &GpuRenderState,
+        state_buffer: &wgpu::Buffer,
+        bind_group: &wgpu::BindGroup,
+        dispatch_w: u32,
+        dispatch_h: u32,
+    ) -> (u32, u32) {
+        let temporal_read = state.restir[2] & 0xFF;
+        let temporal_write = 1 - temporal_read;
+        let mut read = temporal_read;
+        let mut write = temporal_write;
+        // Spatial output goes to slots 2 and 3, never back over the temporal
+        // pair: see `restir_read_slot` in the shader for what feeding one
+        // into the other does by frame eight.
+        let mut spatial_slot = 2;
+        let stages = 1 + state.restir_spatial_passes();
+        for stage in 0..stages {
+            if stage > 0 {
+                read = write;
+                write = spatial_slot;
+                spatial_slot = if spatial_slot == 2 { 3 } else { 2 };
+            }
+            let mut st = *state;
+            st.restir[2] = read | (write << 8);
+            st.restir[3] = if stage == 0 {
+                RESTIR_STAGE_INITIAL
+            } else {
+                RESTIR_STAGE_SPATIAL
+            };
+            ctx.queue
+                .write_buffer(state_buffer, 0, bytemuck::bytes_of(&st));
+            let mut encoder = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("ReSTIR Encoder"),
+                });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("ReSTIR Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(if stage == 0 {
+                    self.restir_initial_compute_pipeline()
+                } else {
+                    self.restir_spatial_compute_pipeline()
+                });
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.dispatch_workgroups(dispatch_w.div_ceil(8), dispatch_h.div_ceil(8), 1);
+            }
+            ctx.queue.submit(Some(encoder.finish()));
+        }
+        // What next frame's temporal reuse reads, and what this frame's
+        // shading pass reads. They are the same slot only when no spatial
+        // pass ran.
+        (temporal_write, write)
     }
 
     /// Create a new ray trace pipeline over a client's geometry module.
@@ -220,9 +310,25 @@ impl RayTracePipeline {
                     cache: None,
                 });
 
+        let mk = |label: &str, entry: &str| {
+            ctx.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&pipeline_layout),
+                    module: &shader_module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        };
+        let restir_initial_pipeline = mk("ReSTIR Initial Pipeline", "restir_initial");
+        let restir_spatial_pipeline = mk("ReSTIR Spatial Pipeline", "restir_spatial");
+
         Ok(Self {
             pipeline,
             refine_pipeline,
+            restir_initial_pipeline,
+            restir_spatial_pipeline,
             bind_group_layout,
         })
     }
@@ -400,7 +506,7 @@ impl RayTracePipeline {
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("Render State Buffer"),
                     contents: bytemuck::bytes_of(&render_state),
-                    usage: wgpu::BufferUsages::UNIFORM,
+                    usage: wgpu::BufferUsages::UNIFORM.union(wgpu::BufferUsages::COPY_DST),
                 });
 
         // The client's geometry, whatever it is: opaque slabs, bound in the
@@ -463,9 +569,13 @@ impl RayTracePipeline {
         // Depth/normal buffer for edge detection (vec4 per pixel: normal.xyz,
         // depth), plus the two guide planes a raw-sample pass fills. See the
         // binding's comment in `raytrace.wgsl`.
+        // Three planes, plus two ReSTIR slots of three each when the
+        // reservoirs are on. See the `ReSTIR DI` block in `integrator.wgsl`
+        // for why they live here and not in storage buffers of their own.
+        let dn_planes: u64 = if render_state.restir_enabled() { 15 } else { 3 };
         let depth_normal_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Depth Normal Buffer"),
-            size: accum_buf_size * 3,
+            size: accum_buf_size * dn_planes,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -660,6 +770,27 @@ impl RayTracePipeline {
             ),
             None => (width, height),
         };
+
+        // ReSTIR's resampling runs before the shading pass and submits its own
+        // command buffers. In a one-shot render there is nothing behind the
+        // frame to reproject, so this is candidate generation plus whatever
+        // spatial reuse was asked for — single-frame ReSTIR, which is exactly
+        // what a parity test wants to look at.
+        let mut render_state = render_state;
+        if render_state.restir_enabled() && render_state.scissor().is_none() {
+            let (_, shade_slot) = self.encode_restir_stages(
+                ctx,
+                &render_state,
+                &render_state_buffer,
+                &bind_group,
+                dispatch_w,
+                dispatch_h,
+            );
+            render_state.restir[2] = shade_slot;
+            render_state.restir[3] = RESTIR_STAGE_SHADE;
+            ctx.queue
+                .write_buffer(&render_state_buffer, 0, bytemuck::bytes_of(&render_state));
+        }
 
         let mut encoder = ctx
             .device
