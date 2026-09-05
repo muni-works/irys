@@ -569,6 +569,12 @@ struct GpuMaterial {
     _pad2: f32,
     _pad3: f32,
     _pad4: f32,
+    // Surface colour the subsurface random walk is asked to produce, and the
+    // per-channel mean free path inside the medium, in scene units.
+    subsurface_color: vec3<f32>,
+    _pad5: f32,
+    subsurface_radius: vec3<f32>,
+    _pad6: f32,
 }
 
 // ─── dispersion ───────────────────────────────────────────────────────────
@@ -1007,7 +1013,7 @@ fn cosine_hemisphere_local(r1: f32, r2: f32) -> vec3<f32> {
 //
 // d'Eon, Portsmouth, Hill, Fascione, "EON: A practical energy-preserving rough
 // diffuse BRDF" (JCGT 14(1), 2025; arXiv:2410.18026). Port of `eon_diffuse`
-// and `hanrahan_krueger` in `pathtrace.rs`; see there for why.
+// in `pathtrace.rs`; see there for why.
 
 const FON_C1: f32 = 0.5 - 2.0 / (3.0 * PI);
 const FON_C2: f32 = 2.0 / 3.0 - 28.0 / (15.0 * PI);
@@ -1050,18 +1056,6 @@ fn eon_diffuse(rho: vec3<f32>, r: f32, wo: vec3<f32>, wi: vec3<f32>) -> vec3<f32
     return f_ss + rho_ms * k;
 }
 
-// Disney's Hanrahan-Krueger-flavoured subsurface lobe (2012 notes, §5.3).
-fn hanrahan_krueger(rho: vec3<f32>, roughness: f32, wo: vec3<f32>, wi: vec3<f32>) -> vec3<f32> {
-    let mu_i = max(wi.z, 1e-6);
-    let mu_o = max(wo.z, 1e-6);
-    let wh = normalize(wo + wi);
-    let cos_d = max(dot(wi, wh), 0.0);
-    let fss90 = roughness * cos_d * cos_d;
-    let fi = 1.0 + (fss90 - 1.0) * pow(clamp(1.0 - mu_i, 0.0, 1.0), 5.0);
-    let fo = 1.0 + (fss90 - 1.0) * pow(clamp(1.0 - mu_o, 0.0, 1.0), 5.0);
-    let ss = 1.25 * (fi * fo * (1.0 / (mu_i + mu_o) - 0.5) + 0.5);
-    return rho * ((1.0 / PI) * ss);
-}
 
 // ─── specular: multiple-scattering compensation ───────────────────────────
 //
@@ -1318,11 +1312,18 @@ fn dielectric_eval(m: GpuMaterial, wo: vec3<f32>, wi: vec3<f32>, eta: f32) -> ve
 struct Lobes {
     w: vec4<f32>,
     diel: f32,
+    // The subsurface lobe. It has no BSDF at this point — it is a BSSRDF and
+    // leaves from somewhere else entirely — so it appears in the weights and
+    // in `bsdf_sample`, and never in the sum `bsdf_eval` returns.
+    sss: f32,
 }
 
 fn lobe_weights(m: GpuMaterial) -> Lobes {
     let opaque = 1.0 - m.transmission;
-    let diff = max(max3(mat_diffuse_albedo(m)), 0.0);
+    // The subsurface weight takes its share out of the diffuse lobe rather
+    // than adding beside it, which keeps the surface's total albedo where it
+    // was.
+    let diff = max(max3(mat_diffuse_albedo(m)), 0.0) * (1.0 - m.subsurface);
     var spec = max(max3(mat_f0(m)), 0.0) + 0.08;
     if m.transmission > 0.0 {
         spec = spec * opaque;
@@ -1330,13 +1331,15 @@ fn lobe_weights(m: GpuMaterial) -> Lobes {
     let sheen = max(m.sheen * max3(m.sheen_color), 0.0);
     let coat = m.clearcoat * 0.25;
     let diel = max(m.transmission, 0.0);
+    let sss = max(m.subsurface * max3(m.subsurface_color), 0.0) * opaque;
     var total = max(diff + spec + sheen + coat, 1e-6);
-    if diel > 0.0 {
-        total = max(diff + spec + sheen + coat + diel, 1e-6);
+    if diel > 0.0 || sss > 0.0 {
+        total = max(diff + spec + sheen + coat + diel + sss, 1e-6);
     }
     var out: Lobes;
     out.w = vec4<f32>(diff, spec, sheen, coat) / total;
     out.diel = diel / total;
+    out.sss = sss / total;
     return out;
 }
 
@@ -1379,13 +1382,11 @@ fn bsdf_eval(
     let lw = lobe_weights(m);
     let w = lw.w;
 
-    // Diffuse: EON, blended towards Hanrahan-Krueger by `subsurface`. At the
-    // defaults both branches collapse to rho/pi and this is Lambert exactly.
+    // Diffuse: EON, minus whatever the subsurface walk carries. The walk is
+    // a BSSRDF with no density here, so it is not in this sum — `subsurface`
+    // only takes its share of the lobe away.
     let rho = mat_diffuse_albedo(m);
-    var diffuse_f = eon_diffuse(rho, m.diffuse_roughness, wo, wi);
-    if m.subsurface > 0.0 {
-        diffuse_f = mix(diffuse_f, hanrahan_krueger(rho, m.roughness, wo, wi), m.subsurface);
-    }
+    let diffuse_f = eon_diffuse(rho, m.diffuse_roughness, wo, wi) * (1.0 - m.subsurface);
     let diffuse = diffuse_f * n_dot_l;
     let pdf_d = n_dot_l / PI;
 
@@ -1454,6 +1455,9 @@ struct BsdfSample {
     value: vec3<f32>,
     pdf: f32,
     ok: bool,
+    // The path went *into* the object instead: the integrator has to walk it
+    // out. `wi` and `value` are meaningless, `pdf` is the lobe probability.
+    sss: bool,
 }
 
 // Importance-sample the BSDF. `r_lobe` picks the lobe; `r1`/`r2` drive it.
@@ -1472,6 +1476,7 @@ fn bsdf_sample(
     out.value = vec3<f32>(0.0);
     out.pdf = 0.0;
     out.ok = false;
+    out.sss = false;
     if wo.z <= 0.0 {
         return out;
     }
@@ -1505,6 +1510,16 @@ fn bsdf_sample(
         if wi.z <= 0.0 {
             return out;
         }
+    } else if lw.sss > 0.0 && r_lobe >= w.x + w.y + w.z + w.w + lw.diel {
+        // Into the object. The walk carries its own colour — that is what the
+        // albedo inversion buys — so the lobe choice costs only its own
+        // probability. The `lw.sss > 0` guard keeps a material without a
+        // subsurface lobe on exactly the branch chain it was on before.
+        out.value = vec3<f32>(1.0);
+        out.pdf = lw.sss;
+        out.ok = true;
+        out.sss = true;
+        return out;
     } else if r_lobe < w.x + w.y + w.z + w.w {
         let ca = mat_coat_alpha(m);
         let wh = sample_gtr1(ca, r1, r2);

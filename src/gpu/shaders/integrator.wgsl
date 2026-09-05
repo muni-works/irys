@@ -590,6 +590,10 @@ fn ground_material() -> GpuMaterial {
     m.sellmeier_b = vec3<f32>(0.0);
     m._pad1 = 0.0;
     m.sellmeier_c = vec3<f32>(0.0);
+    m.subsurface_color = vec3<f32>(1.0);
+    m._pad5 = 0.0;
+    m.subsurface_radius = vec3<f32>(1.0);
+    m._pad6 = 0.0;
     m.thin_film_thickness = 0.0;
     m.thin_film_ior = 1.5;
     m._pad2 = 0.0;
@@ -822,6 +826,125 @@ fn sample_sun(
 // `max_depth` is driven per-frame by the refinement scheduler: draft frames
 // trace shallow to stay interactive and depth escalates as accumulation
 // proceeds, so the first frame is still usable.
+// ─── subsurface: the random walk, on the device ───────────────────────────
+//
+// Chiang, Kutz and Burley 2016, the same walk `pathtrace::subsurface_walk`
+// runs, against `trace_scene` instead of the CPU's BVH.
+//
+// One number differs and it is deliberate: the CPU walks up to 1024 scattering
+// events and this walks 12. A GPU path loop is a uniform-control-flow budget
+// shared by every lane in the workgroup, and a thousand-step inner loop makes
+// the whole wave wait on the one pixel that landed on a bright medium. Twelve
+// is enough for the short mean free paths these scenes actually use — a
+// basketball's 2 mm rubber exits in three or four — and a medium bright enough
+// to need more comes back darker here than on the CPU. That is the documented
+// difference between the tiers; `subsurface = 0` is identical on both.
+const SUBSURFACE_MAX_STEPS: u32 = 12u;
+
+struct SssExit {
+    ok: bool,
+    point: vec3<f32>,
+    normal: vec3<f32>,
+    weight: vec3<f32>,
+}
+
+// Chiang's albedo inversion: the single-scattering albedo whose semi-infinite
+// diffuse reflectance is `a`, for an isotropic phase function.
+fn sss_scatter_albedo(a: f32) -> f32 {
+    let x = clamp(a, 0.0, 1.0);
+    return 1.0 - exp(-5.09406 * x + 2.61188 * x * x - 4.31805 * x * x * x);
+}
+
+fn subsurface_walk(
+    m: GpuMaterial,
+    entry: vec3<f32>,
+    n: vec3<f32>,
+    pixel: vec2<u32>,
+    depth: u32,
+) -> SssExit {
+    var out: SssExit;
+    out.ok = false;
+    out.point = entry;
+    out.normal = n;
+    out.weight = vec3<f32>(0.0);
+
+    let radius = m.subsurface_radius;
+    if radius.x <= 0.0 || radius.y <= 0.0 || radius.z <= 0.0 {
+        return out;
+    }
+    let sigma_t = vec3<f32>(1.0) / radius;
+    let sigma_s = sigma_t
+        * vec3<f32>(
+            sss_scatter_albedo(m.subsurface_color.x),
+            sss_scatter_albedo(m.subsurface_color.y),
+            sss_scatter_albedo(m.subsurface_color.z),
+        );
+
+    // In through the surface, cosine-distributed about the inward normal.
+    let salt = 1201u + depth * 97u;
+    let e0 = rand_uniform2(pixel, salt);
+    let inward = shading_frame(-n, vec3<f32>(0.0));
+    var dir = to_world(inward, cosine_hemisphere_local(e0.x, e0.y));
+    var pos = offset_origin(entry, -n);
+    var weight = vec3<f32>(1.0);
+
+    for (var step = 0u; step < SUBSURFACE_MAX_STEPS; step = step + 1u) {
+        let rs = salt + 13u + step * 31u;
+        let u = rand_uniform2(pixel, rs);
+        // One channel drives the distance; the other two ride along under the
+        // balance heuristic.
+        let ch = min(u32(u.x * 3.0), 2u);
+        let t = -log(max(1.0 - u.y, 1e-7)) / sigma_t[ch];
+
+        let hit = trace_scene(pos, dir);
+        var boundary = MAX_T;
+        if hit.face_idx != 0xFFFFFFFFu {
+            boundary = hit.t;
+        }
+
+        if boundary <= t {
+            let e = exp(-sigma_t * boundary);
+            let pdf = (e.x + e.y + e.z) / 3.0;
+            if pdf <= 0.0 {
+                return out;
+            }
+            weight = weight * e / pdf;
+            var hn = hit_normal(hit);
+            // Face the normal out of the medium: the side the ray was going.
+            if dot(hn, dir) < 0.0 {
+                hn = -hn;
+            }
+            out.ok = true;
+            out.point = pos + dir * boundary;
+            out.normal = hn;
+            out.weight = weight;
+            return out;
+        }
+
+        let e = exp(-sigma_t * t);
+        let pdf = dot(sigma_t * e, vec3<f32>(1.0)) / 3.0;
+        if pdf <= 0.0 {
+            return out;
+        }
+        weight = weight * sigma_s * e / pdf;
+        pos = pos + dir * t;
+        // Isotropic phase function.
+        let p = rand_uniform2(pixel, rs + 7u);
+        let z = 1.0 - 2.0 * p.x;
+        let r = sqrt(max(1.0 - z * z, 0.0));
+        let phi = 2.0 * PI * p.y;
+        dir = normalize(vec3<f32>(r * cos(phi), r * sin(phi), z));
+
+        // Russian roulette on what is left.
+        let q = clamp(max3(weight), 0.0, 1.0);
+        if rand_uniform(pixel, rs + 11u) > q {
+            return out;
+        }
+        weight = weight / q;
+    }
+    return out;
+}
+
 fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>) -> vec4<f32> {
     var l = vec3<f32>(0.0);
     var throughput = vec3<f32>(1.0);
@@ -989,6 +1112,37 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
         let s = bsdf_sample(surf.material, wo_local, eta, lambda_nm, r_lobe, r12.x, r12.y, r_branch);
         if !s.ok {
             break;
+        }
+        if s.sss {
+            // The path leaves the surface entirely: into the object, walk,
+            // and back out somewhere else. Everything after is about the exit.
+            throughput = throughput / s.pdf;
+            let ex = subsurface_walk(surf.material, surf.point, n, pixel, depth);
+            if !ex.ok {
+                break;
+            }
+            throughput = throughput * ex.weight;
+            // Out through the boundary, cosine-distributed: the index-matched
+            // exit the inversion was fitted with, whose f/pdf is exactly 1.
+            let xf = shading_frame(ex.normal, vec3<f32>(0.0));
+            let xe = rand_uniform2(pixel, 1607u + depth * 41u);
+            ray_o = offset_origin(ex.point, ex.normal);
+            ray_d = to_world(xf, cosine_hemisphere_local(xe.x, xe.y));
+            // No NEE strategy found this direction, so an emitter downstream
+            // takes full MIS weight.
+            specular_chain = true;
+            prev_bsdf_pdf = 0.0;
+            if depth >= render_state.rr_start {
+                let q = clamp(max3(throughput), 0.0, 0.95);
+                if rand_uniform(pixel, 1609u + depth * 43u) > q {
+                    break;
+                }
+                throughput = throughput / q;
+            }
+            if max3(throughput) <= 1e-5 {
+                break;
+            }
+            continue;
         }
         throughput = throughput * s.value / s.pdf;
         prev_bsdf_pdf = s.pdf;

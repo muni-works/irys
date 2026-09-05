@@ -27,7 +27,7 @@
 use bytemuck::{Pod, Zeroable};
 use kosm_render::gpu::{GpuContext, GpuMaterial, shaders};
 use kosm_render::math::Vec3;
-use kosm_render::pathtrace::{Pbr, reference_bsdf_eval_at};
+use kosm_render::pathtrace::{Pbr, reference_bsdf_eval_at, reference_lobe_weights};
 
 /// Mirrors `ParityIn` in [`HARNESS`].
 #[repr(C)]
@@ -56,6 +56,10 @@ struct ParityOut {
     resampled: [f32; 4],
     /// `(n(λ), hero_weight(λ))` at the wavelength riding in `wi.w`.
     spectral: [f32; 4],
+    /// `(diffuse, specular, sheen, coat)` lobe-selection probabilities.
+    lobes_a: [f32; 4],
+    /// `(dielectric, subsurface, 0, 0)`.
+    lobes_b: [f32; 4],
 }
 
 /// The compute half: one invocation per input, every entry point the tests use.
@@ -73,6 +77,8 @@ struct ParityOut {
     sampled: vec4<f32>,
     resampled: vec4<f32>,
     spectral: vec4<f32>,
+    lobes_a: vec4<f32>,
+    lobes_b: vec4<f32>,
 }
 
 @group(0) @binding(0) var<storage, read> parity_in: array<ParityIn>;
@@ -94,8 +100,14 @@ fn parity(@builtin(global_invocation_id) gid: vec3<u32>) {
     let e = bsdf_eval(p.material, p.wo.xyz, p.wi.xyz, eta, hero);
     o.eval = vec4<f32>(e.value, e.pdf);
 
+    let lw = lobe_weights(p.material);
+    o.lobes_a = lw.w;
+    o.lobes_b = vec4<f32>(lw.diel, lw.sss, 0.0, 0.0);
+
     let s = bsdf_sample(p.material, p.wo.xyz, eta, hero, p.rnd.x, p.rnd.y, p.rnd.z, p.rnd.w);
-    if s.ok {
+    // A subsurface draw has no direction and no density — the integrator
+    // walks it out of the object — so there is nothing here to compare.
+    if s.ok && !s.sss {
         o.sampled = vec4<f32>(s.wi, s.pdf);
         let r = bsdf_eval(p.material, p.wo.xyz, s.wi, eta, hero);
         o.resampled = vec4<f32>(r.value, r.pdf);
@@ -274,6 +286,27 @@ fn materials() -> Vec<Pbr> {
         ior: 1.7,
         ..base
     });
+    // Subsurface: the weight has to take its share out of the diffuse lobe
+    // and appear in the sampling weights, on both tiers, even though the walk
+    // itself lives in the integrator and not in the BSDF.
+    for v in [0.0f32, 0.35, 1.0] {
+        out.push(Pbr {
+            subsurface: v,
+            subsurface_color: [0.85, 0.45, 0.3],
+            subsurface_radius: [0.004, 0.002, 0.0012],
+            diffuse_roughness: 0.4,
+            ..base
+        });
+    }
+    out.push(Pbr {
+        subsurface: 0.6,
+        subsurface_color: [0.6; 3],
+        subsurface_radius: [0.002; 3],
+        sheen: 0.3,
+        clearcoat: 0.4,
+        thin_film_thickness: 240.0,
+        ..base
+    });
     // Thin films across the whole visible range of thicknesses, over a
     // dielectric and over metals — the two Fresnel paths the film modulates.
     for d in [40.0f32, 180.0, 320.0, 550.0, 900.0] {
@@ -412,6 +445,19 @@ fn gpu_bsdf_eval_matches_the_cpu_reference() {
                 "value channel {c} differs by {rel}: cpu {cf:?} gpu {:?}\n  {m:?}\n  \
                  wo {wo:?} wi {wi:?}",
                 &o.eval[..3]
+            );
+        }
+        // The lobe probabilities are not visible in any single evaluation and
+        // a divergence in them shows up only as noise, so they are checked
+        // outright.
+        let cw = reference_lobe_weights(m);
+        let gw = [
+            o.lobes_a[0], o.lobes_a[1], o.lobes_a[2], o.lobes_a[3], o.lobes_b[0], o.lobes_b[1],
+        ];
+        for i in 0..6 {
+            assert!(
+                (cw[i] - gw[i]).abs() <= 1e-5,
+                "lobe weight {i}: cpu {cw:?} gpu {gw:?}\n  {m:?}"
             );
         }
         let scale = cpdf.abs().max(o.eval[3].abs()).max(1e-3);

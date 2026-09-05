@@ -70,8 +70,16 @@ pub struct GpuMaterial {
     pub thin_film_thickness: f32,
     /// Index of refraction of that film.
     pub thin_film_ior: f32,
-    /// Padding to 16 bytes. The struct is 160 bytes.
+    /// Padding to 16 bytes.
     pub _pad2: [f32; 3],
+    /// Surface colour the subsurface random walk is asked to produce.
+    pub subsurface_color: [f32; 3],
+    /// Padding for 16-byte alignment.
+    pub _pad3: f32,
+    /// Mean free path inside the medium, per channel, in scene units.
+    pub subsurface_radius: [f32; 3],
+    /// Padding for 16-byte alignment. The struct is 192 bytes.
+    pub _pad4: f32,
 }
 
 impl Default for GpuMaterial {
@@ -104,6 +112,10 @@ impl Default for GpuMaterial {
             thin_film_thickness: 0.0,
             thin_film_ior: 1.5,
             _pad2: [0.0; 3],
+            subsurface_color: [1.0; 3],
+            _pad3: 0.0,
+            subsurface_radius: [1.0; 3],
+            _pad4: 0.0,
         }
     }
 }
@@ -190,6 +202,14 @@ impl GpuMaterial {
             thin_film_thickness: p.thin_film_thickness,
             thin_film_ior: p.thin_film_ior,
             _pad2: [0.0; 3],
+            subsurface_color: p.subsurface_color,
+            _pad3: 0.0,
+            subsurface_radius: [
+                p.subsurface_radius[0] as f32,
+                p.subsurface_radius[1] as f32,
+                p.subsurface_radius[2] as f32,
+            ],
+            _pad4: 0.0,
         }
     }
 
@@ -238,6 +258,12 @@ impl GpuMaterial {
             thin_walled: self.thin_walled != 0.0,
             thin_film_thickness: self.thin_film_thickness,
             thin_film_ior: self.thin_film_ior,
+            subsurface_color: self.subsurface_color,
+            subsurface_radius: [
+                self.subsurface_radius[0] as f64,
+                self.subsurface_radius[1] as f64,
+                self.subsurface_radius[2] as f64,
+            ],
             emissive: [0.0; 3],
         }
     }
@@ -933,8 +959,9 @@ mod layout_tests {
         // vec4 color, twelve scalars, then four more 16-byte rows: sheen_color
         // + transmission, attenuation_color + distance, the four dispersion
         // scalars, the two Sellmeier triples with their padding, and the
-        // thin film's thickness and index.
-        assert_eq!(std::mem::size_of::<GpuMaterial>(), 160);
+        // thin film's thickness and index, and the subsurface medium's
+        // colour and per-channel mean free path.
+        assert_eq!(std::mem::size_of::<GpuMaterial>(), 192);
         assert_eq!(std::mem::align_of::<GpuMaterial>(), 4);
     }
 }
