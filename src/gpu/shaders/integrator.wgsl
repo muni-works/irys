@@ -1116,7 +1116,7 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
         if s.sss {
             // The path leaves the surface entirely: into the object, walk,
             // and back out somewhere else. Everything after is about the exit.
-            throughput = throughput / s.pdf;
+            throughput = throughput * s.value / s.pdf;
             let ex = subsurface_walk(surf.material, surf.point, n, pixel, depth);
             if !ex.ok {
                 break;

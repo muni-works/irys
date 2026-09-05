@@ -2633,12 +2633,16 @@ fn bsdf_sample(
         }
         wi
     } else if w[5] > 0.0 && u >= w[0] + w[1] + w[2] + w[3] + w[4] {
-        // Into the object. The walk carries its own colour — that is what the
-        // albedo inversion buys — so all the lobe choice costs is its own
-        // probability. The `w[5] > 0` guard keeps a material without a
-        // subsurface lobe on exactly the branch chain it was on before this
-        // lobe existed, comparison for comparison.
-        return Some(Sampled::Subsurface([1.0 / w[5]; 3]));
+        // Into the object. The walk carries its own *colour* — that is what
+        // the albedo inversion buys — but not its own *weight*: the diffuse
+        // lobe above gave up exactly `subsurface` of itself, so that is what
+        // this lobe is worth, and the division is the lobe choice's own
+        // probability. Together the two sum to `(1 - s)·rho + s·A`, which is
+        // the whole reason the surface's albedo does not move when the
+        // subsurface weight does. The `w[5] > 0` guard keeps a material
+        // without a subsurface lobe on exactly the branch chain it was on
+        // before this lobe existed, comparison for comparison.
+        return Some(Sampled::Subsurface([m.subsurface / w[5]; 3]));
     } else if u < w[0] + w[1] + w[2] + w[3] {
         let ca = m.coat_alpha();
         let wh = sample_gtr1(ca, r1, r2);
@@ -2692,6 +2696,48 @@ fn bsdf_sample(
 #[inline]
 fn reflect(i: Vec3, n: Vec3) -> Vec3 {
     i - n * (2.0 * i.dot(n))
+}
+
+/// How many thin transmissive sheets one shadow ray may cross before it is
+/// declared blocked.
+///
+/// A window is one pane, a double glazing two, a display case in a lit room
+/// perhaps four. Past that the light is not meaningfully getting through and
+/// the traversal cost is not worth paying, so the cap is both a physical
+/// judgement and a loop bound.
+pub const MAX_SHADOW_SHEETS: usize = 4;
+
+/// The fraction of a shadow ray that survives one thin transmissive sheet, or
+/// `None` if the surface is an honest blocker.
+///
+/// `cos_dot` is the (signed) dot of the surface normal with the ray
+/// direction; only its magnitude matters, a pane filters the same from either
+/// side.
+///
+/// The Fresnel factor is the same single-interface `1 − F` the thin-walled
+/// branch of [`dielectric_eval`] applies, so a NEE path and a BSDF path
+/// through the same pane carry the same weight — the condition for MIS to
+/// combine them without double counting.
+///
+/// The result is achromatic because the thin-walled lobe is: this renderer's
+/// sheet has no interior, so there is no path length for Beer–Lambert to act
+/// over and no tint in the BSDF to match. A coloured pane would need both
+/// changed together.
+fn sheet_transmittance(m: &Pbr, cos_dot: f64) -> Option<[f32; 3]> {
+    if !m.thin_walled || m.transmission <= 0.0 {
+        return None;
+    }
+    // A rough sheet scatters, and the straight-line shadow ray is only the
+    // right answer in the smooth limit. Taper to zero as the lobe opens up,
+    // so a frosted pane blocks exactly as it did before.
+    let clarity = (1.0 - m.alpha()).clamp(0.0, 1.0);
+    if clarity <= 0.0 {
+        return None;
+    }
+    let cos = (cos_dot.abs() as f32).clamp(0.0, 1.0);
+    let f = fresnel_dielectric(cos, m.ior.max(1.0));
+    let t = m.transmission * (1.0 - f) * clarity;
+    if t <= 0.0 { None } else { Some([t; 3]) }
 }
 
 /// Power heuristic (β = 2) for multiple importance sampling.
@@ -2898,21 +2944,89 @@ impl<G: Geometry> Scene<G> {
     /// A true any-hit traversal: it returns at the first blocker rather than
     /// finding the nearest one and then comparing distance, which is strictly
     /// more work than a shadow ray needs.
+    ///
+    /// Kept as the fast path for the common case; light sampling goes through
+    /// [`Scene::shadow_transmittance`], which can see *through* a pane.
+    #[allow(dead_code)]
     fn occluded(&self, accel: &SceneAccel<G>, origin: Point3, dir: Vec3, max_dist: f64) -> bool {
-        let ray = Ray::new(origin, dir);
-        if accel.tlas.occluded_range(&ray, 1e-6, max_dist - 1e-6) {
-            return true;
-        }
+        self.shadow_transmittance(accel, origin, dir, max_dist)
+            .is_none()
+    }
+
+    /// How much of a light's radiance survives the trip from `origin` along
+    /// `dir` to `max_dist` — `None` when the ray is blocked outright.
+    ///
+    /// The material-blind any-hit test this replaces made a window pane an
+    /// opaque wall: NEE found a blocker and returned black, so a room lit
+    /// through glass could only be lit by paths that *happened* to refract
+    /// into the sun, which at any sane spp is never. That is why the court's
+    /// clerestory had to be cut open.
+    ///
+    /// A thin-walled transmissive sheet is not a blocker, it is a filter. It
+    /// has no interior for a ray to travel through and no lateral offset
+    /// (see [`Pbr::thin_walled`]), so the shadow ray carries straight on with
+    /// its throughput multiplied by the sheet's transmittance. The factor is
+    /// exactly the one [`dielectric_eval`]'s thin-walled branch applies to a
+    /// BSDF-sampled path — `transmission · (1 − F(cos θ))` — so the two
+    /// strategies estimate the same integral and MIS stays consistent. (It is
+    /// *not* `(1 − F)²`: this renderer's sheet is a single Fresnel interface
+    /// with `R + T = 1`, and a shadow ray that disagreed with the BSDF by a
+    /// second factor of `(1 − F)` would double-count under MIS in one
+    /// direction and lose energy in the other.)
+    ///
+    /// Frosted glass is *not* handled: a rough sheet scatters, and pretending
+    /// the light arrives along the straight line is only right in the smooth
+    /// limit. The transmittance is therefore weighted by the sheet's
+    /// specular lobe narrowness — a fully rough pane blocks as before.
+    ///
+    /// At most [`MAX_SHADOW_SHEETS`] panes are crossed; a shadow ray that
+    /// finds more is treated as blocked, which bounds the traversal cost and
+    /// keeps a stack of panes from turning into an unbounded loop.
+    fn shadow_transmittance(
+        &self,
+        accel: &SceneAccel<G>,
+        origin: Point3,
+        dir: Vec3,
+        max_dist: f64,
+    ) -> Option<[f32; 3]> {
+        let limit = max_dist - 1e-6;
         if let Some(g) = &self.ground {
-            let d = ray.direction.into_inner();
+            let d = dir;
             if d.z.abs() > 1e-12 {
                 let t = (g.z - origin.z) / d.z;
-                if t > 1e-6 && t < max_dist - 1e-6 {
-                    return true;
+                if t > 1e-6 && t < limit {
+                    return None;
                 }
             }
         }
-        false
+
+        let ray = Ray::new(origin, dir);
+        let mut tr = [1.0f32; 3];
+        let mut t0 = 1e-6;
+        let mut crossed = 0usize;
+        loop {
+            let Some(found) = accel.tlas.trace_closest_range(&ray, t0, limit) else {
+                return Some(tr);
+            };
+            if crossed == MAX_SHADOW_SHEETS {
+                // More sheets than the cap allows: fall back to opaque.
+                return None;
+            }
+            crossed += 1;
+            let m = &self.objects[found.payload].material;
+            let Some(sheet) = sheet_transmittance(m, found.hit.normal.into_inner().dot(dir))
+            else {
+                return None;
+            };
+            tr = mul3(tr, sheet);
+            if max3(tr) <= 1e-6 {
+                return None;
+            }
+            t0 = found.hit.t + 1e-6;
+            if t0 >= limit {
+                return Some(tr);
+            }
+        }
     }
 
     /// Next-event estimation: sample *one* area light, drawn from the
@@ -2976,12 +3090,12 @@ impl<G: Geometry> Scene<G> {
             return [0.0; 3];
         }
 
-        if self.occluded(accel, p + n * 1e-5, wi_world, dist) {
+        let Some(tr) = self.shadow_transmittance(accel, p + n * 1e-5, wi_world, dist) else {
             return [0.0; 3];
-        }
+        };
 
         let w = power_heuristic(light_pdf, bsdf_pdf);
-        scale3(mul3(f, light.emission), w / light_pdf)
+        scale3(mul3(mul3(f, light.emission), tr), w / light_pdf)
     }
 
     /// Next-event estimation against the environment, MIS-weighted against
@@ -3018,11 +3132,12 @@ impl<G: Geometry> Scene<G> {
         }
         // The environment is at infinity: nothing between here and the sky
         // may block, so the shadow ray is unbounded.
-        if self.occluded(accel, p + n * 1e-5, wi_world, f64::INFINITY) {
+        let Some(tr) = self.shadow_transmittance(accel, p + n * 1e-5, wi_world, f64::INFINITY)
+        else {
             return [0.0; 3];
-        }
+        };
         let w = power_heuristic(env_pdf, bsdf_pdf);
-        scale3(mul3(f, li), w / env_pdf)
+        scale3(mul3(mul3(f, li), tr), w / env_pdf)
     }
 
     /// Next-event estimation against the sun disc, MIS-weighted against BSDF
@@ -3056,11 +3171,12 @@ impl<G: Geometry> Scene<G> {
             return [0.0; 3];
         }
         // The sun is at infinity, so the shadow ray is unbounded.
-        if self.occluded(accel, p + n * 1e-5, wi_world, f64::INFINITY) {
+        let Some(tr) = self.shadow_transmittance(accel, p + n * 1e-5, wi_world, f64::INFINITY)
+        else {
             return [0.0; 3];
-        }
+        };
         let w = power_heuristic(sun_pdf, bsdf_pdf);
-        scale3(mul3(f, li), w / sun_pdf)
+        scale3(mul3(mul3(f, li), tr), w / sun_pdf)
     }
 }
 
@@ -4169,6 +4285,181 @@ mod tests {
         }
     }
 
+    /// An axis-aligned quad in the z = `z` plane, spanning ±`half` in x and y.
+    fn pane_mesh(z: f64, half: f64) -> TriMesh {
+        let p = |x, y| Point3::new(x, y, z);
+        let positions = vec![p(-half, -half), p(half, -half), p(half, half), p(-half, half)];
+        TriMesh::new(positions, Vec::new(), &[0, 1, 2, 0, 2, 3])
+    }
+
+    /// A smooth thin-walled pane of ordinary window glass.
+    fn window_glass() -> Pbr {
+        Pbr {
+            transmission: 1.0,
+            thin_walled: true,
+            roughness: 0.0,
+            ior: 1.5,
+            ..Pbr::glass(1.5, 0.0)
+        }
+    }
+
+    /// Mean NEE estimate at the origin on a white Lambertian floor facing +z.
+    fn nee_mean(scene: &Scene<TriMesh>, n: usize) -> f64 {
+        let accel = SceneAccel::build(scene);
+        let m = Pbr {
+            base_color: [1.0; 3],
+            metallic: 0.0,
+            roughness: 1.0,
+            ..Pbr::default()
+        };
+        let frame = shading_frame(Vec3::new(0.0, 0.0, 1.0), None);
+        let wo_local = Vec3::new(0.0, 0.0, 1.0);
+        let mut rng = Rng::new(0x9e3779b97f4a7c15);
+        let mut sum = 0.0f64;
+        for _ in 0..n {
+            let e = scene.sample_lights(
+                &accel,
+                Point3::new(0.0, 0.0, 0.0),
+                &frame,
+                wo_local,
+                &m,
+                1.0,
+                0.0,
+                &mut rng,
+            );
+            sum += luminance(e) as f64;
+        }
+        sum / n as f64
+    }
+
+    /// A shadow ray must see *through* a pane of glass, dimmed by exactly the
+    /// factor the thin-walled BSDF applies to a refracted path.
+    ///
+    /// The old material-blind any-hit test returned black here, which is why
+    /// a room could not be lit through a window at any sample count.
+    #[test]
+    fn next_event_passes_through_a_thin_pane() {
+        let light = panel(Point3::new(0.0, 0.0, 6.0), [10.0; 3], 0.35);
+        let open = open_scene(vec![light]);
+        let mut glazed = open_scene(vec![light]);
+        glazed.objects.push(Object::new(
+            Arc::new(Bvh::build(pane_mesh(3.0, 4.0))),
+            window_glass(),
+        ));
+
+        let n = 200_000;
+        let bare = nee_mean(&open, n);
+        let through = nee_mean(&glazed, n);
+        assert!(bare > 0.0, "the open scene must be lit at all");
+
+        // The light is small and nearly overhead, so every shadow ray meets
+        // the pane within a few degrees of normal incidence.
+        let f = fresnel_dielectric(1.0, 1.5);
+        let expected = (1.0 - f) as f64;
+        let ratio = through / bare;
+        assert!(
+            (ratio - expected).abs() < 0.02 * expected,
+            "pane transmittance {ratio} is not within 2% of {expected}"
+        );
+    }
+
+    /// A stack of panes deeper than the cap is an honest blocker, so the
+    /// traversal cannot run away.
+    #[test]
+    fn a_shadow_ray_gives_up_past_the_sheet_cap() {
+        let light = panel(Point3::new(0.0, 0.0, 6.0), [10.0; 3], 0.35);
+        let mut stacked = open_scene(vec![light]);
+        for i in 0..(MAX_SHADOW_SHEETS + 1) {
+            stacked.objects.push(Object::new(
+                Arc::new(Bvh::build(pane_mesh(1.0 + i as f64 * 0.5, 4.0))),
+                window_glass(),
+            ));
+        }
+        assert_eq!(nee_mean(&stacked, 4_000), 0.0);
+    }
+
+    /// A frosted pane still blocks: the straight-line shadow ray is only the
+    /// right answer in the smooth limit, so a wide lobe tapers it away.
+    #[test]
+    fn a_frosted_pane_still_blocks_the_shadow_ray() {
+        let light = panel(Point3::new(0.0, 0.0, 6.0), [10.0; 3], 0.35);
+        let mut frosted = open_scene(vec![light]);
+        frosted.objects.push(Object::new(
+            Arc::new(Bvh::build(pane_mesh(3.0, 4.0))),
+            Pbr {
+                roughness: 1.0,
+                ..window_glass()
+            },
+        ));
+        assert_eq!(nee_mean(&frosted, 4_000), 0.0);
+    }
+
+    /// The *whole* estimator — NEE and BSDF sampling combined under MIS —
+    /// must land on the same `(1 − F)` factor the single strategy does. If
+    /// the two disagreed, MIS would double count the refracted path in one
+    /// direction and lose it in the other; agreement is the check.
+    #[test]
+    fn a_converged_render_through_a_pane_matches_the_single_strategy() {
+        let floor = || {
+            Object::new(
+                Arc::new(Bvh::build(pane_mesh(0.0, 6.0))),
+                Pbr {
+                    base_color: [1.0; 3],
+                    metallic: 0.0,
+                    roughness: 1.0,
+                    specular: 0.0,
+                    ..Pbr::default()
+                },
+            )
+        };
+        let light = panel(Point3::new(0.0, 0.0, 6.0), [10.0; 3], 0.35);
+        let camera = Camera::look_at(
+            Point3::new(0.0, -0.01, 2.0),
+            Point3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            30.0,
+        );
+        let opts = PathTraceOptions {
+            spp: 400,
+            max_depth: 4,
+            firefly_clamp: None,
+            denoise: false,
+            show_background: false,
+            ..PathTraceOptions::default()
+        };
+
+        let mean = |with_pane: bool| -> f64 {
+            let mut scene = open_scene(vec![light]);
+            scene.objects.push(floor());
+            if with_pane {
+                scene.objects.push(Object::new(
+                    Arc::new(Bvh::build(pane_mesh(3.0, 5.0))),
+                    window_glass(),
+                ));
+            }
+            let film = render(&scene, &camera, 24, 24, &opts);
+            let mut sum = 0.0f64;
+            for i in 0..(24 * 24) {
+                sum += luminance([
+                    film.rgb[i * 3],
+                    film.rgb[i * 3 + 1],
+                    film.rgb[i * 3 + 2],
+                ]) as f64;
+            }
+            sum / (24.0 * 24.0)
+        };
+
+        let bare = mean(false);
+        let glazed = mean(true);
+        assert!(bare > 0.0);
+        let expected = (1.0 - fresnel_dielectric(1.0, 1.5)) as f64;
+        let ratio = glazed / bare;
+        assert!(
+            (ratio - expected).abs() < 0.03 * expected,
+            "converged ratio {ratio} is not within 3% of {expected}"
+        );
+    }
+
     /// One light per bounce, drawn from the power table and divided by its
     /// pick probability, must integrate to the same direct lighting as
     /// shadow-raying every light. Two lights of very different power, so a
@@ -5194,6 +5485,71 @@ mod tests {
                 assert!(
                     (got - target).abs() <= 0.03 * target,
                     "channel {c}: walked {got}, asked for {target}"
+                );
+            }
+        }
+    }
+
+    /// The weight moves energy between two lobes; it does not add any.
+    ///
+    /// With `subsurface_color` set to the surface's own diffuse albedo, the
+    /// total directional albedo — the diffuse lobe plus everything the walk
+    /// brings back out — must be the same number at every `subsurface`
+    /// weight. This is the invariant the composition exists to have, and the
+    /// one an entry weight of `1/P(lobe)` instead of `subsurface/P(lobe)`
+    /// silently breaks: nothing else in the model notices, and the object
+    /// simply gets brighter as the knob turns.
+    #[test]
+    fn the_subsurface_weight_moves_energy_and_does_not_make_it() {
+        let albedo = [0.6f32, 0.45, 0.3];
+        let mut totals = Vec::new();
+        for weight in [0.0f32, 0.5, 1.0] {
+            let m = Pbr {
+                base_color: albedo,
+                roughness: 0.5,
+                subsurface: weight,
+                subsurface_color: albedo,
+                subsurface_radius: [0.01; 3],
+                ..Default::default()
+            };
+            let wo = Vec3::new(0.0, 0.0, 1.0);
+            let mut rng = Rng::new(0x5b55_0005);
+            let n = 40_000;
+            let mut acc = [0.0f64; 3];
+            for _ in 0..n {
+                match bsdf_sample(&m, wo, 1.0, 0.0, &mut rng) {
+                    Some(Sampled::Surface(_, f, pdf)) => {
+                        for c in 0..3 {
+                            acc[c] += (f[c] / pdf) as f64;
+                        }
+                    }
+                    Some(Sampled::Subsurface(entry)) => {
+                        if let Some(e) = subsurface_walk(
+                            &m,
+                            Point3::new(0.0, 0.0, 0.0),
+                            Vec3::new(0.0, 0.0, 1.0),
+                            &mut rng,
+                            slab_trace(f64::INFINITY),
+                        ) {
+                            for c in 0..3 {
+                                acc[c] += (entry[c] * e.weight[c]) as f64;
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+            totals.push([
+                acc[0] / n as f64,
+                acc[1] / n as f64,
+                acc[2] / n as f64,
+            ]);
+        }
+        for t in &totals {
+            for c in 0..3 {
+                assert!(
+                    (t[c] - totals[0][c]).abs() <= 0.02 * totals[0][c],
+                    "albedo moved with the weight: {totals:?}"
                 );
             }
         }

@@ -1511,11 +1511,12 @@ fn bsdf_sample(
             return out;
         }
     } else if lw.sss > 0.0 && r_lobe >= w.x + w.y + w.z + w.w + lw.diel {
-        // Into the object. The walk carries its own colour — that is what the
-        // albedo inversion buys — so the lobe choice costs only its own
-        // probability. The `lw.sss > 0` guard keeps a material without a
+        // Into the object. The walk carries its own *colour* — that is what
+        // the albedo inversion buys — but not its own *weight*: the diffuse
+        // lobe gave up exactly `subsurface` of itself, so that is what this
+        // lobe is worth. The `lw.sss > 0` guard keeps a material without a
         // subsurface lobe on exactly the branch chain it was on before.
-        out.value = vec3<f32>(1.0);
+        out.value = vec3<f32>(m.subsurface);
         out.pdf = lw.sss;
         out.ok = true;
         out.sss = true;
