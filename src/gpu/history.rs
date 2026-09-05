@@ -1485,7 +1485,19 @@ impl RayTracePipeline {
                 spatial_variance: u32::from(denoise.spatial_variance),
                 _pad0: 0,
                 _pad1: 0,
-            };
+                            budget_enabled: 0,
+                budget_bias: 0.0,
+                budget_rounds: 0,
+                budget_round: 0,
+                rays_per_frame: 0.0,
+                budget_radius: 0,
+                budget_floor_k: 0,
+                budget_frame: 0,
+                _pad2: 0,
+                _pad3: 0,
+                _pad4: 0,
+                _pad5: 0,
+};
             ctx.queue
                 .write_buffer(&hist.params, 0, bytemuck::bytes_of(&base));
         }
