@@ -11,6 +11,7 @@ mod buffers;
 mod context;
 pub mod geometry;
 mod history;
+pub mod neural;
 mod pipeline;
 mod resident;
 mod scene;
@@ -35,6 +36,7 @@ pub use history::{
     GpuDenoiseParams, History, HistoryBuffers, HistoryPipeline, InstanceMotion, MAX_DENOISE_ITERS,
     atrous_iters_for,
 };
+pub use neural::{NeuralDenoiser, NeuralPipeline};
 pub use pipeline::RayTracePipeline;
 pub use resident::ResidentScene;
 pub use scene::{NoGeometry, SceneRef};

@@ -404,9 +404,13 @@ pub struct HistoryBuffers {
     width: u32,
     height: u32,
     /// (linear radiance, coverage), the running mean.
-    mean: wgpu::Buffer,
+    ///
+    /// Visible to the `gpu` module because the neural denoiser in
+    /// [`super::neural`] reads it, the stats and the à-trous scratch directly
+    /// — it stands exactly where a wavelet iteration stands.
+    pub(super) mean: wgpu::Buffer,
     /// (count, luminance sum, luminance-squared sum, variance of the mean).
-    stats: wgpu::Buffer,
+    pub(super) stats: wgpu::Buffer,
     /// The caller's keep mask, widened to one `u32` per pixel.
     keep: wgpu::Buffer,
     /// The *previous* pass's guide plane 1 — (normal, distance from that
@@ -422,8 +426,8 @@ pub struct HistoryBuffers {
     /// One frame's packed [`InstanceMotion`], or a stub when nothing moved.
     motion: wgpu::Buffer,
     /// (illumination, variance) ping-pong for the wavelet iterations.
-    scratch_a: wgpu::Buffer,
-    scratch_b: wgpu::Buffer,
+    pub(super) scratch_a: wgpu::Buffer,
+    pub(super) scratch_b: wgpu::Buffer,
     /// One uniform slot per pass; see [`PARAM_SLOTS`].
     params: wgpu::Buffer,
     /// Staging for [`RayTracePipeline::read_history`], allocated on first use.
@@ -1202,6 +1206,133 @@ impl RayTracePipeline {
             &ab,
             0,
             groups,
+            "History Resolve",
+        );
+
+        ctx.queue.submit(Some(encoder.finish()));
+        Ok(())
+    }
+
+    /// [`RayTracePipeline::denoise_and_resolve_resident`] with the learned
+    /// filter in place of the à-trous chain.
+    ///
+    /// The two are interchangeable by construction. The network reads the
+    /// same running mean, the same per-pixel statistics and the same guide
+    /// planes a wavelet iteration reads, and writes the same
+    /// `(illumination, variance)` scratch buffer; `resolve` then remodulates
+    /// by the albedo, fades the filter out as the history grows and tonemaps,
+    /// with no idea which of the two produced what it is reading. So a host
+    /// switches denoisers by calling a different method, and nothing else
+    /// about its frame changes.
+    ///
+    /// `denoise` is still honoured for everything that is not the filter
+    /// itself — the exposure and the count cutoff — while its `iters`,
+    /// `sigma_*` and variance settings are simply not consulted, because the
+    /// network has no analogue of them. The cutoff is copied onto the
+    /// denoiser, so one field governs both tiers.
+    ///
+    /// `neural` is resized here if the scene has been; see
+    /// [`super::neural::NeuralDenoiser::ensure`].
+    ///
+    /// `target` must be a view of an `Rgba8Unorm` texture with
+    /// `STORAGE_BINDING` usage, at least the resident scene's size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_and_resolve_resident_neural(
+        &self,
+        ctx: &GpuContext,
+        history_pipeline: &HistoryPipeline,
+        neural_pipeline: &super::neural::NeuralPipeline,
+        neural: &mut super::neural::NeuralDenoiser,
+        res: &mut ResidentScene,
+        denoise: &GpuDenoiseParams,
+        target: &wgpu::TextureView,
+    ) -> Result<(), GpuError> {
+        let (w, h) = res.size();
+        res.ensure_history(ctx, w, h);
+        neural.ensure(ctx, w, h);
+        neural.set_count_cutoff(denoise.count_cutoff.max(1));
+
+        {
+            let hist = res.history().expect("history was just ensured");
+            // Slot 0 is the resolve's. `iters` is 1 rather than the caller's
+            // count: to `resolve` it is not a wavelet iteration count, it is
+            // the flag for "a filtered image is waiting in the scratch".
+            // `src_is_b` is 0 because the network writes A.
+            let base = HistoryParams {
+                width: w,
+                height: h,
+                count_cutoff: denoise.count_cutoff.max(1),
+                iters: 1,
+                sigma_lum: denoise.sigma_lum,
+                sigma_depth: denoise.sigma_depth,
+                sigma_normal: denoise.sigma_normal,
+                exposure: denoise.exposure,
+                stride: 1,
+                src_is_b: 0,
+                scissor_xy: 0,
+                scissor_wh: 0,
+                cur_eye: [0.0; 4],
+                cur_right: [0.0; 4],
+                cur_up: [0.0; 4],
+                cur_forward: [0.0; 4],
+                prev_eye: [0.0; 4],
+                prev_right: [0.0; 4],
+                prev_up: [0.0; 4],
+                prev_forward: [0.0; 4],
+                view_params: [0.0; 4],
+                reprojected: 0,
+                iter_index: 0,
+                origin_x: 0,
+                origin_y: 0,
+                history_cap: denoise.history_cap.max(1),
+                clamp_k: denoise.clamp_k.max(0.0),
+                clamp_reset: denoise.clamp_reset.max(1),
+                motion_instances: 0,
+                motion_ids: 0,
+                spatial_variance: u32::from(denoise.spatial_variance),
+                _pad0: 0,
+                _pad1: 0,
+            };
+            ctx.queue
+                .write_buffer(&hist.params, 0, bytemuck::bytes_of(&base));
+        }
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Neural Denoise Encoder"),
+            });
+
+        let (raw, guides) = res.raw_and_guide_buffers();
+        let hist = res.history().expect("history was just ensured");
+
+        neural.record(
+            ctx,
+            neural_pipeline,
+            &mut encoder,
+            guides,
+            &hist.mean,
+            &hist.stats,
+            &hist.scratch_a,
+        );
+
+        let ab = history_bind_group(
+            ctx,
+            history_pipeline,
+            hist,
+            raw,
+            guides,
+            &hist.scratch_a,
+            &hist.scratch_b,
+            Some(target),
+            "History Bind Group A->B",
+        );
+        dispatch(
+            &mut encoder,
+            &history_pipeline.resolve,
+            &ab,
+            0,
+            (w.div_ceil(8), h.div_ceil(8)),
             "History Resolve",
         );
 
