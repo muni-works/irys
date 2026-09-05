@@ -24,12 +24,16 @@
 //   budget_blur_x   dilate the motion drive by the filter radius, horizontally
 //   budget_blur_y   ...and vertically, then sum the frame's weight
 //   budget_normalize  scale the weights so they sum to `rays_per_frame`
+//   budget_assigned/_rescale  put back what the clamps took
+//   budget_select   turn b(p) into the set of rounds pixel p takes
 //
-// `accumulate` then folds pixel p's sample on round r only when p's coin comes
-// up, at probability b(p)/rounds. Selection is independent of the sample's
-// value, so the mean of what is folded is unbiased — the 1/p reweighting a
-// value-dependent scheme would need is not needed here, and would only add
-// variance.
+// The last pass is what makes the budget cost what it places. Selection is
+// independent of the sample's value, so the mean of what is folded is
+// unbiased — the 1/p reweighting a value-dependent scheme would need is not
+// needed here, and would only add variance — and because it depends on
+// nothing the trace produces it can be decided *before* the trace. It is
+// written where `integrator.wgsl` can read it, and a pixel that will not fold
+// this round is never traced.
 
 // One pixel's four drives and its budget:
 //   .x  the motion drive, dilated by the two blur passes
@@ -111,6 +115,53 @@ const IMAGE_GAIN: f32 = 3.0;
 
 fn budget_drive(x: f32) -> f32 {
     return clamp(x, 0.0, DRIVE_MAX);
+}
+
+// The 8x8 tile a pixel is in — which is one workgroup of the trace.
+//
+// Everything stochastic about the selection is keyed on the tile rather than
+// the pixel, and that is not a detail: a GPU traces a workgroup, not a pixel.
+// A per-pixel dither scatters the selected pixels evenly over the frame, so
+// every workgroup holds one and every workgroup runs — the skip saves the
+// *rays* and none of the time, which is the whole point of it. Keyed on the
+// tile, a converged patch of wall takes the same one round in all 64 of its
+// pixels and the other three rounds do not dispatch it at all.
+//
+// What is given up is the fine-grained decorrelation of neighbouring pixels'
+// round sets. Each pixel still takes exactly floor(b) or ceil(b) rounds, so
+// the count and its expectation are untouched; only which pixels share a
+// round moves, and the equal-samples comparison says it costs nothing.
+fn budget_tile(px: vec2<u32>) -> u32 {
+    return (px.y >> 3u) * ((params.width + 7u) >> 3u) + (px.x >> 3u);
+}
+
+// The dither that decides the fractional part of a pixel's round count: its
+// tile's own hash of (tile, frame), so the cost of a fractional budget is
+// spread over the frame rather than landing on one round of it.
+fn budget_dither(px: vec2<u32>) -> f32 {
+    var h = budget_tile(px) * 73856093u ^ params.budget_frame * 83492791u;
+    h = h ^ (h >> 16u);
+    h = h * 2246822519u;
+    h = h ^ (h >> 13u);
+    h = h * 3266489917u;
+    h = h ^ (h >> 16u);
+    return f32(h) * (1.0 / 4294967296.0);
+}
+
+// Guide plane 3 is the selection mask: one word per pixel in `.x`, bit `r`
+// set when the pixel folds round `r`. It rides in the guide buffer because
+// `integrator.wgsl` already binds all ten storage buffers a browser
+// guarantees and has no room for another — the same reason ReSTIR's
+// reservoirs live there. A whole vec4 for one word wastes twelve bytes a
+// pixel and is worth it: packing four pixels into one vec4 puts four
+// invocations on one 16-byte word, and the components are not independent
+// enough on every backend for that to come back the way it went in.
+fn budget_mask_store(i: u32, word: u32) {
+    guides[3u * n_pixels() + i].x = bitcast<f32>(word);
+}
+
+fn budget_mask_load(i: u32) -> u32 {
+    return bitcast<u32>(guides[3u * n_pixels() + i].x);
 }
 
 // Pass 0: what each pixel's three inputs say, before any dilation.
@@ -325,10 +376,13 @@ fn budget_normalize(@builtin(global_invocation_id) gid: vec3<u32>) {
     // The starvation floor. A pixel whose weight rounds to nothing would
     // never be looked at again, and a scene it stopped agreeing with would
     // never be noticed. Every `budget_floor_k` frames each pixel is
-    // guaranteed one sample; the phase is the pixel's own, so the cost is
-    // spread evenly over the k frames rather than landing on one of them.
+    // guaranteed one sample; the phase is its tile's, so the cost is spread
+    // evenly over the k frames rather than landing on one of them — and a
+    // tile rather than a pixel because a floor scattered pixel by pixel puts
+    // one floored pixel in every workgroup of the frame, and a workgroup with
+    // one pixel in it costs what a full one does.
     let k = max(params.budget_floor_k, 1u);
-    if k == 1u || (params.budget_frame + i) % k == 0u {
+    if k == 1u || (params.budget_frame + budget_tile(gid.xy)) % k == 0u {
         b = max(b, 1.0);
     }
 
@@ -365,8 +419,64 @@ fn budget_rescale(@builtin(global_invocation_id) gid: vec3<u32>) {
     let v = budget[i];
     var b = v.w * scale;
     let k = max(params.budget_floor_k, 1u);
-    if k == 1u || (params.budget_frame + i) % k == 0u {
+    if k == 1u || (params.budget_frame + budget_tile(gid.xy)) % k == 0u {
         b = max(b, 1.0);
     }
     budget[i] = vec4<f32>(v.x, v.y, v.z, clamp(b, 0.0, cap));
+}
+
+// ─── pass 5: which rounds each pixel takes ────────────────────────────────
+//
+// The selection used to live inside `accumulate`, one round at a time, and
+// the trace knew nothing about it: every round traced the whole frame and the
+// fold threw away the samples the budget had not asked for. Four rounds of
+// rays to place one frame's worth of samples — the placement was directed and
+// the *cost* was not.
+//
+// So it is decided here instead, once, for every round at once, and written
+// where the trace can read it: guide plane 3, bit `r` of a pixel's word set
+// when the pixel folds round `r`. `integrator.wgsl` reads that word at the
+// top of its entry point and returns before casting a ray; `accumulate` reads
+// the same word rather than re-deriving it, so the two can never disagree
+// about which rounds a pixel took.
+//
+// Which rounds, given b(p), is now a question about *workgroups*. A pixel
+// takes floor(b) or ceil(b) of them either way — that is what keeps the count
+// where the budget put it, and 1/sqrt(count) is convex enough that a count
+// scattering around b is worse than a count that is b — but which ones is
+// free, and the trace pays per workgroup, not per pixel. So:
+//
+//   * the floor(b) certain rounds are the *low* ones. A pixel with b >= 1 is
+//     traced on round 0 and up, never on a round chosen at random, so the
+//     rounds a tile is busy on are a prefix and the tail of the frame is the
+//     handful of tiles with real work left in them.
+//   * the fractional round is round floor(b) — the next one up — taken when
+//     the *tile's* dither falls under frac(b). The dither is the tile's, not
+//     the pixel's, so a converged patch of wall decides together rather than
+//     scattering one lit pixel into every workgroup of the frame.
+//
+// The expectation is floor(b) + frac(b) = b either way, which is the only
+// thing the budget's accounting rests on.
+@compute @workgroup_size(8, 8)
+fn budget_select(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if !in_bounds(gid) {
+        return;
+    }
+    let i = flat_index(gid);
+    let rounds = max(params.budget_rounds, 1u);
+    let b = clamp(budget[i].w, 0.0, f32(rounds));
+    let whole = min(u32(floor(b)), rounds);
+
+    // The certain rounds: 0 .. whole.
+    var word = 0u;
+    if whole >= 32u {
+        word = 0xFFFFFFFFu;
+    } else {
+        word = (1u << whole) - 1u;
+    }
+    // And the fractional one, on the tile's coin.
+    if whole < rounds && budget_dither(gid.xy) < b - f32(whole) {
+        word = word | (1u << whole);
+    }
+    budget_mask_store(i, word);
 }

@@ -29,8 +29,8 @@ pub use analytic::{AnalyticGeometry, AnalyticPrim};
 pub use budget::{Budget, SampleBudget};
 pub use buffers::{
     DEFAULT_ENV_INTENSITY, DEFAULT_FIREFLY_CLAMP, DEFAULT_MAX_DEPTH, DEFAULT_RR_START,
-    FLAG_CAMERA_VISIBLE_LIGHTS, FLAG_RAW_SAMPLE, GpuAreaLight, GpuCamera, GpuMaterial,
-    GpuRenderState, depth_for_frame, pack_light_power_table,
+    FLAG_BUDGET_GUIDES, FLAG_BUDGET_MASK, FLAG_CAMERA_VISIBLE_LIGHTS, FLAG_RAW_SAMPLE,
+    GpuAreaLight, GpuCamera, GpuMaterial, GpuRenderState, depth_for_frame, pack_light_power_table,
 };
 pub use context::{GpuContext, GpuError};
 pub use geometry::{GeometryModule, GeometrySlab, GpuGeometry, storage_entry};

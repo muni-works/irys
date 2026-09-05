@@ -195,11 +195,12 @@ const REPROJ_NORMAL_DOT: f32 = 0.9;
 // This pass's own raw linear sample: the ray tracer's accumulation buffer
 // after a `raw_sample` pass, which is (radiance, coverage).
 @group(0) @binding(1) var<storage, read> raw: array<vec4<f32>>;
-// The resident depth/normal buffer's three planes. Plane 1 is
-// (face-forwarded normal, distance from the eye) and plane 2 is
-// (denoise albedo, 0), both in the CPU `Film`'s conventions — background
-// depth is 0, not MAX_T.
-@group(0) @binding(2) var<storage, read> guides: array<vec4<f32>>;
+// The resident depth/normal buffer's planes. Plane 1 is (face-forwarded
+// normal, distance from the eye) and plane 2 is (denoise albedo, 0), both in
+// the CPU `Film`'s conventions — background depth is 0, not MAX_T. Plane 3 is
+// the sample budget's per-pixel selection mask, which is the one thing here
+// this shader *writes*: see `budget_select` in `budget.wgsl`.
+@group(0) @binding(2) var<storage, read_write> guides: array<vec4<f32>>;
 // Running mean: (linear radiance, coverage).
 @group(0) @binding(3) var<storage, read_write> mean: array<vec4<f32>>;
 // (count, luminance sum, luminance-squared sum, variance of the mean).
@@ -499,14 +500,14 @@ fn accumulate(@builtin(global_invocation_id) lid: vec3<u32>) {
 
     // ─── the sample budget ───────────────────────────────────────────────
     //
-    // Whether this pixel gets one of this frame's rays at all. `budget.wgsl`
+    // Whether this pixel got one of this frame's rays at all. `budget.wgsl`
     // decided that before the trace ran, from the physics, the history and
-    // the last image; here it is one coin per pixel per round at probability
-    // b(p)/rounds, so a pixel with b = 2 out of 4 rounds is folded twice in
-    // expectation and a converged, static one is not folded at all.
+    // the last image, and wrote the answer where the trace could read it —
+    // so a pixel with b = 2 out of 4 rounds was traced on two of them and a
+    // converged, static one was not traced at all.
     //
-    // The coin is independent of what the sample turned out to be, so the
-    // mean over the folded samples is still an unbiased estimate of the
+    // The selection is independent of what the sample turned out to be, so
+    // the mean over the folded samples is still an unbiased estimate of the
     // pixel. That is the whole reason to select rather than weight.
     //
     // A skipped pixel is not simply abandoned: whatever the reprojection
@@ -514,9 +515,6 @@ fn accumulate(@builtin(global_invocation_id) lid: vec3<u32>) {
     // round of a frame silently loses the history the camera move carried
     // onto it.
     if params.budget_enabled != 0u {
-        let rounds = max(params.budget_rounds, 1u);
-        let b = clamp(budget[i].w, 0.0, f32(rounds));
-
         // Which of this frame's rounds this pixel takes.
         //
         // Not a coin. A coin at probability b/rounds folds b samples in
@@ -533,18 +531,12 @@ fn accumulate(@builtin(global_invocation_id) lid: vec3<u32>) {
         // fractional part decided by a per-pixel dither u so that the
         // expectation is still exactly b. Unbiased, and the count never
         // strays by more than one.
-        var h = gid.x * 73856093u ^ gid.y * 19349663u ^ params.budget_frame * 83492791u;
-        h = h ^ (h >> 16u);
-        h = h * 2246822519u;
-        h = h ^ (h >> 13u);
-        h = h * 3266489917u;
-        h = h ^ (h >> 16u);
-        let u = f32(h) * (1.0 / 4294967296.0);
-
-        let per = b / f32(rounds);
-        let t0 = f32(params.budget_round) * per + u;
-        let t1 = t0 + per;
-        if floor(t1) <= floor(t0) {
+        //
+        // Decided before the trace, by `budget_select`, and read back here
+        // rather than re-derived: the trace skipped the pixels this mask does
+        // not name, so a second derivation that disagreed by one float would
+        // fold a sample that was never taken.
+        if (budget_mask_load(i) & (1u << params.budget_round)) == 0u {
             // Skipped — but not abandoned. Whatever the reprojection carried
             // for this pixel, and a zeroed keep entry, are decisions this pass
             // still has to commit: a pixel that skips every round of a frame

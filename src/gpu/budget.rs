@@ -105,6 +105,13 @@ pub struct SampleBudget {
     /// is a share of the weight every pixel keeps (see `budget.wgsl`).
     /// 1 guarantees every pixel every frame, which is no budget at all.
     pub floor_k: u32,
+    /// Trace every pixel on every round and fold only the selected ones —
+    /// what a budgeted frame did before the trace learned to skip.
+    ///
+    /// The control arm, and nothing else: it places exactly the same samples
+    /// the skipping path does and pays `rounds` full frames of rays to do it.
+    /// `the_skip_folds_the_same_samples` runs the two against each other.
+    pub trace_all: bool,
 }
 
 impl Default for SampleBudget {
@@ -115,6 +122,7 @@ impl Default for SampleBudget {
             rounds: 4,
             radius: 32,
             floor_k: 16,
+            trace_all: false,
         }
     }
 }
@@ -131,6 +139,7 @@ impl SampleBudget {
             rounds: 1,
             radius: 0,
             floor_k: 1,
+            trace_all: false,
         }
     }
 
@@ -176,6 +185,16 @@ pub struct Budget {
     pub history: Vec<f32>,
     /// The image drive, 0..1 — the last sample's disagreement with the mean.
     pub image: Vec<f32>,
+    /// Which rounds each pixel takes: bit `r` set when the pixel folds — and
+    /// so is traced on — round `r`. What `budget_select` wrote and what both
+    /// the trace and the fold read.
+    pub rounds: Vec<u32>,
+    /// The guide depth each pixel's primary hit left behind: distance from
+    /// the eye, 0 for background. Read back beside the budget because it is
+    /// the thing a skipped pixel still owes — see [`FLAG_BUDGET_GUIDES`].
+    ///
+    /// [`FLAG_BUDGET_GUIDES`]: super::FLAG_BUDGET_GUIDES
+    pub depth: Vec<f32>,
 }
 
 impl Budget {
@@ -339,6 +358,18 @@ impl RayTracePipeline {
                 "Budget Rescale",
             );
         }
+        // Last: turn b(p) into the set of rounds each pixel takes, and write
+        // it where the trace can read it. Everything above is a weight field;
+        // this is the decision, and it is made here rather than in the fold so
+        // that a pixel which will not fold this round is never traced.
+        dispatch(
+            &mut encoder,
+            &history_pipeline.budget_select,
+            &group,
+            BUDGET_SLOT,
+            groups,
+            "Budget Select",
+        );
         ctx.queue.submit(Some(encoder.finish()));
         Ok(())
     }
@@ -370,11 +401,17 @@ impl RayTracePipeline {
     ) -> Result<(), GpuError> {
         let bud = if budget.bias <= 0.0 && budget.rounds <= 1 {
             // Nothing to gate: one round at zero bias is the uniform spend,
-            // and skipping the coin keeps it bit-identical to the old path.
+            // and skipping the selection keeps it bit-identical to the old
+            // path.
             NO_BUDGET
         } else {
             budget.fields(round, frame)
         };
+        // Tell the trace about the selection. Round 0 asks the pixels it skips
+        // for their guide planes anyway: the reprojection runs behind that
+        // round and reads every pixel's guides, folded or not.
+        let mut state = state;
+        state.set_budget_mask(bud.enabled != 0 && !budget.trace_all, round, round == 0);
         self.accumulate_resident_inner(
             ctx,
             history_pipeline,
@@ -401,11 +438,16 @@ impl RayTracePipeline {
         let Some((w, h)) = res.history().map(|hi| hi.size()) else {
             return Ok(None);
         };
-        let bytes = (w as u64) * (h as u64) * 16;
+        let plane = (w as u64) * (h as u64) * 16;
+        // The budget itself, then guide planes 1 and 3 — the depth a pass
+        // left behind, and the selection mask that decided which passes it
+        // was.
+        let bytes = plane * 3;
         res.history_mut()
             .expect("just checked")
             .ensure_budget_readback(ctx, bytes);
 
+        let guides = res.raw_and_guide_buffers().1;
         let hist = res.history().expect("just checked");
         let staging = hist.budget_readback_buffer().expect("just ensured");
         let mut encoder = ctx
@@ -413,7 +455,9 @@ impl RayTracePipeline {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Sample Budget Readback Encoder"),
             });
-        encoder.copy_buffer_to_buffer(hist.budget_buffers().0, 0, staging, 0, bytes);
+        encoder.copy_buffer_to_buffer(hist.budget_buffers().0, 0, staging, 0, plane);
+        encoder.copy_buffer_to_buffer(guides, plane, staging, plane, plane);
+        encoder.copy_buffer_to_buffer(guides, plane * 3, staging, plane * 2, plane);
         ctx.queue.submit(Some(encoder.finish()));
 
         let raw = read_back_f32(ctx, staging).await?;
@@ -425,12 +469,16 @@ impl RayTracePipeline {
             motion: vec![0.0; n],
             history: vec![0.0; n],
             image: vec![0.0; n],
+            rounds: vec![0; n],
+            depth: vec![0.0; n],
         };
         for i in 0..n {
             out.motion[i] = raw[i * 4];
             out.history[i] = raw[i * 4 + 1];
             out.image[i] = raw[i * 4 + 2];
             out.samples[i] = raw[i * 4 + 3];
+            out.depth[i] = raw[(n + i) * 4 + 3];
+            out.rounds[i] = raw[(2 * n + i) * 4].to_bits();
         }
         Ok(Some(out))
     }

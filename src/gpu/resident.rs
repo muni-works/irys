@@ -135,10 +135,10 @@ impl FrameTargets {
             output,
             output_view,
             accum: mk("Resident Accumulation Buffer", per_pixel_vec4),
-            // Three planes: the shader's own (normal, t), then the two guide
-            // planes a raw-sample pass fills. See the binding's comment in
-            // `raytrace.wgsl`.
-            depth_normal: mk("Resident Depth Normal Buffer", per_pixel_vec4 * 3),
+            // Four planes: the shader's own (normal, t), the two guide planes
+            // a raw-sample pass fills, and the sample budget's per-pixel
+            // selection mask. See the binding's comment in `integrator.wgsl`.
+            depth_normal: mk("Resident Depth Normal Buffer", per_pixel_vec4 * 4),
             feature_id: mk(
                 "Resident Feature ID Buffer",
                 (width as u64) * (height as u64) * 4,
@@ -462,9 +462,9 @@ impl ResidentScene {
 
     /// Grow `depth_normal` to carry ReSTIR's four reservoir slots.
     ///
-    /// Twelve planes above the three the denoiser's guides use — 192 bytes a
-    /// pixel — allocated the first time a pass asks for reservoirs and never for a
-    /// scene that does not. They ride in this buffer rather than in storage
+    /// Twelve planes above the four the denoiser's guides and the sample
+    /// budget's selection mask use — 192 bytes a pixel — allocated the first
+    /// time a pass asks for reservoirs and never for a scene that does not. They ride in this buffer rather than in storage
     /// buffers of their own because the shader already binds all ten a browser
     /// guarantees; see the `ReSTIR DI` block in `integrator.wgsl`.
     fn ensure_restir_planes(&mut self, ctx: &GpuContext) {
@@ -474,7 +474,7 @@ impl ResidentScene {
         let per_pixel_vec4 = (self.targets.width as u64) * (self.targets.height as u64) * 16;
         self.targets.depth_normal = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Resident Depth Normal Buffer (+ ReSTIR reservoirs)"),
-            size: per_pixel_vec4 * 15,
+            size: per_pixel_vec4 * 16,
             usage: STORAGE_RW.union(wgpu::BufferUsages::COPY_SRC),
             mapped_at_creation: false,
         });

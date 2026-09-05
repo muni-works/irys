@@ -186,6 +186,57 @@ fn sphere_mask(cx: f32) -> Vec<bool> {
     out
 }
 
+/// The distance from the eye to the sphere at `cx` under each pixel's centre
+/// ray, and 0 where the ray misses it. The same arithmetic as `sphere_mask`,
+/// carried one step further — what the guide plane should read wherever the
+/// sphere is what the pixel is looking at.
+fn sphere_depth(cx: f32) -> Vec<f32> {
+    let cam = camera();
+    let eye = [cam.position[0], cam.position[1], cam.position[2]];
+    let norm = |v: [f32; 3]| {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / l, v[1] / l, v[2] / l]
+    };
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let fwd = norm([
+        cam.target[0] - eye[0],
+        cam.target[1] - eye[1],
+        cam.target[2] - eye[2],
+    ]);
+    let right = norm(cross(fwd, [cam.up[0], cam.up[1], cam.up[2]]));
+    let up = cross(right, fwd);
+    let tan = (cam.fov * 0.5).tan();
+    let aspect = W as f32 / H as f32;
+    let c = [cx, 0.0, 1.0];
+
+    let mut out = vec![0.0; N];
+    for y in 0..H {
+        for x in 0..W {
+            let ndc_x = (x as f32 + 0.5) / W as f32 * 2.0 - 1.0;
+            let ndc_y = 1.0 - (y as f32 + 0.5) / H as f32 * 2.0;
+            let d = norm([
+                fwd[0] + right[0] * ndc_x * tan * aspect + up[0] * ndc_y * tan,
+                fwd[1] + right[1] * ndc_x * tan * aspect + up[1] * ndc_y * tan,
+                fwd[2] + right[2] * ndc_x * tan * aspect + up[2] * ndc_y * tan,
+            ]);
+            let oc = [eye[0] - c[0], eye[1] - c[1], eye[2] - c[2]];
+            let b = oc[0] * d[0] + oc[1] * d[1] + oc[2] * d[2];
+            let cq = oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2] - 1.0;
+            let disc = b * b - cq;
+            if disc > 0.0 && -b > 0.0 {
+                out[(y * W + x) as usize] = -b - disc.sqrt();
+            }
+        }
+    }
+    out
+}
+
 /// The instance motion for a sphere that just stepped `step` along +x, with
 /// the plane static.
 fn motion_for(step: f32) -> InstanceMotion {
@@ -592,6 +643,40 @@ fn a_directed_spend_beats_a_uniform_one_at_equal_samples() {
         rd < ru,
         "directing the samples made it worse: {rd:.5} against {ru:.5}"
     );
+
+    // And at equal *time*, which is the comparison a frame budget actually
+    // faces. Before the trace could skip, a directed pass over four rounds
+    // cost four full frames of rays whatever it placed: 155 ms at 640x360
+    // against a uniform pass's 39. Skipping the rounds a pixel does not fold
+    // brings that to about the sample count — measured on the court, a
+    // directed pass placing three samples a pixel costs 3.3 uniform passes,
+    // and a flat one placing 3.3 costs 3.3. So the frame that used to buy one
+    // directed sample a pixel now buys three, and the honest arm against it
+    // is a uniform spend of the 3.3 samples the same time buys.
+    //
+    // On this fixture that is a wash, and the number is here to say so: a
+    // fourth flat sample is worth about what directing three is. What the skip bought is not a better picture
+    // at the same time — it is the same picture at a third of the *rays*, and
+    // a directed spend that is no longer a standing tax on the frame.
+    let spend = |bias: f32, per_pixel: f32| SampleBudget {
+        bias,
+        rays_per_frame: per_pixel * N as f32,
+        radius: if bias > 0.0 { 8 } else { 0 },
+        floor_k: if bias > 0.0 { 8 } else { 1 },
+        ..SampleBudget::directed(W, H, bias, 4)
+    };
+    let flat = run(spend(0.0, 4.0));
+    let rich = run(spend(1.0, 3.0));
+    let (rf, rr) = (rmse(&flat), rmse(&rich));
+    println!(
+        "at equal time — 4.0 samples a pixel spent flat against 3.0 spent where the \
+         budget says: flat {rf:.5}, directed {rr:.5} — a ratio of {:.3}",
+        rr / rf
+    );
+    assert!(
+        rr < rf * 1.05,
+        "at equal time the directed spend lost ground: {rr:.5} against {rf:.5}"
+    );
 }
 
 /// No pixel starves.
@@ -655,5 +740,279 @@ fn every_pixel_is_sampled_within_the_floor_period() {
     assert_eq!(
         starved, 0,
         "{starved} pixels were never sampled in a whole floor period of {K} frames"
+    );
+}
+
+/// The skip folds the samples the fold used to fold.
+///
+/// The budget always *placed* its samples this way; what changed is that the
+/// rounds a pixel does not fold are no longer traced. Nothing about the
+/// placement moved with it: the selection is decided once, before the trace,
+/// and both the trace and the fold read the same word, so a frame that skips
+/// must land on the same history as a frame that traces everything and throws
+/// three quarters of it away. `trace_all` is that control arm.
+///
+/// Bit for bit over one budgeted frame, with the neighbourhood clamp off.
+/// Two things a skipped pixel leaves behind go stale, and neither is read
+/// inside the frame that skipped:
+///
+/// * the **clamp's** 3x3 window is the one place a pixel reads a *neighbour's*
+///   raw sample, and a skipped neighbour's is the last one it took rather than
+///   this round's — an equally good independent sample of the same pixel, and
+///   not the same float;
+/// * a skipped pixel's **guide planes** are round 0's rather than the last
+///   round's, because round 0 is the only round that asks a skipped pixel for
+///   its primary hit. The jitter differs by a fraction of a pixel between
+///   rounds, so the depth the *next* frame reprojects against does too.
+///
+/// So the second half of the test is the honest one for a run of frames: the
+/// clamp on, eight frames of a moving ball, and the two arms holding the same
+/// picture to well under the noise of the samples themselves.
+#[test]
+#[ignore = "requires GPU"]
+fn the_skip_folds_the_same_samples() {
+    let Some(ctx) = ctx_or_skip("the_skip_folds_the_same_samples") else {
+        return;
+    };
+    let pipeline = RayTracePipeline::new(ctx, &AnalyticGeometry::module()).expect("pipeline");
+    let history = HistoryPipeline::new(ctx).expect("history pipeline");
+    let target = Target::new(ctx);
+
+    let step = 0.06_f32;
+
+    let run = |clamp_k: f32, trace_all: bool, frames: u32| {
+        let denoise = GpuDenoiseParams {
+            clamp_k,
+            ..GpuDenoiseParams::default()
+        };
+        let budget = SampleBudget {
+            radius: 8,
+            floor_k: 8,
+            trace_all,
+            ..SampleBudget::directed(W, H, 1.0, 4)
+        };
+        let mut fx = Fixture::new();
+        let mut res = pipeline.resident_scene(ctx, fx.scene(), W, H);
+        for f in 0..16 {
+            pipeline
+                .accumulate_and_denoise_resident(
+                    ctx,
+                    &history,
+                    &mut res,
+                    &camera(),
+                    state(f + 1),
+                    &[],
+                    &denoise,
+                    &target.view,
+                )
+                .expect("settle pass");
+        }
+        for f in 0..frames {
+            fx.move_sphere(f as f32 * step);
+            res.update_scene(ctx, fx.scene());
+            frame(
+                ctx,
+                &pipeline,
+                &history,
+                &mut res,
+                &target,
+                &denoise,
+                &budget,
+                Some(&motion_for(step)),
+                f,
+            );
+        }
+        pollster::block_on(pipeline.read_history(ctx, &mut res))
+            .expect("read")
+            .expect("history")
+    };
+
+    // One budgeted frame with the clamp off: bit for bit, both the means and
+    // the sample counts.
+    let traced = run(0.0, true, 1);
+    let skipped = run(0.0, false, 1);
+    let differing = (0..N * 3)
+        .filter(|&k| traced.rgb[k].to_bits() != skipped.rgb[k].to_bits())
+        .count();
+    assert_eq!(
+        differing,
+        0,
+        "{differing} of {} channels differ between tracing every round and skipping",
+        N * 3
+    );
+    let counts = (0..N)
+        .filter(|&i| traced.count[i] != skipped.count[i])
+        .count();
+    assert_eq!(
+        counts, 0,
+        "{counts} pixels folded a different number of samples"
+    );
+
+    // Eight frames with the clamp on: the same picture, to well under the
+    // samples' own noise.
+    let traced = run(4.0, true, 8);
+    let skipped = run(4.0, false, 8);
+    let mut sum = 0.0f64;
+    for k in 0..N * 3 {
+        let d = (traced.rgb[k] - skipped.rgb[k]) as f64;
+        sum += d * d;
+    }
+    let rmse = (sum / (N * 3) as f64).sqrt();
+    let mean = traced.rgb.iter().map(|&v| v as f64).sum::<f64>() / (N * 3) as f64;
+    println!(
+        "over eight frames with the clamp on, the two arms differ by \
+         {rmse:.6} RMSE on a mean of {mean:.6}"
+    );
+    // The bound is the noise the frame is carrying anyway: after these same
+    // sixteen frames a *uniform* spend sits 0.066 RMSE from the converged
+    // reference (see `a_directed_spend_beats_a_uniform_one_at_equal_samples`),
+    // so two arms that agree to better than that agree to inside the picture's
+    // own error bars.
+    assert!(
+        rmse < 0.06,
+        "the clamp's stale neighbours moved the picture by {rmse:.6} on a mean of {mean:.6}"
+    );
+}
+
+/// A pixel the budget skips is not traced — and the frame's guide planes are
+/// whole anyway.
+///
+/// Those two are in tension, and the guides-only round is what settles them.
+/// The history pass reprojects *every* pixel through this frame's depth,
+/// folded or not, so a skipped pixel cannot simply be left with last frame's
+/// primary hit. Round 0 therefore asks the pixels it skips for their hit and
+/// nothing else: the ray, the guides, no shading, no sample.
+///
+/// The test moves the ball a long way in one frame and looks at the pixels it
+/// moved *onto*. Those are pixels the budget may well skip — a converged
+/// patch of plane the ball has just covered — and their guide depth has to be
+/// the ball's, at this frame's pose, or the next frame's reprojection is
+/// looking at a surface that is not there. Against a CPU sphere
+/// intersection, not against another GPU frame: the two would differ by their
+/// jitter alone, and near the horizon a third of a plane's pixels move more
+/// than two percent in depth over half a pixel of jitter.
+#[test]
+#[ignore = "requires GPU"]
+fn a_skipped_pixel_keeps_its_guides() {
+    let Some(ctx) = ctx_or_skip("a_skipped_pixel_keeps_its_guides") else {
+        return;
+    };
+    let pipeline = RayTracePipeline::new(ctx, &AnalyticGeometry::module()).expect("pipeline");
+    let history = HistoryPipeline::new(ctx).expect("history pipeline");
+    let target = Target::new(ctx);
+    let denoise = GpuDenoiseParams::default();
+    let step = 1.5_f32;
+
+    let mut fx = Fixture::new();
+    let mut res = pipeline.resident_scene(ctx, fx.scene(), W, H);
+    for f in 0..32 {
+        pipeline
+            .accumulate_and_denoise_resident(
+                ctx,
+                &history,
+                &mut res,
+                &camera(),
+                state(f + 1),
+                &[],
+                &denoise,
+                &target.view,
+            )
+            .expect("settle pass");
+    }
+
+    // One budgeted frame, with the ball a long step further along.
+    let budget = SampleBudget {
+        radius: 8,
+        floor_k: 64,
+        ..SampleBudget::directed(W, H, 1.0, 4)
+    };
+    fx.move_sphere(step);
+    res.update_scene(ctx, fx.scene());
+    frame(
+        ctx,
+        &pipeline,
+        &history,
+        &mut res,
+        &target,
+        &denoise,
+        &budget,
+        Some(&motion_for(step)),
+        0,
+    );
+    let b = pollster::block_on(pipeline.read_budget(ctx, &mut res))
+        .expect("read")
+        .expect("budget");
+
+    // The selection is a selection: no pixel claims a round that was never
+    // dispatched, and a good part of the frame claims none at all — which is
+    // the whole saving.
+    let skipped = (0..N).filter(|&i| b.rounds[i] == 0).count();
+    assert!(
+        skipped > N / 8,
+        "only {skipped} of {N} pixels were skipped entirely — nothing is being saved"
+    );
+    for i in 0..N {
+        assert!(
+            b.rounds[i] < 1 << budget.rounds,
+            "pixel {i} claims a round that was never dispatched: {:#x}",
+            b.rounds[i]
+        );
+    }
+
+    // The guides. Every pixel the ball now covers reads the ball's distance,
+    // whether or not it was traced for a sample — eroded by a pixel, so that
+    // a silhouette landing either side of a jittered ray is not the thing
+    // under test.
+    let now = sphere_mask(step);
+    let inside = |i: usize| {
+        let (x, y) = (i % W as usize, i / W as usize);
+        x > 0
+            && y > 0
+            && x + 1 < W as usize
+            && y + 1 < H as usize
+            && now[i]
+            && now[i - 1]
+            && now[i + 1]
+            && now[i - W as usize]
+            && now[i + W as usize]
+    };
+    let want = sphere_depth(step);
+    let mut checked = 0usize;
+    let mut skipped_checked = 0usize;
+    let mut worst = 0.0f32;
+    for (i, &w) in want.iter().enumerate() {
+        if !inside(i) {
+            continue;
+        }
+        checked += 1;
+        if b.rounds[i] == 0 {
+            skipped_checked += 1;
+        }
+        let err = (b.depth[i] - w).abs() / w;
+        worst = worst.max(err);
+        // A percent is the jitter across the ball's own curvature. The ball
+        // one step back would read sixteen percent out, and the plane behind
+        // it further still, so this tells the three apart with room to spare.
+        assert!(
+            err < 0.05,
+            "pixel {i} ({}) reads {} where the ball is at {}",
+            if b.rounds[i] == 0 {
+                "skipped"
+            } else {
+                "traced"
+            },
+            b.depth[i],
+            want[i],
+        );
+    }
+    println!(
+        "{skipped} of {N} pixels traced no round at all; \
+         of the {checked} pixels the ball now covers, {skipped_checked} were skipped \
+         and all read the ball's depth to within {:.3}%",
+        worst * 100.0
+    );
+    assert!(
+        skipped_checked > 0,
+        "no skipped pixel landed on the ball: the test proves nothing"
     );
 }

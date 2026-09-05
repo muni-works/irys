@@ -157,6 +157,12 @@ struct GpuAreaLight {
 const FLAG_RAW_SAMPLE: u32 = 1u;
 // Bit 1: area lights are visible to camera rays.
 const FLAG_CAMERA_VISIBLE_LIGHTS: u32 = 2u;
+// Bit 2: the sample budget's per-pixel selection mask is live; trace only the
+// pixels it selects for this round. Bit 3: a skipped pixel still writes its
+// guide planes. Bits 8..11: which round this dispatch is.
+const FLAG_BUDGET_MASK: u32 = 4u;
+const FLAG_BUDGET_GUIDES: u32 = 8u;
+const BUDGET_ROUND_SHIFT: u32 = 8u;
 
 fn raw_sample_mode() -> bool {
     return (render_state.raw_sample & FLAG_RAW_SAMPLE) != 0u;
@@ -164,6 +170,33 @@ fn raw_sample_mode() -> bool {
 
 fn camera_visible_lights() -> bool {
     return (render_state.raw_sample & FLAG_CAMERA_VISIBLE_LIGHTS) != 0u;
+}
+
+// ─── the sample budget's selection ───────────────────────────────────────
+//
+// `budget.wgsl` decides, before this pass runs, which of the frame's rounds
+// each pixel folds — and a pixel that will not fold this round has no use for
+// a ray. The decision arrives in the fourth plane of `depth_normal_buffer`:
+// one word per pixel in `.x`, bit `r` set when the pixel folds round `r`. It
+// rides in that buffer rather than in a binding of its own because the shader
+// already binds all ten storage buffers a browser guarantees, exactly as
+// ReSTIR's reservoirs do.
+fn budget_mask_mode() -> bool {
+    return (render_state.raw_sample & FLAG_BUDGET_MASK) != 0u;
+}
+
+fn budget_guides_pass() -> bool {
+    return (render_state.raw_sample & FLAG_BUDGET_GUIDES) != 0u;
+}
+
+fn budget_round() -> u32 {
+    return (render_state.raw_sample >> BUDGET_ROUND_SHIFT) & 0xFu;
+}
+
+fn budget_selects(idx: u32) -> bool {
+    let n = camera.width * camera.height;
+    let word = bitcast<u32>(depth_normal_buffer[3u * n + idx].x);
+    return (word & (1u << budget_round())) != 0u;
 }
 
 fn pixel_index(coord: vec2<u32>) -> u32 {
@@ -922,7 +955,7 @@ fn sample_sun(
 // every one a browser guarantees, and five of those belong to the geometry
 // module. Two slots of three planes each — ping-ponged across the frame's
 // dispatches and across frames — sit above the three planes the denoiser's
-// guides use, so a ReSTIR frame costs 96 bytes a pixel that an ordinary one
+// guides and the budget mask use, so a ReSTIR frame costs 96 bytes a pixel that an ordinary one
 // does not allocate at all.
 
 // No sample in this reservoir.
@@ -1059,7 +1092,7 @@ fn oct_decode(e: u32) -> vec3<f32> {
 // ── the reservoir planes ─────────────────────────────────────────────────
 
 fn restir_plane(slot: u32) -> u32 {
-    return (3u + slot * 3u) * camera.width * camera.height;
+    return (4u + slot * 3u) * camera.width * camera.height;
 }
 
 fn restir_store(slot: u32, idx: u32, r: Reservoir, s: RSurface) {
@@ -2097,34 +2130,7 @@ fn scissor_pixel(global_id: vec3<u32>) -> vec4<u32> {
     return vec4<u32>(ox + global_id.x, oy + global_id.y, camera.width, camera.height);
 }
 
-@compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let pixel = scissor_pixel(global_id).xy;
-
-    if pixel.x >= camera.width || pixel.y >= camera.height {
-        return;
-    }
-
-    let ray = ray_origin_and_direction(pixel);
-    let origin = ray[0];
-    let dir = ray[1];
-
-    // Trace ray using BVH acceleration, then test the implicit ground
-    // plane and pick whichever is closer.
-    var hit = trace_scene(origin, dir);
-    // `ground_enabled` has to be honoured here, not only on the shadow ray:
-    // a scene that models its own floor (a room, a court) does not want a
-    // second implicit one at z = 0 fighting it for the same pixels.
-    if render_state.ground_enabled != 0u {
-        let ground = intersect_ground(origin, dir);
-        if ground.t < hit.t {
-            hit.t = ground.t;
-            hit.face_idx = FACE_IDX_GROUND;
-            hit.uv = vec2<f32>(ground.fade, 0.0);
-        }
-    }
-    let new_color = shade(hit, origin, dir, pixel);
-
+fn write_guides(pixel: vec2<u32>, hit: RayHit, dir: vec3<f32>) {
     // Store depth and normal for edge detection. Ground hits get a normal
     // so silhouettes against the ground get drawn just like real faces.
     let pixel_coord = vec2<i32>(pixel);
@@ -2186,6 +2192,67 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
         depth_normal_buffer[2u * n_px + gi] = vec4<f32>(g_albedo, g_id);
     }
+}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let pixel = scissor_pixel(global_id).xy;
+
+    if pixel.x >= camera.width || pixel.y >= camera.height {
+        return;
+    }
+
+    // ─── the sample budget ───────────────────────────────────────────────
+    //
+    // A pixel that will not fold this round's sample has no use for it. The
+    // budget picked the rounds before anything was traced, so the skip can
+    // happen here — before the ray — rather than in the fold, which is where
+    // it was: the rounds were all traced and only the selected ones kept, and
+    // four rounds cost four full frames of rays to place one frame's worth of
+    // samples.
+    //
+    // Round 0 is the exception: the history pass reprojects every pixel
+    // through *this* frame's guide planes, so a skipped pixel still owes its
+    // primary hit. That is what `guides_only` is — the ray, the guides, and
+    // none of the shading.
+    var guides_only = false;
+    if budget_mask_mode() && !budget_selects(pixel_index(pixel)) {
+        if !budget_guides_pass() {
+            return;
+        }
+        guides_only = true;
+    }
+
+    let ray = ray_origin_and_direction(pixel);
+    let origin = ray[0];
+    let dir = ray[1];
+
+    // Trace ray using BVH acceleration, then test the implicit ground
+    // plane and pick whichever is closer.
+    var hit = trace_scene(origin, dir);
+    // `ground_enabled` has to be honoured here, not only on the shadow ray:
+    // a scene that models its own floor (a room, a court) does not want a
+    // second implicit one at z = 0 fighting it for the same pixels.
+    if render_state.ground_enabled != 0u {
+        let ground = intersect_ground(origin, dir);
+        if ground.t < hit.t {
+            hit.t = ground.t;
+            hit.face_idx = FACE_IDX_GROUND;
+            hit.uv = vec2<f32>(ground.fade, 0.0);
+        }
+    }
+    // A guides-only invocation stops here: `write_guides` is the whole of
+    // what it owes, and `shade` — the multi-bounce path and its NEE, which is
+    // where a sample's cost is — is what it saves.
+    if guides_only {
+        write_guides(pixel, hit, dir);
+        return;
+    }
+
+    let new_color = shade(hit, origin, dir, pixel);
+
+    let pixel_coord = vec2<i32>(pixel);
+    write_guides(pixel, hit, dir);
 
     // Progressive accumulation
     var accumulated: vec4<f32>;

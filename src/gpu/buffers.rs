@@ -549,6 +549,30 @@ pub const FLAG_RAW_SAMPLE: u32 = 1 << 0;
 /// rays, as they are to [`crate::pathtrace::render`]'s.
 pub const FLAG_CAMERA_VISIBLE_LIGHTS: u32 = 1 << 1;
 
+/// `GpuRenderState`'s flag word, bit 2: the sample budget's per-pixel
+/// selection mask is live, and this dispatch is to trace only the pixels it
+/// selects for [`GpuRenderState::budget_round`].
+///
+/// The mask is written by `budget.wgsl`'s `budget_select` into the fourth
+/// plane of the depth/normal buffer, one `u32` per pixel with bit `r` set when
+/// the pixel folds round `r`. Without this flag the shader traces every pixel
+/// in the scissor, which is what every caller that never asked for a budget
+/// gets.
+pub const FLAG_BUDGET_MASK: u32 = 1 << 2;
+
+/// `GpuRenderState`'s flag word, bit 3: a pixel the mask skips still writes
+/// its guide planes — the primary hit and nothing else.
+///
+/// Set on round 0 only. The history pass's reprojection reads the guides of
+/// *every* pixel, folded or not, so leaving a skipped pixel's guides a frame
+/// stale would reproject it through last frame's geometry. A guides-only
+/// invocation pays for the primary ray and skips the shading, which is where
+/// a path-traced sample's cost is.
+pub const FLAG_BUDGET_GUIDES: u32 = 1 << 3;
+
+/// Where the budget round index sits in `GpuRenderState`'s flag word.
+const BUDGET_ROUND_SHIFT: u32 = 8;
+
 /// Full path depth, matching `PathTraceOptions::default().max_depth` so the
 /// converged viewport image matches `vcad-render --photoreal`.
 pub const DEFAULT_MAX_DEPTH: u32 = 6;
@@ -629,6 +653,36 @@ impl GpuRenderState {
     /// Whether [`GpuRenderState::set_raw_sample`] is on.
     pub fn raw_sample(&self) -> bool {
         self._pad3[0] & FLAG_RAW_SAMPLE != 0
+    }
+
+    /// Trace only the pixels the sample budget selected for `round`.
+    ///
+    /// `guides` asks the skipped pixels for their primary hit anyway, so the
+    /// guide planes come out of the pass whole; set it on round 0, which is
+    /// the round the reprojection runs behind. See [`FLAG_BUDGET_MASK`] and
+    /// [`FLAG_BUDGET_GUIDES`].
+    ///
+    /// Set by [`crate::gpu::RayTracePipeline::accumulate_resident_round`] out
+    /// of the budget it was handed; a caller driving the rounds itself never
+    /// needs to.
+    pub fn set_budget_mask(&mut self, on: bool, round: u32, guides: bool) {
+        self._pad3[0] &= !(FLAG_BUDGET_MASK | FLAG_BUDGET_GUIDES | (0xFu32 << BUDGET_ROUND_SHIFT));
+        if on {
+            self._pad3[0] |= FLAG_BUDGET_MASK | ((round & 0xF) << BUDGET_ROUND_SHIFT);
+            if guides {
+                self._pad3[0] |= FLAG_BUDGET_GUIDES;
+            }
+        }
+    }
+
+    /// Whether [`GpuRenderState::set_budget_mask`] is on.
+    pub fn budget_mask(&self) -> bool {
+        self._pad3[0] & FLAG_BUDGET_MASK != 0
+    }
+
+    /// The round [`GpuRenderState::set_budget_mask`] was given.
+    pub fn budget_round(&self) -> u32 {
+        (self._pad3[0] >> BUDGET_ROUND_SHIFT) & 0xF
     }
 
     /// Let camera rays see the area lights.

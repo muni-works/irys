@@ -656,13 +656,14 @@ pub struct HistoryPipeline {
     demodulate: wgpu::ComputePipeline,
     atrous: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
-    /// The five gradient-directed sampling passes; see `budget.wgsl`.
+    /// The gradient-directed sampling passes; see `budget.wgsl`.
     pub(super) budget_weight: wgpu::ComputePipeline,
     pub(super) budget_blur_x: wgpu::ComputePipeline,
     pub(super) budget_blur_y: wgpu::ComputePipeline,
     pub(super) budget_normalize: wgpu::ComputePipeline,
     pub(super) budget_assigned: wgpu::ComputePipeline,
     pub(super) budget_rescale: wgpu::ComputePipeline,
+    pub(super) budget_select: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
 }
 
@@ -706,7 +707,7 @@ impl HistoryPipeline {
                         count: None,
                     },
                     storage(1, true),  // raw sample
-                    storage(2, true),  // guide planes
+                    storage(2, false), // guide planes (+ the budget's selection mask)
                     storage(3, false), // mean
                     storage(4, false), // stats
                     storage(5, true),  // keep mask
@@ -762,6 +763,7 @@ impl HistoryPipeline {
             budget_normalize: mk("budget_normalize"),
             budget_assigned: mk("budget_assigned"),
             budget_rescale: mk("budget_rescale"),
+            budget_select: mk("budget_select"),
             layout,
         })
     }
@@ -1485,7 +1487,7 @@ impl RayTracePipeline {
                 spatial_variance: u32::from(denoise.spatial_variance),
                 _pad0: 0,
                 _pad1: 0,
-                            budget_enabled: 0,
+                budget_enabled: 0,
                 budget_bias: 0.0,
                 budget_rounds: 0,
                 budget_round: 0,
@@ -1497,7 +1499,7 @@ impl RayTracePipeline {
                 _pad3: 0,
                 _pad4: 0,
                 _pad5: 0,
-};
+            };
             ctx.queue
                 .write_buffer(&hist.params, 0, bytemuck::bytes_of(&base));
         }

@@ -569,10 +569,11 @@ impl RayTracePipeline {
         // Depth/normal buffer for edge detection (vec4 per pixel: normal.xyz,
         // depth), plus the two guide planes a raw-sample pass fills. See the
         // binding's comment in `raytrace.wgsl`.
-        // Three planes, plus two ReSTIR slots of three each when the
-        // reservoirs are on. See the `ReSTIR DI` block in `integrator.wgsl`
-        // for why they live here and not in storage buffers of their own.
-        let dn_planes: u64 = if render_state.restir_enabled() { 15 } else { 3 };
+        // Three planes plus the sample budget's selection mask, and two
+        // ReSTIR slots of three each when the reservoirs are on. See the
+        // `ReSTIR DI` block in `integrator.wgsl` for why they live here and
+        // not in storage buffers of their own.
+        let dn_planes: u64 = if render_state.restir_enabled() { 16 } else { 4 };
         let depth_normal_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Depth Normal Buffer"),
             size: accum_buf_size * dn_planes,
