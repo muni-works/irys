@@ -266,36 +266,50 @@ pub fn trace<G: Geometry + Send + Sync>(
             continue;
         }
         let seed = opts.seed ^ ((ei as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        for k in 0..n {
-            let mut rng = Rng::new(seed.wrapping_add(k as u64).wrapping_mul(0x2545_f491_4f6c_dd1d));
+        // One photon per index, each with its own seeded stream, so the pass
+        // is deterministic however rayon schedules it — the same property the
+        // pixel loop has, for the same reason.
+        let shoot = |k: usize| -> ([f32; 3], Option<Photon>) {
+            let mut rng =
+                Rng::new(seed.wrapping_add(k as u64).wrapping_mul(0x2545_f491_4f6c_dd1d));
             let Some((origin, dir, power)) = (match em {
-                Emitter::Area { index, .. } => emit_from_area(
-                    &scene.lights[*index],
-                    center,
-                    extent,
-                    n,
-                    &mut rng,
-                ),
+                Emitter::Area { index, .. } => {
+                    emit_from_area(&scene.lights[*index], center, extent, n, &mut rng)
+                }
                 Emitter::Sun { .. } => {
                     emit_from_sun(scene.sun.as_ref().unwrap(), center, extent, n, &mut rng)
                 }
             }) else {
-                continue;
+                return ([0.0; 3], None);
             };
+            let landed =
+                trace_photon(scene, &ctx, origin, dir, power, opts.max_bounces, &mut rng).map(
+                    |(point, normal, power)| Photon {
+                        point,
+                        normal,
+                        power,
+                    },
+                );
+            (power, landed)
+        };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let landed: Vec<([f32; 3], Option<Photon>)> = {
+            use rayon::prelude::*;
+            (0..n).into_par_iter().map(shoot).collect()
+        };
+        #[cfg(target_arch = "wasm32")]
+        let landed: Vec<([f32; 3], Option<Photon>)> = (0..n).map(shoot).collect();
+
+        for (power, ph) in landed {
             emitted[0] += power[0];
             emitted[1] += power[1];
             emitted[2] += power[2];
-            if let Some(hit) =
-                trace_photon(scene, &ctx, origin, dir, power, opts.max_bounces, &mut rng)
-            {
-                deposited[0] += hit.2[0];
-                deposited[1] += hit.2[1];
-                deposited[2] += hit.2[2];
-                photons.push(Photon {
-                    point: hit.0,
-                    normal: hit.1,
-                    power: hit.2,
-                });
+            if let Some(ph) = ph {
+                deposited[0] += ph.power[0];
+                deposited[1] += ph.power[1];
+                deposited[2] += ph.power[2];
+                photons.push(ph);
             }
         }
     }

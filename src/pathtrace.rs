@@ -4614,6 +4614,52 @@ mod tests {
         sum / n as f64
     }
 
+    /// Nothing about an opaque scene changed. The shadow ray that walks
+    /// through sheets has to agree, hit for hit, with the any-hit traversal
+    /// it replaced wherever there are no sheets to walk through — which is
+    /// what makes every render that predates panes bit-identical.
+    #[test]
+    fn an_opaque_scene_occludes_exactly_as_the_any_hit_test_did() {
+        let mut scene = open_scene(vec![panel(Point3::new(0.0, 0.0, 6.0), [10.0; 3], 1.0)]);
+        scene.objects.push(Object::new(
+            Arc::new(Bvh::build(cube_mesh())),
+            Pbr::plastic([0.8, 0.3, 0.2], 0.35, 0.0),
+        ));
+        scene.objects.push(Object::new(
+            Arc::new(Bvh::build(pane_mesh(3.0, 2.0))),
+            // Transmissive but *not* thin-walled: a solid, which still
+            // blocks. The caustic pass is what carries light through those.
+            Pbr::glass(1.5, 0.0),
+        ));
+        let accel = SceneAccel::build(&scene);
+        let mut rng = Rng::new(12345);
+        let mut checked = 0;
+        for _ in 0..4000 {
+            let o = Point3::new(
+                20.0 * rng.f64() - 5.0,
+                20.0 * rng.f64() - 5.0,
+                20.0 * rng.f64() - 5.0,
+            );
+            let d = Vec3::new(
+                2.0 * rng.f64() - 1.0,
+                2.0 * rng.f64() - 1.0,
+                2.0 * rng.f64() - 1.0,
+            );
+            if d.norm() < 1e-6 {
+                continue;
+            }
+            let d = d.normalize();
+            let dist = 30.0 * rng.f64();
+            let old = accel
+                .tlas
+                .occluded_range(&Ray::new(o, d), 1e-6, dist - 1e-6);
+            let new = scene.shadow_transmittance(&accel, o, d, dist).is_none();
+            assert_eq!(old, new, "from {o:?} along {d:?} for {dist}");
+            checked += 1;
+        }
+        assert!(checked > 3000);
+    }
+
     /// A shadow ray must see *through* a pane of glass, dimmed by exactly the
     /// factor the thin-walled BSDF applies to a refracted path.
     ///
