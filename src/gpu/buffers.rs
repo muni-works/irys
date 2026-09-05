@@ -532,6 +532,24 @@ impl GpuRenderState {
         self.env_ground = rgba(g.ground);
     }
 
+    /// Place this pass's primary rays under `filter` rather than uniformly
+    /// in the pixel.
+    ///
+    /// The device's sub-pixel jitter is a Halton pair computed *here*, on the
+    /// host, so importance-sampling the reconstruction filter is a warp of
+    /// two numbers before they are uploaded — and it is
+    /// [`crate::pathtrace::PixelFilter::warp`] itself doing it, the same
+    /// function the CPU integrator calls. There is no filter code in the
+    /// shader at all, and no way for the two tiers to drift.
+    ///
+    /// [`crate::pathtrace::PixelFilter::Box`] restores the uniform jitter
+    /// exactly, which is what [`GpuRenderState::new`] leaves in place.
+    pub fn set_pixel_filter(&mut self, filter: crate::pathtrace::PixelFilter) {
+        let (u, v) = halton_unit(self.frame_index);
+        self.jitter_x = filter.warp(u as f64) as f32;
+        self.jitter_y = filter.warp(v as f64) as f32;
+    }
+
     /// Light the scene with a directional sun, as
     /// [`crate::pathtrace::Scene::sun`] does on the CPU. Pass `None` to
     /// remove it.
@@ -734,6 +752,12 @@ impl GpuRenderState {
 /// Returns values in range [-0.5, 0.5] for sub-pixel jittering.
 fn halton_2_3(index: u32) -> (f32, f32) {
     (halton(index, 2) - 0.5, halton(index, 3) - 0.5)
+}
+
+/// The same pair, before centring: two uniforms in [0, 1), which is what a
+/// reconstruction filter's warp takes.
+fn halton_unit(index: u32) -> (f32, f32) {
+    (halton(index, 2), halton(index, 3))
 }
 
 /// Halton sequence generator for a given base.

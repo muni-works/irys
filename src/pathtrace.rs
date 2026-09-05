@@ -983,6 +983,159 @@ impl Camera {
     }
 }
 
+
+// ─── the pixel filter ─────────────────────────────────────────────────────
+
+/// Gaussian pixel filter standard deviation, in pixels.
+///
+/// 0.4 is the usual choice: narrow enough that the image is not visibly soft,
+/// wide enough that the filter actually does something at the edges a box
+/// filter aliases.
+pub const GAUSSIAN_SIGMA: f64 = 0.4;
+
+/// Blackman-Harris coefficients, the standard 4-term minimum-sidelobe set.
+const BH: [f64; 4] = [0.35875, -0.48829, 0.14128, -0.01168];
+
+/// The reconstruction filter a pixel's samples are drawn against.
+///
+/// Primary rays have always been jittered *uniformly* inside the pixel, which
+/// is a box filter — the worst reconstruction filter there is, and the reason
+/// a thin bright feature against a dark background (a rim, a net cord) crawls
+/// and stairsteps however many samples it gets. A better filter would
+/// normally mean carrying a per-pixel weight sum, which is a second buffer and
+/// a different accumulation rule on both tiers.
+///
+/// It does not have to. Draw the sample *position* from the filter itself —
+/// importance-sample the kernel — and the plain mean of the samples already
+/// is the filtered estimate. The accumulation rule, the running mean in the
+/// device history, and the variance estimator all stay exactly as they were;
+/// the only thing that changes is where in the pixel a ray is aimed.
+///
+/// [`PixelFilter::Box`] is the default, and it is the old behaviour to the
+/// bit: its warp is `u - 0.5`, and the sample position was `u`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PixelFilter {
+    /// Uniform inside the pixel. The historical behaviour, and the default.
+    #[default]
+    Box,
+    /// Gaussian of standard deviation [`GAUSSIAN_SIGMA`], truncated at the
+    /// filter radius.
+    Gaussian,
+    /// Blackman-Harris — a narrower main lobe than the Gaussian and far lower
+    /// sidelobes, so it rings less on a high-contrast edge.
+    BlackmanHarris,
+}
+
+impl PixelFilter {
+    /// Half-width of the filter's support, in pixels.
+    ///
+    /// The box filter stops at the pixel edge; the other two reach into their
+    /// neighbours, which is what lets them reconstruct an edge at all. 1.5 is
+    /// a hair under four standard deviations of the Gaussian, so the truncated
+    /// tail is a part in ten thousand.
+    pub fn radius(self) -> f64 {
+        match self {
+            PixelFilter::Box => 0.5,
+            PixelFilter::Gaussian | PixelFilter::BlackmanHarris => 1.5,
+        }
+    }
+
+    /// The filter kernel at `x` pixels from the pixel centre, unnormalised.
+    /// Zero outside [`PixelFilter::radius`].
+    pub fn weight(self, x: f64) -> f64 {
+        let r = self.radius();
+        if x.abs() > r {
+            return 0.0;
+        }
+        match self {
+            PixelFilter::Box => 1.0,
+            PixelFilter::Gaussian => {
+                (-(x * x) / (2.0 * GAUSSIAN_SIGMA * GAUSSIAN_SIGMA)).exp()
+            }
+            PixelFilter::BlackmanHarris => {
+                let t = (x + r) / (2.0 * r);
+                let tau = core::f64::consts::TAU;
+                BH[0] + BH[1] * (tau * t).cos()
+                    + BH[2] * (2.0 * tau * t).cos()
+                    + BH[3] * (3.0 * tau * t).cos()
+            }
+        }
+    }
+
+    /// Unnormalised CDF of the kernel from `-radius` to `x`.
+    ///
+    /// Both non-box filters integrate in closed form — the Gaussian through
+    /// `erf`, Blackman-Harris because a sum of cosines integrates to a sum of
+    /// sines — so there is no table to build and nothing to keep in sync
+    /// between the two tiers.
+    fn cdf(self, x: f64) -> f64 {
+        let r = self.radius();
+        let x = x.clamp(-r, r);
+        match self {
+            PixelFilter::Box => x + r,
+            PixelFilter::Gaussian => {
+                let k = 1.0 / (GAUSSIAN_SIGMA * core::f64::consts::SQRT_2);
+                erf(x * k) - erf(-r * k)
+            }
+            PixelFilter::BlackmanHarris => {
+                let t = (x + r) / (2.0 * r);
+                let tau = core::f64::consts::TAU;
+                BH[0] * t
+                    + BH[1] * (tau * t).sin() / tau
+                    + BH[2] * (2.0 * tau * t).sin() / (2.0 * tau)
+                    + BH[3] * (3.0 * tau * t).sin() / (3.0 * tau)
+            }
+        }
+    }
+
+    /// Map a uniform `u` in [0, 1) to a sample offset from the pixel centre,
+    /// distributed as the filter.
+    ///
+    /// Inverted by bisection on [`PixelFilter::cdf`], which is monotone
+    /// wherever the kernel is non-negative — as all three of these are. Forty
+    /// halvings over a three-pixel span reaches the last bit of an `f32`
+    /// several times over, and being a deterministic function of `u` alone is
+    /// what makes the CPU and the GPU aim at the same point: the device's
+    /// jitter is warped by *this* function on the host before it is uploaded.
+    pub fn warp(self, u: f64) -> f64 {
+        let r = self.radius();
+        if self == PixelFilter::Box {
+            // Exact, and bit-identical to the un-filtered jitter it replaces.
+            return u - 0.5;
+        }
+        let total = self.cdf(r);
+        if !(total > 0.0) {
+            return 0.0;
+        }
+        let target = u.clamp(0.0, 1.0) * total;
+        let (mut lo, mut hi) = (-r, r);
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            if self.cdf(mid) < target {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+}
+
+/// Abramowitz & Stegun 7.1.26, good to 1.5e-7 — three orders finer than the
+/// bisection that consumes it can resolve, and it avoids a libm `erf` that
+/// wasm would have to bring its own copy of.
+fn erf(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let y = 1.0
+        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+            + 0.254829592)
+            * t
+            * (-x * x).exp();
+    sign * y
+}
+
 /// Integrator settings.
 #[derive(Debug, Clone, Copy)]
 pub struct PathTraceOptions {
@@ -998,6 +1151,11 @@ pub struct PathTraceOptions {
     pub show_background: bool,
     /// Random seed.
     pub seed: u64,
+    /// Reconstruction filter for primary-ray placement within the pixel.
+    ///
+    /// [`PixelFilter::Box`] — uniform jitter — is the default and reproduces
+    /// every earlier render bit for bit.
+    pub filter: PixelFilter,
     /// Run the edge-aware à-trous denoiser over the film before returning.
     ///
     /// This is a pure post-process on the accumulated radiance — it consumes
@@ -1028,6 +1186,7 @@ impl Default for PathTraceOptions {
             firefly_clamp: Some(12.0),
             show_background: true,
             seed: 0x5eed_1234,
+            filter: PixelFilter::Box,
             denoise: true,
             denoise_iters: 5,
             sigma_normal: 0.35,
@@ -2064,9 +2223,10 @@ fn trace_pixel<G: Geometry>(
     let mut lsum2 = 0.0f32;
 
     for s in 0..spp {
-        // Jittered pixel position.
-        let jx = rng.f64();
-        let jy = rng.f64();
+        // Sample position within the pixel, drawn from the reconstruction
+        // filter so that the plain mean below *is* the filtered estimate.
+        let jx = 0.5 + opts.filter.warp(rng.f64());
+        let jy = 0.5 + opts.filter.warp(rng.f64());
         let sx = 2.0 * ((px as f64 + jx) / width as f64) - 1.0;
         let sy = 1.0 - 2.0 * ((py as f64 + jy) / height as f64);
         let (lu, lv) = concentric_disc(rng.f64(), rng.f64());
