@@ -580,7 +580,17 @@ fn ground_material() -> GpuMaterial {
     m.sheen = 0.0;
     m.sheen_roughness = 0.3;
     m.sheen_color = vec3<f32>(1.0);
-    m._pad = 0.0;
+    m.transmission = 0.0;
+    m.attenuation_color = vec3<f32>(1.0);
+    m.attenuation_distance = 0.0;
+    m.abbe = 0.0;
+    m.thin_walled = 0.0;
+    m.has_sellmeier = 0.0;
+    m._pad0 = 0.0;
+    m.sellmeier_b = vec3<f32>(0.0);
+    m._pad1 = 0.0;
+    m.sellmeier_c = vec3<f32>(0.0);
+    m._pad2 = 0.0;
     return m;
 }
 
@@ -611,6 +621,7 @@ fn sample_lights(
     n: vec3<f32>,
     wo_local: vec3<f32>,
     m: GpuMaterial,
+    eta: f32,
     pixel: vec2<u32>,
     depth: u32,
 ) -> vec3<f32> {
@@ -644,7 +655,7 @@ fn sample_lights(
         return vec3<f32>(0.0);
     }
 
-    let e = bsdf_eval(m, wo_local, wi_local);
+    let e = bsdf_eval(m, wo_local, wi_local, eta);
     if max3(e.value) <= 0.0 {
         return vec3<f32>(0.0);
     }
@@ -676,6 +687,7 @@ fn sample_environment(
     n: vec3<f32>,
     wo_local: vec3<f32>,
     m: GpuMaterial,
+    eta: f32,
     pixel: vec2<u32>,
     depth: u32,
 ) -> vec3<f32> {
@@ -699,7 +711,7 @@ fn sample_environment(
     if wi_local.z <= 0.0 {
         return vec3<f32>(0.0);
     }
-    let e = bsdf_eval(m, wo_local, wi_local);
+    let e = bsdf_eval(m, wo_local, wi_local, eta);
     if max3(e.value) <= 0.0 {
         return vec3<f32>(0.0);
     }
@@ -765,6 +777,7 @@ fn sample_sun(
     n: vec3<f32>,
     wo_local: vec3<f32>,
     m: GpuMaterial,
+    eta: f32,
     pixel: vec2<u32>,
     depth: u32,
 ) -> vec3<f32> {
@@ -778,7 +791,7 @@ fn sample_sun(
     if wi_local.z <= 0.0 {
         return vec3<f32>(0.0);
     }
-    let e = bsdf_eval(m, wo_local, wi_local);
+    let e = bsdf_eval(m, wo_local, wi_local, eta);
     if max3(e.value) <= 0.0 {
         return vec3<f32>(0.0);
     }
@@ -813,6 +826,14 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
     var prev_bsdf_pdf = 0.0;
     var specular_chain = true;
     var alpha = 0.0;
+    // The path's hero wavelength in nanometres; <= 0 means "still RGB". A
+    // scene with no dispersive material never leaves that state, draws no
+    // extra random number, and renders exactly what it always did.
+    var lambda_nm = 0.0;
+    // The medium the path is inside, for Beer-Lambert absorption. One slot,
+    // not a stack: nested dielectrics are out of scope, as on the CPU.
+    var in_medium = false;
+    var medium_sigma = vec3<f32>(0.0);
 
     let max_depth = max(render_state.max_depth, 1u);
 
@@ -834,6 +855,17 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
             lh.hit = false;
         }
         let geom_t = select(MAX_T, hit.t, hit.face_idx != 0xFFFFFFFFu);
+
+        // Absorb along the segment just travelled, if it was inside glass.
+        if in_medium && max3(medium_sigma) > 0.0 {
+            var seg = geom_t;
+            if lh.hit && lh.t < geom_t {
+                seg = lh.t;
+            }
+            if seg < MAX_T {
+                throughput = throughput * exp(-medium_sigma * seg);
+            }
+        }
 
         if lh.hit && lh.t < geom_t {
             let light = lights[lh.index];
@@ -902,10 +934,29 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
         }
 
         let wo_world = -ray_d;
+        // Which side of the *geometric* normal the ray arrived on is the whole
+        // of the inside/outside bookkeeping; read it before the face-forward
+        // below destroys the distinction.
+        let entering = dot(surf.normal, wo_world) >= 0.0;
         // Face-forward: interior faces (bore walls) must shade right.
         var n = surf.normal;
         if dot(n, wo_world) < 0.0 {
             n = -n;
+        }
+        // A dispersive material turns the path monochromatic, once.
+        if lambda_nm <= 0.0 && mat_is_dispersive(surf.material) {
+            lambda_nm = sample_lambda_nm(rand_uniform(pixel, 631u + depth * 17u));
+            throughput = throughput * hero_weight(lambda_nm);
+        }
+        // n_transmitted / n_incident for this crossing.
+        var eta = 1.0;
+        if surf.material.transmission > 0.0 {
+            let n_glass = max(mat_index_at(surf.material, lambda_nm), 1e-3);
+            if surf.material.thin_walled != 0.0 || entering {
+                eta = n_glass;
+            } else {
+                eta = 1.0 / n_glass;
+            }
         }
         // Align the frame's x axis with dP/du so an anisotropic highlight
         // follows the surface's own grain, exactly as the CPU renderer does.
@@ -916,9 +967,9 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
         }
 
         // Next-event estimation.
-        var direct = sample_lights(surf.point, frame, n, wo_local, surf.material, pixel, depth)
-            + sample_environment(surf.point, frame, n, wo_local, surf.material, pixel, depth)
-            + sample_sun(surf.point, frame, n, wo_local, surf.material, pixel, depth);
+        var direct = sample_lights(surf.point, frame, n, wo_local, surf.material, eta, pixel, depth)
+            + sample_environment(surf.point, frame, n, wo_local, surf.material, eta, pixel, depth)
+            + sample_sun(surf.point, frame, n, wo_local, surf.material, eta, pixel, depth);
         if depth > 0u && render_state.firefly_clamp > 0.0 {
             direct = min(direct, vec3<f32>(render_state.firefly_clamp));
         }
@@ -927,7 +978,8 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
         // Continue the path.
         let r_lobe = rand_uniform(pixel, 211u + depth * 23u);
         let r12 = rand_uniform2(pixel, 307u + depth * 29u);
-        let s = bsdf_sample(surf.material, wo_local, r_lobe, r12.x, r12.y);
+        let r_branch = rand_uniform(pixel, 509u + depth * 37u);
+        let s = bsdf_sample(surf.material, wo_local, eta, r_lobe, r12.x, r12.y, r_branch);
         if !s.ok {
             break;
         }
@@ -935,8 +987,19 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
         prev_bsdf_pdf = s.pdf;
         specular_chain = false;
 
+        // A transmitted ray leaves on the far side, so it is offset the other
+        // way — and, for a solid, it changes which medium the path is in.
+        let transmitted = s.wi.z < 0.0;
+        if transmitted && surf.material.thin_walled == 0.0 {
+            in_medium = entering;
+            medium_sigma = mat_extinction(surf.material);
+        }
         let wi_world = to_world(frame, s.wi);
-        ray_o = offset_origin(surf.point, n);
+        var off_n = n;
+        if transmitted {
+            off_n = -n;
+        }
+        ray_o = offset_origin(surf.point, off_n);
         ray_d = wi_world;
 
         // Russian roulette.

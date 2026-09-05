@@ -49,6 +49,8 @@ struct ParityOut {
     sampled: [f32; 4],
     /// `(f·cos, pdf)` from re-evaluating at the sampled direction.
     resampled: [f32; 4],
+    /// `(n(λ), hero_weight(λ))` at the wavelength riding in `wi.w`.
+    spectral: [f32; 4],
 }
 
 /// The compute half: one invocation per input, every entry point the tests use.
@@ -64,6 +66,7 @@ struct ParityOut {
     eval: vec4<f32>,
     sampled: vec4<f32>,
     resampled: vec4<f32>,
+    spectral: vec4<f32>,
 }
 
 @group(0) @binding(0) var<storage, read> parity_in: array<ParityIn>;
@@ -78,18 +81,22 @@ fn parity(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = parity_in[i];
     var o: ParityOut;
 
-    let e = bsdf_eval(p.material, p.wo.xyz, p.wi.xyz);
+    // `wo.w` carries eta (n_transmitted / n_incident) and `rnd.w` the
+    // dielectric lobe's reflect-or-refract draw.
+    let eta = p.wo.w;
+    let e = bsdf_eval(p.material, p.wo.xyz, p.wi.xyz, eta);
     o.eval = vec4<f32>(e.value, e.pdf);
 
-    let s = bsdf_sample(p.material, p.wo.xyz, p.rnd.x, p.rnd.y, p.rnd.z);
+    let s = bsdf_sample(p.material, p.wo.xyz, eta, p.rnd.x, p.rnd.y, p.rnd.z, p.rnd.w);
     if s.ok {
         o.sampled = vec4<f32>(s.wi, s.pdf);
-        let r = bsdf_eval(p.material, p.wo.xyz, s.wi);
+        let r = bsdf_eval(p.material, p.wo.xyz, s.wi, eta);
         o.resampled = vec4<f32>(r.value, r.pdf);
     } else {
         o.sampled = vec4<f32>(0.0);
         o.resampled = vec4<f32>(0.0);
     }
+    o.spectral = vec4<f32>(mat_index_at(p.material, p.wi.w), hero_weight(p.wi.w));
     parity_out[i] = o;
 }
 "#;
@@ -260,7 +267,36 @@ fn materials() -> Vec<Pbr> {
         ior: 1.7,
         ..base
     });
+    // Transmissive dielectrics: clear glass at two roughnesses, a dispersive
+    // N-BK7 marble, an absorbing green slab, and a thin-walled pane.
+    out.push(Pbr::glass(1.52, 0.05));
+    out.push(Pbr::glass(1.33, 0.3));
+    out.push(Pbr::glass(1.5168, 0.02).with_sellmeier(kosm_render::spectrum::BK7_SELLMEIER));
+    out.push(Pbr::glass(1.52, 0.15).with_attenuation([0.82, 0.94, 0.86], 0.05));
+    out.push(Pbr {
+        thin_walled: true,
+        abbe: 64.0,
+        ..Pbr::glass(1.52, 0.1)
+    });
+    // Half-transmissive, so both the opaque lobes and the dielectric one are
+    // live at once and their weights have to add up.
+    out.push(Pbr {
+        transmission: 0.5,
+        roughness: 0.25,
+        clearcoat: 0.3,
+        sheen: 0.2,
+        ..base
+    });
     out
+}
+
+/// `eta` for a material's own interface, entering from air.
+fn eta_of(m: &Pbr) -> f32 {
+    if m.transmission > 0.0 {
+        m.index_at(None).max(1e-3)
+    } else {
+        1.0
+    }
 }
 
 fn directions() -> Vec<Vec3> {
@@ -281,6 +317,10 @@ fn v4(v: Vec3) -> [f32; 4] {
     [v.x as f32, v.y as f32, v.z as f32, 0.0]
 }
 
+fn v4w(v: Vec3, w: f32) -> [f32; 4] {
+    [v.x as f32, v.y as f32, v.z as f32, w]
+}
+
 /// Build the full cross product of materials, view and light directions, with
 /// a cheap deterministic sample seed riding along in `rnd`.
 fn sweep() -> (Vec<ParityIn>, Vec<(Pbr, Vec3, Vec3)>) {
@@ -288,16 +328,22 @@ fn sweep() -> (Vec<ParityIn>, Vec<(Pbr, Vec3, Vec3)>) {
     let mut meta = Vec::new();
     let dirs = directions();
     let mut k = 0u32;
+    // `wi` also sweeps the lower hemisphere, which is where the dielectric
+    // lobe's transmitted half lives and where nothing was ever checked before.
+    let below: Vec<Vec3> = dirs.iter().map(|d| Vec3::new(d.x, d.y, -d.z)).collect();
     for m in materials() {
+        let eta = eta_of(&m);
         for &wo in &dirs {
-            for &wi in &dirs {
+            for &wi in dirs.iter().chain(below.iter()) {
                 k = k.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 let r = |s: u32| ((k >> s) & 0xFFFF) as f32 / 65536.0;
                 ins.push(ParityIn {
                     material: GpuMaterial::from_pbr(m),
-                    wo: v4(wo),
-                    wi: v4(wi),
-                    rnd: [r(0), r(8), r(16), 0.0],
+                    wo: v4w(wo, eta),
+                    // A wavelength rides in `wi.w` for the dispersion check;
+                    // it plays no part in the BSDF evaluation.
+                    wi: v4w(wi, 380.0 + 400.0 * r(12)),
+                    rnd: [r(0), r(8), r(16), r(4)],
                 });
                 meta.push((m, wo, wi));
             }
@@ -317,7 +363,7 @@ fn gpu_bsdf_eval_matches_the_cpu_reference() {
 
     let mut worst = 0.0f32;
     for (o, (m, wo, wi)) in outs.iter().zip(&meta) {
-        let (cf, cpdf) = reference_bsdf_eval(m, *wo, *wi);
+        let (cf, cpdf) = reference_bsdf_eval(m, *wo, *wi, eta_of(m));
         for c in 0..3 {
             // The CPU runs f64 and the device f32, and the tables are
             // interpolated on both sides, so this is an f32 tolerance, not
@@ -342,6 +388,37 @@ fn gpu_bsdf_eval_matches_the_cpu_reference() {
         );
     }
     eprintln!("worst relative disagreement over {} cases: {worst:e}", meta.len());
+}
+
+/// The dispersion half: the device's Sellmeier/Cauchy index and its CIE fit
+/// have to be the CPU's, or a prism bends the two tiers by different angles
+/// and the colours land in different places.
+#[test]
+#[ignore = "requires GPU"]
+fn gpu_dispersion_matches_the_cpu_reference() {
+    let Some(ctx) = ctx_or_skip("gpu_dispersion_matches_the_cpu_reference") else {
+        return;
+    };
+    let (ins, meta) = sweep();
+    let outs = run(ctx, &ins);
+    for (o, (i, (m, _, _))) in outs.iter().zip(meta.iter().enumerate()) {
+        let lambda = ins[i].wi[3] as f64;
+        let want = m.index_at(Some(lambda));
+        assert!(
+            (want - o.spectral[0]).abs() <= 2e-5 * want.max(1.0),
+            "n({lambda}nm): cpu {want} gpu {}\n  {m:?}",
+            o.spectral[0]
+        );
+        let hw = kosm_render::spectrum::hero_weight(lambda);
+        for c in 0..3 {
+            assert!(
+                (hw[c] - o.spectral[1 + c]).abs() <= 2e-4,
+                "hero_weight({lambda}nm) channel {c}: cpu {} gpu {}",
+                hw[c],
+                o.spectral[1 + c]
+            );
+        }
+    }
 }
 
 #[test]

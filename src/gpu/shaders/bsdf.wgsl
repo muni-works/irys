@@ -545,7 +545,113 @@ struct GpuMaterial {
     sheen: f32,
     sheen_roughness: f32,
     sheen_color: vec3<f32>,
-    _pad: f32,
+    // Weight of the dielectric transmission lobe; 0 is an opaque surface and
+    // every path below reduces to what it was.
+    transmission: f32,
+    attenuation_color: vec3<f32>,
+    // 0 means "no absorption": the shader has no infinity to compare against,
+    // so `GpuMaterial::from_pbr` folds an infinite distance to zero here.
+    attenuation_distance: f32,
+    abbe: f32,
+    thin_walled: f32,
+    has_sellmeier: f32,
+    _pad0: f32,
+    sellmeier_b: vec3<f32>,
+    _pad1: f32,
+    sellmeier_c: vec3<f32>,
+    _pad2: f32,
+}
+
+// ─── dispersion ───────────────────────────────────────────────────────────
+//
+// A port of `spectrum.rs`. `lambda_nm <= 0` is the sentinel for "this path is
+// still RGB", which is how a non-dispersive scene stays bit-for-bit what it
+// was.
+
+const LAMBDA_MIN_NM: f32 = 380.0;
+const LAMBDA_MAX_NM: f32 = 780.0;
+
+fn skew_gauss(x: f32, mu: f32, s1: f32, s2: f32) -> f32 {
+    var s = s2;
+    if x < mu {
+        s = s1;
+    }
+    let t = (x - mu) / s;
+    return exp(-0.5 * t * t);
+}
+
+// Wyman/Sloan/Shirley multi-lobe Gaussian fit to CIE 1931.
+fn cie_xyz(l: f32) -> vec3<f32> {
+    let x = 1.056 * skew_gauss(l, 599.8, 37.9, 31.0)
+        + 0.362 * skew_gauss(l, 442.0, 16.0, 26.7)
+        - 0.065 * skew_gauss(l, 501.1, 20.4, 26.2);
+    let y = 0.821 * skew_gauss(l, 568.8, 46.9, 40.5)
+        + 0.286 * skew_gauss(l, 530.9, 16.3, 31.1);
+    let z = 1.217 * skew_gauss(l, 437.0, 11.8, 36.0)
+        + 0.681 * skew_gauss(l, 459.0, 26.0, 13.8);
+    return vec3<f32>(x, y, z);
+}
+
+// The weight a path picks up when it becomes monochromatic: the linear-sRGB
+// colour-matching response normalised to integrate to white over the band,
+// divided by the (uniform) wavelength PDF.
+fn hero_weight(lambda_nm: f32) -> vec3<f32> {
+    let c = cie_xyz(lambda_nm);
+    let rgb = vec3<f32>(
+        3.2404542 * c.x - 1.5371385 * c.y - 0.4985314 * c.z,
+        -0.9692660 * c.x + 1.8760108 * c.y + 0.0415560 * c.z,
+        0.0556434 * c.x - 0.2040259 * c.y + 1.0572252 * c.z,
+    );
+    let band = LAMBDA_MAX_NM - LAMBDA_MIN_NM;
+    let norm = vec3<f32>(1.0 / 128.3610214, 1.0 / 101.5380812, 1.0 / 97.0648041);
+    return rgb * norm * band;
+}
+
+fn sample_lambda_nm(u: f32) -> f32 {
+    return LAMBDA_MIN_NM + (LAMBDA_MAX_NM - LAMBDA_MIN_NM) * u;
+}
+
+// Whether this material's index varies with wavelength.
+fn mat_is_dispersive(m: GpuMaterial) -> bool {
+    return m.transmission > 0.0 && (m.has_sellmeier != 0.0 || m.abbe > 0.0);
+}
+
+// Index of refraction at a wavelength in nanometres; `lambda_nm <= 0` is an
+// RGB path and gets the flat `ior`.
+fn mat_index_at(m: GpuMaterial, lambda_nm: f32) -> f32 {
+    if lambda_nm <= 0.0 {
+        return m.ior;
+    }
+    let um = lambda_nm * 1e-3;
+    let l2 = um * um;
+    if m.has_sellmeier != 0.0 {
+        var n2 = 1.0;
+        let b = m.sellmeier_b;
+        let c = m.sellmeier_c;
+        n2 += b.x * l2 / (l2 - c.x);
+        n2 += b.y * l2 / (l2 - c.y);
+        n2 += b.z * l2 / (l2 - c.z);
+        return sqrt(max(n2, 1.0));
+    }
+    if m.abbe > 0.0 {
+        // Cauchy from the d line and the F-to-C spread — OpenPBR's
+        // `specular_ior_dispersion`.
+        let inv_f = 1.0 / (0.48613 * 0.48613);
+        let inv_c = 1.0 / (0.65627 * 0.65627);
+        let inv_d = 1.0 / (0.58756 * 0.58756);
+        let bb = (m.ior - 1.0) / (m.abbe * (inv_f - inv_c));
+        return m.ior - bb * inv_d + bb / l2;
+    }
+    return m.ior;
+}
+
+// Beer-Lambert extinction per unit length: ln(1/attenuation_color)/distance.
+fn mat_extinction(m: GpuMaterial) -> vec3<f32> {
+    if m.attenuation_distance <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    let a = clamp(m.attenuation_color, vec3<f32>(1e-6), vec3<f32>(1.0));
+    return -log(a) / m.attenuation_distance;
 }
 
 // ─── unified BSDF ─────────────────────────────────────────────────────────
@@ -637,7 +743,17 @@ fn mat_f0(m: GpuMaterial) -> vec3<f32> {
 
 // Diffuse albedo (metals have none).
 fn mat_diffuse_albedo(m: GpuMaterial) -> vec3<f32> {
-    return m.color.rgb * (1.0 - m.metallic);
+    // `transmission` takes the diffuse lobe away exactly as `metallic` does:
+    // light that went through did not scatter back.
+    //
+    // Guarded rather than multiplied by a 1.0 that is arithmetically free,
+    // because adding a third factor lets the shader compiler reassociate the
+    // product and an opaque material's shade must not move by even an ulp.
+    let base = m.color.rgb * (1.0 - m.metallic);
+    if m.transmission <= 0.0 {
+        return base;
+    }
+    return base * (1.0 - m.transmission);
 }
 
 // GGX / Trowbridge-Reitz normal distribution, taking the half-vector rather
@@ -942,14 +1058,126 @@ fn vndf_pdf(wo: vec3<f32>, wh: vec3<f32>, at: f32, ab: f32) -> f32 {
     return d * g1 * o_dot_h / n_dot_v / (4.0 * o_dot_h);
 }
 
-// Relative sampling weights of the four lobes (diffuse, specular, sheen, coat).
-fn lobe_weights(m: GpuMaterial) -> vec4<f32> {
+// ─── rough dielectric ─────────────────────────────────────────────────────
+//
+// The WGSL half of `pathtrace::dielectric_eval`. Same conventions, stated
+// there at length: `eta` is n_transmitted/n_incident, the reflect/transmit
+// split is the exact unpolarised Fresnel (TIR is not a special case, it is
+// what that formula returns), and radiance carries the 1/eta^2 camera-path
+// scaling, which cancels Walter's eta_t^2 out of the expression entirely.
+
+// Smith G1 for a direction on either side of the surface.
+fn g1_smith_abs(w: vec3<f32>, at: f32, ab: f32) -> f32 {
+    let z = max(abs(w.z), 1e-6);
+    let lambda = (sqrt((at * w.x) * (at * w.x) + (ab * w.y) * (ab * w.y) + z * z) / z - 1.0) * 0.5;
+    return 1.0 / (1.0 + lambda);
+}
+
+// Exact unpolarised dielectric Fresnel; 1.0 past the critical angle.
+fn fresnel_dielectric(cos_i_in: f32, eta: f32) -> f32 {
+    let cos_i = clamp(cos_i_in, 0.0, 1.0);
+    let sin2_t = (1.0 - cos_i * cos_i) / (eta * eta);
+    if sin2_t >= 1.0 {
+        return 1.0;
+    }
+    let cos_t = sqrt(max(1.0 - sin2_t, 0.0));
+    let rs = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
+    let rp = (cos_t - eta * cos_i) / (cos_t + eta * cos_i);
+    return clamp(0.5 * (rs * rs + rp * rp), 0.0, 1.0);
+}
+
+// The VNDF's density in the half-vector, before any reflect/refract Jacobian.
+fn vndf_density(wo: vec3<f32>, wh: vec3<f32>, at: f32, ab: f32) -> f32 {
+    let n_dot_v = max(wo.z, 1e-6);
+    let d = d_ggx_aniso(wh, at, ab);
+    let g1 = g1_smith_aniso(wo, at, ab);
+    let o_dot_h = max(dot(wo, wh), 1e-9);
+    return d * g1 * o_dot_h / n_dot_v;
+}
+
+// `(f*cos, pdf)` of the dielectric lobe alone, un-weighted.
+fn dielectric_eval(m: GpuMaterial, wo: vec3<f32>, wi: vec3<f32>, eta: f32) -> vec2<f32> {
+    let ab_pair = mat_alpha_tb(m);
+    let at = ab_pair.x;
+    let ab = ab_pair.y;
+
+    if m.thin_walled != 0.0 {
+        // A sheet: the exit direction is the entry direction, so the event is
+        // the GGX reflection lobe mirrored through the surface — roughness
+        // kept, no lateral offset.
+        let flipped = vec3<f32>(wi.x, wi.y, -wi.z);
+        if flipped.z <= 0.0 || wo.z <= 0.0 {
+            return vec2<f32>(0.0);
+        }
+        let wh = normalize(wo + flipped);
+        let f = fresnel_dielectric(max(dot(wo, wh), 0.0), max(m.ior, 1.0));
+        let d = d_ggx_aniso(wh, at, ab);
+        let vis = v_smith_aniso(wo, flipped, at, ab);
+        return vec2<f32>(
+            (1.0 - f) * d * vis * flipped.z,
+            vndf_pdf(wo, wh, at, ab) * (1.0 - f),
+        );
+    }
+
+    if wi.z > 0.0 {
+        let wh = normalize(wo + wi);
+        let f = fresnel_dielectric(max(dot(wo, wh), 0.0), eta);
+        let d = d_ggx_aniso(wh, at, ab);
+        let vis = v_smith_aniso(wo, wi, at, ab);
+        return vec2<f32>(f * d * vis * wi.z, vndf_pdf(wo, wh, at, ab) * f);
+    }
+
+    // Walter's generalised half-vector, with eta_i factored out.
+    let h = -(wo + wi * eta);
+    if length(h) < 1e-9 {
+        return vec2<f32>(0.0);
+    }
+    var wh = normalize(h);
+    if wh.z < 0.0 {
+        wh = -wh;
+    }
+    let cos_o = dot(wo, wh);
+    let cos_i = dot(wi, wh);
+    if cos_o <= 0.0 || cos_i >= 0.0 {
+        return vec2<f32>(0.0);
+    }
+    let f = fresnel_dielectric(cos_o, eta);
+    let d = d_ggx_aniso(wh, at, ab);
+    let g = g1_smith_abs(wo, at, ab) * g1_smith_abs(wi, at, ab);
+    let x = cos_o + eta * cos_i;
+    let denom = max(x * x, 1e-12);
+    let value = (1.0 - f) * d * g * abs(cos_o * cos_i) / abs(wo.z) / denom;
+    let jacobian = eta * eta * abs(cos_i) / denom;
+    let pdf = vndf_density(wo, wh, at, ab) * (1.0 - f) * jacobian;
+    return vec2<f32>(max(value, 0.0), max(pdf, 0.0));
+}
+
+// Relative sampling weights of the five lobes: (diffuse, specular, sheen,
+// coat) in `.rgba`, and the dielectric lobe alongside. At `transmission = 0`
+// the first four are bit-identical to what they were and the fifth is zero.
+struct Lobes {
+    w: vec4<f32>,
+    diel: f32,
+}
+
+fn lobe_weights(m: GpuMaterial) -> Lobes {
+    let opaque = 1.0 - m.transmission;
     let diff = max(max3(mat_diffuse_albedo(m)), 0.0);
-    let spec = max(max3(mat_f0(m)), 0.0) + 0.08;
+    var spec = max(max3(mat_f0(m)), 0.0) + 0.08;
+    if m.transmission > 0.0 {
+        spec = spec * opaque;
+    }
     let sheen = max(m.sheen * max3(m.sheen_color), 0.0);
     let coat = m.clearcoat * 0.25;
-    let total = max(diff + spec + sheen + coat, 1e-6);
-    return vec4<f32>(diff, spec, sheen, coat) / total;
+    let diel = max(m.transmission, 0.0);
+    var total = max(diff + spec + sheen + coat, 1e-6);
+    if diel > 0.0 {
+        total = max(diff + spec + sheen + coat + diel, 1e-6);
+    }
+    var out: Lobes;
+    out.w = vec4<f32>(diff, spec, sheen, coat) / total;
+    out.diel = diel / total;
+    return out;
 }
 
 struct BsdfEval {
@@ -959,11 +1187,22 @@ struct BsdfEval {
 }
 
 // Evaluate the full BSDF and its sampling PDF for a given in/out pair.
-fn bsdf_eval(m: GpuMaterial, wo: vec3<f32>, wi: vec3<f32>) -> BsdfEval {
+fn bsdf_eval(m: GpuMaterial, wo: vec3<f32>, wi: vec3<f32>, eta: f32) -> BsdfEval {
     var out: BsdfEval;
     out.value = vec3<f32>(0.0);
     out.pdf = 0.0;
-    if wi.z <= 0.0 || wo.z <= 0.0 {
+    if wo.z <= 0.0 {
+        return out;
+    }
+    if wi.z <= 0.0 {
+        // Below the surface: only the dielectric lobe lives down here.
+        if m.transmission <= 0.0 {
+            return out;
+        }
+        let lw = lobe_weights(m);
+        let dv = dielectric_eval(m, wo, wi, eta);
+        out.value = vec3<f32>(dv.x * m.transmission);
+        out.pdf = max(lw.diel * dv.y, 0.0);
         return out;
     }
     let n_dot_l = wi.z;
@@ -971,7 +1210,8 @@ fn bsdf_eval(m: GpuMaterial, wo: vec3<f32>, wi: vec3<f32>) -> BsdfEval {
     let wh = normalize(wo + wi);
     let o_dot_h = max(dot(wo, wh), 0.0);
 
-    let w = lobe_weights(m);
+    let lw = lobe_weights(m);
+    let w = lw.w;
 
     // Diffuse: EON, blended towards Hanrahan-Krueger by `subsurface`. At the
     // defaults both branches collapse to rho/pi and this is Lambert exactly.
@@ -990,8 +1230,18 @@ fn bsdf_eval(m: GpuMaterial, wo: vec3<f32>, wi: vec3<f32>) -> BsdfEval {
     let vis = v_smith_aniso(wo, wi, ab_pair.x, ab_pair.y);
     let f0 = mat_f0(m);
     let f = fresnel(f0, o_dot_h);
-    let spec = f * (d * vis * n_dot_l) * ms_compensation(f0, ab_pair.x, ab_pair.y, n_dot_v);
+    var spec = f * (d * vis * n_dot_l) * ms_compensation(f0, ab_pair.x, ab_pair.y, n_dot_v);
     let pdf_s = vndf_pdf(wo, wh, ab_pair.x, ab_pair.y);
+
+    // The dielectric lobe's reflected half: same facets, exact Fresnel split.
+    var diel = vec3<f32>(0.0);
+    var pdf_diel = 0.0;
+    if m.transmission > 0.0 {
+        spec = spec * (1.0 - m.transmission);
+        let dv = dielectric_eval(m, wo, wi, eta);
+        diel = vec3<f32>(dv.x * m.transmission);
+        pdf_diel = dv.y;
+    }
 
     // Sheen, between the coat and the base.
     let sh = sheen_eval(m, wo, wi);
@@ -1018,9 +1268,18 @@ fn bsdf_eval(m: GpuMaterial, wo: vec3<f32>, wi: vec3<f32>) -> BsdfEval {
         coat_atten = 1.0 - cf;
     }
 
-    let under = (diffuse + spec) * sheen_atten + sh.value;
+    // Again spelled as a branch rather than as an addition of zero: an
+    // opaque material has to come out of here bit-for-bit what it always did,
+    // and a fifth term is a licence for the compiler to re-contract the sum.
+    var base = diffuse + spec;
+    var pdf = w.x * pdf_d + w.y * pdf_s + w.z * sh.pdf + w.w * pdf_c;
+    if m.transmission > 0.0 {
+        base = base + diel;
+        pdf = pdf + lw.diel * pdf_diel;
+    }
+    let under = base * sheen_atten + sh.value;
     out.value = under * coat_atten + coat;
-    out.pdf = max(w.x * pdf_d + w.y * pdf_s + w.z * sh.pdf + w.w * pdf_c, 0.0);
+    out.pdf = max(pdf, 0.0);
     return out;
 }
 
@@ -1032,7 +1291,15 @@ struct BsdfSample {
 }
 
 // Importance-sample the BSDF. `r_lobe` picks the lobe; `r1`/`r2` drive it.
-fn bsdf_sample(m: GpuMaterial, wo: vec3<f32>, r_lobe: f32, r1: f32, r2: f32) -> BsdfSample {
+fn bsdf_sample(
+    m: GpuMaterial,
+    wo: vec3<f32>,
+    eta: f32,
+    r_lobe: f32,
+    r1: f32,
+    r2: f32,
+    r_branch: f32,
+) -> BsdfSample {
     var out: BsdfSample;
     out.wi = vec3<f32>(0.0, 0.0, 1.0);
     out.value = vec3<f32>(0.0);
@@ -1041,7 +1308,8 @@ fn bsdf_sample(m: GpuMaterial, wo: vec3<f32>, r_lobe: f32, r1: f32, r2: f32) -> 
     if wo.z <= 0.0 {
         return out;
     }
-    let w = lobe_weights(m);
+    let lw = lobe_weights(m);
+    let w = lw.w;
 
     var wi: vec3<f32>;
     if r_lobe < w.x {
@@ -1070,16 +1338,53 @@ fn bsdf_sample(m: GpuMaterial, wo: vec3<f32>, r_lobe: f32, r1: f32, r2: f32) -> 
         if wi.z <= 0.0 {
             return out;
         }
-    } else {
+    } else if r_lobe < w.x + w.y + w.z + w.w {
         let ca = mat_coat_alpha(m);
         let wh = sample_gtr1(ca, r1, r2);
         wi = reflect(-wo, wh);
         if wi.z <= 0.0 {
             return out;
         }
+    } else {
+        // The dielectric lobe: one VNDF facet, then reflect off it or refract
+        // through it with the exact Fresnel as the branch probability.
+        let ab_pair = mat_alpha_tb(m);
+        let wh = sample_vndf(wo, ab_pair.x, ab_pair.y, r1, r2);
+        let cos_o = max(dot(wo, wh), 0.0);
+        if m.thin_walled != 0.0 {
+            let f = fresnel_dielectric(cos_o, max(m.ior, 1.0));
+            let r = reflect(-wo, wh);
+            if r.z <= 0.0 {
+                return out;
+            }
+            if r_branch < f {
+                wi = r;
+            } else {
+                wi = vec3<f32>(r.x, r.y, -r.z);
+            }
+        } else {
+            let f = fresnel_dielectric(cos_o, eta);
+            if r_branch < f {
+                wi = reflect(-wo, wh);
+                if wi.z <= 0.0 {
+                    return out;
+                }
+            } else {
+                // Snell about the microfacet.
+                let inv = 1.0 / eta;
+                let k = 1.0 - inv * inv * (1.0 - cos_o * cos_o);
+                if k < 0.0 {
+                    return out;
+                }
+                wi = normalize(-wo * inv + wh * (inv * cos_o - sqrt(k)));
+                if wi.z >= 0.0 {
+                    return out;
+                }
+            }
+        }
     }
 
-    let e = bsdf_eval(m, wo, wi);
+    let e = bsdf_eval(m, wo, wi, eta);
     if e.pdf <= 1e-9 {
         return out;
     }

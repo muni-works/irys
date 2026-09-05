@@ -43,8 +43,31 @@ pub struct GpuMaterial {
     pub sheen_roughness: f32,
     /// Colour of the sheen layer.
     pub sheen_color: [f32; 3],
-    /// Padding for 16-byte alignment. The struct is 80 bytes.
-    pub _pad: f32,
+    /// Weight of the dielectric transmission lobe, 0 = opaque.
+    pub transmission: f32,
+    /// Colour transmitted through one attenuation distance of the interior.
+    pub attenuation_color: [f32; 3],
+    /// Distance over which the interior attenuates to `attenuation_color`.
+    /// A non-positive value means no absorption — the shader has no
+    /// infinity to compare against, so "off" is spelled `0` on this side.
+    pub attenuation_distance: f32,
+    /// Abbe number for Cauchy dispersion; 0 = none.
+    pub abbe: f32,
+    /// Non-zero when the surface is an infinitely thin sheet.
+    pub thin_walled: f32,
+    /// Non-zero when `sellmeier_b`/`sellmeier_c` carry a real glass, which
+    /// overrides `abbe`.
+    pub has_sellmeier: f32,
+    /// Padding to keep `sellmeier_b` on its 16-byte boundary.
+    pub _pad0: f32,
+    /// Sellmeier `B` coefficients.
+    pub sellmeier_b: [f32; 3],
+    /// Padding for 16-byte alignment.
+    pub _pad1: f32,
+    /// Sellmeier `C` coefficients, in µm².
+    pub sellmeier_c: [f32; 3],
+    /// Padding for 16-byte alignment. The struct is 144 bytes.
+    pub _pad2: f32,
 }
 
 impl Default for GpuMaterial {
@@ -64,7 +87,17 @@ impl Default for GpuMaterial {
             sheen: 0.0,
             sheen_roughness: 0.3,
             sheen_color: [1.0; 3],
-            _pad: 0.0,
+            transmission: 0.0,
+            attenuation_color: [1.0; 3],
+            attenuation_distance: 0.0,
+            abbe: 0.0,
+            thin_walled: 0.0,
+            has_sellmeier: 0.0,
+            _pad0: 0.0,
+            sellmeier_b: [0.0; 3],
+            _pad1: 0.0,
+            sellmeier_c: [0.0; 3],
+            _pad2: 0.0,
         }
     }
 }
@@ -127,7 +160,28 @@ impl GpuMaterial {
             sheen: p.sheen,
             sheen_roughness: p.sheen_roughness,
             sheen_color: p.sheen_color,
-            _pad: 0.0,
+            transmission: p.transmission,
+            attenuation_color: p.attenuation_color,
+            // Infinity does not survive a `-ffast-math`-shaped shader as a
+            // comparison; "no absorption" is 0 on the GPU and the shader
+            // tests for it that way.
+            attenuation_distance: if p.attenuation_distance.is_finite() {
+                p.attenuation_distance.max(0.0)
+            } else {
+                0.0
+            },
+            abbe: p.abbe,
+            thin_walled: if p.thin_walled { 1.0 } else { 0.0 },
+            has_sellmeier: if p.sellmeier.is_some() { 1.0 } else { 0.0 },
+            _pad0: 0.0,
+            sellmeier_b: p.sellmeier.map_or([0.0; 3], |(b, _)| {
+                [b[0] as f32, b[1] as f32, b[2] as f32]
+            }),
+            _pad1: 0.0,
+            sellmeier_c: p.sellmeier.map_or([0.0; 3], |(_, c)| {
+                [c[0] as f32, c[1] as f32, c[2] as f32]
+            }),
+            _pad2: 0.0,
         }
     }
 
@@ -149,6 +203,31 @@ impl GpuMaterial {
             sheen: self.sheen,
             sheen_roughness: self.sheen_roughness,
             sheen_color: self.sheen_color,
+            transmission: self.transmission,
+            abbe: self.abbe,
+            sellmeier: if self.has_sellmeier != 0.0 {
+                Some((
+                    [
+                        self.sellmeier_b[0] as f64,
+                        self.sellmeier_b[1] as f64,
+                        self.sellmeier_b[2] as f64,
+                    ],
+                    [
+                        self.sellmeier_c[0] as f64,
+                        self.sellmeier_c[1] as f64,
+                        self.sellmeier_c[2] as f64,
+                    ],
+                ))
+            } else {
+                None
+            },
+            attenuation_color: self.attenuation_color,
+            attenuation_distance: if self.attenuation_distance > 0.0 {
+                self.attenuation_distance
+            } else {
+                f32::INFINITY
+            },
+            thin_walled: self.thin_walled != 0.0,
             emissive: [0.0; 3],
         }
     }
@@ -841,8 +920,10 @@ mod layout_tests {
     /// this catches it without a GPU.
     #[test]
     fn the_material_stride_is_what_the_shader_expects() {
-        // vec4 color, twelve scalars, vec3 sheen_color (16-byte aligned) + pad.
-        assert_eq!(std::mem::size_of::<GpuMaterial>(), 80);
+        // vec4 color, twelve scalars, then four more 16-byte rows: sheen_color
+        // + transmission, attenuation_color + distance, the four dispersion
+        // scalars, and the two Sellmeier triples with their padding.
+        assert_eq!(std::mem::size_of::<GpuMaterial>(), 144);
         assert_eq!(std::mem::align_of::<GpuMaterial>(), 4);
     }
 }
