@@ -50,10 +50,10 @@
 //! definition where the ray is tangent to a level set. `Hit::uv` is unused
 //! and zero — a Gaussian has no parameterisation.
 //!
-//! # What the integrator will need
+//! # The compositing path
 //!
-//! Not implemented here, deliberately — the integrator is a separate
-//! concern. What it will need is a **compositing path**, and only that:
+//! [`composite`] does the walk, and the integrator calls it once per ray
+//! segment:
 //!
 //! 1. Trace the splat [`Bvh`] with [`Geometry::intersect_all`] (or
 //!    [`Bvh::trace`], which sorts) to get every splat along the ray in
@@ -70,12 +70,18 @@
 //! find the nearest opaque analytic hit `t_geo` first, composite splats only
 //! for `t < t_geo`, then add `T · L_analytic` for whatever the analytic
 //! surface shades to. Splats in front of a wall veil it; splats behind it
-//! are never reached. Shadow rays through a splat cloud can use the same
-//! accumulation for transmittance, at the cost of the sort.
+//! are never reached. Shadow rays use the same accumulation for
+//! transmittance ([`transmittance`]), at the cost of the sort.
+//!
+//! `Scene::splats` in [`crate::pathtrace`] is where that lands: because the
+//! walk runs on *bounce* rays too, a cloud is an environment with depth — it
+//! supplies the radiance for rays that find no analytic surface, so an
+//! analytic object dropped inside a capture is lit by the captured room.
 //!
 //! [`Bvh`]: crate::Bvh
 //! [`Bvh::trace`]: crate::Bvh::trace
 
+use crate::bvh::Bvh;
 use crate::geometry::Geometry;
 use crate::math::{Aabb, Dir3, Point2, Point3, Vec3};
 use crate::ray::{Hit, Ray};
@@ -449,6 +455,91 @@ impl Geometry for Splats {
         // a wisp of density into a hard shadow.
         false
     }
+}
+
+// ─── the compositing path ─────────────────────────────────────────────────
+
+/// What one ray segment picked up crossing a splat cloud.
+///
+/// The pair a front-to-back walk produces: the radiance the Gaussians added
+/// along the segment, and how much of whatever lies *beyond* the segment
+/// still gets through.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SplatSegment {
+    /// Accumulated radiance, `Σ T·α·c`.
+    pub radiance: [f32; 3],
+    /// Remaining transmittance, `Π (1 − α)`, in `0..=1`.
+    pub transmittance: f32,
+}
+
+impl Default for SplatSegment {
+    fn default() -> Self {
+        Self {
+            radiance: [0.0; 3],
+            transmittance: 1.0,
+        }
+    }
+}
+
+/// Below this the walk stops: the rest of the cloud cannot change the pixel.
+const T_CUTOFF: f32 = 1e-4;
+
+/// Composite the splats a ray meets in `(t_min, t_max)`, front to back.
+///
+/// The walk of the module header, done: gather every splat along the segment
+/// with [`Bvh::trace`] (which sorts by `t`), then accumulate
+/// `C += T·α·c(dir); T *= (1 − α)` and stop once `T` is negligible.
+///
+/// # The model
+///
+/// A splat cloud is a **captured radiance field**: its colours already
+/// include the room's lighting, baked in at capture time. So the cloud is
+/// treated as *emissive and absorbing* — it emits [`SplatSegment::radiance`]
+/// and it attenuates by [`SplatSegment::transmittance`]. It is never shaded,
+/// never spawns a secondary ray, and never receives light from the analytic
+/// scene. What it *is*, for the integrator, is an environment with depth:
+/// like a lat-long map it supplies radiance for directions that hit nothing,
+/// and unlike one it also sits in front of things, veils them, and casts its
+/// accumulated opacity across shadow rays.
+pub fn composite(bvh: &Bvh<Splats>, ray: &Ray, t_min: f64, t_max: f64) -> SplatSegment {
+    let mut seg = SplatSegment::default();
+    if bvh.geometry().is_empty() {
+        return seg;
+    }
+    let dir = ray.direction;
+    for hit in bvh.trace(ray) {
+        if hit.t <= t_min {
+            continue;
+        }
+        if hit.t >= t_max {
+            break;
+        }
+        let (i, alpha) = unpack_payload(hit.payload);
+        let alpha = alpha.clamp(0.0, 1.0);
+        if alpha <= 0.0 {
+            continue;
+        }
+        let c = bvh.geometry().colour(i as usize, dir);
+        let w = seg.transmittance * alpha;
+        for ch in 0..3 {
+            seg.radiance[ch] += w * c[ch];
+        }
+        seg.transmittance *= 1.0 - alpha;
+        if seg.transmittance <= T_CUTOFF {
+            seg.transmittance = 0.0;
+            break;
+        }
+    }
+    seg
+}
+
+/// How much of a light's radiance survives the crossing — the transmittance
+/// half of [`composite`], for a shadow ray, which does not want the colour.
+///
+/// Still pays for the sort, because the alphas multiply in any order but the
+/// early-out needs them front to back. Cheap enough at these densities.
+pub fn transmittance(bvh: &Bvh<Splats>, ray: &Ray, t_min: f64, t_max: f64) -> f32 {
+    composite(bvh, ray, t_min, t_max).transmittance
 }
 
 #[cfg(test)]

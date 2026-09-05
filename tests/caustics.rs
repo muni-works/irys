@@ -50,6 +50,7 @@ fn ball_over_floor(ior: f32) -> Scene<Analytic> {
             material: white_lambert(),
             shadow_catcher: false,
         }),
+        splats: None,
     }
 }
 
@@ -92,6 +93,7 @@ fn the_photon_pass_conserves_the_energy_that_entered_the_glass() {
             material: white_lambert(),
             shadow_catcher: false,
         }),
+        splats: None,
     };
     let map = caustics::trace(&scene, &opts(200_000, 0.05));
     assert!(!map.is_empty(), "no photons landed");

@@ -35,6 +35,7 @@ use crate::caustics::CausticMap;
 use crate::geometry::Geometry;
 use crate::math::{Aabb, Point3, Transform, Vec3};
 use crate::ray::Ray;
+use crate::splats::{SplatSegment, Splats};
 use crate::tlas::{Instance, InstanceHit, Tlas};
 
 /// Rows of the film, in parallel where there are threads to do it with.
@@ -1180,6 +1181,33 @@ pub struct Scene<G> {
     pub sun: Option<Sun>,
     /// Optional studio floor.
     pub ground: Option<Ground>,
+    /// An optional captured Gaussian splat cloud, composited *additively*
+    /// over every ray segment.
+    ///
+    /// This is a radiance field, not geometry: the colours in it already
+    /// include the lighting of the room they were captured in. So the
+    /// integrator treats it as **emissive and absorbing** — along every
+    /// segment it emits `Σ T·α·c` and attenuates what lies beyond by
+    /// `Π (1 − α)` (see [`crate::splats::composite`]). It lights nothing by
+    /// next-event estimation, receives nothing, and spawns no rays; it does
+    /// veil analytic surfaces in front of it and attenuate shadow rays that
+    /// cross it.
+    ///
+    /// The honest way to say it: **a splat backdrop is an environment with
+    /// depth.** Like a lat-long [`EnvMap`] it supplies the radiance for rays
+    /// that hit no analytic surface — so the marble in a captured garage
+    /// picks up reflections and diffuse bounce from the real room — and
+    /// unlike one it also occupies space, so it can stand in front of
+    /// something as well as behind it.
+    ///
+    /// The limitation that comes with that: the splat field is **not
+    /// importance sampled.** There is no `Environment::sample` for it and no
+    /// MIS strategy aimed at its bright spots, so indirect light from the
+    /// cloud arrives only on BSDF-sampled bounce rays. A mirror or a smooth
+    /// glass marble is therefore clean at low sample counts and a rough
+    /// diffuse surface under a small bright window is noisy — exactly the
+    /// behaviour of the analytic [`GradientEnv`], for the same reason.
+    pub splats: Option<Arc<Bvh<Splats>>>,
 }
 
 /// A physical camera. Perspective with a real aperture, or orthographic for
@@ -2916,6 +2944,18 @@ impl<G: Geometry> SceneAccel<G> {
 }
 
 impl<G: Geometry> Scene<G> {
+    /// What the splat cloud, if there is one, adds along `(t_min, t_max)` of
+    /// `ray` — radiance emitted and transmittance surviving.
+    ///
+    /// The identity segment (no radiance, full transmittance) when the scene
+    /// carries no cloud, so every caller can add it unconditionally.
+    fn splat_segment(&self, ray: &Ray, t_min: f64, t_max: f64) -> SplatSegment {
+        match &self.splats {
+            Some(bvh) => crate::splats::composite(bvh, ray, t_min, t_max),
+            None => SplatSegment::default(),
+        }
+    }
+
     /// Closest intersection against objects, ground, and lights.
     fn intersect(&self, accel: &SceneAccel<G>, ray: &Ray) -> Landing {
         let mut best_t = f64::INFINITY;
@@ -3036,7 +3076,15 @@ impl<G: Geometry> Scene<G> {
         }
 
         let ray = Ray::new(origin, dir);
-        let mut tr = [1.0f32; 3];
+        // The splat cloud shadows by its accumulated opacity: a captured wall
+        // is opaque enough to stop the light, a captured net or a wisp of
+        // reconstruction dust is not. Grey, because the alphas are grey —
+        // a Gaussian's colour is emission, not a filter.
+        let splat_tr = self.splat_segment(&ray, 1e-6, limit).transmittance;
+        if splat_tr <= 1e-4 {
+            return None;
+        }
+        let mut tr = [splat_tr; 3];
         let mut t0 = 1e-6;
         let mut crossed = 0usize;
         loop {
@@ -3439,6 +3487,36 @@ fn radiance<G: Geometry>(
 
     for depth in 0..opts.max_depth {
         let landing = scene.intersect(accel, &ray);
+        // The splat cloud along this segment, composited front to back and
+        // stopped at whatever the segment ran into. A captured cloud is a
+        // radiance field with its lighting already baked in, so it is added
+        // as emission and its accumulated opacity veils everything past it:
+        // `L += throughput · C`, then `throughput *= T`. Doing it here — for
+        // the camera ray and for every bounce ray alike — is what makes the
+        // cloud an *environment with depth*: a bounce ray that finds no
+        // analytic surface comes back with the room's own colour, so the
+        // marble is lit by the garage it is standing in.
+        if scene.splats.is_some() && !(depth == 0 && !opts.show_background && matches!(landing, Landing::Miss))
+        {
+            let t_hit = match &landing {
+                Landing::Surface { point, .. } => (*point - ray.origin).norm(),
+                Landing::Light { distance, .. } => *distance,
+                Landing::Miss => f64::INFINITY,
+            };
+            let seg = scene.splat_segment(&ray, 1e-6, t_hit);
+            if max3(seg.radiance) > 0.0 {
+                l = add3(l, mul3(throughput, seg.radiance));
+            }
+            if depth == 0 && seg.transmittance < 0.5 {
+                // The cloud, not the background, is what this pixel shows.
+                primary.hit = true;
+                primary.albedo = seg.radiance;
+            }
+            throughput = scale3(throughput, seg.transmittance);
+            if max3(throughput) <= 1e-5 {
+                break;
+            }
+        }
         // Absorb along the segment just travelled, if it was inside glass.
         if let Some(med) = &medium {
             let sigma = med.extinction();
@@ -4404,6 +4482,7 @@ mod tests {
             env: Environment::default(),
             sun: None,
             ground: None,
+            splats: None,
         }
     }
 
@@ -4554,6 +4633,7 @@ mod tests {
             env: Environment::default(),
             sun: None,
             ground: None,
+            splats: None,
         }
     }
 
@@ -5092,6 +5172,7 @@ mod tests {
                 env: Environment::default(),
                 sun: None,
                 ground: None,
+                splats: None,
             };
             let film = render(
                 &scene,
@@ -6660,6 +6741,7 @@ mod tests {
             env,
             sun: None,
             ground: None,
+            splats: None,
         };
         let cam = test_camera();
         let opts = PathTraceOptions {
@@ -6721,6 +6803,7 @@ mod tests {
                     },
                     shadow_catcher: false,
                 }),
+                splats: None,
             };
             let cam = Camera::look_at(
                 Point3::new(0.0, 0.0, 4.0),
@@ -6771,4 +6854,176 @@ mod tests {
         }
     }
 
+
+    // ─── the splat volume in the integrator ───────────────────────────────
+    //
+    // A splat cloud is composited, not shaded, so what these check is the
+    // arithmetic of the walk — that `C += T·α·c; T *= (1 − α)` happens in
+    // front of the analytic scene, in the right order, and on shadow rays.
+
+    mod splat_volume {
+        use super::*;
+        use crate::splats::Splats;
+
+        /// The degree-0 SH coefficient that makes a splat render as `c`.
+        fn dc(c: [f32; 3]) -> [f32; 3] {
+            const SH_C0: f32 = 0.282_094_79;
+            [
+                (c[0] - 0.5) / SH_C0,
+                (c[1] - 0.5) / SH_C0,
+                (c[2] - 0.5) / SH_C0,
+            ]
+        }
+
+        /// Isotropic splats on the z axis, `(z, opacity, colour)` each.
+        fn cloud(items: &[(f32, f32, [f32; 3])]) -> Arc<Bvh<Splats>> {
+            let positions: Vec<[f32; 3]> = items.iter().map(|it| [0.0, 0.0, it.0]).collect();
+            let scales = vec![[0.2f32; 3]; items.len()];
+            let quats = vec![[1.0f32, 0.0, 0.0, 0.0]; items.len()];
+            let opacities: Vec<f32> = items.iter().map(|it| it.1).collect();
+            let sh: Vec<[f32; 3]> = items.iter().map(|it| dc(it.2)).collect();
+            Arc::new(Bvh::build(Splats::from_parts(
+                &positions, &scales, &quats, &opacities, &sh,
+            )))
+        }
+
+        /// An emissive floor at z = 0 under a black sky: a "plane" whose
+        /// radiance is exactly 1, so anything the camera reads that is not 1
+        /// came from the cloud.
+        fn scene(splats: Option<Arc<Bvh<Splats>>>) -> Scene<TriMesh> {
+            Scene {
+                objects: Vec::new(),
+                lights: Vec::new(),
+                env: Environment::constant([0.0; 3]),
+                sun: None,
+                ground: Some(Ground {
+                    z: 0.0,
+                    material: Pbr {
+                        base_color: [0.0; 3],
+                        roughness: 1.0,
+                        emissive: [1.0; 3],
+                        ..Default::default()
+                    },
+                    shadow_catcher: false,
+                }),
+                splats,
+            }
+        }
+
+        /// The radiance of one ray straight down the z axis at the floor.
+        fn down(scene: &Scene<TriMesh>) -> [f32; 3] {
+            let accel = SceneAccel::build(scene);
+            let opts = PathTraceOptions::default();
+            let ray = Ray::new(Point3::new(0.0, 0.0, 5.0), Vec3::new(0.0, 0.0, -1.0));
+            let mut rng = Rng::new(7);
+            radiance(scene, &accel, &opts, None, None, ray, &mut rng).0
+        }
+
+        #[test]
+        fn an_opaque_splat_hides_the_plane() {
+            let s = scene(Some(cloud(&[(2.5, 1.0, [0.25, 0.5, 0.75])])));
+            let l = down(&s);
+            assert!((l[0] - 0.25).abs() < 1e-4, "{l:?}");
+            assert!((l[1] - 0.5).abs() < 1e-4, "{l:?}");
+            assert!((l[2] - 0.75).abs() < 1e-4, "the floor's 1.0 is gone: {l:?}");
+        }
+
+        #[test]
+        fn a_half_transparent_splat_composites_fifty_fifty() {
+            let s = scene(Some(cloud(&[(2.5, 0.5, [0.0, 0.0, 0.0])])));
+            let l = down(&s);
+            // Black cloud at α = ½ over an emissive floor at 1: half the
+            // floor survives, and none of the cloud's own colour shows.
+            for ch in 0..3 {
+                assert!((l[ch] - 0.5).abs() < 1e-4, "{l:?}");
+            }
+            // And with a white cloud instead, the two halves add back to one.
+            let s = scene(Some(cloud(&[(2.5, 0.5, [1.0, 1.0, 1.0])])));
+            let l = down(&s);
+            for ch in 0..3 {
+                assert!((l[ch] - 1.0).abs() < 1e-4, "{l:?}");
+            }
+        }
+
+        #[test]
+        fn the_nearer_splat_dominates() {
+            // Red in front at z = 3, blue behind at z = 1, both α = ½.
+            let s = scene(Some(cloud(&[
+                (3.0, 0.5, [1.0, 0.0, 0.0]),
+                (1.0, 0.5, [0.0, 0.0, 1.0]),
+            ])));
+            let l = down(&s);
+            // Front to back: ½·red, then ½·½·blue, then ¼ of the floor —
+            // and the floor is white, so it adds ¼ to every channel.
+            assert!((l[0] - (0.5 + 0.25)).abs() < 1e-4, "red at full T: {l:?}");
+            assert!((l[2] - (0.25 + 0.25)).abs() < 1e-4, "blue at half T: {l:?}");
+            assert!(l[0] > l[2], "the nearer colour weighs more: {l:?}");
+            // Green sees only the floor's quarter.
+            assert!((l[1] - 0.25).abs() < 1e-4, "{l:?}");
+            // Swapping the depths swaps the weights, which is the whole test.
+            let s = scene(Some(cloud(&[
+                (3.0, 0.5, [0.0, 0.0, 1.0]),
+                (1.0, 0.5, [1.0, 0.0, 0.0]),
+            ])));
+            let l2 = down(&s);
+            assert!((l2[2] - 0.75).abs() < 1e-4, "{l2:?}");
+            assert!((l2[0] - 0.5).abs() < 1e-4, "{l2:?}");
+            assert!(l2[2] > l2[0], "swapping the depths swaps the weights");
+        }
+
+        #[test]
+        fn a_shadow_ray_is_attenuated_by_the_cloud() {
+            let s = scene(Some(cloud(&[(2.5, 0.5, [0.0; 3])])));
+            let accel = SceneAccel::build(&s);
+            // Upward, from just under the cloud past it — the ground plane is
+            // below the origin, so it does not block.
+            let tr = s
+                .shadow_transmittance(
+                    &accel,
+                    Point3::new(0.0, 0.0, 1.0),
+                    Vec3::new(0.0, 0.0, 1.0),
+                    10.0,
+                )
+                .expect("a half-transparent splat is not a blocker");
+            for ch in 0..3 {
+                assert!((tr[ch] - 0.5).abs() < 1e-4, "{tr:?}");
+            }
+            // Two of them multiply.
+            let s = scene(Some(cloud(&[(2.5, 0.5, [0.0; 3]), (3.5, 0.5, [0.0; 3])])));
+            let accel = SceneAccel::build(&s);
+            let tr = s
+                .shadow_transmittance(
+                    &accel,
+                    Point3::new(0.0, 0.0, 1.0),
+                    Vec3::new(0.0, 0.0, 1.0),
+                    10.0,
+                )
+                .expect("still not a blocker");
+            assert!((tr[0] - 0.25).abs() < 1e-4, "{tr:?}");
+            // An opaque one is.
+            let s = scene(Some(cloud(&[(2.5, 1.0, [0.0; 3])])));
+            let accel = SceneAccel::build(&s);
+            assert!(
+                s.shadow_transmittance(
+                    &accel,
+                    Point3::new(0.0, 0.0, 1.0),
+                    Vec3::new(0.0, 0.0, 1.0),
+                    10.0,
+                )
+                .is_none(),
+                "an opaque splat stops the light"
+            );
+        }
+
+        #[test]
+        fn a_bounce_ray_that_misses_everything_returns_the_cloud() {
+            // The environment-with-depth claim: no analytic geometry at all,
+            // so the only thing a ray can find is the captured field.
+            let mut s = scene(Some(cloud(&[(2.5, 1.0, [0.3, 0.4, 0.5])])));
+            s.ground = None;
+            let l = down(&s);
+            assert!((l[0] - 0.3).abs() < 1e-4, "{l:?}");
+            assert!((l[2] - 0.5).abs() < 1e-4, "{l:?}");
+        }
+    }
 }

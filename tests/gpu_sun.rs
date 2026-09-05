@@ -112,6 +112,7 @@ fn cpu_irradiance(sun: &Sun) -> f64 {
             material: white_lambert(),
             shadow_catcher: false,
         }),
+        splats: None,
     };
     let cam = kosm_render::pathtrace::Camera::look_at(
         Point3::new(0.0, 0.0, 4.0),
