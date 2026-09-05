@@ -136,8 +136,44 @@ struct HistoryParams {
     // nothing until there are a few of them. Off reproduces
     // `pathtrace::denoise` exactly, which is what the parity test wants.
     spatial_variance: u32,
+
+    // ─── gradient-directed sampling ──────────────────────────────────────
+    // See `budget.wgsl`. Non-zero puts `accumulate` behind the per-pixel
+    // budget: pixel p folds this round's sample with probability
+    // b(p)/`budget_rounds`, and otherwise commits whatever the reprojection
+    // carried and leaves the count alone. Zero is one sample everywhere,
+    // which is what every caller that never asked for a budget gets.
+    budget_enabled: u32,
+    // 0 spends the frame's rays uniformly — today's behaviour exactly — and
+    // 1 spends them entirely where the budget says. In between is the linear
+    // blend of the two weight fields.
+    budget_bias: f32,
+    // How many trace rounds the host will dispatch this frame. The budget is
+    // clamped to it, and it is the denominator of the per-round coin.
+    budget_rounds: u32,
+    // Which of those rounds `accumulate` is folding, 0-based. Part of the
+    // coin's seed, so a pixel with b = 2 out of 4 rounds does not take the
+    // same two rounds every frame.
+    budget_round: u32,
+    // The frame's total sample budget, in samples. `sum(b) == rays_per_frame`
+    // to within the clamp; a frame's uniform spend is width * height.
+    rays_per_frame: f32,
+    // How far the motion drive is dilated, in pixels. The à-trous filter's
+    // footprint: a moved object drags everything within it.
+    budget_radius: u32,
+    // Every pixel is guaranteed one sample once every this many frames,
+    // whatever its budget. 1 is "every pixel every frame", which turns the
+    // starvation floor into no budget at all.
+    budget_floor_k: u32,
+    // The frame counter the floor's phase and the coin's seed ride on.
+    budget_frame: u32,
+    // Out to a multiple of 16 bytes, so the Rust struct and this one agree.
     _pad0: u32,
     _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+    _pad4: u32,
+    _pad5: u32,
 }
 
 // How far this frame's surface point may lie off the plane the previous
@@ -459,6 +495,66 @@ fn accumulate(@builtin(global_invocation_id) lid: vec3<u32>) {
     if keep[i] == 0u {
         m = vec4<f32>(0.0);
         st = vec4<f32>(0.0);
+    }
+
+    // ─── the sample budget ───────────────────────────────────────────────
+    //
+    // Whether this pixel gets one of this frame's rays at all. `budget.wgsl`
+    // decided that before the trace ran, from the physics, the history and
+    // the last image; here it is one coin per pixel per round at probability
+    // b(p)/rounds, so a pixel with b = 2 out of 4 rounds is folded twice in
+    // expectation and a converged, static one is not folded at all.
+    //
+    // The coin is independent of what the sample turned out to be, so the
+    // mean over the folded samples is still an unbiased estimate of the
+    // pixel. That is the whole reason to select rather than weight.
+    //
+    // A skipped pixel is not simply abandoned: whatever the reprojection
+    // carried for it still has to be committed, or a pixel that skips every
+    // round of a frame silently loses the history the camera move carried
+    // onto it.
+    if params.budget_enabled != 0u {
+        let rounds = max(params.budget_rounds, 1u);
+        let b = clamp(budget[i].w, 0.0, f32(rounds));
+
+        // Which of this frame's rounds this pixel takes.
+        //
+        // Not a coin. A coin at probability b/rounds folds b samples in
+        // expectation and is unbiased in the *mean*, which is the only thing
+        // an unbiasedness argument covers — but a pixel's error goes as
+        // 1/sqrt(count), and 1/sqrt is convex, so a count that scatters around
+        // b is worse than a count that is b. Measured on a converged frame
+        // with one ball crossing it, the coin gave up a third of what the
+        // whole feature was buying.
+        //
+        // So the rounds are *stratified*. Walk the interval [u, u + b) in
+        // steps of b/rounds and take a round each time the walk crosses an
+        // integer: the pixel takes exactly floor(b) or ceil(b) rounds, the
+        // fractional part decided by a per-pixel dither u so that the
+        // expectation is still exactly b. Unbiased, and the count never
+        // strays by more than one.
+        var h = gid.x * 73856093u ^ gid.y * 19349663u ^ params.budget_frame * 83492791u;
+        h = h ^ (h >> 16u);
+        h = h * 2246822519u;
+        h = h ^ (h >> 13u);
+        h = h * 3266489917u;
+        h = h ^ (h >> 16u);
+        let u = f32(h) * (1.0 / 4294967296.0);
+
+        let per = b / f32(rounds);
+        let t0 = f32(params.budget_round) * per + u;
+        let t1 = t0 + per;
+        if floor(t1) <= floor(t0) {
+            // Skipped — but not abandoned. Whatever the reprojection carried
+            // for this pixel, and a zeroed keep entry, are decisions this pass
+            // still has to commit: a pixel that skips every round of a frame
+            // would otherwise silently lose the history the camera move
+            // carried onto it. Where neither applies, `m` and `st` are what is
+            // already there and this writes them back unchanged.
+            mean[i] = m;
+            stats[i] = st;
+            return;
+        }
     }
 
     // ─── neighbourhood clamping ──────────────────────────────────────────
