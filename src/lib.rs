@@ -30,9 +30,11 @@ pub mod gpu;
 pub mod bvh;
 pub mod env;
 pub mod geometry;
+pub mod heightfield;
 pub mod math;
 pub mod optics;
 pub mod pathtrace;
+pub mod splats;
 mod ray;
 pub mod spectrum;
 mod sah;
@@ -42,6 +44,7 @@ pub mod tlas;
 pub use bvh::{Bvh, BvhNode, FlatBvhNode};
 pub use env::{BuiltinEnv, generate as generate_env, parse_hdr};
 pub use geometry::{Geometry, TriMesh, TriangleHit, intersect_triangle};
+pub use heightfield::HeightField;
 pub use math::{Aabb, Dir3, Point2, Point3, Transform, Vec2, Vec3, transform_from_column_major};
 pub use optics::{fresnel, index, reflect, refract, sellmeier};
 pub use spectrum::{cauchy_index, cie_xyz, hero_weight, sellmeier_index, BK7_SELLMEIER};
@@ -50,4 +53,5 @@ pub use pathtrace::{
     Pbr, PixelFilter, Scene, Sun, denoise, render, render_into, studio_rig,
 };
 pub use ray::{Hit, Ray};
+pub use splats::{Splats, unpack_payload};
 pub use tlas::{FlatTlasNode, Instance, InstanceHit, Tlas};

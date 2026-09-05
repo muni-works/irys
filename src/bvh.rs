@@ -80,6 +80,43 @@ impl<G: Geometry> Bvh<G> {
         &self.geom
     }
 
+    /// The geometry, mutably, for a caller that deforms it in place.
+    ///
+    /// The tree does not watch the geometry, so this hands out a way to
+    /// invalidate it: after any change to a primitive's extent the bounds in
+    /// here are stale, and every trace through them is wrong. Follow it with
+    /// [`Self::refit`] — or rebuild, if the *number* of primitives changed,
+    /// which a refit cannot repair.
+    pub fn geometry_mut(&mut self) -> &mut G {
+        &mut self.geom
+    }
+
+    /// Recompute every node's bounds bottom-up, leaving the tree's shape
+    /// alone.
+    ///
+    /// This is the cheap half of a rebuild. Which primitive sits in which
+    /// leaf is a partition of indices, and a deforming geometry — a frame of
+    /// simulated water, a skinned mesh, a settled pile — keeps its indices
+    /// even as its boxes move. So the partition stays legal and only the
+    /// boxes need recomputing: one pass over the tree, no sort, no SAH
+    /// evaluation, no allocation.
+    ///
+    /// The result is a *correct* tree but not a freshly optimal one: the
+    /// split planes were chosen for the old boxes, so a geometry that
+    /// deforms far enough for its leaves to interpenetrate will trace more
+    /// slowly each frame. Rebuild when that shows up; for a height field,
+    /// whose leaves partition a lattice that never moves, it does not.
+    ///
+    /// Refits the geometry the hierarchy already owns — unlike a builder,
+    /// there is no second geometry it could mean, and taking one would
+    /// invite refitting against a stranger. Reach the owned one through
+    /// [`Self::geometry_mut`].
+    pub fn refit(&mut self) {
+        if let Some(root) = self.root.as_mut() {
+            refit_node(root, &self.geom);
+        }
+    }
+
     /// The root node, if the geometry had any primitives.
     pub fn root(&self) -> Option<&BvhNode> {
         self.root.as_ref()
@@ -286,6 +323,26 @@ fn flatten_node(node: &BvhNode, nodes: &mut Vec<FlatBvhNode>, prims: &mut Vec<u3
     }
 
     idx
+}
+
+/// Recompute one node's bounds from its children (or its primitives).
+fn refit_node<G: Geometry>(node: &mut BvhNode, geom: &G) {
+    match node {
+        BvhNode::Leaf { aabb, prims } => {
+            let mut fresh = Aabb::empty();
+            for &prim in prims.iter() {
+                fresh.include(&geom.bounds(prim as usize));
+            }
+            *aabb = fresh;
+        }
+        BvhNode::Internal { aabb, left, right } => {
+            refit_node(left, geom);
+            refit_node(right, geom);
+            let mut fresh = *left.aabb();
+            fresh.include(right.aabb());
+            *aabb = fresh;
+        }
+    }
 }
 
 /// Build a node recursively.
