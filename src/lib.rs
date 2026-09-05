@@ -27,6 +27,7 @@
 pub mod bvh;
 pub mod geometry;
 pub mod math;
+pub mod pathtrace;
 mod ray;
 mod sah;
 pub mod tlas;
@@ -34,5 +35,9 @@ pub mod tlas;
 pub use bvh::{Bvh, BvhNode, FlatBvhNode};
 pub use geometry::{intersect_triangle, Geometry, TriMesh, TriangleHit};
 pub use math::{transform_from_column_major, Aabb, Dir3, Point2, Point3, Transform, Vec2, Vec3};
+pub use pathtrace::{
+    denoise, render, render_into, studio_rig, AreaLight, Camera, Environment, EnvMap, Film,
+    GradientEnv, Ground, Object, PathTraceOptions, Pbr, Scene,
+};
 pub use ray::{Hit, Ray};
 pub use tlas::{FlatTlasNode, Instance, InstanceHit, Tlas};

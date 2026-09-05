@@ -2,8 +2,8 @@
 
 The light.
 
-Rays, acceleration structures and (soon) the integrator, over anything that
-can be bounded and hit.
+Rays, acceleration structures and the path tracer, over anything that can be
+bounded and hit.
 
 ## The seam
 
@@ -20,8 +20,10 @@ pub trait Geometry {
 ```
 
 How many primitives you have, where each one is, and what a ray finds when it
-meets one. Implement it and you get `Bvh<G>` over your primitives and
-`Tlas<G>` over placed instances of them.
+meets one. Implement it and you get `Bvh<G>` over your primitives, `Tlas<G>` over placed
+instances of them, and `pathtrace::render` over a `Scene<G>` — multiple
+bounces, importance-sampled microfacet lobes, MIS against area lights, a
+physical camera with a real aperture, and an à-trous denoiser.
 
 Primitives are addressed by a flat index. That index comes back on every
 `Hit`, which is how the caller recovers whatever *it* calls the thing — a
@@ -46,7 +48,8 @@ cargo check -p kosm-render --target wasm32-unknown-unknown
 ```
 
 `rayon` is therefore behind a `cfg(not(target_arch = "wasm32"))` dependency,
-not a hard one.
+not a hard one, and the film's row split is a `cfg`'d macro with a serial
+spelling for the browser.
 
 ## Math
 
