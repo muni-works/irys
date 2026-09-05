@@ -533,26 +533,80 @@ fn intersect_lights(origin: vec3<f32>, dir: vec3<f32>) -> LightHit {
     return out;
 }
 
-// Any-hit occlusion against geometry and the ground. Lights do not occlude,
-// matching `pathtrace::Scene::occluded`.
-fn occluded(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
-    let o = origin;
+// How many thin transmissive sheets one shadow ray may cross before it is
+// declared blocked. Mirrors `pathtrace::MAX_SHADOW_SHEETS`.
+const MAX_SHADOW_SHEETS: u32 = 4u;
+
+// The fraction of a shadow ray that survives one thin sheet, or a negative
+// number if the surface is an honest blocker. Mirrors
+// `pathtrace::sheet_transmittance`: the same single-interface `1 - F` the
+// thin-walled BSDF branch applies, so NEE and BSDF sampling through the same
+// pane carry the same weight and MIS combines them without double counting.
+fn sheet_transmittance(m: GpuMaterial, cos_dot: f32) -> f32 {
+    if m.thin_walled == 0.0 || m.transmission <= 0.0 {
+        return -1.0;
+    }
+    // A rough sheet scatters; the straight-line shadow ray is only right in
+    // the smooth limit, so taper to zero as the lobe opens up.
+    let clarity = clamp(1.0 - mat_alpha(m), 0.0, 1.0);
+    if clarity <= 0.0 {
+        return -1.0;
+    }
+    let f = fresnel_dielectric(clamp(abs(cos_dot), 0.0, 1.0), max(m.ior, 1.0));
+    let t = m.transmission * (1.0 - f) * clarity;
+    if t <= 0.0 {
+        return -1.0;
+    }
+    return t;
+}
+
+// How much of a light's radiance survives the trip from `origin` along `dir`
+// to `max_dist`; a negative return means blocked outright. Mirrors
+// `pathtrace::Scene::shadow_transmittance`.
+//
+// The material-blind any-hit test this replaces made a window pane an opaque
+// wall, which is why a room could not be lit through glass at any sample
+// count. A thin-walled transmissive sheet is a filter, not a blocker: the
+// shadow ray carries straight on, dimmed.
+fn shadow_transmittance(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> f32 {
     // Scale-aware on both ends: the near end so the shadow ray does not find
     // the surface it left, the far end so it does not find the light's own
     // surface just short of `max_dist`.
-    let eps = ray_eps(o);
-    let hit = trace_scene(o, dir);
-    if hit.face_idx != 0xFFFFFFFFu && hit.t > eps && hit.t < max_dist - eps {
-        return true;
-    }
+    let eps = ray_eps(origin);
     if render_state.ground_enabled != 0u {
-        let g = intersect_ground(o, dir);
+        let g = intersect_ground(origin, dir);
         if g.t > eps && g.t < max_dist - eps {
-            return true;
+            return -1.0;
         }
     }
-    return false;
+    var tr = 1.0;
+    var o = origin;
+    var travelled = 0.0;
+    for (var crossed = 0u; crossed <= MAX_SHADOW_SHEETS; crossed = crossed + 1u) {
+        let hit = trace_scene(o, dir);
+        let e = ray_eps(o);
+        if hit.face_idx == 0xFFFFFFFFu || hit.t <= e || travelled + hit.t >= max_dist - eps {
+            return tr;
+        }
+        if crossed == MAX_SHADOW_SHEETS {
+            // More sheets than the cap allows: fall back to opaque.
+            return -1.0;
+        }
+        let m = materials[hit_material_index(hit)];
+        let sheet = sheet_transmittance(m, dot(hit_normal(hit), dir));
+        if sheet < 0.0 {
+            return -1.0;
+        }
+        tr = tr * sheet;
+        if tr <= 1e-6 {
+            return -1.0;
+        }
+        travelled = travelled + hit.t + e;
+        o = o + dir * (hit.t + e);
+    }
+    return tr;
 }
+
 
 // ─── surface description at a hit ─────────────────────────────────────────
 
@@ -676,12 +730,13 @@ fn sample_lights(
         return vec3<f32>(0.0);
     }
 
-    if occluded(offset_origin(p, n), wi_world, dist) {
+    let tr = shadow_transmittance(offset_origin(p, n), wi_world, dist);
+    if tr < 0.0 {
         return vec3<f32>(0.0);
     }
 
     let w = power_heuristic(light_pdf, e.pdf);
-    return e.value * l.emission.rgb * (w / light_pdf);
+    return e.value * l.emission.rgb * (tr * w / light_pdf);
 }
 
 // Next-event estimation against the environment, MIS-weighted against BSDF
@@ -727,11 +782,12 @@ fn sample_environment(
     }
     // The environment is at infinity: nothing between here and the sky may
     // block, so the shadow ray is unbounded.
-    if occluded(offset_origin(p, n), es.dir, MAX_T) {
+    let tr = shadow_transmittance(offset_origin(p, n), es.dir, MAX_T);
+    if tr < 0.0 {
         return vec3<f32>(0.0);
     }
     let w = power_heuristic(es.pdf, e.pdf);
-    return e.value * es.radiance * (w / es.pdf);
+    return e.value * es.radiance * (tr * w / es.pdf);
 }
 
 // ─── the sun ──────────────────────────────────────────────────────────────
@@ -807,11 +863,12 @@ fn sample_sun(
         return vec3<f32>(0.0);
     }
     // The sun is at infinity, so the shadow ray is unbounded.
-    if occluded(offset_origin(p, n), wi_world, MAX_T) {
+    let tr = shadow_transmittance(offset_origin(p, n), wi_world, MAX_T);
+    if tr < 0.0 {
         return vec3<f32>(0.0);
     }
     let w = power_heuristic(pdf, e.pdf);
-    return e.value * render_state.sun_radiance.rgb * (w / pdf);
+    return e.value * render_state.sun_radiance.rgb * (tr * w / pdf);
 }
 
 // ─── integrator ───────────────────────────────────────────────────────────
