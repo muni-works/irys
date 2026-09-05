@@ -27,7 +27,7 @@
 use bytemuck::{Pod, Zeroable};
 use kosm_render::gpu::{GpuContext, GpuMaterial, shaders};
 use kosm_render::math::Vec3;
-use kosm_render::pathtrace::{Pbr, reference_bsdf_eval};
+use kosm_render::pathtrace::{Pbr, reference_bsdf_eval_at};
 
 /// Mirrors `ParityIn` in [`HARNESS`].
 #[repr(C)]
@@ -37,6 +37,11 @@ struct ParityIn {
     wo: [f32; 4],
     wi: [f32; 4],
     rnd: [f32; 4],
+    /// `.x` is the hero wavelength the BSDF is evaluated at — 0 for an RGB
+    /// path. Deliberately *not* the wavelength in `wi.w`, which drives the
+    /// dispersion check: the two answer different questions, and sharing a
+    /// slot would hide a shader that read the wrong one.
+    hero: [f32; 4],
 }
 
 /// Mirrors `ParityOut` in [`HARNESS`].
@@ -60,6 +65,7 @@ struct ParityIn {
     wo: vec4<f32>,
     wi: vec4<f32>,
     rnd: vec4<f32>,
+    hero: vec4<f32>,
 }
 
 struct ParityOut {
@@ -84,13 +90,14 @@ fn parity(@builtin(global_invocation_id) gid: vec3<u32>) {
     // `wo.w` carries eta (n_transmitted / n_incident) and `rnd.w` the
     // dielectric lobe's reflect-or-refract draw.
     let eta = p.wo.w;
-    let e = bsdf_eval(p.material, p.wo.xyz, p.wi.xyz, eta);
+    let hero = p.hero.x;
+    let e = bsdf_eval(p.material, p.wo.xyz, p.wi.xyz, eta, hero);
     o.eval = vec4<f32>(e.value, e.pdf);
 
-    let s = bsdf_sample(p.material, p.wo.xyz, eta, p.rnd.x, p.rnd.y, p.rnd.z, p.rnd.w);
+    let s = bsdf_sample(p.material, p.wo.xyz, eta, hero, p.rnd.x, p.rnd.y, p.rnd.z, p.rnd.w);
     if s.ok {
         o.sampled = vec4<f32>(s.wi, s.pdf);
-        let r = bsdf_eval(p.material, p.wo.xyz, s.wi, eta);
+        let r = bsdf_eval(p.material, p.wo.xyz, s.wi, eta, hero);
         o.resampled = vec4<f32>(r.value, r.pdf);
     } else {
         o.sampled = vec4<f32>(0.0);
@@ -267,6 +274,27 @@ fn materials() -> Vec<Pbr> {
         ior: 1.7,
         ..base
     });
+    // Thin films across the whole visible range of thicknesses, over a
+    // dielectric and over metals — the two Fresnel paths the film modulates.
+    for d in [40.0f32, 180.0, 320.0, 550.0, 900.0] {
+        out.push(Pbr { thin_film_thickness: d, ..base });
+        out.push(Pbr {
+            thin_film_thickness: d,
+            thin_film_ior: 2.0,
+            metallic: 1.0,
+            roughness: 0.18,
+            ..base
+        });
+    }
+    out.push(Pbr {
+        thin_film_thickness: 280.0,
+        thin_film_ior: 1.33,
+        metallic: 0.5,
+        roughness: 0.5,
+        clearcoat: 0.4,
+        sheen: 0.3,
+        ..base
+    });
     // Transmissive dielectrics: clear glass at two roughnesses, a dispersive
     // N-BK7 marble, an absorbing green slab, and a thin-walled pane.
     out.push(Pbr::glass(1.52, 0.05));
@@ -323,7 +351,7 @@ fn v4w(v: Vec3, w: f32) -> [f32; 4] {
 
 /// Build the full cross product of materials, view and light directions, with
 /// a cheap deterministic sample seed riding along in `rnd`.
-fn sweep() -> (Vec<ParityIn>, Vec<(Pbr, Vec3, Vec3)>) {
+fn sweep() -> (Vec<ParityIn>, Vec<(Pbr, Vec3, Vec3, f32)>) {
     let mut ins = Vec::new();
     let mut meta = Vec::new();
     let dirs = directions();
@@ -336,6 +364,13 @@ fn sweep() -> (Vec<ParityIn>, Vec<(Pbr, Vec3, Vec3)>) {
         for &wo in &dirs {
             for &wi in dirs.iter().chain(below.iter()) {
                 k = k.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                // Every case is drawn as an RGB path or a hero-wavelength
+                // one; the film takes a different branch for each.
+                let hero = if k & 0x40 != 0 {
+                    0.0
+                } else {
+                    380.0 + 400.0 * ((k >> 20) & 0xFF) as f32 / 256.0
+                };
                 let r = |s: u32| ((k >> s) & 0xFFFF) as f32 / 65536.0;
                 ins.push(ParityIn {
                     material: GpuMaterial::from_pbr(m),
@@ -344,8 +379,9 @@ fn sweep() -> (Vec<ParityIn>, Vec<(Pbr, Vec3, Vec3)>) {
                     // it plays no part in the BSDF evaluation.
                     wi: v4w(wi, 380.0 + 400.0 * r(12)),
                     rnd: [r(0), r(8), r(16), r(4)],
+                    hero: [hero, 0.0, 0.0, 0.0],
                 });
-                meta.push((m, wo, wi));
+                meta.push((m, wo, wi, hero));
             }
         }
     }
@@ -362,8 +398,8 @@ fn gpu_bsdf_eval_matches_the_cpu_reference() {
     let outs = run(ctx, &ins);
 
     let mut worst = 0.0f32;
-    for (o, (m, wo, wi)) in outs.iter().zip(&meta) {
-        let (cf, cpdf) = reference_bsdf_eval(m, *wo, *wi, eta_of(m));
+    for (o, (m, wo, wi, hero)) in outs.iter().zip(&meta) {
+        let (cf, cpdf) = reference_bsdf_eval_at(m, *wo, *wi, eta_of(m), *hero);
         for c in 0..3 {
             // The CPU runs f64 and the device f32, and the tables are
             // interpolated on both sides, so this is an f32 tolerance, not
@@ -401,7 +437,7 @@ fn gpu_dispersion_matches_the_cpu_reference() {
     };
     let (ins, meta) = sweep();
     let outs = run(ctx, &ins);
-    for (o, (i, (m, _, _))) in outs.iter().zip(meta.iter().enumerate()) {
+    for (o, (i, (m, _, _, _))) in outs.iter().zip(meta.iter().enumerate()) {
         let lambda = ins[i].wi[3] as f64;
         let want = m.index_at(Some(lambda));
         assert!(
@@ -429,7 +465,7 @@ fn gpu_bsdf_sample_pdf_matches_eval_pdf() {
     };
     let (ins, meta) = sweep();
     let outs = run(ctx, &ins);
-    for (o, (m, wo, _)) in outs.iter().zip(&meta) {
+    for (o, (m, wo, _, _)) in outs.iter().zip(&meta) {
         let sampled = o.sampled[3];
         if sampled <= 0.0 {
             continue; // the sampler rejected this draw
@@ -474,6 +510,7 @@ fn gpu_furnace_closes_on_a_rough_metal() {
                         wo: v4(wo),
                         wi: v4(wo),
                         rnd: [0.9, a, b, 0.0],
+                        hero: [0.0; 4],
                     }
                 })
                 .collect();

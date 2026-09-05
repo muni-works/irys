@@ -66,8 +66,12 @@ pub struct GpuMaterial {
     pub _pad1: f32,
     /// Sellmeier `C` coefficients, in µm².
     pub sellmeier_c: [f32; 3],
-    /// Padding for 16-byte alignment. The struct is 144 bytes.
-    pub _pad2: f32,
+    /// Thickness of the thin film in nanometres; 0 = no film.
+    pub thin_film_thickness: f32,
+    /// Index of refraction of that film.
+    pub thin_film_ior: f32,
+    /// Padding to 16 bytes. The struct is 160 bytes.
+    pub _pad2: [f32; 3],
 }
 
 impl Default for GpuMaterial {
@@ -97,7 +101,9 @@ impl Default for GpuMaterial {
             sellmeier_b: [0.0; 3],
             _pad1: 0.0,
             sellmeier_c: [0.0; 3],
-            _pad2: 0.0,
+            thin_film_thickness: 0.0,
+            thin_film_ior: 1.5,
+            _pad2: [0.0; 3],
         }
     }
 }
@@ -181,7 +187,9 @@ impl GpuMaterial {
             sellmeier_c: p.sellmeier.map_or([0.0; 3], |(_, c)| {
                 [c[0] as f32, c[1] as f32, c[2] as f32]
             }),
-            _pad2: 0.0,
+            thin_film_thickness: p.thin_film_thickness,
+            thin_film_ior: p.thin_film_ior,
+            _pad2: [0.0; 3],
         }
     }
 
@@ -228,6 +236,8 @@ impl GpuMaterial {
                 f32::INFINITY
             },
             thin_walled: self.thin_walled != 0.0,
+            thin_film_thickness: self.thin_film_thickness,
+            thin_film_ior: self.thin_film_ior,
             emissive: [0.0; 3],
         }
     }
@@ -922,8 +932,9 @@ mod layout_tests {
     fn the_material_stride_is_what_the_shader_expects() {
         // vec4 color, twelve scalars, then four more 16-byte rows: sheen_color
         // + transmission, attenuation_color + distance, the four dispersion
-        // scalars, and the two Sellmeier triples with their padding.
-        assert_eq!(std::mem::size_of::<GpuMaterial>(), 144);
+        // scalars, the two Sellmeier triples with their padding, and the
+        // thin film's thickness and index.
+        assert_eq!(std::mem::size_of::<GpuMaterial>(), 160);
         assert_eq!(std::mem::align_of::<GpuMaterial>(), 4);
     }
 }

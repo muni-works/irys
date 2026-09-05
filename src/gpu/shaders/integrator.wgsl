@@ -590,7 +590,11 @@ fn ground_material() -> GpuMaterial {
     m.sellmeier_b = vec3<f32>(0.0);
     m._pad1 = 0.0;
     m.sellmeier_c = vec3<f32>(0.0);
+    m.thin_film_thickness = 0.0;
+    m.thin_film_ior = 1.5;
     m._pad2 = 0.0;
+    m._pad3 = 0.0;
+    m._pad4 = 0.0;
     return m;
 }
 
@@ -622,6 +626,7 @@ fn sample_lights(
     wo_local: vec3<f32>,
     m: GpuMaterial,
     eta: f32,
+    lambda_nm: f32,
     pixel: vec2<u32>,
     depth: u32,
 ) -> vec3<f32> {
@@ -655,7 +660,7 @@ fn sample_lights(
         return vec3<f32>(0.0);
     }
 
-    let e = bsdf_eval(m, wo_local, wi_local, eta);
+    let e = bsdf_eval(m, wo_local, wi_local, eta, lambda_nm);
     if max3(e.value) <= 0.0 {
         return vec3<f32>(0.0);
     }
@@ -688,6 +693,7 @@ fn sample_environment(
     wo_local: vec3<f32>,
     m: GpuMaterial,
     eta: f32,
+    lambda_nm: f32,
     pixel: vec2<u32>,
     depth: u32,
 ) -> vec3<f32> {
@@ -711,7 +717,7 @@ fn sample_environment(
     if wi_local.z <= 0.0 {
         return vec3<f32>(0.0);
     }
-    let e = bsdf_eval(m, wo_local, wi_local, eta);
+    let e = bsdf_eval(m, wo_local, wi_local, eta, lambda_nm);
     if max3(e.value) <= 0.0 {
         return vec3<f32>(0.0);
     }
@@ -778,6 +784,7 @@ fn sample_sun(
     wo_local: vec3<f32>,
     m: GpuMaterial,
     eta: f32,
+    lambda_nm: f32,
     pixel: vec2<u32>,
     depth: u32,
 ) -> vec3<f32> {
@@ -791,7 +798,7 @@ fn sample_sun(
     if wi_local.z <= 0.0 {
         return vec3<f32>(0.0);
     }
-    let e = bsdf_eval(m, wo_local, wi_local, eta);
+    let e = bsdf_eval(m, wo_local, wi_local, eta, lambda_nm);
     if max3(e.value) <= 0.0 {
         return vec3<f32>(0.0);
     }
@@ -967,9 +974,9 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
         }
 
         // Next-event estimation.
-        var direct = sample_lights(surf.point, frame, n, wo_local, surf.material, eta, pixel, depth)
-            + sample_environment(surf.point, frame, n, wo_local, surf.material, eta, pixel, depth)
-            + sample_sun(surf.point, frame, n, wo_local, surf.material, eta, pixel, depth);
+        var direct = sample_lights(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth)
+            + sample_environment(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth)
+            + sample_sun(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth);
         if depth > 0u && render_state.firefly_clamp > 0.0 {
             direct = min(direct, vec3<f32>(render_state.firefly_clamp));
         }
@@ -979,7 +986,7 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
         let r_lobe = rand_uniform(pixel, 211u + depth * 23u);
         let r12 = rand_uniform2(pixel, 307u + depth * 29u);
         let r_branch = rand_uniform(pixel, 509u + depth * 37u);
-        let s = bsdf_sample(surf.material, wo_local, eta, r_lobe, r12.x, r12.y, r_branch);
+        let s = bsdf_sample(surf.material, wo_local, eta, lambda_nm, r_lobe, r12.x, r12.y, r_branch);
         if !s.ok {
             break;
         }

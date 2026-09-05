@@ -559,7 +559,16 @@ struct GpuMaterial {
     sellmeier_b: vec3<f32>,
     _pad1: f32,
     sellmeier_c: vec3<f32>,
+    // Thickness of the thin film in nanometres; 0 is no film and every path
+    // below is bit-for-bit what it was.
+    thin_film_thickness: f32,
+    thin_film_ior: f32,
+    // Three scalars, not a vec3: a vec3 would take its own 16-byte
+    // alignment and push the struct to 176 bytes, which is not the 160 the
+    // Rust side packs.
     _pad2: f32,
+    _pad3: f32,
+    _pad4: f32,
 }
 
 // ─── dispersion ───────────────────────────────────────────────────────────
@@ -595,13 +604,16 @@ fn cie_xyz(l: f32) -> vec3<f32> {
 // The weight a path picks up when it becomes monochromatic: the linear-sRGB
 // colour-matching response normalised to integrate to white over the band,
 // divided by the (uniform) wavelength PDF.
-fn hero_weight(lambda_nm: f32) -> vec3<f32> {
-    let c = cie_xyz(lambda_nm);
-    let rgb = vec3<f32>(
+fn xyz_to_linear_srgb(c: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
         3.2404542 * c.x - 1.5371385 * c.y - 0.4985314 * c.z,
         -0.9692660 * c.x + 1.8760108 * c.y + 0.0415560 * c.z,
         0.0556434 * c.x - 0.2040259 * c.y + 1.0572252 * c.z,
     );
+}
+
+fn hero_weight(lambda_nm: f32) -> vec3<f32> {
+    let rgb = xyz_to_linear_srgb(cie_xyz(lambda_nm));
     let band = LAMBDA_MAX_NM - LAMBDA_MIN_NM;
     let norm = vec3<f32>(1.0 / 128.3610214, 1.0 / 101.5380812, 1.0 / 97.0648041);
     return rgb * norm * band;
@@ -834,6 +846,154 @@ fn g1_smith_aniso(w: vec3<f32>, at: f32, ab: f32) -> f32 {
 fn fresnel(f0: vec3<f32>, cos_theta: f32) -> vec3<f32> {
     let m = pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
     return f0 + (vec3<f32>(1.0) - f0) * m;
+}
+
+// ─── thin-film iridescence ────────────────────────────────────────────────
+//
+// Belcour and Barla (SIGGRAPH 2017). A port of `optics.rs`; see there for
+// what the Airy summation is and why the spectral integral has a closed form.
+
+fn tf_f0_of(n1: f32, n2: f32) -> f32 {
+    let r = (n1 - n2) / (n1 + n2);
+    return r * r;
+}
+
+fn tf_ior_of_f0(f0: f32) -> f32 {
+    let s = sqrt(clamp(f0, 0.0, 0.9999));
+    return (1.0 + s) / (1.0 - s);
+}
+
+fn tf_schlick(f0: f32, cos_theta: f32) -> f32 {
+    return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+// The Fourier transform of the CIE curves at the frequency `opd` nanometres
+// of path difference implies, as linear sRGB.
+fn tf_sensitivity(opd: f32, shift: vec3<f32>) -> vec3<f32> {
+    let two_pi = 2.0 * PI;
+    let phase = two_pi * opd * 1.0e-9;
+    let val = vec3<f32>(5.4856e-13, 4.4201e-13, 5.2481e-13);
+    let pos = vec3<f32>(1.6810e+06, 1.7953e+06, 2.2084e+06);
+    let vr = vec3<f32>(4.3278e+09, 9.3046e+09, 6.6121e+09);
+    var xyz = val * sqrt(two_pi * vr) * cos(pos * phase + shift) * exp(-vr * phase * phase);
+    xyz.x += 9.7470e-14
+        * sqrt(two_pi * 4.5282e+09)
+        * cos(2.2399e+06 * phase + shift.x)
+        * exp(-4.5282e+09 * phase * phase);
+    xyz = xyz / 1.0685e-7;
+    return xyz_to_linear_srgb(xyz);
+}
+
+// The film's two interfaces, its phase shift and its path difference.
+// `opd < 0` is the sentinel for "past the critical angle": reflect it all.
+struct Film {
+    r12: f32,
+    t121: f32,
+    r23: vec3<f32>,
+    phi: vec3<f32>,
+    opd: f32,
+}
+
+fn tf_film(thickness_nm: f32, film_ior: f32, cos_theta1: f32, base_f0: vec3<f32>) -> Film {
+    var f: Film;
+    f.opd = -1.0;
+    let outside = 1.0;
+    let t = clamp(thickness_nm / 0.03, 0.0, 1.0);
+    let n1 = outside + (film_ior - outside) * (t * t * (3.0 - 2.0 * t));
+    let ratio = outside / n1;
+    let cos2sq = 1.0 - ratio * ratio * (1.0 - cos_theta1 * cos_theta1);
+    if cos2sq < 0.0 {
+        return f;
+    }
+    let cos_theta2 = sqrt(cos2sq);
+    f.r12 = tf_schlick(tf_f0_of(n1, outside), cos_theta1);
+    f.t121 = 1.0 - f.r12;
+    var phi12 = 0.0;
+    if n1 < outside {
+        phi12 = PI;
+    }
+    let phi21 = PI - phi12;
+    var r23 = vec3<f32>(0.0);
+    var phi = vec3<f32>(0.0);
+    for (var c = 0u; c < 3u; c = c + 1u) {
+        let n3 = tf_ior_of_f0(base_f0[c]);
+        r23[c] = tf_schlick(tf_f0_of(n3, n1), cos_theta2);
+        var phi23 = 0.0;
+        if n3 < n1 {
+            phi23 = PI;
+        }
+        phi[c] = phi21 + phi23;
+    }
+    f.r23 = r23;
+    f.phi = phi;
+    f.opd = 2.0 * n1 * thickness_nm * cos_theta2;
+    return f;
+}
+
+// (DC term, oscillating amplitude, r123) per channel.
+fn tf_terms(f: Film) -> mat3x3<f32> {
+    let r123 = clamp(f.r12 * f.r23, vec3<f32>(1e-5), vec3<f32>(0.9999));
+    let r = sqrt(r123);
+    let rs = (f.t121 * f.t121) * f.r23 / (vec3<f32>(1.0) - r123);
+    return mat3x3<f32>(vec3<f32>(f.r12) + rs, rs - vec3<f32>(f.t121), r);
+}
+
+// The colour-integrated Airy reflectance — the RGB path.
+fn thin_film_fresnel(
+    thickness_nm: f32,
+    film_ior: f32,
+    cos_theta1: f32,
+    base_f0: vec3<f32>,
+) -> vec3<f32> {
+    let f = tf_film(thickness_nm, film_ior, cos_theta1, base_f0);
+    if f.opd < 0.0 {
+        return vec3<f32>(1.0);
+    }
+    let t = tf_terms(f);
+    var out = t[0];
+    var cm = t[1];
+    for (var m = 1u; m <= 2u; m = m + 1u) {
+        let s = tf_sensitivity(f32(m) * f.opd, f32(m) * f.phi);
+        cm = cm * t[2];
+        out = out + cm * 2.0 * s;
+    }
+    return clamp(out, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// The exact Airy reflectance at one wavelength — the hero-wavelength path.
+// The series is geometric, so it sums in closed form with no truncation.
+fn thin_film_fresnel_at(
+    thickness_nm: f32,
+    film_ior: f32,
+    cos_theta1: f32,
+    base_f0: vec3<f32>,
+    lambda_nm: f32,
+) -> vec3<f32> {
+    let f = tf_film(thickness_nm, film_ior, cos_theta1, base_f0);
+    if f.opd < 0.0 {
+        return vec3<f32>(1.0);
+    }
+    let t = tf_terms(f);
+    let psi = 2.0 * PI * f.opd / max(lambda_nm, 1e-3) + f.phi;
+    let cp = cos(psi);
+    let r = t[2];
+    let denom = max(vec3<f32>(1.0) - 2.0 * r * cp + r * r, vec3<f32>(1e-6));
+    return clamp(t[0] + 2.0 * t[1] * (r * cp - r * r) / denom, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// The specular lobe's Fresnel: Schlick, or the film's Airy reflectance over
+// it. `thin_film_thickness == 0` returns `fresnel` itself, so a material
+// without a film is bit-for-bit what it was; `lambda_nm <= 0` is the RGB
+// sentinel.
+fn spec_fresnel(m: GpuMaterial, f0: vec3<f32>, cos_theta: f32, lambda_nm: f32) -> vec3<f32> {
+    if m.thin_film_thickness <= 0.0 {
+        return fresnel(f0, cos_theta);
+    }
+    let c = clamp(cos_theta, 0.0, 1.0);
+    if lambda_nm > 0.0 {
+        return thin_film_fresnel_at(m.thin_film_thickness, m.thin_film_ior, c, f0, lambda_nm);
+    }
+    return thin_film_fresnel(m.thin_film_thickness, m.thin_film_ior, c, f0);
 }
 
 // Cosine-weighted hemisphere sample in the local frame (+Z = normal).
@@ -1187,7 +1347,13 @@ struct BsdfEval {
 }
 
 // Evaluate the full BSDF and its sampling PDF for a given in/out pair.
-fn bsdf_eval(m: GpuMaterial, wo: vec3<f32>, wi: vec3<f32>, eta: f32) -> BsdfEval {
+fn bsdf_eval(
+    m: GpuMaterial,
+    wo: vec3<f32>,
+    wi: vec3<f32>,
+    eta: f32,
+    lambda_nm: f32,
+) -> BsdfEval {
     var out: BsdfEval;
     out.value = vec3<f32>(0.0);
     out.pdf = 0.0;
@@ -1229,7 +1395,7 @@ fn bsdf_eval(m: GpuMaterial, wo: vec3<f32>, wi: vec3<f32>, eta: f32) -> BsdfEval
     let d = d_ggx_aniso(wh, ab_pair.x, ab_pair.y);
     let vis = v_smith_aniso(wo, wi, ab_pair.x, ab_pair.y);
     let f0 = mat_f0(m);
-    let f = fresnel(f0, o_dot_h);
+    let f = spec_fresnel(m, f0, o_dot_h, lambda_nm);
     var spec = f * (d * vis * n_dot_l) * ms_compensation(f0, ab_pair.x, ab_pair.y, n_dot_v);
     let pdf_s = vndf_pdf(wo, wh, ab_pair.x, ab_pair.y);
 
@@ -1295,6 +1461,7 @@ fn bsdf_sample(
     m: GpuMaterial,
     wo: vec3<f32>,
     eta: f32,
+    lambda_nm: f32,
     r_lobe: f32,
     r1: f32,
     r2: f32,
@@ -1384,7 +1551,7 @@ fn bsdf_sample(
         }
     }
 
-    let e = bsdf_eval(m, wo, wi, eta);
+    let e = bsdf_eval(m, wo, wi, eta, lambda_nm);
     if e.pdf <= 1e-9 {
         return out;
     }

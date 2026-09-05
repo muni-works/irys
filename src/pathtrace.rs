@@ -190,6 +190,22 @@ pub struct Pbr {
     /// roughened by the same GGX lobe, with no lateral offset and no
     /// absorption — which is what a pane of glass actually looks like.
     pub thin_walled: bool,
+    /// Thickness of a thin film over the surface, in nanometres. `0` — the
+    /// default — is no film and the specular lobe's Fresnel is exactly what
+    /// it was. OpenPBR's `thin_film_thickness`.
+    ///
+    /// A few hundred nanometres is where the interference falls in the
+    /// visible band: a soap bubble runs 100–1000 nm, the oxide on tempered
+    /// steel 20–80 nm, an anti-reflection coating a quarter of a wavelength.
+    /// The colour is a function of thickness *and* angle, which is why an
+    /// iridescent surface shifts hue as it turns and a tinted one does not.
+    pub thin_film_thickness: f32,
+    /// Index of refraction of that film — OpenPBR's `thin_film_ior`.
+    ///
+    /// It sits between the outside (1.0) and the substrate, and its contrast
+    /// against both is what sets how strong the interference is. 1.5 is a
+    /// generic oil or lacquer; 1.34 is a soap film.
+    pub thin_film_ior: f32,
     /// Linear emissive radiance.
     pub emissive: [f32; 3],
 }
@@ -217,6 +233,8 @@ impl Default for Pbr {
             attenuation_color: [1.0; 3],
             attenuation_distance: f32::INFINITY,
             thin_walled: false,
+            thin_film_thickness: 0.0,
+            thin_film_ior: 1.5,
             emissive: [0.0; 3],
         }
     }
@@ -1699,6 +1717,38 @@ fn fresnel(f0: [f32; 3], cos_theta: f32) -> [f32; 3] {
     ]
 }
 
+/// The specular lobe's Fresnel: Schlick against `f0`, or the Airy
+/// reflectance of a thin film sitting on top of it.
+///
+/// One function, so the film modulates the dielectric `F0` path and the metal
+/// path alike — a metal's `f0` *is* its base colour, and an oxide film over
+/// steel colours it exactly the way this composes. `lambda_nm <= 0` means the
+/// path is still RGB and wants the colour-integrated form; a path that has
+/// already drawn a hero wavelength gets the exact reflectance at that λ
+/// instead, which is both cheaper and righter.
+///
+/// `thin_film_thickness == 0` returns [`fresnel`] itself, not a limit of the
+/// film model that happens to be close — so a material without a film is
+/// bit-for-bit what it was.
+#[inline]
+fn spec_fresnel(m: &Pbr, f0: [f32; 3], cos_theta: f32, lambda_nm: f32) -> [f32; 3] {
+    if m.thin_film_thickness <= 0.0 {
+        return fresnel(f0, cos_theta);
+    }
+    let cos = cos_theta.clamp(0.0, 1.0);
+    if lambda_nm > 0.0 {
+        crate::optics::thin_film_fresnel_at(
+            m.thin_film_thickness,
+            m.thin_film_ior,
+            cos,
+            f0,
+            lambda_nm,
+        )
+    } else {
+        crate::optics::thin_film_fresnel(m.thin_film_thickness, m.thin_film_ior, cos, f0)
+    }
+}
+
 // ─── diffuse: energy-preserving Oren-Nayar ────────────────────────────────
 //
 // d'Eon, Portsmouth, Hill, Fascione, "EON: A practical energy-preserving
@@ -2195,7 +2245,7 @@ fn lobe_weights(m: &Pbr) -> [f32; 5] {
 ///
 /// Both vectors are in the local shading frame (+Z = normal) and point away
 /// from the surface. Returns `(f * cos, pdf)`.
-fn bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3, eta: f32) -> ([f32; 3], f32) {
+fn bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3, eta: f32, lambda_nm: f32) -> ([f32; 3], f32) {
     if wo.z <= 0.0 {
         return ([0.0; 3], 0.0);
     }
@@ -2240,7 +2290,7 @@ fn bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3, eta: f32) -> ([f32; 3], f32) {
     let d = d_ggx_aniso(wh, at, ab);
     let vis = v_smith_aniso(wo, wi, at, ab);
     let f0 = m.f0();
-    let f = fresnel(f0, o_dot_h);
+    let f = spec_fresnel(m, f0, o_dot_h, lambda_nm);
     let spec = scale3(
         mul3(
             scale3(f, d * vis * n_dot_l),
@@ -2308,11 +2358,32 @@ fn bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3, eta: f32) -> ([f32; 3], f32) {
 /// this implementation — see `tests/bsdf_parity.rs`. Returns `(f * cos, pdf)`;
 /// the PDF is the one MIS must agree on across both renderers.
 pub fn reference_bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3, eta: f32) -> ([f32; 3], f32) {
-    bsdf_eval(m, wo, wi, eta)
+    bsdf_eval(m, wo, wi, eta, 0.0)
+}
+
+/// [`reference_bsdf_eval`] for a path that already carries a hero wavelength.
+///
+/// Only the thin film cares: everything else in the model is achromatic in
+/// λ, and `lambda_nm <= 0` is the RGB sentinel, so this and the four-argument
+/// form agree exactly for any material without a film.
+pub fn reference_bsdf_eval_at(
+    m: &Pbr,
+    wo: Vec3,
+    wi: Vec3,
+    eta: f32,
+    lambda_nm: f32,
+) -> ([f32; 3], f32) {
+    bsdf_eval(m, wo, wi, eta, lambda_nm)
 }
 
 /// Importance-sample the BSDF. Returns `(wi_local, f*cos, pdf)`.
-fn bsdf_sample(m: &Pbr, wo: Vec3, eta: f32, rng: &mut Rng) -> Option<(Vec3, [f32; 3], f32)> {
+fn bsdf_sample(
+    m: &Pbr,
+    wo: Vec3,
+    eta: f32,
+    lambda_nm: f32,
+    rng: &mut Rng,
+) -> Option<(Vec3, [f32; 3], f32)> {
     if wo.z <= 0.0 {
         return None;
     }
@@ -2394,7 +2465,7 @@ fn bsdf_sample(m: &Pbr, wo: Vec3, eta: f32, rng: &mut Rng) -> Option<(Vec3, [f32
         }
     };
 
-    let (f, pdf) = bsdf_eval(m, wo, wi, eta);
+    let (f, pdf) = bsdf_eval(m, wo, wi, eta, lambda_nm);
     if pdf <= 1e-9 {
         return None;
     }
@@ -2648,6 +2719,7 @@ impl<G: Geometry> Scene<G> {
         wo_local: Vec3,
         m: &Pbr,
         eta: f32,
+        lambda_nm: f32,
         rng: &mut Rng,
     ) -> [f32; 3] {
         let Frame { t, b, n } = *frame;
@@ -2674,7 +2746,7 @@ impl<G: Geometry> Scene<G> {
             return [0.0; 3];
         }
 
-        let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local, eta);
+        let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local, eta, lambda_nm);
         if max3(f) <= 0.0 {
             return [0.0; 3];
         }
@@ -2709,6 +2781,7 @@ impl<G: Geometry> Scene<G> {
         wo_local: Vec3,
         m: &Pbr,
         eta: f32,
+        lambda_nm: f32,
         rng: &mut Rng,
     ) -> [f32; 3] {
         let Frame { t, b, n } = *frame;
@@ -2722,7 +2795,7 @@ impl<G: Geometry> Scene<G> {
         if wi_local.z <= 0.0 {
             return [0.0; 3];
         }
-        let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local, eta);
+        let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local, eta, lambda_nm);
         if max3(f) <= 0.0 {
             return [0.0; 3];
         }
@@ -2746,6 +2819,7 @@ impl<G: Geometry> Scene<G> {
         wo_local: Vec3,
         m: &Pbr,
         eta: f32,
+        lambda_nm: f32,
         rng: &mut Rng,
     ) -> [f32; 3] {
         let Some(sun) = &self.sun else {
@@ -2760,7 +2834,7 @@ impl<G: Geometry> Scene<G> {
         if wi_local.z <= 0.0 {
             return [0.0; 3];
         }
-        let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local, eta);
+        let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local, eta, lambda_nm);
         if max3(f) <= 0.0 {
             return [0.0; 3];
         }
@@ -2954,6 +3028,9 @@ fn radiance<G: Geometry>(
                     primary.normal = vec_to_f32(n);
                     primary.albedo = material.denoise_albedo();
                 }
+                // The hero wavelength as the BSDF wants it: `0` for an RGB
+                // path, which is the sentinel every lobe reads as "achromatic".
+                let hero = lambda_nm.unwrap_or(0.0) as f32;
                 let frame = shading_frame(n, tangent);
                 let wo_local = to_local(frame.t, frame.b, n, wo_world);
                 if wo_local.z <= 0.0 {
@@ -2966,12 +3043,16 @@ fn radiance<G: Geometry>(
                 // environment when it is importance-sampled.
                 let direct = add3(
                     add3(
-                        scene.sample_lights(accel, point, &frame, wo_local, &material, eta, rng),
+                        scene.sample_lights(
+                            accel, point, &frame, wo_local, &material, eta, hero, rng,
+                        ),
                         scene.sample_environment(
-                            accel, point, &frame, wo_local, &material, eta, rng,
+                            accel, point, &frame, wo_local, &material, eta, hero, rng,
                         ),
                     ),
-                    scene.sample_sun(accel, point, &frame, wo_local, &material, eta, rng),
+                    scene.sample_sun(
+                        accel, point, &frame, wo_local, &material, eta, hero, rng,
+                    ),
                 );
                 let direct = match opts.firefly_clamp {
                     Some(c) if depth > 0 => [direct[0].min(c), direct[1].min(c), direct[2].min(c)],
@@ -2980,7 +3061,7 @@ fn radiance<G: Geometry>(
                 l = add3(l, mul3(throughput, direct));
 
                 // Continue the path.
-                let Some((wi_local, f, pdf)) = bsdf_sample(&material, wo_local, eta, rng) else {
+                let Some((wi_local, f, pdf)) = bsdf_sample(&material, wo_local, eta, lambda_nm.unwrap_or(0.0) as f32, rng) else {
                     break;
                 };
                 throughput = mul3(throughput, scale3(f, 1.0 / pdf));
@@ -3696,7 +3777,7 @@ mod tests {
             if wi_local.z <= 0.0 {
                 continue;
             }
-            let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local, eta);
+            let (f, bsdf_pdf) = bsdf_eval(m, wo_local, wi_local, eta, 0.0);
             if max3(f) <= 0.0 {
                 continue;
             }
@@ -3797,7 +3878,7 @@ mod tests {
         if wi_local.z <= 0.0 {
             return [0.0; 3];
         }
-        let (f, _) = bsdf_eval(m, wo_local, wi_local, eta);
+        let (f, _) = bsdf_eval(m, wo_local, wi_local, eta, 0.0);
         let pdf = pick_pdf * (dist * dist / (cos_light * light.area())) as f32;
         if !pdf.is_finite() || pdf <= 0.0 {
             return [0.0; 3];
@@ -3900,6 +3981,7 @@ mod tests {
                 wo_local,
                 &m,
                 1.0,
+                0.0,
                 &mut rng,
             );
             let b = sample_all_lights_reference(
@@ -4214,8 +4296,8 @@ mod tests {
                 ] {
                     let mut rng = Rng::new(7);
                     for _ in 0..256 {
-                        if let Some((wi, _f, pdf)) = bsdf_sample(&m, wo, 1.0, &mut rng) {
-                            let (_f2, pdf2) = bsdf_eval(&m, wo, wi, 1.0);
+                        if let Some((wi, _f, pdf)) = bsdf_sample(&m, wo, 1.0, 0.0, &mut rng) {
+                            let (_f2, pdf2) = bsdf_eval(&m, wo, wi, 1.0, 0.0);
                             assert!(
                                 (pdf - pdf2).abs() <= 1e-4 * pdf.max(1.0),
                                 "pdf mismatch at aniso={aniso} rough={roughness}: \
@@ -4280,15 +4362,15 @@ mod tests {
         let along = Vec3::new(0.25, 0.0, 1.0).normalize();
         let across = Vec3::new(0.0, 0.25, 1.0).normalize();
 
-        let (f_iso_a, _) = bsdf_eval(&rough(0.0), wo, along, 1.0);
-        let (f_iso_b, _) = bsdf_eval(&rough(0.0), wo, across, 1.0);
+        let (f_iso_a, _) = bsdf_eval(&rough(0.0), wo, along, 1.0, 0.0);
+        let (f_iso_b, _) = bsdf_eval(&rough(0.0), wo, across, 1.0, 0.0);
         assert!(
             (f_iso_a[0] - f_iso_b[0]).abs() < 1e-6,
             "isotropic lobe must be rotationally symmetric"
         );
 
-        let (f_pos_a, _) = bsdf_eval(&rough(0.8), wo, along, 1.0);
-        let (f_pos_b, _) = bsdf_eval(&rough(0.8), wo, across, 1.0);
+        let (f_pos_a, _) = bsdf_eval(&rough(0.8), wo, along, 1.0, 0.0);
+        let (f_pos_b, _) = bsdf_eval(&rough(0.8), wo, across, 1.0, 0.0);
         assert!(
             f_pos_a[0] > f_pos_b[0] * 1.5,
             "positive anisotropy should spread energy along the tangent: \
@@ -4297,8 +4379,8 @@ mod tests {
             f_pos_b[0]
         );
 
-        let (f_neg_a, _) = bsdf_eval(&rough(-0.8), wo, along, 1.0);
-        let (f_neg_b, _) = bsdf_eval(&rough(-0.8), wo, across, 1.0);
+        let (f_neg_a, _) = bsdf_eval(&rough(-0.8), wo, along, 1.0, 0.0);
+        let (f_neg_b, _) = bsdf_eval(&rough(-0.8), wo, across, 1.0, 0.0);
         assert!(
             f_neg_b[0] > f_neg_a[0] * 1.5,
             "negative anisotropy should spread energy across the tangent: \
@@ -4574,7 +4656,7 @@ mod tests {
                 ..Default::default()
             };
             for wo in view_directions() {
-                let e = integrate_hemisphere(220, |wi| bsdf_eval(&m, wo, wi, 1.0).0[0]);
+                let e = integrate_hemisphere(220, |wi| bsdf_eval(&m, wo, wi, 1.0, 0.0).0[0]);
                 assert!(
                     (0.99..=1.01).contains(&e),
                     "compensated GGX albedo {e} at alpha {alpha}, mu {}",
@@ -4596,7 +4678,7 @@ mod tests {
                 ..Default::default()
             };
             for wo in view_directions() {
-                let e = integrate_hemisphere(220, |wi| bsdf_eval(&m, wo, wi, 1.0).0[0]);
+                let e = integrate_hemisphere(220, |wi| bsdf_eval(&m, wo, wi, 1.0, 0.0).0[0]);
                 assert!(
                     (0.0..=1.0).contains(&e),
                     "dielectric specular albedo {e} at roughness {roughness}"
@@ -4675,8 +4757,8 @@ mod tests {
             for b in dirs {
                 // `bsdf_eval` returns f*cos, so divide the cosines back out
                 // before comparing: f(a,b) == f(b,a).
-                let ab = scale3(bsdf_eval(&m, a, b, 1.0).0, 1.0 / b.z as f32);
-                let ba = scale3(bsdf_eval(&m, b, a, 1.0).0, 1.0 / a.z as f32);
+                let ab = scale3(bsdf_eval(&m, a, b, 1.0, 0.0).0, 1.0 / b.z as f32);
+                let ba = scale3(bsdf_eval(&m, b, a, 1.0, 0.0).0, 1.0 / a.z as f32);
                 for c in 0..3 {
                     let scale = ab[c].abs().max(ba[c].abs()).max(1e-3);
                     assert!(
@@ -4693,6 +4775,99 @@ mod tests {
     /// from a different distribution than its PDF claims, across every new
     /// parameter.
     // ─── transmission ─────────────────────────────────────────────────────
+
+    /// The film is an *addition*: with no film the specular Fresnel must be
+    /// the same function it always was, to the bit, or every scene that
+    /// predates iridescence moves.
+    #[test]
+    fn a_zero_thickness_film_is_the_plain_fresnel_bit_for_bit() {
+        let m = Pbr {
+            base_color: [0.9, 0.7, 0.3],
+            metallic: 0.8,
+            roughness: 0.3,
+            thin_film_ior: 2.0,
+            ..Default::default()
+        };
+        assert_eq!(m.thin_film_thickness, 0.0);
+        for wo in view_directions() {
+            for wi in view_directions() {
+                let (plain, _) = bsdf_eval(&m, wo, wi, 1.0, 0.0);
+                let (spectral, _) = bsdf_eval(&m, wo, wi, 1.0, 550.0);
+                assert_eq!(plain, spectral, "the RGB and hero paths must agree");
+                for c in 0..3 {
+                    let f0 = m.f0();
+                    let wh = (wo + wi).normalize();
+                    let _ = fresnel(f0, wo.dot(wh).max(0.0) as f32)[c];
+                }
+            }
+        }
+    }
+
+    /// A film modulates the Fresnel, and the Fresnel depends on the half
+    /// vector alone, so the layered BSDF stays as reciprocal as it was.
+    #[test]
+    fn an_iridescent_bsdf_is_reciprocal() {
+        let m = Pbr {
+            base_color: [0.9, 0.85, 0.8],
+            metallic: 1.0,
+            roughness: 0.25,
+            thin_film_thickness: 420.0,
+            thin_film_ior: 1.45,
+            ..Default::default()
+        };
+        let plain = Pbr { thin_film_thickness: 0.0, ..m };
+        for lambda in [0.0f32, 500.0] {
+            for a in view_directions() {
+                for b in view_directions() {
+                    if a.z <= 0.0 || b.z <= 0.0 {
+                        continue;
+                    }
+                    let ab = scale3(bsdf_eval(&m, a, b, 1.0, lambda).0, 1.0 / b.z as f32);
+                    let ba = scale3(bsdf_eval(&m, b, a, 1.0, lambda).0, 1.0 / a.z as f32);
+                    // The bar is the *same material without the film*: the
+                    // film must not make the stack any less reciprocal than
+                    // Turquin's view-only compensation already does.
+                    let pab = scale3(bsdf_eval(&plain, a, b, 1.0, 0.0).0, 1.0 / b.z as f32);
+                    let pba = scale3(bsdf_eval(&plain, b, a, 1.0, 0.0).0, 1.0 / a.z as f32);
+                    for c in 0..3 {
+                        let scale = ab[c].abs().max(ba[c].abs()).max(1e-4);
+                        let pscale = pab[c].abs().max(pba[c].abs()).max(1e-4);
+                        let bar = ((pab[c] - pba[c]).abs() / pscale + 1e-3).max(0.01);
+                        assert!(
+                            (ab[c] - ba[c]).abs() / scale <= bar * 1.05,
+                            "{ab:?} vs {ba:?} at lambda {lambda}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Interference redistributes energy across the spectrum; it does not
+    /// create any.
+    #[test]
+    fn an_iridescent_lobe_stays_under_one() {
+        for thickness in [80.0f32, 300.0, 700.0] {
+            for roughness in [0.1f32, 0.4, 0.9] {
+                let m = Pbr {
+                    base_color: [1.0; 3],
+                    metallic: 1.0,
+                    roughness,
+                    thin_film_thickness: thickness,
+                    thin_film_ior: 1.5,
+                    ..Default::default()
+                };
+                for wo in view_directions() {
+                    for lambda in [0.0f32, 480.0] {
+                        let e = integrate_hemisphere(220, |wi| {
+                            bsdf_eval(&m, wo, wi, 1.0, lambda).0[1]
+                        });
+                        assert!(e <= 1.02, "albedo {e} at d {thickness} r {roughness}");
+                    }
+                }
+            }
+        }
+    }
 
     fn smooth_glass(ior: f32, roughness: f32) -> Pbr {
         Pbr {
@@ -4756,7 +4931,7 @@ mod tests {
             let expected_sin_t = theta.sin() / 1.5;
             let mut n = 0;
             for _ in 0..4000 {
-                let Some((wi, _, _)) = bsdf_sample(&m, wo, 1.5, &mut rng) else {
+                let Some((wi, _, _)) = bsdf_sample(&m, wo, 1.5, 0.0, &mut rng) else {
                     continue;
                 };
                 if wi.z >= 0.0 {
@@ -4790,7 +4965,7 @@ mod tests {
                 let n = 200_000;
                 let mut sum = 0.0f64;
                 for _ in 0..n {
-                    if let Some((wi, f, pdf)) = bsdf_sample(&m, wo, 1.5, &mut rng) {
+                    if let Some((wi, f, pdf)) = bsdf_sample(&m, wo, 1.5, 0.0, &mut rng) {
                         // The lobe's *energy*, so the η² radiance-transport
                         // scaling is taken back out on the transmitted half —
                         // see the note on `dielectric_eval`. A furnace is a
@@ -4827,7 +5002,7 @@ mod tests {
         let (mut sum, mut hits) = (0.0f64, 0u32);
         for _ in 0..n {
             // In.
-            let Some((wi, f, pdf)) = bsdf_sample(&m, wo, 1.5, &mut rng) else {
+            let Some((wi, f, pdf)) = bsdf_sample(&m, wo, 1.5, 0.0, &mut rng) else {
                 continue;
             };
             if wi.z >= 0.0 {
@@ -4838,7 +5013,7 @@ mod tests {
             // other way, so the ray arrives at it from below and the local
             // frame flips.
             let wo2 = Vec3::new(-wi.x, -wi.y, -wi.z);
-            let Some((_, f2, pdf2)) = bsdf_sample(&m, wo2, 1.0 / 1.5, &mut rng) else {
+            let Some((_, f2, pdf2)) = bsdf_sample(&m, wo2, 1.0 / 1.5, 0.0, &mut rng) else {
                 continue;
             };
             sum += t1 * (f2[0] / pdf2) as f64;
@@ -4918,7 +5093,7 @@ mod tests {
             let wo = Vec3::new(incidence.sin(), 0.0, incidence.cos());
             let mut r1 = None;
             for _ in 0..8000 {
-                if let Some((wi, _, _)) = bsdf_sample(&m, wo, n as f32, &mut rng) {
+                if let Some((wi, _, _)) = bsdf_sample(&m, wo, n as f32, 0.0, &mut rng) {
                     if wi.z < 0.0 {
                         r1 = Some((wi.x * wi.x + wi.y * wi.y).sqrt().asin());
                         break;
@@ -4931,7 +5106,7 @@ mod tests {
             let wo2 = Vec3::new(r2.sin(), 0.0, r2.cos());
             let mut i2 = None;
             for _ in 0..8000 {
-                if let Some((wi, _, _)) = bsdf_sample(&m, wo2, (1.0 / n) as f32, &mut rng) {
+                if let Some((wi, _, _)) = bsdf_sample(&m, wo2, (1.0 / n) as f32, 0.0, &mut rng) {
                     if wi.z < 0.0 {
                         i2 = Some((wi.x * wi.x + wi.y * wi.y).sqrt().asin());
                         break;
@@ -5001,10 +5176,10 @@ mod tests {
                 for _ in 0..2000 {
                     let theta = rng.f64() * 1.4;
                     let wo = Vec3::new(theta.sin(), 0.0, theta.cos());
-                    let Some((wi, f, pdf)) = bsdf_sample(&m, wo, 1.52, &mut rng) else {
+                    let Some((wi, f, pdf)) = bsdf_sample(&m, wo, 1.52, 0.0, &mut rng) else {
                         continue;
                     };
-                    let (f2, pdf2) = bsdf_eval(&m, wo, wi, 1.52);
+                    let (f2, pdf2) = bsdf_eval(&m, wo, wi, 1.52, 0.0);
                     assert!(
                         (pdf - pdf2).abs() <= 1e-4 * pdf.max(1.0),
                         "r={roughness} thin={thin}: {pdf} vs {pdf2}"
@@ -5031,7 +5206,7 @@ mod tests {
         let wo = Vec3::new(theta.sin(), 0.0, theta.cos());
         let mut n = 0;
         for _ in 0..4000 {
-            let Some((wi, _, _)) = bsdf_sample(&m, wo, 1.52, &mut rng) else {
+            let Some((wi, _, _)) = bsdf_sample(&m, wo, 1.52, 0.0, &mut rng) else {
                 continue;
             };
             if wi.z >= 0.0 {
@@ -5094,12 +5269,12 @@ mod tests {
                 Vec3::new(0.6, 0.2, 0.77).normalize(),
                 Vec3::new(0.9, 0.1, 0.42).normalize(),
             ] {
-                let reference = integrate_hemisphere(200, |wi| bsdf_eval(&m, wo, wi, 1.0).0[0]);
+                let reference = integrate_hemisphere(200, |wi| bsdf_eval(&m, wo, wi, 1.0, 0.0).0[0]);
                 let mut rng = Rng::new(29);
                 let n = 200_000;
                 let mut sum = 0.0f64;
                 for _ in 0..n {
-                    if let Some((_wi, f, pdf)) = bsdf_sample(&m, wo, 1.0, &mut rng) {
+                    if let Some((_wi, f, pdf)) = bsdf_sample(&m, wo, 1.0, 0.0, &mut rng) {
                         sum += (f[0] / pdf) as f64;
                     }
                 }
@@ -5137,7 +5312,7 @@ mod tests {
                 let n = 20000;
                 let mut sum = 0.0f32;
                 for _ in 0..n {
-                    if let Some((_wi, f, pdf)) = bsdf_sample(&m, wo, 1.0, &mut rng) {
+                    if let Some((_wi, f, pdf)) = bsdf_sample(&m, wo, 1.0, 0.0, &mut rng) {
                         sum += f[0] / pdf;
                     }
                 }
