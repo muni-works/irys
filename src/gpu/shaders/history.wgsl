@@ -8,17 +8,27 @@
 //!
 //! Five entry points, run in this order once per pass:
 //!
-//! * `reproject` (optional) — carry each pixel's history across a camera
-//!   move: unproject through this pass's depth, project into the previous
-//!   view, and take the previous pixel's mean and count where the previous
-//!   depth and normal agree that it is the same surface. The gather reads
-//!   pixels other invocations would be writing, so it lands in the scratch
-//!   pair rather than in `mean`/`stats`, and `accumulate` reads it from there
-//!   — see `params.reprojected`.
+//! * `reproject` (optional) — carry each pixel's history across the frame's
+//!   motion: unproject through this pass's depth, carry the world point back
+//!   through its own instance's transform (`motion`), project into the
+//!   previous view, and take the previous pixel's mean and count where the
+//!   previous *id*, depth and normal agree that it is the same surface. A
+//!   scene with nothing moving supplies no instances and this is the
+//!   camera-only reprojection it used to be. The gather reads pixels other
+//!   invocations would be writing, so it lands in the scratch pair rather
+//!   than in `mean`/`stats`, and `accumulate` reads it from there — see
+//!   `params.reprojected`.
 //! * `accumulate` — fold `raw` into `mean`/`stats`, honouring the caller's
 //!   per-pixel keep mask. A zero mask entry restarts that pixel's history.
+//!   The fold is bounded (`history_cap`), so it is an exponential moving
+//!   average rather than a mean that can no longer be moved, and a pixel
+//!   whose history disagrees with what this pass's neighbourhood says it
+//!   should be has that history *shortened* rather than trusted — which is
+//!   what catches a shadow the ball has already left.
 //! * `demodulate` — divide the mean by the albedo guide and prefilter the
-//!   variance, writing `scratch_src`.
+//!   variance, writing `scratch_src`. A pixel with fewer than four samples
+//!   gets SVGF's spatial estimate — a 7x7 luminance variance over its
+//!   neighbours — because its own two temporal moments say nothing yet.
 //! * `atrous` — one 5x5 B3-spline wavelet iteration at `params.stride`,
 //!   reading `scratch_src` and writing `scratch_dst`. Dispatched once per
 //!   iteration with the two scratch buffers swapped between them.
@@ -102,6 +112,32 @@ struct HistoryParams {
     // and would put this struct's size past the Rust one.
     origin_x: u32,
     origin_y: u32,
+
+    // ─── temporal accumulation knobs ─────────────────────────────────────
+    // Longest history a pixel may hold. Past it the fold is an exponential
+    // moving average with a fixed 1/`history_cap` weight rather than a true
+    // mean, so lighting that changed a hundred frames ago cannot outvote what
+    // the pixel is seeing now.
+    history_cap: u32,
+    // Neighbourhood colour clamping, in standard deviations of this pass's
+    // raw 3x3 neighbourhood. Zero turns it off.
+    clamp_k: f32,
+    // The history length a clamped pixel drops to. Not 1: a clamped pixel is
+    // one whose history was *stale*, not one that has never been seen, and
+    // restarting it from a single sample puts the grain back.
+    clamp_reset: u32,
+    // How many instances `motion` carries. Zero means every surface is
+    // static and the reprojection is the camera-only one.
+    motion_instances: u32,
+    // How many entries the id -> instance table at the head of `motion` has.
+    motion_ids: u32,
+    // Non-zero to estimate a short-history pixel's variance spatially (SVGF's
+    // 7x7 fallback) rather than from its own two temporal moments, which say
+    // nothing until there are a few of them. Off reproduces
+    // `pathtrace::denoise` exactly, which is what the parity test wants.
+    spatial_variance: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 // How far this frame's surface point may lie off the plane the previous
@@ -142,7 +178,23 @@ const REPROJ_NORMAL_DOT: f32 = 0.9;
 // the previous eye) — one vec4 per pixel, copied out of `guides` at the end
 // of the pass that wrote it. Zeroed depth means "the previous pass had
 // nothing there", which reads as a restart.
+// The previous pass's guide planes 1 and 2 — (face-forwarded normal, distance
+// from the previous eye) for `n` pixels, then (albedo, biased hit id) for `n`
+// more — copied out of `guides` at the end of the pass that wrote them.
+// Zeroed depth means "the previous pass had nothing there", which reads as a
+// restart.
 @group(0) @binding(9) var<storage, read> prev_guides: array<vec4<f32>>;
+// Object motion, packed by `gpu::history::InstanceMotion`:
+//
+//   [0 .. ceil(motion_ids/4))   the id -> instance slot table, four bitcast
+//                               u32s to a vec4, indexed by the *unbiased*
+//                               hit id. 0xFFFFFFFF means "static".
+//   then three vec4s per instance: the rows of the 3x4 matrix
+//   `prev_T · cur_T⁻¹`, which takes a point where this frame put it to
+//   where the previous frame had it.
+//
+// A frame with nothing moving binds a stub and sets `motion_instances` to 0.
+@group(0) @binding(10) var<storage, read> motion: array<vec4<f32>>;
 
 fn luminance(c: vec3<f32>) -> f32 {
     return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
@@ -162,6 +214,70 @@ fn guide_normal(i: u32) -> vec3<f32> {
 
 fn guide_albedo(i: u32) -> vec3<f32> {
     return guides[2u * n_pixels() + i].xyz;
+}
+
+// The hit's identity at pixel `i`, biased by one so 0 is "nothing here".
+// Written into guide plane 2's spare lane by the integrator.
+fn guide_id(i: u32) -> u32 {
+    return u32(max(guides[2u * n_pixels() + i].w, 0.0));
+}
+
+// The same, off the previous pass's copy.
+fn prev_guide_id(j: u32) -> u32 {
+    return u32(max(prev_guides[n_pixels() + j].w, 0.0));
+}
+
+// ─── object motion ────────────────────────────────────────────────────────
+
+// vec4s the id -> instance table occupies at the head of `motion`.
+fn motion_table_len() -> u32 {
+    return (params.motion_ids + 3u) / 4u;
+}
+
+// Which instance the (unbiased) hit id `id` belongs to, or 0xFFFFFFFF for a
+// surface with no motion of its own.
+fn instance_of(id: u32) -> u32 {
+    if id >= params.motion_ids {
+        return 0xFFFFFFFFu;
+    }
+    let v = motion[id / 4u];
+    let lane = id % 4u;
+    var f = v.x;
+    if lane == 1u {
+        f = v.y;
+    } else if lane == 2u {
+        f = v.z;
+    } else if lane == 3u {
+        f = v.w;
+    }
+    return bitcast<u32>(f);
+}
+
+// Where instance `inst` had the world point `p` on the previous frame.
+fn motion_point(inst: u32, p: vec3<f32>) -> vec3<f32> {
+    let b = motion_table_len() + inst * 3u;
+    let r0 = motion[b];
+    let r1 = motion[b + 1u];
+    let r2 = motion[b + 2u];
+    return vec3<f32>(
+        dot(r0.xyz, p) + r0.w,
+        dot(r1.xyz, p) + r1.w,
+        dot(r2.xyz, p) + r2.w,
+    );
+}
+
+// The same matrix's rotation acting on a direction, for carrying the normal
+// into the previous frame so the normal gate compares like with like.
+fn motion_dir(inst: u32, d: vec3<f32>) -> vec3<f32> {
+    let b = motion_table_len() + inst * 3u;
+    let r0 = motion[b];
+    let r1 = motion[b + 1u];
+    let r2 = motion[b + 2u];
+    let v = vec3<f32>(dot(r0.xyz, d), dot(r1.xyz, d), dot(r2.xyz, d));
+    if length(v) < 1e-12 {
+        return d;
+    }
+    return normalize(v);
 }
 
 // The demodulation divisor, per channel and floored, as `pathtrace::denoise`
@@ -240,7 +356,26 @@ fn reproject(@builtin(global_invocation_id) gid: vec3<u32>) {
         params.cur_right.xyz, params.cur_up.xyz, params.cur_forward.xyz,
         params.view_params.x, params.view_params.y, gid.x, gid.y,
     );
-    let p = params.cur_eye.xyz + depth * dir;
+    let p_now = params.cur_eye.xyz + depth * dir;
+
+    // Where the *instance* this pixel is looking at had that point last
+    // frame. A ball in flight moves with its own transform; a static surface
+    // has none and this is the identity, which is the camera-only
+    // reprojection this pass used to be.
+    let id = guide_id(i);
+    var inst = 0xFFFFFFFFu;
+    if params.motion_instances > 0u && id > 0u {
+        let cand = instance_of(id - 1u);
+        if cand < params.motion_instances {
+            inst = cand;
+        }
+    }
+    var p = p_now;
+    var n_now = guide_normal(i);
+    if inst != 0xFFFFFFFFu {
+        p = motion_point(inst, p_now);
+        n_now = motion_dir(inst, n_now);
+    }
 
     // ... and where it was on the previous frame's film.
     let v = p - params.prev_eye.xyz;
@@ -268,6 +403,13 @@ fn reproject(@builtin(global_invocation_id) gid: vec3<u32>) {
     if prev_depth <= 0.0 {
         return;
     }
+    // The strongest gate there is: was the previous frame looking at the same
+    // *object*? A ball crossing the floor and the floor behind it agree on
+    // depth to well inside the tolerance for a frame or two, and disagree
+    // here on every one of them.
+    if prev_guide_id(j) != id {
+        return;
+    }
     let prev_n = prev_guides[j].xyz;
     let prev_dir = view_ray(
         params.prev_right.xyz, params.prev_up.xyz, params.prev_forward.xyz,
@@ -278,7 +420,7 @@ fn reproject(@builtin(global_invocation_id) gid: vec3<u32>) {
     if abs(dot(p - q, prev_n)) > REPROJ_DEPTH_TOL * expected {
         return; // disoccluded: something else was there
     }
-    if dot(guide_normal(i), prev_n) < REPROJ_NORMAL_DOT {
+    if dot(n_now, prev_n) < REPROJ_NORMAL_DOT {
         return; // the same plane, a different surface — a silhouette edge
     }
 
@@ -319,28 +461,108 @@ fn accumulate(@builtin(global_invocation_id) lid: vec3<u32>) {
         st = vec4<f32>(0.0);
     }
 
-    let n = st.x + 1.0;
-    // Welford-style running mean, so the history never holds a sum that can
-    // lose the low bits of a long accumulation.
-    m = m + (c - m) / n;
-    let lsum = st.y + l;
-    let lsum2 = st.z + l * l;
+    // ─── neighbourhood clamping ──────────────────────────────────────────
+    //
+    // A carried history can be *stale* without being wrong about which
+    // surface it is on: the ball has moved off the floor and the floor is
+    // still holding the ball's shadow. Nothing in the depth/normal/id gates
+    // sees that, because the floor is still the floor.
+    //
+    // What does see it is this pass's own sample. Clamp the history into the
+    // range the raw 3x3 neighbourhood says the pixel plausibly is, and a
+    // shadow that has gone is out of range on the first frame and reeled in
+    // over the next few. The clamped pixel's history length drops with it, so
+    // the à-trous filter widens there and the reeling-in is not visible as
+    // noise.
+    if params.clamp_k > 0.0 && st.x > 0.5 {
+        var s1 = vec3<f32>(0.0);
+        var s2 = vec3<f32>(0.0);
+        var hsum = vec3<f32>(0.0);
+        var k = 0.0;
+        let x = i32(gid.x);
+        let y = i32(gid.y);
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            let qy = y + dy;
+            if qy < 0 || qy >= i32(params.height) {
+                continue;
+            }
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let qx = x + dx;
+                if qx < 0 || qx >= i32(params.width) {
+                    continue;
+                }
+                let q = u32(qy) * params.width + u32(qx);
+                let t = raw[q].rgb;
+                s1 = s1 + t;
+                s2 = s2 + t * t;
+                hsum = hsum + mean[q].rgb;
+                k = k + 1.0;
+            }
+        }
+        if k > 0.0 {
+            let mu = s1 / k;
+            let sd = sqrt(max(s2 / k - mu * mu, vec3<f32>(0.0)));
+            // What is compared is the *history's* 3x3 mean against the raw
+            // sample's 3x3 mean, not the history's own pixel against the raw
+            // neighbourhood. The two are blurred by the same kernel, so the
+            // spatial bias that makes a plain TAA clamp fire on every gradient
+            // in the frame cancels, and what is left is the error bar on a
+            // nine-sample mean — three times tighter than one sample's, which
+            // is three times the sensitivity to lighting that really did
+            // change.
+            let hmu = hsum / k;
+            let tol = params.clamp_k * sd / sqrt(k) + 1e-5;
+            let d = abs(hmu - mu);
+            if max(d.x, max(d.y, d.z)) > max(tol.x, max(tol.y, tol.z)) {
+                // The history is *shortened*, not overwritten. Snapping the
+                // colour to the edge of the neighbourhood would be the usual
+                // TAA move and it is a biased one: on a still frame the
+                // clamp fires by chance a few percent of the time, always
+                // pulling towards a nine-sample mean, and a hundred passes of
+                // that is a visible tint. Shortening the history is unbiased —
+                // the next few samples are simply worth much more — and the
+                // stale value is gone in about `clamp_reset` frames either
+                // way.
+                st.x = min(st.x, f32(max(params.clamp_reset, 1u)));
+            }
+            // `mean[q]` for a neighbour is read while other invocations of
+            // this same dispatch may be folding their own sample into it. The
+            // race is deliberate and harmless: what comes back is that
+            // neighbour's history either side of one sample out of `n`, and
+            // the test is a comparison of nine-pixel means against an error
+            // bar. Synchronising it would cost a full-frame dispatch to buy a
+            // difference under the noise floor.
+        }
+    }
+
+    // ─── the bounded fold ────────────────────────────────────────────────
+    //
+    // A true running mean over an unbounded history is the right estimator
+    // for a still picture and the wrong one for a live scene: at n = 400 a
+    // pixel that has just been lit differently moves a quarter of a percent
+    // a frame. Cap n and the fold becomes an exponential moving average with
+    // a floor on its weight, which converges just as far and then keeps up.
+    let cap = f32(max(params.history_cap, 1u));
+    let n = min(st.x + 1.0, cap);
+    let inv = 1.0 / n;
+    m = m + (c - m) * inv;
+    // The luminance moments are means, not sums, so they ride the same cap.
+    let mu1 = st.y + (l - st.y) * inv;
+    let mu2 = st.z + (l * l - st.z) * inv;
 
     // Variance of the *mean*, matching `pathtrace::trace_pixel`: sample
     // variance over n, with a single sample falling back to its own magnitude
     // because it says nothing about its own spread.
     var v: f32;
     if n > 1.5 {
-        let inv = 1.0 / n;
-        let mu = lsum * inv;
-        let sample_var = max(lsum2 * inv - mu * mu, 0.0) * n / (n - 1.0);
+        let sample_var = max(mu2 - mu1 * mu1, 0.0) * n / (n - 1.0);
         v = sample_var * inv;
     } else {
-        v = lsum * lsum;
+        v = mu1 * mu1;
     }
 
     mean[i] = m;
-    stats[i] = vec4<f32>(n, lsum, lsum2, v);
+    stats[i] = vec4<f32>(n, mu1, mu2, v);
 }
 
 // ─── pass 2: demodulate and prefilter the variance ────────────────────────
@@ -386,6 +608,63 @@ fn demodulate(@builtin(global_invocation_id) gid: vec3<u32>) {
     if k > 0.0 {
         v = s / k;
     }
+
+    // ─── SVGF's spatial fallback ─────────────────────────────────────────
+    //
+    // Two temporal moments over one, two or three samples are not an error
+    // bar; they are three numbers. A pixel that short has to be told how
+    // noisy it is by its *neighbours* instead — a 7x7 luminance variance over
+    // the demodulated illumination, taps rejected on the same depth and
+    // normal the filter itself rejects on, so the estimate does not straddle
+    // an edge and hand the filter licence to blur across it.
+    //
+    // This is what lets a one-frame pixel be filtered wide and correctly on
+    // the frame it appears, rather than showing its single sample and then
+    // settling. Off, `demodulate` is exactly the CPU filter's prefilter,
+    // which is what the parity test pins.
+    if params.spatial_variance != 0u && stats[i].x < 4.0 {
+        var s1 = 0.0;
+        var s2 = 0.0;
+        var kk = 0.0;
+        let z_p = guide_depth(i);
+        let n_p = guide_normal(i);
+        for (var dy = -3; dy <= 3; dy = dy + 1) {
+            let qy = y + dy;
+            if qy < 0 || qy >= i32(params.height) {
+                continue;
+            }
+            for (var dx = -3; dx <= 3; dx = dx + 1) {
+                let qx = x + dx;
+                if qx < 0 || qx >= i32(params.width) {
+                    continue;
+                }
+                let q = u32(qy) * params.width + u32(qx);
+                let z_q = guide_depth(q);
+                if z_q <= 0.0 {
+                    continue;
+                }
+                if abs(z_p - z_q) > 0.1 * z_p {
+                    continue;
+                }
+                if dot(n_p, guide_normal(q)) < 0.8 {
+                    continue;
+                }
+                let lq = luminance(mean[q].rgb / demod_albedo(q));
+                s1 = s1 + lq;
+                s2 = s2 + lq * lq;
+                kk = kk + 1.0;
+            }
+        }
+        if kk > 1.0 {
+            let mu = s1 / kk;
+            // The variance of the neighbourhood, widened as the history
+            // shortens: a 3-sample pixel is nearly there and a 1-sample one
+            // is not, and the filter should know the difference.
+            let spatial = max(s2 / kk - mu * mu, 0.0) * (4.0 - stats[i].x);
+            v = max(spatial, 1e-8);
+        }
+    }
+
     scratch_src[i] = vec4<f32>(illum, v);
 }
 

@@ -207,7 +207,18 @@ fn the_device_denoise_matches_the_cpu_filter() {
     let pipeline = RayTracePipeline::new(ctx, &AnalyticGeometry::module()).expect("pipeline");
     let history = HistoryPipeline::new(ctx).expect("history pipeline");
     let n = (W * H) as usize;
-    let denoise = GpuDenoiseParams::default();
+    // `spatial_variance` off. The default is on, and on purpose: SVGF's
+    // spatial estimate is what lets a one-frame pixel be filtered as wide as
+    // its neighbours say it needs, instead of showing the error bar its own
+    // single sample gives — which is no error bar at all. The CPU filter has
+    // no such estimator, so the two tiers cannot agree byte for byte with it
+    // on. This test is about the *filter* being the same filter, so it turns
+    // the estimator off and pins the à-trous weights; the live tier runs with
+    // it on.
+    let denoise = GpuDenoiseParams {
+        spatial_variance: false,
+        ..GpuDenoiseParams::default()
+    };
 
     // The CPU reference: the same single raw sample, filtered and tonemapped
     // through the CPU tier.
