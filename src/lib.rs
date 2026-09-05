@@ -30,6 +30,7 @@ pub mod gpu;
 pub mod bvh;
 pub mod geometry;
 pub mod math;
+pub mod optics;
 pub mod pathtrace;
 mod ray;
 mod sah;
@@ -38,6 +39,7 @@ pub mod tlas;
 pub use bvh::{Bvh, BvhNode, FlatBvhNode};
 pub use geometry::{Geometry, TriMesh, TriangleHit, intersect_triangle};
 pub use math::{Aabb, Dir3, Point2, Point3, Transform, Vec2, Vec3, transform_from_column_major};
+pub use optics::{fresnel, index, reflect, refract, sellmeier};
 pub use pathtrace::{
     AreaLight, Camera, EnvMap, Environment, Film, GradientEnv, Ground, Object, PathTraceOptions,
     Pbr, Scene, denoise, render, render_into, studio_rig,
