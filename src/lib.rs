@@ -34,6 +34,7 @@ pub mod math;
 pub mod optics;
 pub mod pathtrace;
 mod ray;
+pub mod spectrum;
 mod sah;
 mod tables;
 pub mod tlas;
@@ -43,6 +44,7 @@ pub use env::{BuiltinEnv, generate as generate_env, parse_hdr};
 pub use geometry::{Geometry, TriMesh, TriangleHit, intersect_triangle};
 pub use math::{Aabb, Dir3, Point2, Point3, Transform, Vec2, Vec3, transform_from_column_major};
 pub use optics::{fresnel, index, reflect, refract, sellmeier};
+pub use spectrum::{cauchy_index, cie_xyz, hero_weight, sellmeier_index, BK7_SELLMEIER};
 pub use pathtrace::{
     AreaLight, Camera, EnvMap, Environment, Film, GradientEnv, Ground, Object, PathTraceOptions,
     Pbr, PixelFilter, Scene, Sun, denoise, render, render_into, studio_rig,

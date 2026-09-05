@@ -1,9 +1,15 @@
 [package]
 name = "kosm-render"
-version.workspace = true
+# Published on its own cadence: vcad depends on this by version, and the
+# workspace's 0.0.1 is the game's number, not the renderer's.
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 description = "The light: rays, acceleration structures and a path tracer over any geometry that can be bounded and hit"
+repository = "https://github.com/ecto/kosm"
+readme = "README.md"
+keywords = ["raytracing", "pathtracing", "renderer", "bvh", "graphics"]
+categories = ["graphics", "rendering", "rendering::engine"]
 
 [dependencies]
 tang.workspace = true
@@ -23,6 +29,12 @@ js-sys = { version = "0.3", optional = true }
 
 [features]
 default = []
+
+# `gpu`: the wgpu compute tier — the device, the storage buffers, the WGSL
+# integrator and the device-side denoiser, alongside the CPU one. Off by
+# default; the CPU path tracer needs nothing but `tang` and `rayon`. It builds
+# for wasm32 too, which is why `pollster` is native-only and the browser's
+# buffer mapping goes through `js-sys` directly.
 gpu = [
     "dep:wgpu",
     "dep:bytemuck",
