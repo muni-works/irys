@@ -91,10 +91,17 @@ struct HistoryParams {
     // Which à-trous iteration this slot drives, 0-based. `atrous` compares it
     // against the per-pixel iteration budget below.
     iter_index: u32,
-    // Explicit u32 padding, not a vec3<u32>: a vec3 in WGSL is 16-byte
-    // aligned and would put this struct's size 16 bytes past the Rust one.
-    _pad_reproj0: u32,
-    _pad_reproj1: u32,
+    // The frame-space pixel this dispatch's (0, 0) invocation stands on.
+    // `accumulate` dispatches over its scissor box's workgroups rather than
+    // the frame's — a box worth a tenth of the frame is a tenth of the
+    // workgroups, not a full grid that returns early nine times out of ten —
+    // so its invocation ids are shifted onto the box's corner. Every other
+    // pass covers the frame and leaves these zero.
+    //
+    // Explicit u32s, not a vec2<u32> pair: a vec3 in WGSL is 16-byte aligned
+    // and would put this struct's size past the Rust one.
+    origin_x: u32,
+    origin_y: u32,
 }
 
 // How far this frame's surface point may lie off the plane the previous
@@ -282,11 +289,16 @@ fn reproject(@builtin(global_invocation_id) gid: vec3<u32>) {
 // ─── pass 1: fold this sample into the history ────────────────────────────
 
 @compute @workgroup_size(8, 8)
-fn accumulate(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn accumulate(@builtin(global_invocation_id) lid: vec3<u32>) {
+    // The dispatch covers the scissor box's workgroups, not the frame's, so
+    // the invocation id is box-relative. Everything below wants frame
+    // coordinates.
+    let gid = vec3<u32>(lid.x + params.origin_x, lid.y + params.origin_y, lid.z);
     if !in_bounds(gid) {
         return;
     }
-    // Outside the trace pass's scissor there is no new sample to fold in.
+    // The box is not a whole number of workgroups, and outside the trace
+    // pass's scissor there is no new sample to fold in either way.
     if !in_scissor(gid) {
         return;
     }
