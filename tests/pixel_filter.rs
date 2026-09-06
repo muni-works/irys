@@ -124,7 +124,10 @@ fn the_wide_filters_span_more_than_a_pixel() {
     let bh = width(PixelFilter::BlackmanHarris);
     assert!(b > 0.75 && b < 0.85, "box 10-90 width {b}");
     assert!(g > b, "the Gaussian ({g}) is no wider than the box ({b})");
-    assert!(bh > b, "Blackman-Harris ({bh}) is no wider than the box ({b})");
+    assert!(
+        bh > b,
+        "Blackman-Harris ({bh}) is no wider than the box ({b})"
+    );
     // A Gaussian of sigma 0.4 has a 10-90 edge width of 2*0.4*1.2816 ~ 1.025.
     let expect = 2.0 * GAUSSIAN_SIGMA * 1.281_551_6;
     assert!(

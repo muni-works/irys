@@ -349,7 +349,10 @@ impl NeuralDenoiser {
             ],
         });
 
-        let groups = (self.width.div_ceil(WG).max(1), self.height.div_ceil(WG).max(1));
+        let groups = (
+            self.width.div_ceil(WG).max(1),
+            self.height.div_ceil(WG).max(1),
+        );
         for (pipe, label) in [
             (&pipeline.conv1, "Neural Conv 1"),
             (&pipeline.conv2, "Neural Conv 2"),

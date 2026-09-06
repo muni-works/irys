@@ -103,7 +103,14 @@ impl Fixture {
 }
 
 fn camera() -> GpuCamera {
-    GpuCamera::new([5.0, -5.0, 3.5], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], 0.7, W, H)
+    GpuCamera::new(
+        [5.0, -5.0, 3.5],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+        0.7,
+        W,
+        H,
+    )
 }
 
 fn state(frame: u32) -> GpuRenderState {
@@ -342,7 +349,10 @@ fn a_moving_sphere_keeps_its_history_and_its_trail_does_not() {
     );
 
     assert!(sphere_n > 100, "the sphere should cover real pixels");
-    assert!(trail_n > 20, "the sphere did not move far enough to uncover a trail");
+    assert!(
+        trail_n > 20,
+        "the sphere did not move far enough to uncover a trail"
+    );
 
     // The sphere keeps a real history — most of the sixteen frames — and
     // keeps it *because* it was told what moved.

@@ -8,12 +8,12 @@
 //! Run with `--features gpu -- --ignored --test-threads=1`.
 #![cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 
+use kosm_render::Vec3;
 use kosm_render::gpu::{
     AnalyticGeometry, AnalyticPrim, GpuCamera, GpuContext, GpuMaterial, GpuRenderState,
     RayTracePipeline, SceneRef,
 };
 use kosm_render::pathtrace::{GradientEnv, Pbr, Sun};
-use kosm_render::Vec3;
 
 const W: u32 = 32;
 const H: u32 = 32;

@@ -9,12 +9,12 @@
 
 use std::sync::Arc;
 
+use kosm_render::analytic::{Frame, Prim};
 use kosm_render::caustics::{self, CausticOptions};
 use kosm_render::pathtrace::{
     Camera, Environment, Ground, Object, PathTraceOptions, Pbr, Scene, Sun, render,
     render_with_caustics,
 };
-use kosm_render::analytic::{Frame, Prim};
 use kosm_render::{Analytic, Bvh, Point3, Vec3};
 
 const SPHERE_R: f64 = 1.0;

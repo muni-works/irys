@@ -243,7 +243,9 @@ pub fn parse_hdr(bytes: &[u8]) -> Result<EnvMap, String> {
             let h: usize = parts[1]
                 .parse()
                 .map_err(|_| format!("bad height in {s:?}"))?;
-            let w: usize = parts[3].parse().map_err(|_| format!("bad width in {s:?}"))?;
+            let w: usize = parts[3]
+                .parse()
+                .map_err(|_| format!("bad width in {s:?}"))?;
             resolution = (w, h);
             break;
         }
@@ -292,7 +294,11 @@ fn read_scanline(bytes: &[u8], i: &mut usize, row: &mut [[u8; 4]]) -> Result<(),
     let head = [bytes[*i], bytes[*i + 1], bytes[*i + 2], bytes[*i + 3]];
     let rle_len = ((head[2] as usize) << 8) | head[3] as usize;
 
-    if !(head[0] == 2 && head[1] == 2 && head[2] & 0x80 == 0 && rle_len == w && (4..=0x7fff).contains(&w))
+    if !(head[0] == 2
+        && head[1] == 2
+        && head[2] & 0x80 == 0
+        && rle_len == w
+        && (4..=0x7fff).contains(&w))
     {
         // Flat RGBE, one quadruple per pixel. (Old-style RLE — a 1,1,1,n
         // repeat marker — is not produced by any modern writer and is not

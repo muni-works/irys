@@ -596,7 +596,9 @@ mod tests {
         }
         let id = vec![3.0f32; n];
         let count = vec![4.0f32; n];
-        let out = net.forward(w, h, &mean, &variance, &normal, &depth, &albedo, &id, &count);
+        let out = net.forward(
+            w, h, &mean, &variance, &normal, &depth, &albedo, &id, &count,
+        );
         let lo = mean.iter().copied().fold(f32::INFINITY, f32::min);
         let hi = mean.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         for v in out {

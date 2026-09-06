@@ -73,7 +73,14 @@ impl Fixture {
 }
 
 fn camera() -> GpuCamera {
-    GpuCamera::new([5.0, -5.0, 3.5], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], 0.7, W, H)
+    GpuCamera::new(
+        [5.0, -5.0, 3.5],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+        0.7,
+        W,
+        H,
+    )
 }
 
 fn state(frame: u32) -> GpuRenderState {
@@ -192,8 +199,14 @@ fn the_two_lobes_sum_to_the_sample() {
             if only_surfaces && g.depth[i] <= 0.0 {
                 continue;
             }
-            assert_eq!(d.count[i], summed.count[i], "{label}: pixel {i}'s diffuse count");
-            assert_eq!(s.count[i], summed.count[i], "{label}: pixel {i}'s specular count");
+            assert_eq!(
+                d.count[i], summed.count[i],
+                "{label}: pixel {i}'s diffuse count"
+            );
+            assert_eq!(
+                s.count[i], summed.count[i],
+                "{label}: pixel {i}'s specular count"
+            );
             for k in 0..3 {
                 let a = d.rgb[i * 3 + k] + s.rgb[i * 3 + k];
                 worst = worst.max((a - summed.rgb[i * 3 + k]).abs());
@@ -201,7 +214,9 @@ fn the_two_lobes_sum_to_the_sample() {
             de += d.rgb[i * 3] as f64;
             se += s.rgb[i * 3] as f64;
         }
-        eprintln!("lobes, {label}: worst |diffuse + specular - summed| = {worst:.2e}; red energy diffuse {de:.2} specular {se:.2}");
+        eprintln!(
+            "lobes, {label}: worst |diffuse + specular - summed| = {worst:.2e}; red energy diffuse {de:.2} specular {se:.2}"
+        );
         (worst, de, se)
     };
 
@@ -235,7 +250,10 @@ fn the_two_lobes_sum_to_the_sample() {
         pass(&mut res, f);
     }
     let (worst, _, _) = check(&mut res, "four passes", true);
-    assert!(worst < 1e-5, "the folded lobes do not sum to the folded sample: {worst}");
+    assert!(
+        worst < 1e-5,
+        "the folded lobes do not sum to the folded sample: {worst}"
+    );
 }
 
 /// The specular demodulator in guide plane 4 is `spec_albedo` on the CPU, at
@@ -288,7 +306,10 @@ fn the_specular_albedo_guide_matches_the_cpu_lookup() {
                 continue;
             }
             let m = if g.id[i] as u32 == 1 { &sphere } else { &plane };
-            assert!((g.roughness[i] - m.roughness).abs() < 1e-6, "pixel {i}: roughness");
+            assert!(
+                (g.roughness[i] - m.roughness).abs() < 1e-6,
+                "pixel {i}: roughness"
+            );
             let d = pixel_dir(&cam, x, y);
             let n = &g.normal[i * 3..i * 3 + 3];
             let mu = (-(n[0] * d[0] + n[1] * d[1] + n[2] * d[2])).max(1e-3);
@@ -304,7 +325,10 @@ fn the_specular_albedo_guide_matches_the_cpu_lookup() {
     // The view cosine is recomputed on the CPU from the pixel's *centre*
     // ray, and the trace jittered its own inside the pixel, so this is a
     // tolerance on the cosine, not on the lookup.
-    assert!(worst < 5e-3, "the guide disagrees with the CPU lookup by {worst}");
+    assert!(
+        worst < 5e-3,
+        "the guide disagrees with the CPU lookup by {worst}"
+    );
 }
 
 /// A mirror sliding in its own plane: the reflection stays where it was, the

@@ -289,7 +289,11 @@ impl Splats {
                     add(&mut c, SH_C3[0] * y * (3.0 * xx - yy), at(9));
                     add(&mut c, SH_C3[1] * xy * z, at(10));
                     add(&mut c, SH_C3[2] * y * (4.0 * zz - xx - yy), at(11));
-                    add(&mut c, SH_C3[3] * z * (2.0 * zz - 3.0 * xx - 3.0 * yy), at(12));
+                    add(
+                        &mut c,
+                        SH_C3[3] * z * (2.0 * zz - 3.0 * xx - 3.0 * yy),
+                        at(12),
+                    );
                     add(&mut c, SH_C3[4] * x * (4.0 * zz - xx - yy), at(13));
                     add(&mut c, SH_C3[5] * z * (xx - yy), at(14));
                     add(&mut c, SH_C3[6] * x * (xx - 3.0 * yy), at(15));
@@ -317,10 +321,7 @@ impl Splats {
 /// The inverse of the packing documented at the top of this module.
 #[inline]
 pub fn unpack_payload(payload: u64) -> (u32, f32) {
-    (
-        payload as u32,
-        f32::from_bits((payload >> 32) as u32),
-    )
+    (payload as u32, f32::from_bits((payload >> 32) as u32))
 }
 
 /// Pack a splat index and its peak alpha into a payload word.
@@ -571,7 +572,9 @@ mod tests {
         let splats = single([0.0, 0.0, 0.0], s as f32, 1.0, [0.0, 0.0, 0.0]);
         // One sigma off-axis: the peak response is exp(-1/2).
         let ray = Ray::new(Point3::new(-4.0, s, 0.0), Vec3::new(1.0, 0.0, 0.0));
-        let hit = splats.intersect(&ray, 0, 0.0, f64::INFINITY).expect("within 3σ");
+        let hit = splats
+            .intersect(&ray, 0, 0.0, f64::INFINITY)
+            .expect("within 3σ");
         let (_, alpha) = unpack_payload(hit.payload);
         assert!(
             (alpha as f64 - (-0.5f64).exp()).abs() < 1e-6,
