@@ -65,15 +65,15 @@ fn mask_at(x: u32, y: u32) -> vec2<u32> {
 // The blue-noise pattern at (pixel, frame, dim): one Owen-scrambled Sobol
 // pair per dimension pair, indexed by the frame, shifted per pixel by the
 // mask read at the dimension's own offset. See `sampler.rs` for why.
-fn blue_noise_sample(pixel: vec2<u32>, frame: u32, dim: u32) -> f32 {
+fn blue_noise_sample(pixel: vec2<u32>, frame: u32, dim: u32, salt: u32) -> f32 {
     let pair = dim >> 1u;
     let comp = dim & 1u;
-    let index = nested_uniform_scramble(frame, hash_u32(pair + 0x9E3779B9u));
+    let index = nested_uniform_scramble(frame, hash_u32(pair + 0x9E3779B9u + salt));
     var raw = reverseBits(index);
     if comp != 0u {
         raw = sobol_dim1(index);
     }
-    let scrambled = nested_uniform_scramble(raw, hash_u32(dim + 0x7F4A7C15u));
+    let scrambled = nested_uniform_scramble(raw, hash_u32(dim + 0x7F4A7C15u + salt));
     let value = f32(scrambled >> 8u) * (1.0 / 16777216.0);
     let shift = f32(mask_at(pixel.x, pixel.y)[comp]) * (1.0 / 256.0);
     return fract(value + shift);
@@ -81,8 +81,10 @@ fn blue_noise_sample(pixel: vec2<u32>, frame: u32, dim: u32) -> f32 {
 
 // The white-noise hash the integrator has always drawn from, as a function
 // of the same key, so the two patterns are compared under one harness.
-fn white_noise_sample(pixel: vec2<u32>, frame: u32, dim: u32) -> f32 {
-    var state = pixel.x * 1973u + pixel.y * 9277u + dim * 26699u + frame * 12345u + 1u;
+fn white_noise_sample(pixel: vec2<u32>, frame: u32, dim: u32, salt: u32) -> f32 {
+    // `salt` — the caller's `seed * 2654435761u` — decorrelates whole renders
+    // from one another. A seed of 0 reproduces the original hash exactly.
+    var state = pixel.x * 1973u + pixel.y * 9277u + dim * 26699u + frame * 12345u + salt + 1u;
     state = state * 747796405u + 2891336453u;
     let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
     let r = (word >> 22u) ^ word;

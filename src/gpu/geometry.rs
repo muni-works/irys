@@ -98,3 +98,67 @@ pub fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         count: None,
     }
 }
+
+/// Deepest root-to-leaf path a client's WGSL traversal is expected to walk.
+///
+/// A stack-based BVH/TLAS walk in WGSL holds its stack in a fixed
+/// `array<u32, N>` and *silently drops* a push that would overflow it —
+/// geometry simply disappears from the render, with no diagnostic at all.
+/// Sixty-four, not the thirty-two such traversals started at: a merged offline
+/// scene (one BLAS per object folded into a single tree) is deeper than any
+/// viewport scene.
+///
+/// The renderer owns no primitives, so it cannot enforce this in a shader of
+/// its own; [`validate_tree_depth`] is the gate a geometry module calls before
+/// upload, so the bound is checked rather than hoped for.
+pub const MAX_TRAVERSAL_DEPTH: usize = 64;
+
+/// Measure a flattened tree and refuse one deeper than [`MAX_TRAVERSAL_DEPTH`].
+///
+/// `nodes` is the array [`crate::bvh::Bvh::flatten`] produces, in the same
+/// order: node 0 is the root, an internal node's `left_or_first` and
+/// `right_or_count` are child indices, and a leaf's are a range into the
+/// primitive-index list. An empty tree is depth 0 and passes.
+///
+/// Cycles and out-of-range indices cannot arise from `flatten`, but a client
+/// may pack its own array, so the walk visits each node at most once rather
+/// than trusting the shape.
+pub fn validate_tree_depth(nodes: &[crate::bvh::FlatBvhNode]) -> Result<(), super::GpuError> {
+    let depth = tree_depth(nodes);
+    if depth > MAX_TRAVERSAL_DEPTH {
+        return Err(super::GpuError::InvalidInput(format!(
+            "packed tree is {depth} levels deep (max {MAX_TRAVERSAL_DEPTH}) -- a WGSL \
+             traversal stack cannot hold it and would silently drop geometry. Build \
+             shallower (fewer primitives per tree, or a two-level TLAS), or trace on \
+             the CPU"
+        )));
+    }
+    Ok(())
+}
+
+/// The deepest root-to-leaf path in a flattened tree, counting the root as 1.
+///
+/// Iterative: a 64-deep tree is fine on the stack, but a malformed array that
+/// chains a million nodes should return a number, not blow the host's.
+pub fn tree_depth(nodes: &[crate::bvh::FlatBvhNode]) -> usize {
+    if nodes.is_empty() {
+        return 0;
+    }
+    let mut best = 0usize;
+    let mut visited = vec![false; nodes.len()];
+    let mut stack = vec![(0u32, 1usize)];
+    while let Some((idx, depth)) = stack.pop() {
+        let Some(&(_, is_leaf, left, right)) = nodes.get(idx as usize) else {
+            continue;
+        };
+        if std::mem::replace(&mut visited[idx as usize], true) {
+            continue;
+        }
+        best = best.max(depth);
+        if !is_leaf {
+            stack.push((left, depth + 1));
+            stack.push((right, depth + 1));
+        }
+    }
+    best
+}

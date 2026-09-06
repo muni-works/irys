@@ -1041,3 +1041,249 @@ async fn wait_for_map(ctx: &GpuContext, readback_buffer: &wgpu::Buffer) -> Resul
     }
     Ok(())
 }
+
+/// Settings for an offline (non-interactive) GPU render.
+///
+/// Deliberately narrow compared with [`GpuRenderState`]: the viewport-only
+/// knobs (edge overlay, stylisation, debug modes, adaptive refinement, the
+/// device-side history and ReSTIR) are all forced off, because an offline
+/// render wants the integrator's estimate and nothing painted on top of it.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy)]
+pub struct OfflineOptions {
+    /// Output width in pixels.
+    pub width: u32,
+    /// Output height in pixels.
+    pub height: u32,
+    /// Samples per pixel. Each is one dispatch of the main kernel.
+    pub spp: u32,
+    /// Maximum path length. Held constant across all samples — the viewport's
+    /// [`super::depth_for_frame`] escalation exists to make the *first* frame
+    /// land fast, which an offline render does not care about, and it would
+    /// bias the running mean towards the shallow early samples.
+    pub max_depth: u32,
+    /// Depth at which Russian roulette begins.
+    pub rr_start: u32,
+    /// Clamp on indirect radiance to kill fireflies (0 disables).
+    pub firefly_clamp: f32,
+    /// Overall multiplier on the analytic studio environment. Ignored when the
+    /// scene carries an HDR environment, which brings its own intensity.
+    pub env_intensity: f32,
+    /// Whether the implicit ground plane participates in the path trace.
+    pub ground_enabled: bool,
+    /// The exact counterpart of
+    /// [`crate::pathtrace::PathTraceOptions::show_background`].
+    ///
+    /// `true` puts the *lighting environment* behind the subject; `false`
+    /// leaves it black, which paired with the film's coverage alpha gives a
+    /// transparent RGBA render. Either way the viewport's themed `sky_color`
+    /// backdrop — a UI choice unrelated to the sky the integrator samples — is
+    /// out of the picture.
+    ///
+    /// Defaults to `true`: an offline render is not a viewport.
+    pub show_background: bool,
+    /// RNG decorrelation seed. The same seed and the same scene give the same
+    /// image, every run, on the same adapter.
+    pub seed: u32,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for OfflineOptions {
+    fn default() -> Self {
+        Self {
+            width: 512,
+            height: 512,
+            spp: 64,
+            max_depth: super::buffers::DEFAULT_MAX_DEPTH,
+            rr_start: super::buffers::DEFAULT_RR_START,
+            firefly_clamp: super::buffers::DEFAULT_FIREFLY_CLAMP,
+            env_intensity: super::buffers::DEFAULT_ENV_INTENSITY,
+            ground_enabled: true,
+            show_background: true,
+            seed: 0,
+        }
+    }
+}
+
+/// The HDR result of an offline render.
+///
+/// This is the accumulation buffer verbatim: **linear radiance**, not
+/// tonemapped and not gamma-encoded. Exposure, ACES and sRGB encoding belong
+/// to the caller — feed [`Self::to_film`] into the CPU renderer's output
+/// transform rather than writing a second, subtly different one.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+pub struct OfflineResult {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Samples per pixel that were actually accumulated.
+    pub spp: u32,
+    /// Linear RGB radiance plus coverage, 4 floats per pixel, row-major
+    /// top-to-bottom. Alpha is the integrator's coverage estimate: 0 on a
+    /// pixel every sample of which missed the geometry, 1 on a fully covered
+    /// one, and the fraction between on a silhouette.
+    pub rgba: Vec<f32>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl OfflineResult {
+    /// Linear RGB at one pixel.
+    pub fn pixel(&self, x: u32, y: u32) -> [f32; 3] {
+        let i = ((y * self.width + x) * 4) as usize;
+        [self.rgba[i], self.rgba[i + 1], self.rgba[i + 2]]
+    }
+
+    /// Mean relative luminance over the whole image.
+    pub fn mean_luminance(&self) -> f32 {
+        if self.rgba.is_empty() {
+            return 0.0;
+        }
+        let mut sum = 0.0f64;
+        let mut n = 0usize;
+        for p in self.rgba.chunks_exact(4) {
+            sum += (0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]) as f64;
+            n += 1;
+        }
+        (sum / n.max(1) as f64) as f32
+    }
+
+    /// Repackage as a [`crate::pathtrace::Film`] so the CPU renderer's
+    /// exposure/ACES/sRGB path can be reused unchanged.
+    ///
+    /// The normal, depth, albedo and variance guide buffers are left **zeroed**
+    /// — an offline render never asks the shader for them, since the guide
+    /// planes are only written in raw-sample mode. The result must therefore
+    /// not be fed to [`crate::pathtrace::denoise`], which reads all four; use
+    /// [`super::ResidentScene`] with `render_resident_linear` if guides are
+    /// what you want.
+    pub fn to_film(&self) -> crate::pathtrace::Film {
+        let n = (self.width as usize) * (self.height as usize);
+        let mut rgb = Vec::with_capacity(n * 3);
+        let mut alpha = Vec::with_capacity(n);
+        for p in self.rgba.chunks_exact(4) {
+            rgb.extend_from_slice(&p[..3]);
+            alpha.push(p[3]);
+        }
+        crate::pathtrace::Film {
+            width: self.width,
+            height: self.height,
+            rgb,
+            alpha,
+            normal: vec![0.0; n * 3],
+            depth: vec![0.0; n],
+            albedo: vec![0.0; n * 3],
+            variance: vec![0.0; n],
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RayTracePipeline {
+    /// Render `spp` samples per pixel offline and read back the HDR
+    /// accumulation buffer once.
+    ///
+    /// [`Self::render_with_render_state`] is shaped for a 1-spp progressive
+    /// viewport: every call recreates every scene buffer, rebuilds the bind
+    /// group, and reads back the tonemapped `Rgba8Unorm` texture. At one frame
+    /// per gesture that is free; at 512 spp it is 512 scene uploads and 512
+    /// GPU→CPU round trips, and the round trips alone dominate the render.
+    ///
+    /// Here the scene goes up once as a [`super::ResidentScene`] and the
+    /// per-sample loop rewrites only the render-state uniform — frame index and
+    /// Halton jitter — before dispatching the main kernel. Refinement, the
+    /// device-side history and denoiser, and ReSTIR are all off: they are
+    /// interactivity aids that trade bias for speed at low sample counts, which
+    /// is the wrong trade when the whole point is to converge.
+    ///
+    /// The readback is the f32 accumulation buffer, not the tonemapped texture,
+    /// so the caller gets linear HDR radiance and applies its own exposure.
+    ///
+    /// Native only — it blocks on the buffer mapping, which would deadlock the
+    /// browser's single-threaded event loop.
+    pub fn render_offline<'s>(
+        &self,
+        ctx: &GpuContext,
+        scene: impl Into<SceneRef<'s>>,
+        camera: &GpuCamera,
+        opts: &OfflineOptions,
+    ) -> Result<OfflineResult, GpuError> {
+        let (width, height) = (opts.width.max(1), opts.height.max(1));
+        let spp = opts.spp.max(1);
+
+        let mut res = self.resident_scene(ctx, scene, width, height);
+        let plane = (width as u64) * (height as u64) * 16;
+
+        // One submit per sample. `write_buffer` is staged and applied at the
+        // next submit, so the frame index cannot be advanced several times
+        // inside a single encoder — every dispatch would read the same uniform
+        // and collapse the running mean.
+        for frame_index in 1..=spp {
+            let state = self.offline_render_state(opts, frame_index);
+            let mut encoder = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Offline Ray Trace Encoder"),
+                });
+            self.encode_resident(ctx, &mut res, camera, state, None, &mut encoder);
+            ctx.queue.submit(Some(encoder.finish()));
+        }
+
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Offline HDR Readback Buffer"),
+            size: plane,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Offline Readback Encoder"),
+            });
+        // Only the first plane: the two lobe planes behind it are written in
+        // raw-sample mode, which an offline render never asks for.
+        encoder.copy_buffer_to_buffer(res.raw_and_guide_buffers().0, 0, &readback, 0, plane);
+        ctx.queue.submit(Some(encoder.finish()));
+
+        let rgba = pollster::block_on(read_back_f32(ctx, &readback))?;
+
+        Ok(OfflineResult {
+            width,
+            height,
+            spp,
+            rgba,
+        })
+    }
+
+    /// The render state for one sample of an offline render.
+    ///
+    /// Everything the viewport uses to stay responsive is off: no edge overlay,
+    /// no stylisation, no debug mode, no adaptive refinement, no ReSTIR, and a
+    /// fixed `max_depth` instead of the per-frame escalation. The scene-derived
+    /// fields (light count, environment) are filled in by
+    /// [`super::ResidentScene`] from the buffers actually bound.
+    fn offline_render_state(&self, opts: &OfflineOptions, frame_index: u32) -> GpuRenderState {
+        let mut s = GpuRenderState::new(frame_index);
+        let (jx, jy) = super::buffers::halton_jitter(frame_index);
+        s.jitter_x = jx;
+        s.jitter_y = jy;
+        s.enable_edges = 0;
+        s.stylize = 0;
+        s.debug_mode = 0;
+        s.refine_sample_count = 0;
+        s.restir[0] = 0;
+        s.max_depth = opts.max_depth.max(1);
+        s.rr_start = opts.rr_start;
+        s.firefly_clamp = opts.firefly_clamp;
+        s.env_intensity = opts.env_intensity;
+        s.ground_enabled = u32::from(opts.ground_enabled);
+        s.seed = opts.seed;
+        s.background_mode = if opts.show_background {
+            super::buffers::BACKGROUND_ENVIRONMENT
+        } else {
+            super::buffers::BACKGROUND_BLACK
+        };
+        s
+    }
+}

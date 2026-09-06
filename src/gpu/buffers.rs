@@ -354,15 +354,40 @@ pub struct GpuCamera {
     pub target: [f32; 4],
     /// Up vector.
     pub up: [f32; 4],
+    /// World direction mapping to screen +x. Only read when
+    /// [`basis_mode`](Self::basis_mode) is [`CAMERA_BASIS_EXPLICIT`].
+    pub right: [f32; 4],
     /// Field of view in radians.
     pub fov: f32,
     /// Image width.
     pub width: u32,
     /// Image height.
     pub height: u32,
-    /// Padding.
-    pub _pad: u32,
+    /// How the shader builds the screen basis.
+    ///
+    /// * [`CAMERA_BASIS_DERIVED`] — build it right-handedly from `position`,
+    ///   `target` and `up` (`right = forward x up`). What the viewport has
+    ///   always done, and what [`GpuCamera::new`] still sets.
+    /// * [`CAMERA_BASIS_EXPLICIT`] — use [`right`](Self::right) and
+    ///   [`up`](Self::up) *verbatim*, with `forward = normalize(target -
+    ///   position)`.
+    ///
+    /// The explicit mode exists because a client's camera can carry a
+    /// **mirrored** (left-handed) screen basis, and no `look_at`-plus-up-hint
+    /// construction can reproduce one — rebuilding such a view right-handedly
+    /// flips the image left-for-right.
+    ///
+    /// Occupies what used to be the trailing padding word, so every field
+    /// before `right` keeps its offset.
+    pub basis_mode: u32,
 }
+
+/// [`GpuCamera::basis_mode`]: derive the screen basis from the up hint.
+pub const CAMERA_BASIS_DERIVED: u32 = 0;
+
+/// [`GpuCamera::basis_mode`]: use the supplied `right`/`up` verbatim, so a
+/// mirrored basis survives the trip to the shader.
+pub const CAMERA_BASIS_EXPLICIT: u32 = 1;
 
 /// Render state for progressive rendering.
 ///
@@ -516,7 +541,51 @@ pub struct GpuRenderState {
     pub prev_cam_look_at: [f32; 4],
     /// The previous pass's camera up vector in `.xyz`.
     pub prev_cam_up: [f32; 4],
+    /// Extra decorrelation term folded into the WGSL per-pixel RNG seed.
+    ///
+    /// The shader's white-noise hash is `pixel.x*1973 + pixel.y*9277 +
+    /// dim*26699 + frame*12345 + seed*2654435761 + 1`, and the blue-noise
+    /// sampler mixes the same `seed*2654435761` into its Owen scramble keys.
+    /// Zero — the value the viewport uses and the value every existing
+    /// constructor sets — reproduces the pre-seed behaviour bit for bit, so
+    /// the browser path is unchanged. An offline render sets it to get a
+    /// different but *reproducible* sample sequence for the same frames.
+    pub seed: u32,
+    /// What a camera ray that hits nothing returns.
+    ///
+    /// * [`BACKGROUND_SKY`] (0) — `sky_color`, the *themed viewport backdrop*.
+    ///   The historical behaviour, and what every viewport constructor sets.
+    /// * [`BACKGROUND_ENVIRONMENT`] (1) — `env_radiance`, the same sky the
+    ///   integrator lights with. This is [`crate::pathtrace::PathTraceOptions::show_background`]
+    ///   on the CPU, so an offline render asks for it.
+    /// * [`BACKGROUND_BLACK`] (2) — black with zero coverage, the CPU's
+    ///   `show_background` off. Paired with the film's coverage alpha this is
+    ///   what makes a transparent PNG.
+    ///
+    /// It has to be a shader-side choice rather than a CPU composite: a pixel
+    /// on the subject's silhouette averages background and surface samples
+    /// together, and once that mean exists the two cannot be separated again.
+    pub background_mode: u32,
+    /// Padding to a 16-byte multiple (required for uniform buffers).
+    pub _pad_bg: [u32; 2],
+    /// The previous pass's screen `+x` in `.xyz` and its
+    /// [`GpuCamera::basis_mode`] in `.w`, so ReSTIR's temporal reprojection
+    /// rebuilds the same — possibly mirrored — basis the pass was rendered
+    /// with. Filled in by [`crate::gpu::ResidentScene`]; a caller never sets it.
+    pub prev_cam_right: [f32; 4],
 }
+
+/// [`GpuRenderState::background_mode`]: draw the themed viewport backdrop.
+pub const BACKGROUND_SKY: u32 = 0;
+
+/// [`GpuRenderState::background_mode`]: draw the lighting environment, as the
+/// CPU renderer does with `PathTraceOptions::show_background`.
+pub const BACKGROUND_ENVIRONMENT: u32 = 1;
+
+/// [`GpuRenderState::background_mode`]: leave the backdrop black, matching the
+/// CPU renderer with `show_background` off. Paired with the film's coverage
+/// alpha this is what makes a transparent PNG.
+pub const BACKGROUND_BLACK: u32 = 2;
 
 /// ReSTIR stage: generate candidates, resample temporally, test the survivor.
 pub const RESTIR_STAGE_INITIAL: u32 = 0;
@@ -788,6 +857,10 @@ impl GpuRenderState {
             prev_cam_position: [0.0; 4],
             prev_cam_look_at: [0.0; 4],
             prev_cam_up: [0.0; 4],
+            seed: 0,
+            background_mode: BACKGROUND_SKY,
+            _pad_bg: [0; 2],
+            prev_cam_right: [0.0; 4],
         }
     }
 
@@ -1052,6 +1125,10 @@ impl GpuRenderState {
             prev_cam_position: [0.0; 4],
             prev_cam_look_at: [0.0; 4],
             prev_cam_up: [0.0; 4],
+            seed: 0,
+            background_mode: BACKGROUND_SKY,
+            _pad_bg: [0; 2],
+            prev_cam_right: [0.0; 4],
         }
     }
 
@@ -1075,6 +1152,15 @@ impl GpuRenderState {
             refine_sample_count,
         )
     }
+}
+
+/// Sub-pixel jitter for one accumulation frame, in `[-0.5, 0.5]`.
+///
+/// The same low-discrepancy offsets [`GpuRenderState::new`] bakes in, exposed
+/// so an offline sample loop can advance the jitter without rebuilding the
+/// whole render state each sample.
+pub fn halton_jitter(frame_index: u32) -> (f32, f32) {
+    halton_2_3(frame_index)
 }
 
 /// Generate Halton sequence sample for bases 2 and 3.
@@ -1116,10 +1202,49 @@ impl GpuCamera {
             position: [position[0], position[1], position[2], 1.0],
             target: [target[0], target[1], target[2], 1.0],
             up: [up[0], up[1], up[2], 0.0],
+            // Unread in derived mode; zero rather than a made-up axis so a
+            // stale value can never be mistaken for a real basis.
+            right: [0.0; 4],
             fov,
             width,
             height,
-            _pad: 0,
+            basis_mode: CAMERA_BASIS_DERIVED,
+        }
+    }
+
+    /// Create a camera from an explicit — possibly mirrored — screen basis.
+    ///
+    /// `forward`, `right` and `up` are used as given (the shader normalises
+    /// them but does not re-orthogonalise), so a left-handed view reaches the
+    /// GPU unflipped. `focus_dist` only positions the `target` point the
+    /// shader derives `forward` from; it does not focus anything, since the
+    /// GPU tracer is a pinhole.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_basis(
+        position: [f32; 3],
+        forward: [f32; 3],
+        right: [f32; 3],
+        up: [f32; 3],
+        fov: f32,
+        focus_dist: f32,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let d = focus_dist.max(1.0);
+        Self {
+            position: [position[0], position[1], position[2], 1.0],
+            target: [
+                position[0] + forward[0] * d,
+                position[1] + forward[1] * d,
+                position[2] + forward[2] * d,
+                1.0,
+            ],
+            up: [up[0], up[1], up[2], 0.0],
+            right: [right[0], right[1], right[2], 0.0],
+            fov,
+            width,
+            height,
+            basis_mode: CAMERA_BASIS_EXPLICIT,
         }
     }
 }

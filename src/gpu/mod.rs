@@ -28,17 +28,24 @@ pub use wgpu;
 pub use analytic::{AnalyticGeometry, AnalyticPrim};
 pub use budget::{Budget, SampleBudget};
 pub use buffers::{
-    DEFAULT_ENV_INTENSITY, DEFAULT_FIREFLY_CLAMP, DEFAULT_MAX_DEPTH, DEFAULT_RR_START,
+    BACKGROUND_BLACK, BACKGROUND_ENVIRONMENT, BACKGROUND_SKY, CAMERA_BASIS_DERIVED,
+    CAMERA_BASIS_EXPLICIT, DEFAULT_ENV_INTENSITY, DEFAULT_FIREFLY_CLAMP, DEFAULT_MAX_DEPTH, DEFAULT_RR_START,
     FLAG_BUDGET_GUIDES, FLAG_BUDGET_MASK, FLAG_CAMERA_VISIBLE_LIGHTS, FLAG_RAW_SAMPLE,
-    GpuAreaLight, GpuCamera, GpuMaterial, GpuRenderState, depth_for_frame, pack_light_power_table,
+    GpuAreaLight, GpuCamera, GpuMaterial, GpuRenderState, depth_for_frame, halton_jitter,
+    pack_light_power_table,
 };
 pub use context::{GpuContext, GpuError};
-pub use geometry::{GeometryModule, GeometrySlab, GpuGeometry, storage_entry};
+pub use geometry::{
+    GeometryModule, GeometrySlab, GpuGeometry, MAX_TRAVERSAL_DEPTH, storage_entry, tree_depth,
+    validate_tree_depth,
+};
 pub use history::{
     GpuDenoiseParams, Guides, History, HistoryBuffers, HistoryPipeline, InstanceMotion,
     MAX_DENOISE_ITERS, atrous_iters_for,
 };
 pub use neural::{NeuralDenoiser, NeuralPipeline};
 pub use pipeline::RayTracePipeline;
+#[cfg(not(target_arch = "wasm32"))]
+pub use pipeline::{OfflineOptions, OfflineResult};
 pub use resident::ResidentScene;
 pub use scene::{NoGeometry, SceneRef};
