@@ -752,9 +752,10 @@ fn every_pixel_is_sampled_within_the_floor_period() {
 /// must land on the same history as a frame that traces everything and throws
 /// three quarters of it away. `trace_all` is that control arm.
 ///
-/// Bit for bit over one budgeted frame, with the neighbourhood clamp off.
-/// Two things a skipped pixel leaves behind go stale, and neither is read
-/// inside the frame that skipped:
+/// Bit for bit over one budgeted frame, with the neighbourhood clamp off
+/// (and with it the firefly cap and the variance box, which read the same
+/// window). Two things a skipped pixel leaves behind go stale, and neither is
+/// read inside the frame that skipped:
 ///
 /// * the **clamp's** 3x3 window is the one place a pixel reads a *neighbour's*
 ///   raw sample, and a skipped neighbour's is the last one it took rather than
@@ -781,9 +782,16 @@ fn the_skip_folds_the_same_samples() {
     let step = 0.06_f32;
 
     let run = |clamp_k: f32, trace_all: bool, frames: u32| {
+        // With the clamp off, everything else that reads a neighbour's raw
+        // sample — the firefly cap's box and the variance box — is off too,
+        // or the bit-for-bit arm reads a skipped neighbour's stale sample.
+        let neighbourhood = clamp_k > 0.0;
+        let d = GpuDenoiseParams::default();
         let denoise = GpuDenoiseParams {
             clamp_k,
-            ..GpuDenoiseParams::default()
+            firefly_k: if neighbourhood { d.firefly_k } else { 0.0 },
+            variance_gamma: if neighbourhood { d.variance_gamma } else { 0.0 },
+            ..d
         };
         let budget = SampleBudget {
             radius: 8,

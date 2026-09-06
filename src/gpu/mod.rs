@@ -36,7 +36,8 @@ pub use context::{GpuContext, GpuError};
 pub use geometry::{GeometryModule, GeometrySlab, GpuGeometry, storage_entry};
 pub use history::{
     GpuDenoiseParams, Guides, History, HistoryBuffers, HistoryPipeline, InstanceMotion,
-    MAX_DENOISE_ITERS, atrous_iters_for,
+    MAX_DENOISE_ITERS, atrous_iters_for, firefly_k_for, fresh_extra_iters_for,
+    fresh_lum_relax_for, variance_gamma_for,
 };
 pub use neural::{NeuralDenoiser, NeuralPipeline};
 pub use pipeline::RayTracePipeline;

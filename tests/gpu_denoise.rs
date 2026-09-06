@@ -215,8 +215,12 @@ fn the_device_denoise_matches_the_cpu_filter() {
     // on. This test is about the *filter* being the same filter, so it turns
     // the estimator off and pins the à-trous weights; the live tier runs with
     // it on.
+    // The disocclusion fallback off, for the same reason: it widens a
+    // one-sample pixel's filter past what the CPU filter runs.
     let denoise = GpuDenoiseParams {
         spatial_variance: false,
+        fresh_extra_iters: 0,
+        fresh_lum_relax: 1.0,
         ..GpuDenoiseParams::default()
     };
 

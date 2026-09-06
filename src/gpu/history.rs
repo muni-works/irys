@@ -87,6 +87,26 @@
 //! so the à-trous filter is wide and correct on the frame the pixel appears
 //! rather than one convergence later.
 //!
+//! # What stops it boiling
+//!
+//! All of the above converges; none of it is *still*. A firefly folded at
+//! weight 1/n resets a pixel by more than its whole signal, the à-trous
+//! edge-stops read noisy luminance so the kernel changes shape frame to
+//! frame even where the radiance does not, nothing smooths the filtered
+//! output over time, and a disoccluded pixel shows near-raw samples for a
+//! few frames. Four fields on [`GpuDenoiseParams`] answer those in order:
+//! [`GpuDenoiseParams::firefly_k`] caps the raw sample against the previous
+//! frame's neighbourhood before it is folded;
+//! [`GpuDenoiseParams::variance_gamma`] clips a history that has fallen
+//! outside the raw neighbourhood's variance box;
+//! [`GpuDenoiseParams::temporal_filter`] runs a second exponential moving
+//! average over the *presented* frame, carried across the same motion the
+//! history is; and [`GpuDenoiseParams::fresh_extra_iters`] with
+//! [`GpuDenoiseParams::fresh_lum_relax`] widen the filter for pixels with
+//! fewer than four samples. Each is off at a value of zero (one, for the
+//! relax) and each is a no-op on a one-sample history, which is what keeps
+//! the parity below.
+//!
 //! # Parity with the CPU filter
 //!
 //! [`HistoryBuffers::denoise_params`] defaults to
@@ -130,6 +150,36 @@ pub fn atrous_iters_for(count: f32, iters: u32, count_cutoff: u32) -> u32 {
     let cutoff = count_cutoff.max(1) as f32;
     let t = ((cutoff - count) / (cutoff - 1.0).max(1e-6)).clamp(0.0, 1.0);
     (iters as f32 * t).ceil() as u32
+}
+
+/// The firefly clamp's multiple at `count` samples of history: `k` on the
+/// first, `2k` from 32 on. The mirror of `firefly_k_for` in `history.wgsl`.
+pub fn firefly_k_for(count: f32, k: f32) -> f32 {
+    let t = ((count - 1.0) / 31.0).clamp(0.0, 1.0);
+    k * (1.0 + t)
+}
+
+/// The variance clamp's γ at `count` samples of history: 1.0 on the first,
+/// `gamma` from 32 on. The mirror of `variance_gamma_for` in `history.wgsl`.
+pub fn variance_gamma_for(count: f32, gamma: f32) -> f32 {
+    let t = ((count - 1.0) / 31.0).clamp(0.0, 1.0);
+    1.0 + (gamma - 1.0) * t
+}
+
+/// Extra à-trous iterations a pixel with `count` samples gets: `extra` under
+/// four, none from there. The mirror of `fresh_extra_iters_for` in
+/// `history.wgsl`.
+pub fn fresh_extra_iters_for(count: f32, extra: u32) -> u32 {
+    if count < 4.0 { extra } else { 0 }
+}
+
+/// How much wider a pixel with `count` samples has its luminance edge-stop:
+/// `relax` on the first, 1x by the fourth. The mirror of `fresh_lum_relax_for`
+/// in `history.wgsl`.
+pub fn fresh_lum_relax_for(count: f32, relax: f32) -> f32 {
+    let relax = relax.max(1.0);
+    let t = ((count - 1.0) / 3.0).clamp(0.0, 1.0);
+    relax + (1.0 - relax) * t
 }
 
 /// Uniform slots: one per à-trous iteration, one shared by the accumulate,
@@ -207,6 +257,49 @@ pub struct GpuDenoiseParams {
     /// wide as its neighbours say it needs on the frame it appears. Off
     /// reproduces [`crate::pathtrace::denoise`] exactly.
     pub spatial_variance: bool,
+    /// Firefly clamp on the raw sample, before it is folded.
+    ///
+    /// A sample's demodulated luminance is capped at `firefly_k` times a
+    /// robust local estimate — the 3x3 mean of the *previous* accumulated
+    /// frame, which the sample cannot have widened — and the multiple relaxes
+    /// to twice this by 32 samples of history (see [`firefly_k_for`]), where
+    /// one sample moves the mean little and the clamp's own bias would
+    /// otherwise pile up. This is what stops one bright path from resetting a
+    /// converged pixel. Zero turns it off; the first pass of a frame, which
+    /// has no previous frame to cap against, is never clamped.
+    pub firefly_k: f32,
+    /// Variance-based history clamp.
+    ///
+    /// A pixel's history whose luminance is outside `mean ± γ·σ` of this
+    /// pass's raw 3x3 neighbourhood is rescaled to the box's edge and
+    /// shortened to `clamp_reset`. The σ is the larger of the neighbourhood's
+    /// and the pixel's own temporal one: nine one-sample taps of heavy-tailed
+    /// path-tracing noise sit low and narrow, and a box built on them alone
+    /// clipped the court's back wall a tenth too dark.
+    /// This is γ at a long history; it ramps from 1.0 on a one-sample history
+    /// (see [`variance_gamma_for`]), tight where the history is worth little
+    /// and loose where it is the better estimate. Inside the box nothing is
+    /// touched, so a still frame converges as if it were not there. Runs
+    /// alongside `clamp_k`, which sees smooth changes this cannot; this sees
+    /// ghosts and firefly residue that cannot. Zero turns it off.
+    pub variance_gamma: f32,
+    /// The second temporal pass over the *filtered* output.
+    ///
+    /// The presented frame is blended toward the previous presented frame —
+    /// reprojected with the same motion the history was — by a weight that
+    /// grows with the history toward this value and collapses when the two
+    /// differ by more than the pixel's error bar. It removes the flicker the
+    /// à-trous kernel's noisy edge-stops leave even where the radiance is
+    /// stable. Zero presents the filtered frame as it is.
+    pub temporal_filter: f32,
+    /// Disocclusion fallback: extra à-trous iterations a pixel with fewer
+    /// than four samples gets on top of its budget, at the next stride up.
+    /// Fresh pixels come out blurry rather than grainy. Zero for none.
+    pub fresh_extra_iters: u32,
+    /// How much wider a fresh pixel's luminance edge-stop is on its first
+    /// sample, falling to 1x by its fourth (see [`fresh_lum_relax_for`]).
+    /// 1.0 leaves it alone.
+    pub fresh_lum_relax: f32,
 }
 
 impl Default for GpuDenoiseParams {
@@ -223,6 +316,11 @@ impl Default for GpuDenoiseParams {
             clamp_k: 4.0,
             clamp_reset: 2,
             spatial_variance: true,
+            firefly_k: 12.0,
+            variance_gamma: 2.5,
+            temporal_filter: 0.9,
+            fresh_extra_iters: 1,
+            fresh_lum_relax: 3.0,
         }
     }
 }
@@ -276,12 +374,38 @@ pub(super) struct HistoryParams {
     pub budget_radius: u32,
     pub budget_floor_k: u32,
     pub budget_frame: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
-    pub _pad3: u32,
-    pub _pad4: u32,
-    pub _pad5: u32,
+    // The four stabilizers; see [`GpuDenoiseParams`] and `history.wgsl`.
+    pub firefly_k: f32,
+    pub variance_gamma: f32,
+    pub temporal_filter: f32,
+    pub fresh_extra_iters: u32,
+    pub fresh_lum_relax: f32,
+    // `resolve` only: the previous presented frame was reprojected this
+    // frame and is waiting in `filtered_reproj`.
+    pub filtered_reprojected: u32,
+}
+
+/// The [`HistoryParams`] fields the stabilizers read, off a
+/// [`GpuDenoiseParams`], with `filtered_reprojected` left for the resolve
+/// call to set.
+struct StabilizerFields {
+    firefly_k: f32,
+    variance_gamma: f32,
+    temporal_filter: f32,
+    fresh_extra_iters: u32,
+    fresh_lum_relax: f32,
+}
+
+impl StabilizerFields {
+    fn of(d: &GpuDenoiseParams) -> Self {
+        Self {
+            firefly_k: d.firefly_k.max(0.0),
+            variance_gamma: d.variance_gamma.max(0.0),
+            temporal_filter: d.temporal_filter.clamp(0.0, 1.0),
+            fresh_extra_iters: d.fresh_extra_iters,
+            fresh_lum_relax: d.fresh_lum_relax.max(1.0),
+        }
+    }
 }
 
 /// Every [`HistoryParams`] field the budget passes read, defaulted off.
@@ -494,6 +618,16 @@ pub struct HistoryBuffers {
     /// (illumination, variance) ping-pong for the wavelet iterations.
     pub(super) scratch_a: wgpu::Buffer,
     pub(super) scratch_b: wgpu::Buffer,
+    /// The previous pass's presented frame, linear and re-modulated, as
+    /// `(rgb, valid)`: what the second temporal pass blends toward. Written
+    /// by `resolve`.
+    filtered: wgpu::Buffer,
+    /// The same, gathered onto this pass's pixel grid by `reproject`.
+    filtered_reproj: wgpu::Buffer,
+    /// Whether `reproject` ran since the last resolve, so the resolve knows
+    /// to read `filtered_reproj` rather than `filtered`. Set by the
+    /// accumulate half of a frame, consumed by the denoise half.
+    filtered_reprojected: bool,
     /// One uniform slot per pass; see [`PARAM_SLOTS`].
     params: wgpu::Buffer,
     /// Staging for [`RayTracePipeline::read_history`], allocated on first use.
@@ -535,6 +669,9 @@ impl HistoryBuffers {
             budget_readback: None,
             scratch_a: mk("History Scratch A", n * 16),
             scratch_b: mk("History Scratch B", n * 16),
+            filtered: mk("History Presented Frame", n * 16),
+            filtered_reproj: mk("History Presented Frame Reprojected", n * 16),
+            filtered_reprojected: false,
             params: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("History Params"),
                 size: PARAM_STRIDE * PARAM_SLOTS as u64,
@@ -641,6 +778,10 @@ impl HistoryBuffers {
         // meaning exactly one thing.
         enc.clear_buffer(&self.prev_guides, 0, None);
         enc.clear_buffer(&self.budget, 0, None);
+        // A zeroed `valid` lane: the next presented frame has nothing to
+        // blend toward.
+        enc.clear_buffer(&self.filtered, 0, None);
+        enc.clear_buffer(&self.filtered_reproj, 0, None);
         ctx.queue.submit(Some(enc.finish()));
     }
 }
@@ -728,6 +869,8 @@ impl HistoryPipeline {
                     storage(11, false), // the per-pixel sample budget
                     storage(12, false), // the budget's dilation ping-pong
                     storage(13, false), // the budget's atomic totals
+                    storage(14, false), // the previous presented frame
+                    storage(15, false), // ... reprojected onto this frame
                 ],
             });
 
@@ -879,6 +1022,14 @@ pub(super) fn history_bind_group(
                 binding: 13,
                 resource: hist.budget_total.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: hist.filtered.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 15,
+                resource: hist.filtered_reproj.as_entire_binding(),
+            },
         ],
     })
 }
@@ -988,6 +1139,52 @@ impl RayTracePipeline {
             denoise,
             motion,
             NO_BUDGET,
+            None,
+        )
+    }
+
+    /// Fold a sample the *host* supplies, rather than one the tracer takes.
+    ///
+    /// `raw` is one `(linear radiance, coverage)` per pixel, row-major, the
+    /// frame's size — exactly what a raw-sample trace pass would have left
+    /// in the accumulation buffer. It is uploaded there and put through the
+    /// same accumulate pass a traced sample goes through: the firefly cap,
+    /// the clamps, the bounded fold. Nothing is traced, so the guide planes
+    /// are whatever the last trace left, and there is no reprojection.
+    ///
+    /// This is how the stabilizers are tested: a frame with one pixel a
+    /// thousand times too bright is a thing worth folding on purpose and a
+    /// thing no scene produces on demand.
+    pub fn fold_resident_sample(
+        &self,
+        ctx: &GpuContext,
+        history_pipeline: &HistoryPipeline,
+        res: &mut ResidentScene,
+        camera: &GpuCamera,
+        state: GpuRenderState,
+        raw: &[f32],
+        denoise: &GpuDenoiseParams,
+    ) -> Result<(), GpuError> {
+        let (w, h) = res.size();
+        let n = (w as usize) * (h as usize) * 4;
+        if raw.len() != n {
+            return Err(GpuError::InvalidInput(format!(
+                "raw sample has {} floats, expected {w}x{h}x4 = {n}",
+                raw.len(),
+            )));
+        }
+        self.accumulate_resident_inner(
+            ctx,
+            history_pipeline,
+            res,
+            camera,
+            state,
+            &[],
+            None,
+            denoise,
+            None,
+            NO_BUDGET,
+            Some(raw),
         )
     }
 
@@ -1008,6 +1205,7 @@ impl RayTracePipeline {
         denoise: &GpuDenoiseParams,
         motion: Option<&InstanceMotion>,
         bud: BudgetFields,
+        raw_override: Option<&[f32]>,
     ) -> Result<(), GpuError> {
         let (w, h) = res.size();
         let n = (w as usize) * (h as usize);
@@ -1043,6 +1241,7 @@ impl RayTracePipeline {
         // the second case: the pixel is where it was and the surface under it
         // is not.
         let reproject = prev_view.is_some() || motion.map(|m| m.instances > 0).unwrap_or(false);
+        let stab = StabilizerFields::of(denoise);
 
         // The motion table. Grown rather than reallocated per frame: a scene's
         // instance count barely moves, so after the first frame this is a
@@ -1058,6 +1257,11 @@ impl RayTracePipeline {
 
         {
             let hist = res.history_mut().expect("history was just ensured");
+            // The presented frame was carried with the history; the resolve
+            // half of this frame reads the carried copy.
+            if reproject {
+                hist.filtered_reprojected = true;
+            }
 
             // Widen the caller's mask, for the rows this box touches only.
             // WGSL has no 8-bit storage type, and one word per pixel is a
@@ -1133,12 +1337,12 @@ impl RayTracePipeline {
                 budget_radius: bud.radius,
                 budget_floor_k: bud.floor_k,
                 budget_frame: bud.frame,
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
-                _pad3: 0,
-                _pad4: 0,
-                _pad5: 0,
+                firefly_k: stab.firefly_k,
+                variance_gamma: stab.variance_gamma,
+                temporal_filter: stab.temporal_filter,
+                fresh_extra_iters: stab.fresh_extra_iters,
+                fresh_lum_relax: stab.fresh_lum_relax,
+                filtered_reprojected: 0,
             };
             ctx.queue
                 .write_buffer(&hist.params, 0, bytemuck::bytes_of(&base));
@@ -1172,7 +1376,13 @@ impl RayTracePipeline {
         let mut state = state;
         state.set_raw_sample(true);
         state.refine_sample_count = 0;
-        self.encode_raw_sample_into(ctx, res, camera, state, &mut encoder);
+        match raw_override {
+            Some(sample) => {
+                let (raw, _) = res.raw_and_guide_buffers();
+                ctx.queue.write_buffer(raw, 0, bytemuck::cast_slice(sample));
+            }
+            None => self.encode_raw_sample_into(ctx, res, camera, state, &mut encoder),
+        }
 
         let (raw, guides) = res.raw_and_guide_buffers();
         let hist = res.history().expect("history was just ensured");
@@ -1263,9 +1473,19 @@ impl RayTracePipeline {
         let (w, h) = res.size();
         res.ensure_history(ctx, w, h);
         let iters = denoise.iters.min(MAX_DENOISE_ITERS);
+        let stab = StabilizerFields::of(denoise);
+        // The disocclusion fallback's extra iterations are dispatched on top
+        // of the budget's; every pixel with four or more samples passes
+        // straight through them.
+        let dispatched = if iters == 0 {
+            0
+        } else {
+            (iters + stab.fresh_extra_iters).min(MAX_DENOISE_ITERS)
+        };
 
         {
-            let hist = res.history().expect("history was just ensured");
+            let hist = res.history_mut().expect("history was just ensured");
+            let filtered_reprojected = std::mem::take(&mut hist.filtered_reprojected);
             // Slot 0 is shared by demodulate and resolve; slots 1..=iters
             // carry each wavelet iteration's tap stride. The accumulate calls
             // wrote slot 0 for their own passes; this overwrites it, and the
@@ -1283,7 +1503,7 @@ impl RayTracePipeline {
                 stride: 1,
                 // The final iteration lands in scratch_b when the count is
                 // odd, since iteration 0 reads A and writes B.
-                src_is_b: u32::from(iters % 2 == 1),
+                src_is_b: u32::from(dispatched % 2 == 1),
                 scissor_xy: 0,
                 scissor_wh: 0,
                 cur_eye: [0.0; 4],
@@ -1313,16 +1533,16 @@ impl RayTracePipeline {
                 budget_radius: NO_BUDGET.radius,
                 budget_floor_k: NO_BUDGET.floor_k,
                 budget_frame: NO_BUDGET.frame,
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
-                _pad3: 0,
-                _pad4: 0,
-                _pad5: 0,
+                firefly_k: stab.firefly_k,
+                variance_gamma: stab.variance_gamma,
+                temporal_filter: stab.temporal_filter,
+                fresh_extra_iters: stab.fresh_extra_iters,
+                fresh_lum_relax: stab.fresh_lum_relax,
+                filtered_reprojected: u32::from(filtered_reprojected),
             };
             ctx.queue
                 .write_buffer(&hist.params, 0, bytemuck::bytes_of(&base));
-            for it in 0..iters {
+            for it in 0..dispatched {
                 let p = HistoryParams {
                     stride: 1u32 << it,
                     iter_index: it,
@@ -1372,7 +1592,7 @@ impl RayTracePipeline {
         );
 
         let groups = (w.div_ceil(8), h.div_ceil(8));
-        if iters > 0 {
+        if dispatched > 0 {
             dispatch(
                 &mut encoder,
                 &history_pipeline.demodulate,
@@ -1381,7 +1601,7 @@ impl RayTracePipeline {
                 groups,
                 "History Demodulate",
             );
-            for it in 0..iters {
+            for it in 0..dispatched {
                 // Iteration 0 reads A and writes B, so even iterations use the
                 // A->B group and odd ones B->A.
                 let group = if it % 2 == 0 { &ab } else { &ba };
@@ -1446,9 +1666,11 @@ impl RayTracePipeline {
         res.ensure_history(ctx, w, h);
         neural.ensure(ctx, w, h);
         neural.set_count_cutoff(denoise.count_cutoff.max(1));
+        let stab = StabilizerFields::of(denoise);
 
         {
-            let hist = res.history().expect("history was just ensured");
+            let hist = res.history_mut().expect("history was just ensured");
+            let filtered_reprojected = std::mem::take(&mut hist.filtered_reprojected);
             // Slot 0 is the resolve's. `iters` is 1 rather than the caller's
             // count: to `resolve` it is not a wavelet iteration count, it is
             // the flag for "a filtered image is waiting in the scratch".
@@ -1485,8 +1707,6 @@ impl RayTracePipeline {
                 motion_instances: 0,
                 motion_ids: 0,
                 spatial_variance: u32::from(denoise.spatial_variance),
-                _pad0: 0,
-                _pad1: 0,
                 budget_enabled: 0,
                 budget_bias: 0.0,
                 budget_rounds: 0,
@@ -1495,10 +1715,12 @@ impl RayTracePipeline {
                 budget_radius: 0,
                 budget_floor_k: 0,
                 budget_frame: 0,
-                _pad2: 0,
-                _pad3: 0,
-                _pad4: 0,
-                _pad5: 0,
+                firefly_k: stab.firefly_k,
+                variance_gamma: stab.variance_gamma,
+                temporal_filter: stab.temporal_filter,
+                fresh_extra_iters: stab.fresh_extra_iters,
+                fresh_lum_relax: stab.fresh_lum_relax,
+                filtered_reprojected: u32::from(filtered_reprojected),
             };
             ctx.queue
                 .write_buffer(&hist.params, 0, bytemuck::bytes_of(&base));
