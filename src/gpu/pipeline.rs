@@ -1015,24 +1015,30 @@ async fn wait_for_map(ctx: &GpuContext, readback_buffer: &wgpu::Buffer) -> Resul
 
     #[cfg(not(target_arch = "wasm32"))]
     let map_result = {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let success = Arc::new(AtomicBool::new(false));
-        let success_clone = success.clone();
-
+        // The callback is the only reliable signal that the map finished.
+        // `poll(Wait)` returning is not: when several threads share the
+        // device, another thread's poll can be the one that services this
+        // request, and our own wait can return before the callback has run.
+        // So the callback sends on a channel and the loop below polls until
+        // that message arrives. wgpu promises the callback fires exactly
+        // once — on success, on error, or when the buffer is dropped — so
+        // `recv` cannot hang on a request that was serviced elsewhere.
+        let (tx, rx) = std::sync::mpsc::channel();
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            if result.is_ok() {
-                success_clone.store(true, Ordering::SeqCst);
-            }
+            let _ = tx.send(result);
         });
 
-        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-
-        if success.load(Ordering::SeqCst) {
-            Ok(())
-        } else {
-            Err(GpuError::BufferMapping)
+        loop {
+            if ctx.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+                break Err(GpuError::BufferMapping);
+            }
+            match rx.try_recv() {
+                Ok(Ok(())) => break Ok(()),
+                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    break Err(GpuError::BufferMapping);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+            }
         }
     };
 

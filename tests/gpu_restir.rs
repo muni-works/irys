@@ -437,3 +437,43 @@ fn restir_pass_time_at_the_live_tier_size() {
         two / plain
     );
 }
+
+/// Eight threads read back through the one shared context at once.
+///
+/// The readback used to trust `device.poll(Wait)` returning as proof that
+/// its own map had completed; with several threads polling, another
+/// thread's poll could service the request and ours would return first,
+/// which surfaced as a spurious `BufferMapping` about one run in four when
+/// the tests in this file ran in parallel. Now the callback itself is the
+/// signal. Twenty passes per thread makes the old failure near-certain.
+#[test]
+#[ignore = "needs a GPU"]
+fn concurrent_readbacks_share_the_context() {
+    let Some(ctx) = ctx_or_skip("concurrent_readbacks_share_the_context") else {
+        return;
+    };
+    let handles: Vec<_> = (0..8u32)
+        .map(|i| {
+            std::thread::spawn(move || {
+                let pipeline = RayTracePipeline::new(ctx, &AnalyticGeometry::module())
+                    .expect("pipeline");
+                let room = Room::new(0.0);
+                let (w, h) = (64, 48);
+                let mut res = pipeline.resident_scene(ctx, room.scene(), w, h);
+                for f in 1..=20 {
+                    let film = pollster::block_on(pipeline.render_resident_linear(
+                        ctx,
+                        &mut res,
+                        &camera(w, h),
+                        state(f, None, 1),
+                    ))
+                    .unwrap_or_else(|e| panic!("thread {i} pass {f}: {e}"));
+                    assert_eq!(film.rgb.len(), (w * h * 3) as usize);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("a readback thread panicked");
+    }
+}
