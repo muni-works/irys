@@ -389,7 +389,7 @@ fn a_moved_light_is_clamped_out_within_four_frames() {
     let denoise = GpuDenoiseParams::default();
     let mut res = pipeline.resident_scene(ctx, fx.scene(), W, H);
 
-    let mut pass = |res: &mut _, f: u32| {
+    let pass = |res: &mut _, f: u32| {
         pipeline
             .accumulate_and_denoise_resident(
                 ctx,
@@ -622,22 +622,36 @@ fn the_first_frame_has_no_grain() {
         (devs[devs.len() / 2], devs[devs.len() * 95 / 100])
     };
 
-    let first = run(1, GpuDenoiseParams::default());
+    // The disocclusion fallback off for the two arms being compared: it
+    // widens every one-sample pixel's filter whether or not the variance
+    // estimate is spatial, and would smooth the blind arm on its own.
+    let no_fallback = GpuDenoiseParams {
+        fresh_extra_iters: 0,
+        fresh_lum_relax: 1.0,
+        ..GpuDenoiseParams::default()
+    };
+    let first = run(1, no_fallback);
     let converged = run(64, GpuDenoiseParams::default());
     let blind = run(
         1,
         GpuDenoiseParams {
             spatial_variance: false,
-            ..GpuDenoiseParams::default()
+            ..no_fallback
         },
     );
+    let with_fallback = run(1, GpuDenoiseParams::default());
 
     let (m1, p1) = roughness(&first);
     let (mc, pc) = roughness(&converged);
     let (mb, pb) = roughness(&blind);
+    let (mf, pf) = roughness(&with_fallback);
     println!(
         "3x3 deviation (median, p95): first frame ({m1}, {p1}), converged ({mc}, {pc}), \
-         first frame without the spatial variance ({mb}, {pb})"
+         first frame without the spatial variance ({mb}, {pb}), with the fallback ({mf}, {pf})"
+    );
+    assert!(
+        pf <= p1,
+        "the disocclusion fallback made the first frame rougher: p95 {pf}/255 against {p1}/255"
     );
 
     assert!(

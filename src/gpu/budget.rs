@@ -287,12 +287,13 @@ impl RayTracePipeline {
                 budget_radius: bud.radius,
                 budget_floor_k: bud.floor_k,
                 budget_frame: bud.frame,
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
-                _pad3: 0,
-                _pad4: 0,
-                _pad5: 0,
+                // The budget passes read none of the stabilizers.
+                firefly_k: 0.0,
+                variance_gamma: 0.0,
+                temporal_filter: 0.0,
+                fresh_extra_iters: 0,
+                fresh_lum_relax: 1.0,
+                filtered_reprojected: 0,
             };
             ctx.queue.write_buffer(
                 &hist.params_buffer(),
@@ -423,6 +424,7 @@ impl RayTracePipeline {
             denoise,
             motion,
             bud,
+            None,
         )
     }
 

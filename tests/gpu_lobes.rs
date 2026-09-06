@@ -166,8 +166,13 @@ fn the_two_lobes_sum_to_the_sample() {
     // Clamp off: the clamp is per lobe by design — a stale reflection is
     // shortened without touching the diffuse history under it — so with it
     // on the two lobes' counts can legitimately part company.
+    // The variance box shortens per lobe the same way (and skips the
+    // specular one), and the firefly cap scales a sample before it is
+    // folded; both off, so the fold is the bare fold on both sides.
     let denoise = GpuDenoiseParams {
         clamp_k: 0.0,
+        variance_gamma: 0.0,
+        firefly_k: 0.0,
         ..GpuDenoiseParams::default()
     };
     let n = (W * H) as usize;

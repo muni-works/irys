@@ -32,12 +32,23 @@
 //! * `atrous` — one 5x5 B3-spline wavelet iteration at `params.stride`,
 //!   reading `scratch_src` and writing `scratch_dst`. Dispatched once per
 //!   iteration with the two scratch buffers swapped between them.
-//! * `resolve` — re-modulate, blend by history length, tonemap, and store
-//!   into the caller's texture.
+//! * `resolve` — re-modulate, blend by history length, run the second
+//!   temporal pass over the filtered result, tonemap, and store into the
+//!   caller's texture.
 //!
 //! This is a port of `pathtrace::denoise`, filter weight for filter weight, so
 //! a one-sample history denoises to what the CPU would have produced from the
-//! same `Film`. `tests/gpu_history.rs` pins that.
+//! same `Film`. `tests/gpu_denoise.rs` pins that.
+//!
+//! Four stabilizers sit in that path, each behind a `HistoryParams` field
+//! with a value that turns it off, and each a no-op on a one-sample history
+//! so the parity above holds: a firefly cap on the raw sample before it is
+//! folded, a variance box the carried history is clipped into, a second
+//! exponential moving average over the *filtered* output, and a wider filter
+//! for pixels with fewer than four samples. `tests/gpu_stabilizers.rs` pins
+//! each of them. Watching the court without them, the image boiled: grain
+//! crawled where the radiance was still, and a region popped whenever a
+//! firefly landed.
 
 const PI: f32 = 3.14159265359;
 
@@ -167,13 +178,29 @@ struct HistoryParams {
     budget_floor_k: u32,
     // The frame counter the floor's phase and the coin's seed ride on.
     budget_frame: u32,
-    // Out to a multiple of 16 bytes, so the Rust struct and this one agree.
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
-    _pad3: u32,
-    _pad4: u32,
-    _pad5: u32,
+    // ─── the four stabilizers ────────────────────────────────────────────
+    // Firefly clamp on the raw sample, before it is folded: a sample's
+    // demodulated luminance is capped at this many times a robust local
+    // estimate (the 3x3 mean of the *previous* accumulated frame), the
+    // multiple relaxing to twice this as the history grows. Zero turns it off.
+    firefly_k: f32,
+    // Variance-based history clamp: a history outside mean ± γ·σ of this
+    // pass's raw 3x3 neighbourhood is clipped to the box and shortened. This
+    // is γ at a long history; it ramps from 1.0 at one sample. Zero is off.
+    variance_gamma: f32,
+    // The second temporal pass over the *filtered* output: the most of the
+    // previous presented frame a pixel may keep, reached at a long history.
+    // Zero presents the filtered frame as it is.
+    temporal_filter: f32,
+    // Disocclusion fallback: extra à-trous iterations a pixel with fewer than
+    // four samples gets, and how much wider its luminance edge-stop is on its
+    // first sample (falling to 1x by the fourth).
+    fresh_extra_iters: u32,
+    fresh_lum_relax: f32,
+    // `resolve` only: non-zero when `reproject` ran this frame and the
+    // previous presented frame is waiting, reprojected, in
+    // `filtered_reproj` rather than in `filtered` itself.
+    filtered_reprojected: u32,
 }
 
 // How far this frame's surface point may lie off the plane the previous
@@ -232,6 +259,49 @@ const REPROJ_NORMAL_DOT: f32 = 0.9;
 //
 // A frame with nothing moving binds a stub and sets `motion_instances` to 0.
 @group(0) @binding(10) var<storage, read> motion: array<vec4<f32>>;
+// The previous pass's *presented* frame, linear and re-modulated, before the
+// tonemap: (rgb, valid). What the second temporal pass blends toward.
+// Written by `resolve`, one pixel per invocation, and read by `reproject`.
+@group(0) @binding(17) var<storage, read_write> filtered: array<vec4<f32>>;
+// The same, carried onto this pass's pixel grid by `reproject` with the
+// motion the history itself was carried with. A pixel the reprojection could
+// not carry has `valid` zero here.
+@group(0) @binding(18) var<storage, read_write> filtered_reproj: array<vec4<f32>>;
+
+// Floor on the firefly clamp's local estimate, in demodulated luminance, so a
+// history that is still black does not cap the first light to reach it at
+// nothing.
+const FIREFLY_FLOOR: f32 = 0.01;
+
+// The firefly multiple at `count` samples of history: the caller's `k` on
+// the first, twice it from 32 on. A bright sample folded at weight 1/n moves
+// the mean by less as n grows, so the cap can afford to be looser where the
+// clamp's own bias would otherwise accumulate. Mirrored in Rust as
+// `gpu::history::firefly_k_for`.
+fn firefly_k_for(count: f32) -> f32 {
+    return params.firefly_k * mix(1.0, 2.0, clamp((count - 1.0) / 31.0, 0.0, 1.0));
+}
+
+// The variance clamp's γ at `count` samples: 1.0 on the first, the caller's
+// `variance_gamma` from 32 on. Mirrored as `gpu::history::variance_gamma_for`.
+fn variance_gamma_for(count: f32) -> f32 {
+    return mix(1.0, params.variance_gamma, clamp((count - 1.0) / 31.0, 0.0, 1.0));
+}
+
+// Extra wavelet iterations a pixel with `count` samples gets, on top of its
+// budget: the disocclusion fallback. Mirrored as `gpu::history::fresh_extra_iters_for`.
+fn fresh_extra_iters_for(count: f32) -> u32 {
+    if count < 4.0 {
+        return params.fresh_extra_iters;
+    }
+    return 0u;
+}
+
+// How much wider a fresh pixel's luminance edge-stop is: `fresh_lum_relax` on
+// the first sample, 1x by the fourth. Mirrored as `gpu::history::fresh_lum_relax_for`.
+fn fresh_lum_relax_for(count: f32) -> f32 {
+    return mix(max(params.fresh_lum_relax, 1.0), 1.0, clamp((count - 1.0) / 3.0, 0.0, 1.0));
+}
 
 // ─── the split denoiser's own buffers ─────────────────────────────────────
 // Two planes each, diffuse then specular, in `mean`/`stats`' layouts: the
@@ -397,6 +467,7 @@ fn reproject(@builtin(global_invocation_id) gid: vec3<u32>) {
     // `reproject_commit` never copies a stale gather back into the history.
     scratch_src[i] = vec4<f32>(0.0);
     scratch_dst[i] = vec4<f32>(0.0);
+    filtered_reproj[i] = vec4<f32>(0.0);
 
     let depth = guide_depth(i);
     if depth <= 0.0 {
@@ -478,6 +549,273 @@ fn reproject(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     scratch_src[i] = mean[j];
     scratch_dst[i] = stats[j];
+    // The presented frame rides the same motion, so the second temporal pass
+    // blends a pixel toward where *it* was shown, not toward whatever was
+    // shown at its screen position.
+    filtered_reproj[i] = filtered[j];
+}
+
+// ─── the stabilizers, shared by the summed fold and the per-lobe folds ──
+
+// `lobe` for the summed history in `raw`/`mean`/`stats`, as against the two
+// lobes' own planes. What lets one stabilizer body serve both folds.
+const LOBE_SUM: u32 = 2u;
+
+fn hist_raw(lobe: u32, q: u32) -> vec4<f32> {
+    if lobe == LOBE_SUM {
+        return raw[q];
+    }
+    return raw_lobe(lobe, q);
+}
+
+fn hist_mean(lobe: u32, q: u32) -> vec4<f32> {
+    if lobe == LOBE_SUM {
+        return mean[q];
+    }
+    return lobe_mean[lobe * n_pixels() + q];
+}
+
+fn hist_stats(lobe: u32, q: u32) -> vec4<f32> {
+    if lobe == LOBE_SUM {
+        return stats[q];
+    }
+    return lobe_stats[lobe * n_pixels() + q];
+}
+
+fn hist_demod_lum(lobe: u32, q: u32) -> f32 {
+    if lobe == LOBE_SUM {
+        return demod_lum(q);
+    }
+    return lobe_demod_lum(lobe, q);
+}
+
+// Everything that stands between a raw sample and the fold: the firefly cap
+// on the sample, the neighbourhood clamp and the variance box on the history.
+// `c` is the sample, `m` and `st` the history it is about to be folded into;
+// all three may come back changed.
+fn stabilize_sample(
+    gid: vec3<u32>,
+    i: u32,
+    lobe: u32,
+    cp: ptr<function, vec4<f32>>,
+    mp: ptr<function, vec4<f32>>,
+    stp: ptr<function, vec4<f32>>,
+) {
+    var c = *cp;
+    var m = *mp;
+    var st = *stp;
+
+    // ─── the firefly clamp ───────────────────────────────────────────────
+    //
+    // A path that finds a small bright light through a glossy bounce comes
+    // back a thousand times brighter than its neighbours, and at weight 1/n
+    // it moves a converged pixel by more than the whole of its signal. Cap
+    // the sample's demodulated luminance at a multiple of what the pixel's
+    // neighbourhood has *already* settled to — the previous frame's 3x3 mean,
+    // which a firefly cannot widen because it has not been folded yet. A pixel
+    // whose neighbourhood has no history (the frame's first pass) is left
+    // alone: there is nothing robust to cap against, and a first pass is what
+    // the parity test compares to the CPU filter.
+    //
+    // `firefly_cap` is in demodulated luminance and is reused below to cap the
+    // neighbourhood's raw taps, so a firefly on a neighbour cannot widen the
+    // box the history is clamped into either.
+    //
+    // The cap is always taken from the *summed* sample and the summed
+    // neighbourhood, whichever lobe is being folded, and the lobe's sample
+    // is scaled by the same factor: a firefly is a property of the path, not
+    // of the half of it that happened to be specular, and a rough surface's
+    // specular half — small, and made of rare bright samples — capped
+    // against its own dim neighbourhood loses real energy. Measured on the
+    // court, a per-lobe cap took a percent off the back wall. The centre
+    // pixel is left out of the neighbourhood: by the time the lobes fold,
+    // the summed mean already holds this sample.
+    var firefly_cap = 1e30;
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    if params.firefly_k > 0.0 && st.x > 0.5 {
+        var hist_sum = 0.0;
+        var hist_k = 0.0;
+        var raw_sum = 0.0;
+        var raw_k = 0.0;
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            let qy = y + dy;
+            if qy < 0 || qy >= i32(params.height) {
+                continue;
+            }
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let qx = x + dx;
+                if qx < 0 || qx >= i32(params.width) {
+                    continue;
+                }
+                let q = u32(qy) * params.width + u32(qx);
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                if stats[q].x > 0.5 {
+                    hist_sum = hist_sum + luminance(mean[q].rgb) / demod_lum(q);
+                    hist_k = hist_k + 1.0;
+                }
+                raw_sum = raw_sum + luminance(raw[q].rgb) / demod_lum(q);
+                raw_k = raw_k + 1.0;
+            }
+        }
+        // The previous accumulated frame's neighbourhood where there is one;
+        // this pass's neighbours, centre excluded, where there is not.
+        var local = 0.0;
+        if hist_k > 0.0 {
+            local = hist_sum / hist_k;
+        } else if raw_k > 0.0 {
+            local = raw_sum / raw_k;
+        }
+        firefly_cap = firefly_k_for(st.x) * max(local, FIREFLY_FLOOR);
+        let ld = luminance(raw[i].rgb) / demod_lum(i);
+        if ld > firefly_cap {
+            c = vec4<f32>(c.rgb * (firefly_cap / ld), c.w);
+        }
+    }
+
+    // ─── neighbourhood clamping ──────────────────────────────────────────
+    //
+    // A carried history can be *stale* without being wrong about which
+    // surface it is on: the ball has moved off the floor and the floor is
+    // still holding the ball's shadow. Nothing in the depth/normal/id gates
+    // sees that, because the floor is still the floor.
+    //
+    // What does see it is this pass's own sample. Clamp the history into the
+    // range the raw 3x3 neighbourhood says the pixel plausibly is, and a
+    // shadow that has gone is out of range on the first frame and reeled in
+    // over the next few. The clamped pixel's history length drops with it, so
+    // the à-trous filter widens there and the reeling-in is not visible as
+    // noise.
+    if (params.clamp_k > 0.0 || params.variance_gamma > 0.0) && st.x > 0.5 {
+        var s1 = vec3<f32>(0.0);
+        var s2 = vec3<f32>(0.0);
+        var hsum = vec3<f32>(0.0);
+        var k = 0.0;
+        // The largest temporal luminance variance in the neighbourhood,
+        // over pixels with enough history to have one; the variance box's
+        // floor.
+        var vt = max(st.z - st.y * st.y, 0.0);
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            let qy = y + dy;
+            if qy < 0 || qy >= i32(params.height) {
+                continue;
+            }
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let qx = x + dx;
+                if qx < 0 || qx >= i32(params.width) {
+                    continue;
+                }
+                let q = u32(qy) * params.width + u32(qx);
+                var t = hist_raw(lobe, q).rgb;
+                if dx == 0 && dy == 0 {
+                    t = c.rgb;
+                } else {
+                    // The same cap the centre got, so one firefly among the
+                    // neighbours cannot widen the box.
+                    let lq = luminance(raw[q].rgb) / demod_lum(q);
+                    if lq > firefly_cap {
+                        t = t * (firefly_cap / lq);
+                    }
+                }
+                s1 = s1 + t;
+                s2 = s2 + t * t;
+                hsum = hsum + hist_mean(lobe, q).rgb;
+                k = k + 1.0;
+                let sq = hist_stats(lobe, q);
+                if sq.x >= 4.0 {
+                    vt = max(vt, sq.z - sq.y * sq.y);
+                }
+            }
+        }
+        if k > 0.0 {
+            let mu = s1 / k;
+            let sd = sqrt(max(s2 / k - mu * mu, vec3<f32>(0.0)));
+            // What is compared is the *history's* 3x3 mean against the raw
+            // sample's 3x3 mean, not the history's own pixel against the raw
+            // neighbourhood. The two are blurred by the same kernel, so the
+            // spatial bias that makes a plain TAA clamp fire on every gradient
+            // in the frame cancels, and what is left is the error bar on a
+            // nine-sample mean — three times tighter than one sample's, which
+            // is three times the sensitivity to lighting that really did
+            // change.
+            let hmu = hsum / k;
+            let tol = params.clamp_k * sd / sqrt(k) + 1e-5;
+            let d = abs(hmu - mu);
+            if params.clamp_k > 0.0 && max(d.x, max(d.y, d.z)) > max(tol.x, max(tol.y, tol.z)) {
+                // The history is *shortened*, not overwritten. Snapping the
+                // colour to the edge of the neighbourhood would be the usual
+                // TAA move and it is a biased one: on a still frame the
+                // clamp fires by chance a few percent of the time, always
+                // pulling towards a nine-sample mean, and a hundred passes of
+                // that is a visible tint. Shortening the history is unbiased —
+                // the next few samples are simply worth much more — and the
+                // stale value is gone in about `clamp_reset` frames either
+                // way.
+                st.x = min(st.x, f32(max(params.clamp_reset, 1u)));
+            }
+            // ─── the variance box ────────────────────────────────────────
+            //
+            // The test above sees a *smooth* change — a shadow that left —
+            // through nine-sample means. What it does not see is a history
+            // that is simply nowhere near what the pixel is now: a ghost
+            // carried onto the wrong shading, or the residue of a firefly
+            // folded before the cap was there. Those are outside
+            // mean ± γ·σ of the raw neighbourhood, with γ tight on a young
+            // history — one sample of it is worth little more than one of
+            // the neighbours — and loose on a long one, where the history is
+            // the better estimate and the box should only catch what is
+            // plainly wrong. A history outside the box is clipped to its edge
+            // and shortened; inside it, nothing is touched, so a still frame
+            // converges as if the box were not there. The σ is floored at a
+            // few percent of the mean so nine taps that happen to agree
+            // cannot collapse the box onto themselves.
+            //
+            // The test is in luminance, and the σ is the *larger* of the
+            // neighbourhood's spatial spread and the temporal spread any of
+            // its pixels has seen. Nine taps of one-sample path-tracing
+            // noise are a poor estimate of a heavy-tailed spread — most
+            // samples sit under the mean and the odd bright one carries it —
+            // and a box built on them alone sits low and narrow, so the
+            // history above it is clipped down far more often than up.
+            // Measured on the court that was a tenth off the back wall's
+            // brightness. The temporal moments have seen the tails; they set
+            // the floor, and the neighbours' rather than the pixel's own so
+            // that a pixel too young to have moments is held to what its
+            // surroundings know. What is left for the box is a history
+            // *grossly* outside the noise — a surface carried onto the wrong
+            // lighting, a light that came on — which is what it is for.
+            //
+            // Not on the specular lobe: its history is already held to its
+            // roughness, and its samples are the rare bright ones the box
+            // would read as ghosts.
+            if params.variance_gamma > 0.0 && st.x > 1.5 && lobe != LOBE_SPECULAR {
+                let gamma = variance_gamma_for(st.x);
+                let mu_l = luminance(mu);
+                let sd_l = luminance(sd);
+                let sd_t = sqrt(vt);
+                let width = gamma * max(max(sd_l, sd_t), 0.05 * abs(mu_l)) + 1e-4;
+                let l_m = luminance(m.rgb);
+                let edge = clamp(l_m, mu_l - width, mu_l + width);
+                if edge != l_m && l_m > 1e-6 {
+                    m = vec4<f32>(m.rgb * (edge / l_m), m.w);
+                    st.x = min(st.x, f32(max(params.clamp_reset, 1u)));
+                }
+            }
+            // `hist_mean(lobe, q)` for a neighbour is read while other invocations of
+            // this same dispatch may be folding their own sample into it. The
+            // race is deliberate and harmless: what comes back is that
+            // neighbour's history either side of one sample out of `n`, and
+            // the test is a comparison of nine-pixel means against an error
+            // bar. Synchronising it would cost a full-frame dispatch to buy a
+            // difference under the noise floor.
+        }
+    }
+
+    *cp = c;
+    *mp = m;
+    *stp = st;
 }
 
 // ─── pass 1: fold this sample into the history ────────────────────────────
@@ -497,8 +835,7 @@ fn accumulate(@builtin(global_invocation_id) lid: vec3<u32>) {
         return;
     }
     let i = flat_index(gid);
-    let c = raw[i];
-    let l = luminance(c.rgb);
+    var c = raw[i];
 
     // Where this pixel's history is: in the buffers, or — if `reproject` ran
     // this pass — in the scratch pair it gathered into.
@@ -564,79 +901,8 @@ fn accumulate(@builtin(global_invocation_id) lid: vec3<u32>) {
         }
     }
 
-    // ─── neighbourhood clamping ──────────────────────────────────────────
-    //
-    // A carried history can be *stale* without being wrong about which
-    // surface it is on: the ball has moved off the floor and the floor is
-    // still holding the ball's shadow. Nothing in the depth/normal/id gates
-    // sees that, because the floor is still the floor.
-    //
-    // What does see it is this pass's own sample. Clamp the history into the
-    // range the raw 3x3 neighbourhood says the pixel plausibly is, and a
-    // shadow that has gone is out of range on the first frame and reeled in
-    // over the next few. The clamped pixel's history length drops with it, so
-    // the à-trous filter widens there and the reeling-in is not visible as
-    // noise.
-    if params.clamp_k > 0.0 && st.x > 0.5 {
-        var s1 = vec3<f32>(0.0);
-        var s2 = vec3<f32>(0.0);
-        var hsum = vec3<f32>(0.0);
-        var k = 0.0;
-        let x = i32(gid.x);
-        let y = i32(gid.y);
-        for (var dy = -1; dy <= 1; dy = dy + 1) {
-            let qy = y + dy;
-            if qy < 0 || qy >= i32(params.height) {
-                continue;
-            }
-            for (var dx = -1; dx <= 1; dx = dx + 1) {
-                let qx = x + dx;
-                if qx < 0 || qx >= i32(params.width) {
-                    continue;
-                }
-                let q = u32(qy) * params.width + u32(qx);
-                let t = raw[q].rgb;
-                s1 = s1 + t;
-                s2 = s2 + t * t;
-                hsum = hsum + mean[q].rgb;
-                k = k + 1.0;
-            }
-        }
-        if k > 0.0 {
-            let mu = s1 / k;
-            let sd = sqrt(max(s2 / k - mu * mu, vec3<f32>(0.0)));
-            // What is compared is the *history's* 3x3 mean against the raw
-            // sample's 3x3 mean, not the history's own pixel against the raw
-            // neighbourhood. The two are blurred by the same kernel, so the
-            // spatial bias that makes a plain TAA clamp fire on every gradient
-            // in the frame cancels, and what is left is the error bar on a
-            // nine-sample mean — three times tighter than one sample's, which
-            // is three times the sensitivity to lighting that really did
-            // change.
-            let hmu = hsum / k;
-            let tol = params.clamp_k * sd / sqrt(k) + 1e-5;
-            let d = abs(hmu - mu);
-            if max(d.x, max(d.y, d.z)) > max(tol.x, max(tol.y, tol.z)) {
-                // The history is *shortened*, not overwritten. Snapping the
-                // colour to the edge of the neighbourhood would be the usual
-                // TAA move and it is a biased one: on a still frame the
-                // clamp fires by chance a few percent of the time, always
-                // pulling towards a nine-sample mean, and a hundred passes of
-                // that is a visible tint. Shortening the history is unbiased —
-                // the next few samples are simply worth much more — and the
-                // stale value is gone in about `clamp_reset` frames either
-                // way.
-                st.x = min(st.x, f32(max(params.clamp_reset, 1u)));
-            }
-            // `mean[q]` for a neighbour is read while other invocations of
-            // this same dispatch may be folding their own sample into it. The
-            // race is deliberate and harmless: what comes back is that
-            // neighbour's history either side of one sample out of `n`, and
-            // the test is a comparison of nine-pixel means against an error
-            // bar. Synchronising it would cost a full-frame dispatch to buy a
-            // difference under the noise floor.
-        }
-    }
+    stabilize_sample(gid, i, LOBE_SUM, &c, &m, &st);
+    let l = luminance(c.rgb);
 
     // ─── the bounded fold ────────────────────────────────────────────────
     //
@@ -818,7 +1084,12 @@ fn atrous(@builtin(global_invocation_id) gid: vec3<u32>) {
     // The budget is full at a single sample, so a one-sample history is
     // filtered exactly as `pathtrace::denoise` filters a `Film` — which is
     // what the parity test pins.
-    if params.iter_index >= atrous_iters_for(stats[p].x) {
+    //
+    // A pixel with fewer than four samples — freshly disoccluded, or restarted
+    // by the clamp — gets `fresh_extra_iters` more on top: the widest stride
+    // yet, so it is blurry for a frame or two rather than grainy.
+    let count = stats[p].x;
+    if params.iter_index >= atrous_iters_for(count) + fresh_extra_iters_for(count) {
         scratch_dst[p] = centre;
         return;
     }
@@ -834,7 +1105,10 @@ fn atrous(@builtin(global_invocation_id) gid: vec3<u32>) {
     // The estimator's own error bar sets how much luminance disagreement
     // counts as signal rather than noise, so a firefly — which has an enormous
     // error bar — stops protecting itself and gets filtered.
-    let l_tol = sigma_l * sqrt(max(centre.w, 0.0)) + 1e-4;
+    // A fresh pixel's luminance stop is relaxed too: its own error bar is a
+    // spatial guess, and a stop that trusts it keeps the grain it was meant
+    // to remove.
+    let l_tol = (sigma_l * sqrt(max(centre.w, 0.0)) + 1e-4) * fresh_lum_relax_for(count);
 
     var sum = vec3<f32>(0.0);
     var vsum = 0.0;
@@ -909,6 +1183,43 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(linear_to_srgb1(c.x), linear_to_srgb1(c.y), linear_to_srgb1(c.z));
 }
 
+// The second temporal pass, and the record of what was presented: `rgb_in`
+// is the filtered, re-modulated linear colour, `var_l` its luminance
+// variance in the same units, `cnt` the history length the weight rides on.
+// Shared by `resolve` and `resolve_lobes`, so the presented frame is
+// stabilised the same way whichever chain produced it.
+fn present(i: u32, rgb_in: vec3<f32>, var_l: f32, cnt: f32) -> vec3<f32> {
+    // ─── the second temporal pass ────────────────────────────────────────
+    //
+    // The filter above is spatial and its weights read noisy luminance, so
+    // even where the radiance is stable the kernel is not, and the presented
+    // pixel flickers by a code or two a frame. Blend it toward what was
+    // presented last frame — carried across the same motion the history was
+    // — by a weight that grows with the history and collapses when the two
+    // disagree by more than the pixel's own error bar, so a change that is
+    // real gets through in a frame and a change that is the filter changing
+    // its mind does not. A one-sample pixel keeps none of it.
+    var rgb = rgb_in;
+    if params.temporal_filter > 0.0 && guide_depth(i) > 0.0 && cnt > 1.5 {
+        var prev: vec4<f32>;
+        if params.filtered_reprojected != 0u {
+            prev = filtered_reproj[i];
+        } else {
+            prev = filtered[i];
+        }
+        if prev.w > 0.5 {
+            let base = params.temporal_filter * (1.0 - 1.0 / cnt);
+            let d = abs(luminance(rgb) - luminance(prev.rgb));
+            let sigma = sqrt(var_l) + 0.02 * luminance(rgb) + 1e-4;
+            let r = d / (2.0 * sigma);
+            let w = base * exp(-r * r);
+            rgb = mix(rgb, prev.rgb, w);
+        }
+    }
+    filtered[i] = vec4<f32>(rgb, 1.0);
+    return rgb;
+}
+
 @compute @workgroup_size(8, 8)
 fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     if !in_bounds(gid) {
@@ -917,6 +1228,11 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = flat_index(gid);
     let m = mean[i];
     var rgb = m.rgb;
+    let cnt = stats[i].x;
+    // The error bar on what is about to be presented, as a luminance
+    // variance in radiance units: the mean's own until the filter has
+    // something better.
+    var var_l = max(stats[i].w, 0.0);
 
     if params.iters > 0u && guide_depth(i) > 0.0 {
         var filt: vec4<f32>;
@@ -933,7 +1249,11 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
         let span = max(f32(params.count_cutoff) - 1.0, 1e-6);
         let strength = clamp((f32(params.count_cutoff) - cnt) / span, 0.0, 1.0);
         rgb = mix(rgb, remod, strength);
+        let dl = demod_lum(i);
+        var_l = mix(var_l, max(filt.w, 0.0) * dl * dl, strength);
     }
+
+    rgb = present(i, rgb, var_l, cnt);
 
     let mapped = linear_to_srgb(tonemap_aces(rgb * params.exposure));
     textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(mapped, m.w));
@@ -1178,8 +1498,7 @@ fn reproject_lobes(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn fold_lobe(gid: vec3<u32>, i: u32, lobe: u32) {
     let n = n_pixels();
     let slot = lobe * n + i;
-    let c = raw_lobe(lobe, i);
-    let l = luminance(c.rgb);
+    var c = raw_lobe(lobe, i);
 
     var m = lobe_mean[slot];
     var st = lobe_stats[slot];
@@ -1200,42 +1519,8 @@ fn fold_lobe(gid: vec3<u32>, i: u32, lobe: u32) {
         }
     }
 
-    if params.clamp_k > 0.0 && st.x > 0.5 {
-        var s1 = vec3<f32>(0.0);
-        var s2 = vec3<f32>(0.0);
-        var hsum = vec3<f32>(0.0);
-        var k = 0.0;
-        let x = i32(gid.x);
-        let y = i32(gid.y);
-        for (var dy = -1; dy <= 1; dy = dy + 1) {
-            let qy = y + dy;
-            if qy < 0 || qy >= i32(params.height) {
-                continue;
-            }
-            for (var dx = -1; dx <= 1; dx = dx + 1) {
-                let qx = x + dx;
-                if qx < 0 || qx >= i32(params.width) {
-                    continue;
-                }
-                let q = u32(qy) * params.width + u32(qx);
-                let t = raw_lobe(lobe, q).rgb;
-                s1 = s1 + t;
-                s2 = s2 + t * t;
-                hsum = hsum + lobe_mean[lobe * n + q].rgb;
-                k = k + 1.0;
-            }
-        }
-        if k > 0.0 {
-            let mu = s1 / k;
-            let sd = sqrt(max(s2 / k - mu * mu, vec3<f32>(0.0)));
-            let hmu = hsum / k;
-            let tol = params.clamp_k * sd / sqrt(k) + 1e-5;
-            let d = abs(hmu - mu);
-            if max(d.x, max(d.y, d.z)) > max(tol.x, max(tol.y, tol.z)) {
-                st.x = min(st.x, f32(max(params.clamp_reset, 1u)));
-            }
-        }
-    }
+    stabilize_sample(gid, i, lobe, &c, &m, &st);
+    let l = luminance(c.rgb);
 
     let cap = lobe_history_cap(lobe, i);
     let cnt = min(st.x + 1.0, cap);
@@ -1383,7 +1668,8 @@ fn atrous_lobe(gid: vec3<u32>, p: u32, lobe: u32) {
         scratch_dst[slot] = centre;
         return;
     }
-    if params.iter_index >= atrous_iters_for(lobe_stats[slot].x) {
+    let count = lobe_stats[slot].x;
+    if params.iter_index >= atrous_iters_for(count) + fresh_extra_iters_for(count) {
         scratch_dst[slot] = centre;
         return;
     }
@@ -1399,7 +1685,7 @@ fn atrous_lobe(gid: vec3<u32>, p: u32, lobe: u32) {
     let n_p = guide_normal(p);
     let c_p = centre.xyz;
     let l_p = luminance(c_p);
-    let l_tol = sigma_l * sqrt(max(centre.w, 0.0)) + 1e-4;
+    let l_tol = (sigma_l * sqrt(max(centre.w, 0.0)) + 1e-4) * fresh_lum_relax_for(count);
 
     var sum = vec3<f32>(0.0);
     var vsum = 0.0;
@@ -1470,6 +1756,11 @@ fn resolve_lobes(@builtin(global_invocation_id) gid: vec3<u32>) {
     let md = lobe_mean[i];
     let ms = lobe_mean[n + i];
     var rgb = md.rgb + ms.rgb;
+    // The diffuse half's history length drives the second temporal pass:
+    // the specular half's is roughness-capped and says how long a
+    // reflection is trusted, not how settled the pixel is.
+    let cnt = lobe_stats[i].x;
+    var var_l = max(lobe_stats[i].w, 0.0) + max(lobe_stats[n + i].w, 0.0);
 
     if params.iters > 0u && guide_depth(i) > 0.0 {
         var fd: vec4<f32>;
@@ -1484,10 +1775,17 @@ fn resolve_lobes(@builtin(global_invocation_id) gid: vec3<u32>) {
         // diffuse * albedo + specular * specular albedo, each faded by its
         // own history length: a rough floor's specular half is filtered long
         // after its diffuse half has converged.
-        let d = mix(md.rgb, fd.xyz * lobe_demod(LOBE_DIFFUSE, i), lobe_strength(lobe_stats[i].x));
-        let s = mix(ms.rgb, fs.xyz * lobe_demod(LOBE_SPECULAR, i), lobe_strength(lobe_stats[n + i].x));
+        let sd = lobe_strength(lobe_stats[i].x);
+        let ss = lobe_strength(lobe_stats[n + i].x);
+        let d = mix(md.rgb, fd.xyz * lobe_demod(LOBE_DIFFUSE, i), sd);
+        let s = mix(ms.rgb, fs.xyz * lobe_demod(LOBE_SPECULAR, i), ss);
         rgb = d + s;
+        let ld = lobe_demod_lum(LOBE_DIFFUSE, i);
+        let ls = lobe_demod_lum(LOBE_SPECULAR, i);
+        var_l = mix(max(lobe_stats[i].w, 0.0), max(fd.w, 0.0) * ld * ld, sd)
+            + mix(max(lobe_stats[n + i].w, 0.0), max(fs.w, 0.0) * ls * ls, ss);
     }
+    rgb = present(i, rgb, var_l, cnt);
 
     let mapped = linear_to_srgb(tonemap_aces(rgb * params.exposure));
     textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(mapped, md.w));
