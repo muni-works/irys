@@ -15,9 +15,10 @@
 //! Kernel-predicting, in the sense of Bako et al.: three 3x3 convolutions
 //! over per-pixel features, a softmax over the 25 outputs, and those 25
 //! numbers used as the weights of a 5x5 average over the frame's own
-//! demodulated illumination. It predicts a *filter*, not a picture, so every
-//! pixel it produces is a convex combination of light the path tracer
-//! actually measured. That is the same promise the à-trous filter makes; the
+//! demodulated illumination, after a firefly [`Veto`] has gated and clamped
+//! the taps that are outliers against their own neighbourhood. It predicts a
+//! *filter*, not a picture, so every pixel it produces stays inside the range
+//! of light the path tracer actually measured nearby. That is the same promise the à-trous filter makes; the
 //! difference is where the weights come from.
 //!
 //! Deliberately not a U-Net. A U-Net's downsamples are what let it invent
@@ -28,10 +29,10 @@
 //!
 //! # Layout
 //!
-//! [`Weights`] is a flat `f32` blob in one fixed order — `W1 b1 W2 b2 W3 b3`,
-//! each `W` as `[out][in][3][3]` — so the same bytes are what
-//! [`Weights::forward`] indexes and what the GPU pass uploads into a storage
-//! buffer without rearrangement.
+//! [`Weights`] is a flat `f32` blob in one fixed order — `W1 b1 W2 b2 W3 b3`
+//! then the three [`Veto`] scalars, each `W` as `[out][in][3][3]` — so the
+//! same bytes are what [`Weights::forward`] indexes and what the GPU pass
+//! uploads into a storage buffer without rearrangement.
 
 use std::io::Read;
 use std::path::Path;
@@ -44,6 +45,11 @@ pub const TAPS: usize = 5;
 pub const K: usize = TAPS * TAPS;
 /// Convolution kernel size in each layer.
 pub const KS: usize = 3;
+/// Trailing scalars after the three layers: the firefly veto's shape.
+///
+/// `[0]` is the gate's steepness, `[1]` its threshold and `[2]` the clamp's
+/// headroom, all *pre-activation* — see [`Veto::from_raw`].
+pub const VETO: usize = 3;
 
 /// The albedo floor the demodulation divides by — the same constant
 /// [`crate::pathtrace::denoise`] uses, because the two filters have to mean
@@ -77,14 +83,127 @@ pub fn id_feature(id: f32) -> f32 {
     (h >> 8) as f32 / 16_777_216.0
 }
 
-const MAGIC: &[u8; 8] = b"KOSMKPN1";
+const MAGIC: &[u8; 8] = b"KOSMKPN2";
+
+/// The gate's floor: how much of a vetoed tap survives.
+///
+/// Not zero, and that is the point. If every tap in a neighbourhood is a
+/// bright outlier against the other twenty-four — a small, genuinely bright
+/// thing filling the whole 5x5 — then every gate closes at once, and a hard
+/// zero would leave the softmax with nothing to normalise. At a floor the
+/// gates all collapse to the same small number, renormalise back to the plain
+/// softmax, and the filter degrades into the one it was before the veto.
+pub const VETO_FLOOR: f32 = 1e-3;
+
+/// The luminance offset that keeps the log and the ratio finite in the dark.
+pub const VETO_EPS: f32 = 1e-4;
+
+/// The firefly veto's three scalars, after their activations.
+///
+/// # What the veto is for
+///
+/// Demodulation divides the running mean by the albedo, and on the
+/// backboard's glass the albedo sits at [`DEMOD_FLOOR`] — so a single stray
+/// path that landed a hundred times the neighbourhood's radiance comes out of
+/// that divide a hundred times brighter still. A softmax over 25 taps cannot
+/// throw such a tap away: its weights are strictly positive, so the best it
+/// can do is make the firefly a small fraction of a very large number. The
+/// à-trous filter has no such trouble, because its luminance edge-stop is an
+/// exponential that reaches zero — and that is most of why the hand-tuned
+/// filter still beat the network on the glass and on the net.
+///
+/// So the kernel gets a veto the softmax cannot undo, in two parts:
+///
+/// - a **soft gate**, `g = FLOOR + (1 - FLOOR)·σ(-scale·(ln ratio - thresh))`,
+///   multiplied into each tap's softmax weight before renormalisation. The
+///   ratio is the tap's luminance over a *leave-one-out* mean of the other
+///   twenty-four, so a tap is judged against a neighbourhood it is not itself
+///   inflating. Multiplying a softmax weight by a gate is adding `ln g` to the
+///   logit, which is exactly the unbounded-below term the softmax lacked.
+/// - a **hard clamp**, scaling a tap's whole RGB so its luminance is at most
+///   `cap` times that same leave-one-out mean. The gate is soft, and a network
+///   that wanted to could learn to hold it open; the clamp is a `min` and it
+///   cannot. Nothing is un-clamped afterwards, because a firefly is not energy
+///   the picture is missing — it is a sampling artefact, and the reference
+///   render does not have it either.
+///
+/// `cap >= 1` is enforced by the activation, and that is what keeps the
+/// network's promise intact: a clamped tap is pulled down to at least its own
+/// neighbourhood's mean and never below it, so the filtered pixel still lies
+/// inside the range of light the path tracer measured nearby.
+#[derive(Debug, Clone, Copy)]
+pub struct Veto {
+    /// Steepness of the gate, in log-luminance-ratio.
+    pub scale: f32,
+    /// Where the gate is half closed, in nats of ratio.
+    pub thresh: f32,
+    /// The clamp's ceiling, as a multiple of the leave-one-out mean.
+    pub cap: f32,
+}
+
+/// `ln(1 + e^x)`, without overflowing for large `x`.
+pub fn softplus(x: f32) -> f32 {
+    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
+}
+
+impl Veto {
+    /// The three trained scalars, read through the activations that keep them
+    /// in the range the veto means anything in.
+    ///
+    /// `scale` and the clamp's headroom go through a softplus because a
+    /// negative steepness would gate the *dim* taps and a cap below one would
+    /// pull every tap under its own neighbourhood; `thresh` is free, because
+    /// every real number is a sensible place to put the knee.
+    pub fn from_raw(raw: [f32; VETO]) -> Self {
+        Self {
+            scale: softplus(raw[0]),
+            thresh: raw[1],
+            cap: 1.0 + softplus(raw[2]),
+        }
+    }
+
+    /// The raw scalars a fresh network starts from: a gate half closed at
+    /// about 1.4x the neighbourhood, and a clamp at 3x.
+    pub fn initial_raw() -> [f32; VETO] {
+        [3.9819, 0.35, 1.8546]
+    }
+
+    /// One tap's gate and clamp, from its luminance and the leave-one-out
+    /// mean of the rest of its neighbourhood.
+    ///
+    /// Returns `(gate, clamp)`: the first multiplies the tap's softmax weight,
+    /// the second scales the tap's radiance.
+    pub fn tap(&self, l: f32, mu: f32) -> (f32, f32) {
+        let t = ((l + VETO_EPS) / (mu + VETO_EPS)).ln();
+        let s = 1.0 / (1.0 + (self.scale * (t - self.thresh)).exp());
+        let gate = VETO_FLOOR + (1.0 - VETO_FLOOR) * s;
+        let clamp = ((self.cap * mu + VETO_EPS) / (l + VETO_EPS)).min(1.0);
+        (gate, clamp)
+    }
+}
+
+/// The leave-one-out means of a neighbourhood's luminances.
+///
+/// `mu[j]` is the mean of every luminance but `l[j]`. Excluding the tap is
+/// what makes the estimate robust *to* the tap: a firefly weighed against a
+/// mean it is itself a twenty-fifth of would talk its own threshold up, and
+/// two fireflies in one neighbourhood would cover for each other.
+pub fn leave_one_out(l: &[f32; K]) -> [f32; K] {
+    let sum: f32 = l.iter().sum();
+    let inv = 1.0 / (K - 1) as f32;
+    let mut mu = [0.0f32; K];
+    for j in 0..K {
+        mu[j] = ((sum - l[j]) * inv).max(0.0);
+    }
+    mu
+}
 
 /// A trained network.
 #[derive(Debug, Clone)]
 pub struct Weights {
     /// Hidden channels in both interior layers.
     pub hidden: usize,
-    /// `W1 b1 W2 b2 W3 b3`, flat.
+    /// `W1 b1 W2 b2 W3 b3 veto`, flat.
     pub data: Vec<f32>,
 }
 
@@ -117,6 +236,10 @@ impl From<std::io::Error> for WeightsError {
 impl Weights {
     /// Parse the blob a trainer wrote: an eight-byte magic, `C_IN`, hidden,
     /// `K` and `KS` as `u32`, then every `f32`.
+    ///
+    /// The magic is `KOSMKPN2` and not `KOSMKPN1` because the tail grew: a
+    /// v1 blob has no veto scalars, and reading one as if it did would take
+    /// three of the last layer's biases for a gate.
     ///
     /// The four shape words are checked rather than trusted. A file with the
     /// wrong feature count would otherwise run — every index would be in
@@ -160,13 +283,13 @@ impl Weights {
 
     fn expected_len(&self) -> usize {
         let h = self.hidden;
-        (h * C_IN * KS * KS + h) + (h * h * KS * KS + h) + (K * h * KS * KS + K)
+        (h * C_IN * KS * KS + h) + (h * h * KS * KS + h) + (K * h * KS * KS + K) + VETO
     }
 
     /// Offsets into [`Weights::data`], in the order the blob stores them:
-    /// `[W1, b1, W2, b2, W3, b3]`. The GPU pass wants exactly these six
-    /// numbers in its uniform, so they are computed in one place.
-    pub fn offsets(&self) -> [u32; 6] {
+    /// `[W1, b1, W2, b2, W3, b3, veto]`. The GPU pass wants exactly these
+    /// seven numbers in its uniform, so they are computed in one place.
+    pub fn offsets(&self) -> [u32; 7] {
         let h = self.hidden;
         let mut at = 0u32;
         let push = |n: usize, at: &mut u32| {
@@ -181,7 +304,14 @@ impl Weights {
             push(h, &mut at),
             push(K * h * KS * KS, &mut at),
             push(K, &mut at),
+            push(VETO, &mut at),
         ]
+    }
+
+    /// The firefly veto this fit learned; see [`Veto`].
+    pub fn veto(&self) -> Veto {
+        let o = self.offsets()[6] as usize;
+        Veto::from_raw([self.data[o], self.data[o + 1], self.data[o + 2]])
     }
 
     /// Trainable scalars.
@@ -319,31 +449,51 @@ impl Weights {
         let z3 = conv(&a2, h, K, off[4], off[5], false);
 
         let mut out = vec![0.0f32; 3 * n];
+        let veto = self.veto();
         let r = (TAPS / 2) as i32;
         for y in 0..height {
             for x in 0..width {
                 let p = y * width + x;
-                let mut mx = f32::NEG_INFINITY;
-                for k in 0..K {
-                    mx = mx.max(z3[k * n + p]);
-                }
-                let mut w = [0.0f32; K];
-                let mut sum = 0.0;
-                for k in 0..K {
-                    w[k] = (z3[k * n + p] - mx).exp();
-                    sum += w[k];
-                }
-                let inv = 1.0 / sum;
-                let mut acc = [0.0f32; 3];
+
+                // the 5x5 neighbourhood, once: its pixels and their luminances
+                let mut tap = [0usize; K];
+                let mut lum = [0.0f32; K];
                 for ky in 0..TAPS {
                     let sy = clamp(y as i32 + ky as i32 - r, height);
                     for kx in 0..TAPS {
                         let sx = clamp(x as i32 + kx as i32 - r, width);
                         let q = sy * width + sx;
-                        let wk = w[ky * TAPS + kx] * inv;
-                        for c in 0..3 {
-                            acc[c] += wk * illum[c * n + q];
-                        }
+                        let j = ky * TAPS + kx;
+                        tap[j] = q;
+                        lum[j] = luminance([illum[q], illum[n + q], illum[2 * n + q]]).max(0.0);
+                    }
+                }
+                let mu = leave_one_out(&lum);
+
+                let mut mx = f32::NEG_INFINITY;
+                for k in 0..K {
+                    mx = mx.max(z3[k * n + p]);
+                }
+                // softmax, gated: the exponential is the network's opinion and
+                // the gate is the veto's, and they multiply before the sum
+                // that normalises them — so a vetoed tap does not merely lose
+                // weight, it hands that weight to the taps that survived.
+                let mut w = [0.0f32; K];
+                let mut clip = [0.0f32; K];
+                let mut sum = 0.0;
+                for k in 0..K {
+                    let (gate, clamp_k) = veto.tap(lum[k], mu[k]);
+                    clip[k] = clamp_k;
+                    w[k] = (z3[k * n + p] - mx).exp() * gate;
+                    sum += w[k];
+                }
+                let inv = 1.0 / sum.max(1e-20);
+                let mut acc = [0.0f32; 3];
+                for k in 0..K {
+                    let q = tap[k];
+                    let wk = w[k] * inv * clip[k];
+                    for c in 0..3 {
+                        acc[c] += wk * illum[c * n + q];
                     }
                 }
                 for c in 0..3 {
@@ -376,7 +526,7 @@ mod tests {
         };
         let n = w.expected_len();
         let mut s = seed | 1;
-        let data = (0..n)
+        let mut data: Vec<f32> = (0..n)
             .map(|_| {
                 s = s
                     .wrapping_mul(6364136223846793005)
@@ -384,6 +534,10 @@ mod tests {
                 ((s >> 40) as f32 / 8388608.0) - 0.5
             })
             .collect();
+        // The veto's three scalars are not weights and random values there
+        // mean a random gate; a synthetic net gets the fresh one instead.
+        let tail = data.len() - VETO;
+        data[tail..].copy_from_slice(&Veto::initial_raw());
         Weights { hidden, data }
     }
 

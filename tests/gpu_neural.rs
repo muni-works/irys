@@ -18,7 +18,7 @@
 
 use kosm_render::gpu::wgpu;
 use kosm_render::gpu::{GpuContext, NeuralDenoiser, NeuralPipeline};
-use kosm_render::neural::{C_IN, K, KS, Weights};
+use kosm_render::neural::{C_IN, K, KS, VETO, Veto, Weights};
 
 const W: u32 = 24;
 const H: u32 = 16;
@@ -39,7 +39,7 @@ fn synthetic(hidden: usize, seed: u64) -> Weights {
         + (hidden * hidden * KS * KS + hidden)
         + (K * hidden * KS * KS + K);
     let mut s = seed | 1;
-    let mut b = b"KOSMKPN1".to_vec();
+    let mut b = b"KOSMKPN2".to_vec();
     for v in [C_IN as u32, hidden as u32, K as u32, KS as u32] {
         b.extend_from_slice(&v.to_le_bytes());
     }
@@ -51,6 +51,13 @@ fn synthetic(hidden: usize, seed: u64) -> Weights {
         let x = ((s >> 40) as f32 / 8_388_608.0 - 0.5) * 0.6;
         b.extend_from_slice(&x.to_le_bytes());
     }
+    // The firefly veto's three scalars are not weights, and a random gate is
+    // a gate nobody would ship. A fresh net's are the ones a fit starts from,
+    // so the parity check runs the regime the viewer actually runs.
+    for v in Veto::initial_raw() {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(b.len(), 24 + (n + VETO) * 4);
     Weights::from_bytes(&b).expect("synthetic blob is well formed")
 }
 
@@ -100,6 +107,17 @@ impl Frame {
                     f.albedo[p * 3 + c] = 0.15 + 0.25 * ((p + c * 5) % 7) as f32 / 7.0;
                     f.mean[p * 3 + c] =
                         0.05 + 1.6 * ((p * 13 + c * 29) % 31) as f32 / 31.0 + if bg { 3.0 } else { 0.0 };
+                }
+                // Every eleventh pixel is a firefly: one path that came back
+                // far too bright, which after the demodulation is exactly the
+                // tap the veto exists to gate and clamp. Without one in the
+                // fixture the gate sits at ~1 and the clamp at its inactive
+                // branch everywhere, and the parity check would agree about a
+                // code path neither side ran.
+                if p % 11 == 3 && !bg {
+                    for c in 0..3 {
+                        f.mean[p * 3 + c] *= 60.0;
+                    }
                 }
                 f.variance[p] = 0.002 + 0.05 * ((p * 7) % 11) as f32 / 11.0;
                 f.count[p] = 1.0 + ((p * 3) % 12) as f32;
@@ -312,4 +330,97 @@ fn background_and_converged_pixels_are_passed_through() {
             );
         }
     }
+}
+
+/// The veto does something: the fireflies the fixture plants stop spreading
+/// into the pixels around them, and the pixels that never saw one are left
+/// where they were.
+///
+/// Parity says the shader is the reference; this says the reference is worth
+/// mirroring. The comparison is against the *same* network with the veto
+/// switched off — `scale` at zero makes the gate a constant, which
+/// renormalises straight back to the plain softmax, and a `cap` of 1e5 never
+/// binds — so the only difference between the two runs is the veto and not
+/// the weights.
+///
+/// What is measured is the *output*, and that is the point. A firefly's own
+/// pixel is not especially interesting: the network may already be looking
+/// away from it. The damage a firefly does is to the two dozen pixels whose
+/// 5x5 it falls in, each of which a positive-weight softmax must give some
+/// share of a hundredfold outlier. That is the smear the à-trous filter's
+/// luminance edge-stop kills and the ungated softmax could not.
+#[test]
+fn the_veto_stops_a_firefly_from_smearing_into_its_neighbours() {
+    let n = (W * H) as usize;
+    let frame = Frame::new();
+    let with = synthetic(8, 4242);
+
+    let mut without = with.clone();
+    let o = without.offsets()[6] as usize;
+    without.data[o] = -30.0;
+    without.data[o + 2] = 1e5;
+    assert!(without.veto().scale < 1e-6 && without.veto().cap > 1e4);
+    assert!(with.veto().scale > 1.0 && with.veto().cap < 10.0);
+
+    let run = |w: &Weights| {
+        w.forward(
+            W as usize,
+            H as usize,
+            &frame.mean,
+            &frame.variance,
+            &frame.normal,
+            &frame.depth,
+            &frame.albedo,
+            &frame.id,
+            &frame.count,
+        )
+    };
+    let gated = run(&with);
+    let bare = run(&without);
+
+    // does this pixel's 5x5 contain one of the planted fireflies?
+    let hot = |p: usize| {
+        (0..25).any(|k| {
+            let (dx, dy) = ((k % 5) as i32 - 2, (k / 5) as i32 - 2);
+            let x = ((p % W as usize) as i32 + dx).clamp(0, W as i32 - 1) as usize;
+            let y = ((p / W as usize) as i32 + dy).clamp(0, H as i32 - 1) as usize;
+            let q = y * W as usize + x;
+            q % 11 == 3 && frame.depth[q] > 0.0
+        })
+    };
+
+    let (mut worst_cut, mut quiet_worst, mut quiet, mut brightened) = (1.0f32, 0.0f32, 0, 0.0f32);
+    for p in 0..n {
+        if frame.depth[p] <= 0.0 {
+            continue;
+        }
+        let (g, b) = (gated[p * 3 + 1], bare[p * 3 + 1]);
+        if hot(p) {
+            worst_cut = worst_cut.max(b / g.max(1e-6));
+        } else {
+            quiet += 1;
+            quiet_worst = quiet_worst.max((g - b).abs() / b.abs().max(1e-3));
+        }
+        brightened = brightened.max((g - b) / b.abs().max(1e-3));
+    }
+
+    // The smear, cut. An ungated softmax gives a hundredfold tap a positive
+    // share it cannot refuse; the gate takes it to the floor.
+    assert!(
+        worst_cut > 4.0,
+        "the veto only cut the worst smeared pixel by {worst_cut}x"
+    );
+    // A veto that also brightens is a veto that has stopped being a veto.
+    assert!(brightened < 0.05, "a pixel got {brightened} brighter");
+    // And away from every firefly it is a near no-op: the ratios are all
+    // about one, the gate is open, the clamp is on its inactive branch. If
+    // this drifted the veto would be a general blur with a good excuse.
+    assert!(quiet > 20, "only {quiet} pixels were away from a firefly");
+    assert!(
+        quiet_worst < 0.05,
+        "the veto moved a quiet pixel by {quiet_worst}"
+    );
+    eprintln!(
+        "veto: worst smear cut {worst_cut:.1}x, {quiet} quiet pixels moved at most {quiet_worst:.3}"
+    );
 }

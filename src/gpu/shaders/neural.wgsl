@@ -9,13 +9,14 @@
 // 3x3 neighbourhood out of L2 instead, which the cache is good at, and cost
 // one buffer of `hidden * n` floats each.
 //
-// The weights arrive as one flat `array<f32>` of `W1 b1 W2 b2 W3 b3` with
-// the six offsets in the uniform, but each `W` is **tap-major** here —
-// `[out][tap][in]` rather than the file's `[out][in][tap]`. That is the one
-// thing `NeuralDenoiser::new` rearranges on upload, and it is worth a
-// rearrangement: the inner loop of every convolution walks the input channel
-// at a fixed neighbour, so tap-major makes both the weight read and the
-// activation read a contiguous run.
+// The weights arrive as one flat `array<f32>` of `W1 b1 W2 b2 W3 b3` and the
+// firefly veto's three scalars, with the seven offsets in the uniform, but
+// each `W` is **tap-major** here — `[out][tap][in]` rather than the file's
+// `[out][in][tap]`. That is the one thing `NeuralDenoiser::new` rearranges on
+// upload, and it is worth a rearrangement: the inner loop of every
+// convolution walks the input channel at a fixed neighbour, so tap-major
+// makes both the weight read and the activation read a contiguous run. The
+// veto's three have no tap axis and are carried through untouched.
 //
 // Every read of the history's `mean`, `stats` and guide planes matches
 // `history.wgsl`'s, and the output lands in the same `(illumination,
@@ -28,6 +29,9 @@ const K: u32 = 25u;
 const KS: i32 = 3;
 const DEMOD_FLOOR: f32 = 0.01;
 const DEPTH_SCALE: f32 = 3000.0;
+// `crate::neural::VETO_FLOOR` and `VETO_EPS`.
+const VETO_FLOOR: f32 = 1e-3;
+const VETO_EPS: f32 = 1e-4;
 
 struct NeuralParams {
     width: u32,
@@ -48,7 +52,8 @@ struct NeuralParams {
     // passed through, exactly as `atrous_iters_for` fades the à-trous filter
     // out. A converged pixel needs no filter.
     count_cutoff: u32,
-    _pad: u32,
+    // Where the firefly veto's three scalars start in `weights`.
+    veto: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: NeuralParams;
@@ -168,6 +173,37 @@ fn feature(c: u32, i: u32) -> f32 {
     return id_feature(guide_id(i));
 }
 
+// ─── the firefly veto ─────────────────────────────────────────────────────
+//
+// `crate::neural::Veto`, term for term. Demodulation divides by an albedo
+// that is DEMOD_FLOOR on the backboard's glass, so one stray path becomes a
+// tap a hundred times its neighbours; a softmax has only positive weights and
+// cannot discard it. The gate multiplies each tap's softmax weight by a
+// sigmoid of how far its log-luminance sits above a leave-one-out mean of the
+// other twenty-four, which is the same as adding an unbounded-below term to
+// the logit. The clamp then caps the tap's radiance at `cap` times that mean,
+// and being a `min` it is the half the network cannot learn its way out of.
+//
+// Nothing is given back afterwards. A firefly is not light the frame is
+// missing — the converged reference has no such pixel either.
+
+fn softplus(x: f32) -> f32 {
+    if x > 20.0 { return x; }
+    return log(1.0 + exp(x));
+}
+
+// (gate, clamp) for one tap, from its luminance and the leave-one-out mean.
+fn veto_tap(l: f32, mu: f32) -> vec2<f32> {
+    let scale = softplus(weights[params.veto]);
+    let thresh = weights[params.veto + 1u];
+    let cap = 1.0 + softplus(weights[params.veto + 2u]);
+    let t = log((l + VETO_EPS) / (mu + VETO_EPS));
+    let s = 1.0 / (1.0 + exp(scale * (t - thresh)));
+    let gate = VETO_FLOOR + (1.0 - VETO_FLOOR) * s;
+    let clip = min((cap * mu + VETO_EPS) / (l + VETO_EPS), 1.0);
+    return vec2<f32>(gate, clip);
+}
+
 // ─── pass 1: features → hidden, ReLU ──────────────────────────────────────
 
 @compute @workgroup_size(8, 8)
@@ -274,21 +310,39 @@ fn conv3_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
         mx = max(mx, acc);
     }
 
+    // The 5x5 neighbourhood the kernel will average, and its luminances: the
+    // veto needs the whole set before it can judge any one of it.
+    let r = TAPS / 2;
+    var tap: array<u32, 25>;
+    var lum: array<f32, 25>;
+    var lsum = 0.0;
+    for (var ky = 0; ky < TAPS; ky = ky + 1) {
+        for (var kx = 0; kx < TAPS; kx = kx + 1) {
+            let j = u32(ky * TAPS + kx);
+            let t = pixel_at(x + kx - r, y + ky - r);
+            tap[j] = t;
+            let l = max(luminance(illum(t)), 0.0);
+            lum[j] = l;
+            lsum = lsum + l;
+        }
+    }
+    let loo = 1.0 / f32(K - 1u);
+
+    var clip: array<f32, 25>;
     var sum = 0.0;
     for (var o = 0u; o < K; o = o + 1u) {
-        let e = exp(z[o] - mx);
+        let mu = max((lsum - lum[o]) * loo, 0.0);
+        let gc = veto_tap(lum[o], mu);
+        clip[o] = gc.y;
+        let e = exp(z[o] - mx) * gc.x;
         z[o] = e;
         sum = sum + e;
     }
-    let inv = 1.0 / sum;
+    let inv = 1.0 / max(sum, 1e-20);
 
-    let r = TAPS / 2;
     var acc = vec3<f32>(0.0);
-    for (var ky = 0; ky < TAPS; ky = ky + 1) {
-        for (var kx = 0; kx < TAPS; kx = kx + 1) {
-            let q = pixel_at(x + kx - r, y + ky - r);
-            acc = acc + (z[u32(ky * TAPS + kx)] * inv) * illum(q);
-        }
+    for (var o = 0u; o < K; o = o + 1u) {
+        acc = acc + (z[o] * inv * clip[o]) * illum(tap[o]);
     }
     filtered[p] = vec4<f32>(acc, stats[p].w);
 }

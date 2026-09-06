@@ -53,7 +53,10 @@ struct NeuralParams {
     w3: u32,
     b3: u32,
     count_cutoff: u32,
-    _pad: u32,
+    /// Where the firefly veto's three scalars start; see
+    /// [`crate::neural::Veto`]. `tap_major` leaves them alone, so this is the
+    /// file's own offset.
+    veto: u32,
 }
 
 /// The three compute pipelines and their shared layout, built once.
@@ -144,6 +147,9 @@ impl NeuralPipeline {
 /// channel at a fixed neighbour, so tap-major turns a stride-9 gather into a
 /// contiguous run beside the equally contiguous activation read. The biases
 /// have no tap axis and are copied straight through.
+///
+/// The veto's three scalars sit past the last bias and are not a matrix, so
+/// the clone carries them through untouched.
 fn tap_major(w: &Weights) -> Vec<f32> {
     use crate::neural::{C_IN, K, KS};
     let taps = KS * KS;
@@ -172,7 +178,7 @@ fn tap_major(w: &Weights) -> Vec<f32> {
 /// weights never change and the activations are sized by the frame.
 pub struct NeuralDenoiser {
     hidden: u32,
-    offsets: [u32; 6],
+    offsets: [u32; 7],
     width: u32,
     height: u32,
     weights: wgpu::Buffer,
@@ -299,7 +305,7 @@ impl NeuralDenoiser {
             w3: self.offsets[4],
             b3: self.offsets[5],
             count_cutoff: self.cutoff,
-            _pad: 0,
+            veto: self.offsets[6],
         };
         ctx.queue
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&p));
