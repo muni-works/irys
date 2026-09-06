@@ -1,4 +1,4 @@
-//! A built-in geometry module: spheres and planes.
+//! A built-in geometry module: spheres, planes and axis-aligned boxes.
 //!
 //! Not a production tier — a real client packs its own primitives. This is
 //! what the renderer's own tests trace, so they need no client at all, and it
@@ -13,7 +13,7 @@ use super::geometry::{GeometryModule, GeometrySlab, GpuGeometry, storage_entry};
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct AnalyticPrim {
-    /// 0 = sphere, 1 = plane.
+    /// 0 = sphere, 1 = plane, 2 = axis-aligned box.
     pub kind: u32,
     /// Index into the scene's materials.
     pub material_idx: u32,
@@ -21,9 +21,10 @@ pub struct AnalyticPrim {
     pub orientation: u32,
     /// Padding to a 16-byte boundary.
     pub _pad: u32,
-    /// Sphere: centre in `.xyz`, radius in `.w`. Plane: a point on it.
+    /// Sphere: centre in `.xyz`, radius in `.w`. Plane: a point on it. Box:
+    /// its centre.
     pub a: [f32; 4],
-    /// Sphere: unused. Plane: the unit normal.
+    /// Sphere: unused. Plane: the unit normal. Box: the half extents.
     pub b: [f32; 4],
 }
 
@@ -49,6 +50,19 @@ impl AnalyticPrim {
             _pad: 0,
             a: [point[0], point[1], point[2], 0.0],
             b: [normal[0], normal[1], normal[2], 0.0],
+        }
+    }
+
+    /// An axis-aligned box: `center ± half` on each axis. The GPU half of
+    /// `analytic::Prim::Box` with an identity frame.
+    pub fn aabb(center: [f32; 3], half: [f32; 3], material_idx: u32) -> Self {
+        Self {
+            kind: 2,
+            material_idx,
+            orientation: 0,
+            _pad: 0,
+            a: [center[0], center[1], center[2], 0.0],
+            b: [half[0], half[1], half[2], 0.0],
         }
     }
 }

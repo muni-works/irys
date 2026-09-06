@@ -1,19 +1,20 @@
-// A small built-in geometry module: spheres and planes, traced linearly.
+// A small built-in geometry module: spheres, planes and axis-aligned boxes,
+// traced linearly.
 //
 // Implements kosm-render's geometry contract (see `gpu::geometry`) so the
 // renderer's own tests have something to trace without depending on a client.
 // One storage buffer, at binding 1 — four to spare for a real client.
 
 struct AnalyticPrim {
-    // 0 = sphere, 1 = plane.
+    // 0 = sphere, 1 = plane, 2 = axis-aligned box.
     kind: u32,
     material_idx: u32,
     // 0 = forward, 1 = reversed.
     orientation: u32,
     _pad: u32,
-    // Sphere: centre.xyz, radius in .w. Plane: a point on it.
+    // Sphere: centre.xyz, radius in .w. Plane: a point on it. Box: centre.
     a: vec4<f32>,
-    // Sphere: unused. Plane: unit normal.
+    // Sphere: unused. Plane: unit normal. Box: half extents.
     b: vec4<f32>,
 }
 
@@ -79,6 +80,51 @@ fn analytic_hit_plane(origin: vec3<f32>, dir: vec3<f32>, p: AnalyticPrim) -> Ray
     return hit;
 }
 
+// An axis-aligned box: the slab intersection from the prelude, and the face
+// the ray entered or left through, kept in `uv.x` for the normal.
+fn analytic_hit_box(origin: vec3<f32>, dir: vec3<f32>, p: AnalyticPrim, t_floor: f32) -> RayHit {
+    var hit: RayHit;
+    hit.t = MAX_T;
+    hit.face_idx = FACE_IDX_MISS;
+
+    let lo = p.a.xyz - p.b.xyz;
+    let hi = p.a.xyz + p.b.xyz;
+    let inv = 1.0 / dir;
+    let tt = intersect_aabb(origin, inv, lo, hi);
+    if tt.y < tt.x || tt.y <= t_floor {
+        return hit;
+    }
+    // The near face if the ray starts outside, else the far one.
+    var t = tt.x;
+    if t <= t_floor {
+        t = tt.y;
+    }
+    // Which face: the axis whose slab bound the point sits on.
+    let q = (origin + dir * t - p.a.xyz) / p.b.xyz;
+    let aq = abs(q);
+    var axis = 0u;
+    if aq.y > aq.x && aq.y >= aq.z {
+        axis = 1u;
+    } else if aq.z > aq.x && aq.z > aq.y {
+        axis = 2u;
+    }
+    var sign = 0.0;
+    if q[axis] > 0.0 {
+        sign = 1.0;
+    }
+    hit.t = t;
+    hit.uv = vec2<f32>(f32(2u * axis) + sign + 0.5, 0.0);
+    return hit;
+}
+
+fn box_normal(uv: vec2<f32>) -> vec3<f32> {
+    let face = u32(uv.x);
+    let axis = face / 2u;
+    var n = vec3<f32>(0.0);
+    n[axis] = select(-1.0, 1.0, (face & 1u) == 1u);
+    return n;
+}
+
 fn trace_scene(origin: vec3<f32>, dir: vec3<f32>) -> RayHit {
     var best: RayHit;
     best.t = MAX_T;
@@ -91,6 +137,8 @@ fn trace_scene(origin: vec3<f32>, dir: vec3<f32>) -> RayHit {
         var h: RayHit;
         if p.kind == 0u {
             h = analytic_hit_sphere(origin, dir, p);
+        } else if p.kind == 2u {
+            h = analytic_hit_box(origin, dir, p, floor_t);
         } else {
             h = analytic_hit_plane(origin, dir, p);
         }
@@ -115,6 +163,11 @@ fn hit_normal(hit: RayHit) -> vec3<f32> {
         if p.orientation == 1u { return -n; }
         return n;
     }
+    if p.kind == 2u {
+        let n = box_normal(hit.uv);
+        if p.orientation == 1u { return -n; }
+        return n;
+    }
     if p.orientation == 1u { return -p.b.xyz; }
     return p.b.xyz;
 }
@@ -126,6 +179,9 @@ fn hit_tangent(hit: RayHit) -> vec3<f32> {
         let s = sin(hit.uv.y);
         if abs(s) < 1e-6 { return vec3<f32>(0.0); }
         return vec3<f32>(-sin(hit.uv.x), cos(hit.uv.x), 0.0);
+    }
+    if p.kind == 2u {
+        return onb(box_normal(hit.uv))[0];
     }
     return onb(p.b.xyz)[0];
 }

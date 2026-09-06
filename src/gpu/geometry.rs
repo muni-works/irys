@@ -44,10 +44,14 @@
 //! | 11      | renderer   | `lights` (storage)                          |
 //! | 12      | renderer   | feature-id buffer (rw storage)              |
 //! | 13, 14  | renderer   | environment textures (not storage buffers)  |
+//! | 15      | renderer   | `caustics` uniform                          |
+//! | 16, 17  | renderer   | photon-map textures (not storage buffers)   |
 //!
 //! Five client storage buffers plus five renderer ones is exactly ten. That
 //! ceiling is why the environment is a pair of textures rather than buffers,
-//! and it is pinned by `render_shader_fits_the_browser_storage_buffer_budget`.
+//! and why the photon map is too: bindings 15..=17 add a uniform and two
+//! sampled textures and no storage buffer. It is pinned by
+//! `render_shader_fits_the_browser_storage_buffer_budget`.
 //! A client that needs fewer than five slabs simply declares fewer; it may not
 //! declare more.
 

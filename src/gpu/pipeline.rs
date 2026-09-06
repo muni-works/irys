@@ -276,6 +276,8 @@ impl RayTracePipeline {
                         },
                     ]
                     .into_iter()
+                    // The photon map: a uniform and two textures at 15..=17.
+                    .chain(super::resident::CausticBinding::layout_entries())
                     .chain(geometry.layout.iter().copied())
                     .collect::<Vec<_>>(),
                 });
@@ -701,6 +703,9 @@ impl RayTracePipeline {
             mapped_at_creation: false,
         });
 
+        // The one-shot path binds no photon map; the shader's guard stays off.
+        let no_caustics = super::resident::CausticBinding::new(ctx, None);
+
         // Create bind group
         let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Ray Trace Bind Group"),
@@ -748,6 +753,7 @@ impl RayTracePipeline {
                 },
             ]
             .into_iter()
+            .chain(no_caustics.entries())
             .chain(
                 geometry_buffers
                     .iter()
