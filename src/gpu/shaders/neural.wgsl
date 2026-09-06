@@ -22,7 +22,7 @@
 // variance)` scratch buffer the à-trous iterations write, so `resolve` is
 // untouched and remodulates and tonemaps whichever filter ran.
 
-const C_IN: u32 = 10u;
+const C_IN: u32 = 11u;
 const TAPS: i32 = 5;
 const K: u32 = 25u;
 const KS: i32 = 3;
@@ -91,6 +91,27 @@ fn guide_albedo(i: u32) -> vec3<f32> {
     return guides[2u * n_pixels() + i].xyz;
 }
 
+fn guide_id(i: u32) -> f32 {
+    return guides[2u * n_pixels() + i].w;
+}
+
+// `crate::neural::id_feature`, tap for tap.
+//
+// The id is a label and not a quantity, so it is hashed rather than fed: the
+// only thing the convolution wants from it is whether two pixels are the same
+// surface, and a hash makes that a difference it can see. Zero — background —
+// stays zero.
+fn id_feature(id: f32) -> f32 {
+    if id <= 0.0 {
+        return 0.0;
+    }
+    var h = u32(id) * 0x9E3779B9u;
+    h = h ^ (h >> 15u);
+    h = h * 0x85EBCA6Bu;
+    h = h ^ (h >> 13u);
+    return f32(h >> 8u) / 16777216.0;
+}
+
 fn demod_albedo(i: u32) -> vec3<f32> {
     return max(guide_albedo(i), vec3<f32>(DEMOD_FLOOR));
 }
@@ -141,7 +162,10 @@ fn feature(c: u32, i: u32) -> f32 {
         if d > 0.0 { return d / (d + DEPTH_SCALE); }
         return 0.0;
     }
-    return la;
+    if c == 9u {
+        return la;
+    }
+    return id_feature(guide_id(i));
 }
 
 // ─── pass 1: features → hidden, ReLU ──────────────────────────────────────
@@ -156,11 +180,11 @@ fn conv1(@builtin(global_invocation_id) gid: vec3<u32>) {
     let y = i32(gid.y);
     let h = params.hidden;
 
-    // The nine neighbours, and the ninety features over them, once for the
-    // whole invocation rather than once per output channel. `feature` is a
+    // The nine neighbours, and the ninety-nine features over them, once for
+    // the whole invocation rather than once per output channel. `feature` is a
     // couple of buffer reads and a log, and at 32 output channels the naive
     // loop evaluates every one of them thirty-two times.
-    var nb: array<f32, 90>;
+    var nb: array<f32, 99>;
     for (var t = 0u; t < 9u; t = t + 1u) {
         let q = pixel_at(x + i32(t % 3u) - 1, y + i32(t / 3u) - 1);
         for (var i = 0u; i < C_IN; i = i + 1u) {

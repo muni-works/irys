@@ -37,7 +37,7 @@ use std::io::Read;
 use std::path::Path;
 
 /// Input feature planes per pixel; see [`Weights::features_at`].
-pub const C_IN: usize = 10;
+pub const C_IN: usize = 11;
 /// The predicted filter's footprint.
 pub const TAPS: usize = 5;
 /// Predicted weights per pixel.
@@ -52,6 +52,30 @@ pub const DEMOD_FLOOR: f32 = 0.01;
 
 /// Soft normalisation for the depth feature, in the scene's own units.
 pub const DEPTH_SCALE: f32 = 3000.0;
+
+/// Fold a biased hit id into a feature the convolutions can find edges in.
+///
+/// The id is a *label*, not a quantity: id 7 is not between id 6 and id 8 in
+/// any sense the network should be allowed to interpolate over. What the
+/// network actually needs from it is one question — "is my neighbour the same
+/// surface as me?" — and a hash answers exactly that: identical ids give
+/// identical values, different ids give values that differ, and a 3x3
+/// convolution reads the difference as an edge. Feeding the raw id instead
+/// would invite the net to learn that high-numbered materials are shiny.
+///
+/// Zero — the background sentinel — is kept at zero rather than hashed, so
+/// "nothing here" is a value and not an arbitrary point in the range.
+pub fn id_feature(id: f32) -> f32 {
+    if id <= 0.0 {
+        return 0.0;
+    }
+    let mut h = (id as u32).wrapping_mul(0x9E37_79B9);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x85EB_CA6B);
+    h ^= h >> 13;
+    // [0, 1), and never exactly 0 for a real id, so background stays distinct
+    (h >> 8) as f32 / 16_777_216.0
+}
 
 const MAGIC: &[u8; 8] = b"KOSMKPN1";
 
@@ -175,11 +199,15 @@ impl Weights {
     /// | 5..8  | the world normal |
     /// | 8     | `depth / (depth + DEPTH_SCALE)`, zero on background |
     /// | 9     | `luminance(albedo)` |
+    /// | 10    | [`id_feature`] of the biased hit id |
     ///
     /// The two radiance-like planes are log-compressed so a light panel does
     /// not drown a floor; the count plane is what lets one network serve
     /// every history length, since a pixel on its first sample and one on its
-    /// sixteenth want different kernels.
+    /// sixteenth want different kernels. The id plane is what keeps a
+    /// backboard's glass out of the wall behind it: normal and depth agree
+    /// across that silhouette often enough, and the id never does.
+    #[allow(clippy::too_many_arguments)]
     pub fn features_at(
         mean: [f32; 3],
         variance: f32,
@@ -187,6 +215,7 @@ impl Weights {
         depth: f32,
         albedo: [f32; 3],
         count: f32,
+        id: f32,
     ) -> [f32; C_IN] {
         let a = [
             albedo[0].max(DEMOD_FLOOR),
@@ -209,6 +238,7 @@ impl Weights {
                 0.0
             },
             la,
+            id_feature(id),
         ]
     }
 
@@ -231,7 +261,8 @@ impl Weights {
         normal: &[f32],
         depth: &[f32],
         albedo: &[f32],
-        count: f32,
+        id: &[f32],
+        count: &[f32],
     ) -> Vec<f32> {
         let n = width * height;
         let h = self.hidden;
@@ -248,7 +279,8 @@ impl Weights {
                 [normal[p * 3], normal[p * 3 + 1], normal[p * 3 + 2]],
                 depth[p],
                 al,
-                count,
+                count[p],
+                id[p],
             );
             for (c, v) in f.iter().enumerate() {
                 feat[c * n + p] = *v;
@@ -408,7 +440,9 @@ mod tests {
                 normal[p * 3 + c] = if c == 2 { 1.0 } else { 0.0 };
             }
         }
-        let out = net.forward(w, h, &mean, &variance, &normal, &depth, &albedo, 4.0);
+        let id = vec![3.0f32; n];
+        let count = vec![4.0f32; n];
+        let out = net.forward(w, h, &mean, &variance, &normal, &depth, &albedo, &id, &count);
         let lo = mean.iter().copied().fold(f32::INFINITY, f32::min);
         let hi = mean.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         for v in out {

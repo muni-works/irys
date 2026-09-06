@@ -64,6 +64,7 @@ struct Frame {
     depth: Vec<f32>,
     albedo: Vec<f32>,
     count: Vec<f32>,
+    id: Vec<f32>,
 }
 
 impl Frame {
@@ -76,6 +77,7 @@ impl Frame {
             depth: vec![0.0; n],
             albedo: vec![0.0; n * 3],
             count: vec![0.0; n],
+            id: vec![0.0; n],
         };
         for y in 0..H as usize {
             for x in 0..W as usize {
@@ -101,6 +103,10 @@ impl Frame {
                 }
                 f.variance[p] = 0.002 + 0.05 * ((p * 7) % 11) as f32 / 11.0;
                 f.count[p] = 1.0 + ((p * 3) % 12) as f32;
+                // Several materials, with the background at the zero
+                // sentinel, so the id feature is a seam rather than a
+                // constant both implementations agree about by accident.
+                f.id[p] = if bg { 0.0 } else { (1 + (p * 5) % 4) as f32 };
             }
         }
         f
@@ -121,7 +127,7 @@ impl Frame {
             v[g2] = self.albedo[p * 3];
             v[g2 + 1] = self.albedo[p * 3 + 1];
             v[g2 + 2] = self.albedo[p * 3 + 2];
-            v[g2 + 3] = 1.0;
+            v[g2 + 3] = self.id[p];
         }
         v
     }
@@ -197,12 +203,12 @@ fn read_back(ctx: &GpuContext, src: &wgpu::Buffer, len: usize) -> Vec<f32> {
 /// The shader and the reference forward, on the same frame and the same
 /// weights.
 ///
-/// The per-pixel history in `stats` is not constant, and
-/// [`Weights::forward`] takes one count for the frame, so the reference is
-/// run per count value and the pixels holding that count are the ones
-/// compared. That is slower than one call and it is the only way to test the
-/// count feature at all — a frame where every pixel has the same history
-/// would pass with the feature stuck at a constant.
+/// Every input plane varies across the frame — the history length pixel by
+/// pixel, the hit id pixel by pixel, a band of background through the middle
+/// — because a feature that is constant over the test frame is a feature the
+/// test cannot tell is wired to the wrong index. Both sides now take the
+/// count and the id per pixel, as the device always had them, so this is one
+/// call and not one call per distinct count.
 #[test]
 fn the_shader_matches_the_reference_forward() {
     let Some(ctx) = ctx_or_skip("gpu_neural") else {
@@ -230,41 +236,38 @@ fn the_shader_matches_the_reference_forward() {
     ctx.queue.submit(Some(enc.finish()));
     let got = read_back(ctx, &scratch, n * 4);
 
+    let want = weights.forward(
+        W as usize,
+        H as usize,
+        &frame.mean,
+        &frame.variance,
+        &frame.normal,
+        &frame.depth,
+        &frame.albedo,
+        &frame.id,
+        &frame.count,
+    );
+
     // The reference produces remodulated radiance; the shader leaves
     // demodulated illumination in the scratch for `resolve` to remodulate.
     let mut compared = 0usize;
     let mut worst = 0.0f32;
-    let mut counts: Vec<f32> = frame.count.clone();
-    counts.sort_by(f32::total_cmp);
-    counts.dedup();
-    for c in counts {
-        let want = weights.forward(
-            W as usize,
-            H as usize,
-            &frame.mean,
-            &frame.variance,
-            &frame.normal,
-            &frame.depth,
-            &frame.albedo,
-            c,
-        );
-        for p in 0..n {
-            if frame.count[p] != c || frame.depth[p] <= 0.0 {
-                continue;
-            }
-            for ch in 0..3 {
-                let a = frame.albedo[p * 3 + ch].max(kosm_render::neural::DEMOD_FLOOR);
-                let mine = got[p * 4 + ch] * a;
-                let theirs = want[p * 3 + ch];
-                let rel = (mine - theirs).abs() / theirs.abs().max(1e-3);
-                worst = worst.max(rel);
-                assert!(
-                    rel < 2e-3,
-                    "pixel {p} channel {ch} at count {c}: shader {mine}, reference {theirs}"
-                );
-            }
-            compared += 1;
+    for p in 0..n {
+        if frame.depth[p] <= 0.0 {
+            continue;
         }
+        for ch in 0..3 {
+            let a = frame.albedo[p * 3 + ch].max(kosm_render::neural::DEMOD_FLOOR);
+            let mine = got[p * 4 + ch] * a;
+            let theirs = want[p * 3 + ch];
+            let rel = (mine - theirs).abs() / theirs.abs().max(1e-3);
+            worst = worst.max(rel);
+            assert!(
+                rel < 2e-3,
+                "pixel {p} channel {ch}: shader {mine}, reference {theirs}"
+            );
+        }
+        compared += 1;
     }
     assert!(compared > n / 2, "only {compared} of {n} pixels compared");
     eprintln!("neural parity: {compared} pixels, worst relative error {worst:.2e}");
