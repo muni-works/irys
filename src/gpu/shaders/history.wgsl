@@ -233,6 +233,21 @@ const REPROJ_NORMAL_DOT: f32 = 0.9;
 // A frame with nothing moving binds a stub and sets `motion_instances` to 0.
 @group(0) @binding(10) var<storage, read> motion: array<vec4<f32>>;
 
+// ─── the split denoiser's own buffers ─────────────────────────────────────
+// Two planes each, diffuse then specular, in `mean`/`stats`' layouts: the
+// running mean of each lobe's history and its statistics. One departure:
+// the specular mean's `.w` is not coverage — the diffuse plane has that —
+// but the running mean of the reflection's distance, which the specular
+// reprojection steers by. The summed `mean`/`stats` above keep going
+// exactly as they did, so the neural path and every existing reader see
+// nothing new.
+@group(0) @binding(14) var<storage, read_write> lobe_mean: array<vec4<f32>>;
+@group(0) @binding(15) var<storage, read_write> lobe_stats: array<vec4<f32>>;
+// Where `reproject_lobes` gathers to: four planes, (diffuse mean, diffuse
+// stats, specular mean, specular stats), read back by `accumulate_lobes`
+// exactly as `accumulate` reads the scratch pair.
+@group(0) @binding(16) var<storage, read_write> lobe_gather: array<vec4<f32>>;
+
 fn luminance(c: vec3<f32>) -> f32 {
     return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
 }
@@ -922,4 +937,558 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let mapped = linear_to_srgb(tonemap_aces(rgb * params.exposure));
     textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(mapped, m.w));
+}
+
+// ─── the split denoiser ───────────────────────────────────────────────────
+//
+// Everything above filters one buffer: the sample as the integrator summed
+// it. What follows filters it as *two*, the way NRD, Lumen and FidelityFX
+// do: the part that left the primary hit through a diffuse lobe, demodulated
+// by the albedo and held for a long history, and the part that left through
+// a specular lobe, demodulated by the lobe's own directional albedo, held
+// for a history no longer than its roughness warrants, reprojected through
+// the point the reflection actually shows, and filtered with an edge-stop
+// that is sharp on a mirror and wide on a rough floor. The two are
+// recombined in `resolve_lobes`.
+//
+// Five more entry points, dispatched in the same slots as their unsplit
+// twins: `reproject_lobes` (with `reproject`), `accumulate_lobes` (after
+// `accumulate`), then `demodulate_lobes`, `atrous_lobes` and `resolve_lobes`
+// *instead of* `demodulate`, `atrous` and `resolve`. Nothing above changes.
+
+// The specular history's bounds, in samples, interpolated by roughness: a
+// mirror keeps a handful, a rough surface keeps as many as a diffuse one.
+//
+// The floor is not 1. With the reflection reprojected through its own point
+// a mirror's history is *right* until the camera moves, and on the court a
+// floor of one left the backboard glass with no temporal history at all —
+// measured over the `--denoise-eval` sequence it was 21.8 codes off the
+// reference against 18.7 unsplit; a floor of 8 brought it to 19.4, and
+// lifting the cap altogether (32) drifted back out to 20.0.
+const SPEC_HISTORY_MIN: f32 = 8.0;
+const SPEC_HISTORY_MAX: f32 = 32.0;
+// What the luminance edge-stop is scaled by on the specular half, by
+// roughness: a mirror's reflection is an image and must not be blurred
+// across; a rough lobe's is a smear and should be.
+const SPEC_SIGMA_MIRROR: f32 = 0.25;
+const SPEC_SIGMA_ROUGH: f32 = 2.0;
+
+const LOBE_DIFFUSE: u32 = 0u;
+const LOBE_SPECULAR: u32 = 1u;
+
+fn guide_spec_albedo(i: u32) -> vec3<f32> {
+    return guides[4u * n_pixels() + i].xyz;
+}
+
+fn guide_roughness(i: u32) -> f32 {
+    return guides[4u * n_pixels() + i].w;
+}
+
+// A reflection further than this many times the surface's own distance is
+// the sky as far as parallax goes.
+const SPEC_FAR: f32 = 32.0;
+
+// How far *this pass's* specular bounce off pixel `i`'s surface went, made
+// usable: a hit's distance capped at `SPEC_FAR` surface distances, an
+// escaped bounce read as that cap, and a diffuse bounce — which says nothing
+// about the reflection — as 0.
+fn guide_spec_dist(i: u32) -> f32 {
+    let t = guides[5u * n_pixels() + i].x;
+    let far = SPEC_FAR * guide_depth(i);
+    if t < 0.0 {
+        return far;
+    }
+    return min(t, far);
+}
+
+// The reflection's distance as the specular history has averaged it: the
+// specular lobe mean's spare lane. One sample's bounce is one direction out
+// of a rough lobe, and the reprojection wants the lobe's centre, not its
+// last draw.
+fn spec_dist_smoothed(i: u32) -> f32 {
+    return lobe_mean[n_pixels() + i].w;
+}
+
+// How much of the reflection's parallax a lobe of this roughness shows:
+// all of it on a mirror, none of it on a Lambertian smear. The factor
+// NRD scales its virtual position by.
+fn spec_dominant(roughness: f32) -> f32 {
+    let r = clamp(roughness, 0.0, 1.0);
+    return (1.0 - r) * (sqrt(1.0 - r) + r);
+}
+
+// The demodulator for one lobe, floored as `demod_albedo` is.
+fn lobe_demod(lobe: u32, i: u32) -> vec3<f32> {
+    if lobe == LOBE_DIFFUSE {
+        return demod_albedo(i);
+    }
+    return max(guide_spec_albedo(i), vec3<f32>(DEMOD_FLOOR));
+}
+
+fn lobe_demod_lum(lobe: u32, i: u32) -> f32 {
+    return max(luminance(lobe_demod(lobe, i)), DEMOD_FLOOR);
+}
+
+// The longest history one lobe may hold at pixel `i`.
+fn lobe_history_cap(lobe: u32, i: u32) -> f32 {
+    let cap = f32(max(params.history_cap, 1u));
+    if lobe == LOBE_DIFFUSE {
+        return cap;
+    }
+    return min(cap, mix(SPEC_HISTORY_MIN, SPEC_HISTORY_MAX, guide_roughness(i)));
+}
+
+// This pass's raw sample for one lobe: the integrator's planes 1 and 2.
+fn raw_lobe(lobe: u32, i: u32) -> vec4<f32> {
+    return raw[(1u + lobe) * n_pixels() + i];
+}
+
+// Where pixel `i` was on the previous frame's film, validated as the same
+// surface, or -1 if there is nothing to carry. `reproject`'s test, made a
+// function so the specular half can run it twice.
+//
+// `virtual_t` is the specular twist. A reflection is not *on* the mirror:
+// it is the reflected scene seen through it, `t` further along the view
+// ray, and under a camera move it slides across the mirror with that
+// point's parallax rather than the mirror's. So the specular half projects
+// the point `virtual_t` behind the surface — surface plus the reflected ray
+// extended by the specular bounce's hit distance — and takes the history
+// from wherever *that* landed, still gated on the surface: the previous
+// pixel has to have been looking at this same object, in this same plane.
+// The virtual point is not carried by the object's own motion: a mirror
+// sliding in its own plane shows the same static world it did, and it is
+// the surface, not the reflection, that moved.
+fn reproject_find(gid: vec3<u32>, i: u32, virtual_t: f32) -> i32 {
+    let depth = guide_depth(i);
+    if depth <= 0.0 {
+        return -1;
+    }
+    let dir = view_ray(
+        params.cur_right.xyz, params.cur_up.xyz, params.cur_forward.xyz,
+        params.view_params.x, params.view_params.y, gid.x, gid.y,
+    );
+    let p_now = params.cur_eye.xyz + depth * dir;
+
+    let id = guide_id(i);
+    var inst = 0xFFFFFFFFu;
+    if params.motion_instances > 0u && id > 0u {
+        let cand = instance_of(id - 1u);
+        if cand < params.motion_instances {
+            inst = cand;
+        }
+    }
+    var p = p_now;
+    var n_now = guide_normal(i);
+    if inst != 0xFFFFFFFFu {
+        p = motion_point(inst, p_now);
+        n_now = motion_dir(inst, n_now);
+    }
+    // What is projected: the surface, or the point the reflection shows.
+    var proj = p;
+    if virtual_t > 0.0 {
+        proj = params.cur_eye.xyz + (depth + virtual_t) * dir;
+    }
+
+    let v = proj - params.prev_eye.xyz;
+    let z = dot(v, params.prev_forward.xyz);
+    if z <= 0.0 {
+        return -1;
+    }
+    let tan_fov = params.view_params.z;
+    let aspect = params.view_params.w;
+    let ndc_x = dot(v, params.prev_right.xyz) / (z * tan_fov * aspect);
+    let ndc_y = dot(v, params.prev_up.xyz) / (z * tan_fov);
+    let fx = (ndc_x + 1.0) * 0.5 * f32(params.width) - 0.5;
+    let fy = (1.0 - ndc_y) * 0.5 * f32(params.height) - 0.5;
+    let qx = i32(round(fx));
+    let qy = i32(round(fy));
+    if qx < 0 || qy < 0 || qx >= i32(params.width) || qy >= i32(params.height) {
+        return -1;
+    }
+    let j = u32(qy) * params.width + u32(qx);
+
+    let prev_depth = prev_guides[j].w;
+    if prev_depth <= 0.0 {
+        return -1;
+    }
+    if prev_guide_id(j) != id {
+        return -1;
+    }
+    let prev_n = prev_guides[j].xyz;
+    let prev_dir = view_ray(
+        params.prev_right.xyz, params.prev_up.xyz, params.prev_forward.xyz,
+        tan_fov, aspect, u32(qx), u32(qy),
+    );
+    let q = params.prev_eye.xyz + prev_depth * prev_dir;
+    // The surface's own distance sets the tolerance, whatever was projected.
+    let expected = length(p - params.prev_eye.xyz);
+    if abs(dot(p - q, prev_n)) > REPROJ_DEPTH_TOL * expected {
+        return -1;
+    }
+    if dot(n_now, prev_n) < REPROJ_NORMAL_DOT {
+        return -1;
+    }
+    return i32(j);
+}
+
+// ─── pass 0b: carry both lobes' histories across the frame ───────────────
+
+@compute @workgroup_size(8, 8)
+fn reproject_lobes(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if !in_bounds(gid) {
+        return;
+    }
+    let i = flat_index(gid);
+    let n = n_pixels();
+    lobe_gather[i] = vec4<f32>(0.0);
+    lobe_gather[n + i] = vec4<f32>(0.0);
+    lobe_gather[2u * n + i] = vec4<f32>(0.0);
+    lobe_gather[3u * n + i] = vec4<f32>(0.0);
+
+    // The diffuse half follows the surface, exactly as `reproject` does.
+    let jd = reproject_find(gid, i, 0.0);
+    if jd >= 0 {
+        lobe_gather[i] = lobe_mean[u32(jd)];
+        lobe_gather[n + i] = lobe_stats[u32(jd)];
+    }
+    // The specular half follows the reflection — and, where the virtual
+    // point lands on nothing it can use (a curved reflector, a point off the
+    // previous film), the surface, which is what it had before. The
+    // distance is the history's own average where it has one, and this
+    // pass's bounce where it does not.
+    var t = spec_dist_smoothed(i);
+    if t <= 0.0 {
+        t = guide_spec_dist(i);
+    }
+    var js = reproject_find(gid, i, t * spec_dominant(guide_roughness(i)));
+    if js < 0 {
+        js = jd;
+    }
+    if js >= 0 {
+        lobe_gather[2u * n + i] = lobe_mean[n + u32(js)];
+        lobe_gather[3u * n + i] = lobe_stats[n + u32(js)];
+    }
+}
+
+// ─── pass 1b: fold this sample into each lobe's history ──────────────────
+
+// `accumulate`'s fold, for one lobe. The budget's skip, the keep mask, the
+// neighbourhood clamp and the bounded fold are all as above; what differs is
+// the cap, which the specular half takes from its roughness.
+fn fold_lobe(gid: vec3<u32>, i: u32, lobe: u32) {
+    let n = n_pixels();
+    let slot = lobe * n + i;
+    let c = raw_lobe(lobe, i);
+    let l = luminance(c.rgb);
+
+    var m = lobe_mean[slot];
+    var st = lobe_stats[slot];
+    if params.reprojected != 0u {
+        m = lobe_gather[(2u * lobe) * n + i];
+        st = lobe_gather[(2u * lobe + 1u) * n + i];
+    }
+    if keep[i] == 0u {
+        m = vec4<f32>(0.0);
+        st = vec4<f32>(0.0);
+    }
+
+    if params.budget_enabled != 0u {
+        if (budget_mask_load(i) & (1u << params.budget_round)) == 0u {
+            lobe_mean[slot] = m;
+            lobe_stats[slot] = st;
+            return;
+        }
+    }
+
+    if params.clamp_k > 0.0 && st.x > 0.5 {
+        var s1 = vec3<f32>(0.0);
+        var s2 = vec3<f32>(0.0);
+        var hsum = vec3<f32>(0.0);
+        var k = 0.0;
+        let x = i32(gid.x);
+        let y = i32(gid.y);
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            let qy = y + dy;
+            if qy < 0 || qy >= i32(params.height) {
+                continue;
+            }
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let qx = x + dx;
+                if qx < 0 || qx >= i32(params.width) {
+                    continue;
+                }
+                let q = u32(qy) * params.width + u32(qx);
+                let t = raw_lobe(lobe, q).rgb;
+                s1 = s1 + t;
+                s2 = s2 + t * t;
+                hsum = hsum + lobe_mean[lobe * n + q].rgb;
+                k = k + 1.0;
+            }
+        }
+        if k > 0.0 {
+            let mu = s1 / k;
+            let sd = sqrt(max(s2 / k - mu * mu, vec3<f32>(0.0)));
+            let hmu = hsum / k;
+            let tol = params.clamp_k * sd / sqrt(k) + 1e-5;
+            let d = abs(hmu - mu);
+            if max(d.x, max(d.y, d.z)) > max(tol.x, max(tol.y, tol.z)) {
+                st.x = min(st.x, f32(max(params.clamp_reset, 1u)));
+            }
+        }
+    }
+
+    let cap = lobe_history_cap(lobe, i);
+    let cnt = min(st.x + 1.0, cap);
+    let inv = 1.0 / cnt;
+    if lobe == LOBE_SPECULAR {
+        // The specular mean's spare lane is the reflection's distance, folded
+        // with the same weight — and left alone by a diffuse bounce, which
+        // saw no reflection to measure.
+        let t = guide_spec_dist(i);
+        var td = m.w;
+        if t > 0.0 {
+            td = select(td + (t - td) * inv, t, td <= 0.0);
+        }
+        m = vec4<f32>(m.rgb + (c.rgb - m.rgb) * inv, td);
+    } else {
+        m = m + (c - m) * inv;
+    }
+    let mu1 = st.y + (l - st.y) * inv;
+    let mu2 = st.z + (l * l - st.z) * inv;
+    var v: f32;
+    if cnt > 1.5 {
+        let sample_var = max(mu2 - mu1 * mu1, 0.0) * cnt / (cnt - 1.0);
+        v = sample_var * inv;
+    } else {
+        v = mu1 * mu1;
+    }
+    lobe_mean[slot] = m;
+    lobe_stats[slot] = vec4<f32>(cnt, mu1, mu2, v);
+}
+
+@compute @workgroup_size(8, 8)
+fn accumulate_lobes(@builtin(global_invocation_id) lid: vec3<u32>) {
+    let gid = vec3<u32>(lid.x + params.origin_x, lid.y + params.origin_y, lid.z);
+    if !in_bounds(gid) {
+        return;
+    }
+    if !in_scissor(gid) {
+        return;
+    }
+    let i = flat_index(gid);
+    fold_lobe(gid, i, LOBE_DIFFUSE);
+    fold_lobe(gid, i, LOBE_SPECULAR);
+}
+
+// ─── pass 2b: demodulate each lobe and prefilter its variance ────────────
+
+// `demodulate`, for one lobe, writing plane `lobe` of `scratch_src`.
+fn demod_lobe(gid: vec3<u32>, i: u32, lobe: u32) {
+    let n = n_pixels();
+    let slot = lobe * n + i;
+    let illum = lobe_mean[slot].rgb / lobe_demod(lobe, i);
+
+    var s = 0.0;
+    var k = 0.0;
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+        let qy = y + dy;
+        if qy < 0 || qy >= i32(params.height) {
+            continue;
+        }
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            let qx = x + dx;
+            if qx < 0 || qx >= i32(params.width) {
+                continue;
+            }
+            let q = u32(qy) * params.width + u32(qx);
+            if guide_depth(q) <= 0.0 {
+                continue;
+            }
+            let lq = lobe_demod_lum(lobe, q);
+            s = s + lobe_stats[lobe * n + q].w / (lq * lq);
+            k = k + 1.0;
+        }
+    }
+    let own_l = lobe_demod_lum(lobe, i);
+    var v = lobe_stats[slot].w / (own_l * own_l);
+    if k > 0.0 {
+        v = s / k;
+    }
+
+    if params.spatial_variance != 0u && lobe_stats[slot].x < 4.0 {
+        var s1 = 0.0;
+        var s2 = 0.0;
+        var kk = 0.0;
+        let z_p = guide_depth(i);
+        let n_p = guide_normal(i);
+        for (var dy = -3; dy <= 3; dy = dy + 1) {
+            let qy = y + dy;
+            if qy < 0 || qy >= i32(params.height) {
+                continue;
+            }
+            for (var dx = -3; dx <= 3; dx = dx + 1) {
+                let qx = x + dx;
+                if qx < 0 || qx >= i32(params.width) {
+                    continue;
+                }
+                let q = u32(qy) * params.width + u32(qx);
+                let z_q = guide_depth(q);
+                if z_q <= 0.0 {
+                    continue;
+                }
+                if abs(z_p - z_q) > 0.1 * z_p {
+                    continue;
+                }
+                if dot(n_p, guide_normal(q)) < 0.8 {
+                    continue;
+                }
+                let lq = luminance(lobe_mean[lobe * n + q].rgb / lobe_demod(lobe, q));
+                s1 = s1 + lq;
+                s2 = s2 + lq * lq;
+                kk = kk + 1.0;
+            }
+        }
+        if kk > 1.0 {
+            let mu = s1 / kk;
+            let spatial = max(s2 / kk - mu * mu, 0.0) * (4.0 - lobe_stats[slot].x);
+            v = max(spatial, 1e-8);
+        }
+    }
+
+    scratch_src[slot] = vec4<f32>(illum, v);
+}
+
+@compute @workgroup_size(8, 8)
+fn demodulate_lobes(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if !in_bounds(gid) {
+        return;
+    }
+    let i = flat_index(gid);
+    demod_lobe(gid, i, LOBE_DIFFUSE);
+    demod_lobe(gid, i, LOBE_SPECULAR);
+}
+
+// ─── pass 3b: one à-trous iteration over each lobe ───────────────────────
+
+// `atrous`, for one lobe, over plane `lobe` of the scratch pair. The
+// specular half's luminance tolerance is scaled by its roughness.
+fn atrous_lobe(gid: vec3<u32>, p: u32, lobe: u32) {
+    let n = n_pixels();
+    let slot = lobe * n + p;
+    let z_p = guide_depth(p);
+    let centre = scratch_src[slot];
+    if z_p <= 0.0 {
+        scratch_dst[slot] = centre;
+        return;
+    }
+    if params.iter_index >= atrous_iters_for(lobe_stats[slot].x) {
+        scratch_dst[slot] = centre;
+        return;
+    }
+
+    let stride = i32(max(params.stride, 1u));
+    let sigma_n2 = max(params.sigma_normal, 1e-4) * max(params.sigma_normal, 1e-4);
+    var sigma_l = max(params.sigma_lum, 1e-6);
+    if lobe == LOBE_SPECULAR {
+        sigma_l = sigma_l * mix(SPEC_SIGMA_MIRROR, SPEC_SIGMA_ROUGH, guide_roughness(p));
+    }
+    let sigma_z = max(params.sigma_depth, 1e-6) * f32(stride);
+
+    let n_p = guide_normal(p);
+    let c_p = centre.xyz;
+    let l_p = luminance(c_p);
+    let l_tol = sigma_l * sqrt(max(centre.w, 0.0)) + 1e-4;
+
+    var sum = vec3<f32>(0.0);
+    var vsum = 0.0;
+    var wsum = 0.0;
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    for (var ky = 0; ky < 5; ky = ky + 1) {
+        let qy = y + (ky - 2) * stride;
+        if qy < 0 || qy >= i32(params.height) {
+            continue;
+        }
+        for (var kx = 0; kx < 5; kx = kx + 1) {
+            let qx = x + (kx - 2) * stride;
+            if qx < 0 || qx >= i32(params.width) {
+                continue;
+            }
+            let q = u32(qy) * params.width + u32(qx);
+            let z_q = guide_depth(q);
+            if z_q <= 0.0 {
+                continue;
+            }
+            let dn = n_p - guide_normal(q);
+            let w_n = exp(-dot(dn, dn) / sigma_n2);
+            let w_z = exp(-abs(z_p - z_q) / (sigma_z * z_p));
+            let tap = scratch_src[lobe * n + q];
+            let w_l = exp(-abs(l_p - luminance(tap.xyz)) / l_tol);
+            let weight = b3(kx) * b3(ky) * w_n * w_z * w_l;
+            if weight <= 0.0 {
+                continue;
+            }
+            sum = sum + tap.xyz * weight;
+            vsum = vsum + weight * weight * tap.w;
+            wsum = wsum + weight;
+        }
+    }
+    if wsum > 0.0 {
+        scratch_dst[slot] = vec4<f32>(sum / wsum, vsum / (wsum * wsum));
+    } else {
+        scratch_dst[slot] = centre;
+    }
+}
+
+@compute @workgroup_size(8, 8)
+fn atrous_lobes(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if !in_bounds(gid) {
+        return;
+    }
+    let p = flat_index(gid);
+    atrous_lobe(gid, p, LOBE_DIFFUSE);
+    atrous_lobe(gid, p, LOBE_SPECULAR);
+}
+
+// ─── pass 4b: recombine, tonemap, present ────────────────────────────────
+
+// `resolve`'s fade, for one lobe's history length.
+fn lobe_strength(count: f32) -> f32 {
+    let span = max(f32(params.count_cutoff) - 1.0, 1e-6);
+    return clamp((f32(params.count_cutoff) - count) / span, 0.0, 1.0);
+}
+
+@compute @workgroup_size(8, 8)
+fn resolve_lobes(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if !in_bounds(gid) {
+        return;
+    }
+    let i = flat_index(gid);
+    let n = n_pixels();
+    let md = lobe_mean[i];
+    let ms = lobe_mean[n + i];
+    var rgb = md.rgb + ms.rgb;
+
+    if params.iters > 0u && guide_depth(i) > 0.0 {
+        var fd: vec4<f32>;
+        var fs: vec4<f32>;
+        if params.src_is_b != 0u {
+            fd = scratch_dst[i];
+            fs = scratch_dst[n + i];
+        } else {
+            fd = scratch_src[i];
+            fs = scratch_src[n + i];
+        }
+        // diffuse * albedo + specular * specular albedo, each faded by its
+        // own history length: a rough floor's specular half is filtered long
+        // after its diffuse half has converged.
+        let d = mix(md.rgb, fd.xyz * lobe_demod(LOBE_DIFFUSE, i), lobe_strength(lobe_stats[i].x));
+        let s = mix(ms.rgb, fs.xyz * lobe_demod(LOBE_SPECULAR, i), lobe_strength(lobe_stats[n + i].x));
+        rgb = d + s;
+    }
+
+    let mapped = linear_to_srgb(tonemap_aces(rgb * params.exposure));
+    textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(mapped, md.w));
 }
