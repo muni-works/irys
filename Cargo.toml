@@ -12,7 +12,11 @@ keywords = ["raytracing", "pathtracing", "renderer", "bvh", "graphics"]
 categories = ["graphics", "rendering", "rendering::engine"]
 
 [dependencies]
-tang.workspace = true
+# The registry tang, not the workspace's path: vcad consumes this crate by git,
+# and a path outside the repo would resolve to nothing on any other machine (or
+# to a second `tang` here). The workspace's `[patch.crates-io]` still redirects
+# it to the local checkout for every build in this repo.
+tang = "0.2"
 # The GPU tier. `bytemuck` and `wgpu` only; the wasm glue below is what a
 # browser needs to await a buffer mapping without blocking.
 wgpu = { version = "30", features = ["webgpu", "wgsl"], optional = true }

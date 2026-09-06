@@ -300,6 +300,16 @@ pub struct GpuDenoiseParams {
     /// sample, falling to 1x by its fourth (see [`fresh_lum_relax_for`]).
     /// 1.0 leaves it alone.
     pub fresh_lum_relax: f32,
+    /// Split the first bounce into a diffuse and a specular lobe and denoise
+    /// the two separately — a long, albedo-demodulated history for the
+    /// diffuse half; a roughness-capped, parallax-corrected, sharper-filtered
+    /// history for the specular half — and recombine them at the resolve.
+    ///
+    /// Off, the à-trous chain filters the summed sample exactly as it always
+    /// has, which is what the CPU parity test pins. The lobe histories are
+    /// accumulated either way, so a caller can flip this between frames; the
+    /// neural path filters the summed buffer regardless.
+    pub lobes: bool,
 }
 
 impl Default for GpuDenoiseParams {
@@ -321,6 +331,7 @@ impl Default for GpuDenoiseParams {
             temporal_filter: 0.9,
             fresh_extra_iters: 1,
             fresh_lum_relax: 3.0,
+            lobes: false,
         }
     }
 }
@@ -615,7 +626,8 @@ pub struct HistoryBuffers {
     budget_total: wgpu::Buffer,
     /// Staging for [`RayTracePipeline::read_budget`], allocated on first use.
     budget_readback: Option<wgpu::Buffer>,
-    /// (illumination, variance) ping-pong for the wavelet iterations.
+    /// (illumination, variance) ping-pong for the wavelet iterations. Two
+    /// planes each: the unsplit chain uses the first, the split chain both.
     pub(super) scratch_a: wgpu::Buffer,
     pub(super) scratch_b: wgpu::Buffer,
     /// The previous pass's presented frame, linear and re-modulated, as
@@ -628,6 +640,13 @@ pub struct HistoryBuffers {
     /// to read `filtered_reproj` rather than `filtered`. Set by the
     /// accumulate half of a frame, consumed by the denoise half.
     filtered_reprojected: bool,
+    /// The split denoiser's per-lobe running means and statistics, two
+    /// planes each (diffuse, specular), in `mean`/`stats`' layouts.
+    lobe_mean: wgpu::Buffer,
+    lobe_stats: wgpu::Buffer,
+    /// Where `reproject_lobes` gathers: four planes, mean and stats for each
+    /// lobe.
+    lobe_gather: wgpu::Buffer,
     /// One uniform slot per pass; see [`PARAM_SLOTS`].
     params: wgpu::Buffer,
     /// Staging for [`RayTracePipeline::read_history`], allocated on first use.
@@ -667,8 +686,11 @@ impl HistoryBuffers {
             budget_scratch: mk("Sample Budget Scratch", n * 16),
             budget_total: mk("Sample Budget Total", 8),
             budget_readback: None,
-            scratch_a: mk("History Scratch A", n * 16),
-            scratch_b: mk("History Scratch B", n * 16),
+            scratch_a: mk("History Scratch A", n * 32),
+            scratch_b: mk("History Scratch B", n * 32),
+            lobe_mean: mk("History Lobe Mean", n * 32),
+            lobe_stats: mk("History Lobe Stats", n * 32),
+            lobe_gather: mk("History Lobe Gather", n * 64),
             filtered: mk("History Presented Frame", n * 16),
             filtered_reproj: mk("History Presented Frame Reprojected", n * 16),
             filtered_reprojected: false,
@@ -773,6 +795,8 @@ impl HistoryBuffers {
             });
         enc.clear_buffer(&self.mean, 0, None);
         enc.clear_buffer(&self.stats, 0, None);
+        enc.clear_buffer(&self.lobe_mean, 0, None);
+        enc.clear_buffer(&self.lobe_stats, 0, None);
         // A reprojection into a history that is gone would carry zeros, which
         // is harmless, but forgetting the previous view too keeps "cleared"
         // meaning exactly one thing.
@@ -797,6 +821,12 @@ pub struct HistoryPipeline {
     demodulate: wgpu::ComputePipeline,
     atrous: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
+    /// The split denoiser's passes; see `GpuDenoiseParams::lobes`.
+    reproject_lobes: wgpu::ComputePipeline,
+    accumulate_lobes: wgpu::ComputePipeline,
+    demodulate_lobes: wgpu::ComputePipeline,
+    atrous_lobes: wgpu::ComputePipeline,
+    resolve_lobes: wgpu::ComputePipeline,
     /// The gradient-directed sampling passes; see `budget.wgsl`.
     pub(super) budget_weight: wgpu::ComputePipeline,
     pub(super) budget_blur_x: wgpu::ComputePipeline,
@@ -869,8 +899,11 @@ impl HistoryPipeline {
                     storage(11, false), // the per-pixel sample budget
                     storage(12, false), // the budget's dilation ping-pong
                     storage(13, false), // the budget's atomic totals
-                    storage(14, false), // the previous presented frame
-                    storage(15, false), // ... reprojected onto this frame
+                    storage(14, false), // the split denoiser's lobe means
+                    storage(15, false), // ... and lobe statistics
+                    storage(16, false), // ... and its reprojection gather
+                    storage(17, false), // the previous presented frame
+                    storage(18, false), // ... reprojected onto this frame
                 ],
             });
 
@@ -900,6 +933,11 @@ impl HistoryPipeline {
             demodulate: mk("demodulate"),
             atrous: mk("atrous"),
             resolve: mk("resolve"),
+            reproject_lobes: mk("reproject_lobes"),
+            accumulate_lobes: mk("accumulate_lobes"),
+            demodulate_lobes: mk("demodulate_lobes"),
+            atrous_lobes: mk("atrous_lobes"),
+            resolve_lobes: mk("resolve_lobes"),
             budget_weight: mk("budget_weight"),
             budget_blur_x: mk("budget_blur_x"),
             budget_blur_y: mk("budget_blur_y"),
@@ -1024,10 +1062,22 @@ pub(super) fn history_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 14,
-                resource: hist.filtered.as_entire_binding(),
+                resource: hist.lobe_mean.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 15,
+                resource: hist.lobe_stats.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: hist.lobe_gather.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: hist.filtered.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 18,
                 resource: hist.filtered_reproj.as_entire_binding(),
             },
         ],
@@ -1419,6 +1469,27 @@ impl RayTracePipeline {
             (bw.div_ceil(8), bh.div_ceil(8)),
             "History Accumulate",
         );
+        // The same again for the two lobes, always: the lobe histories are
+        // cheap to keep and a caller may flip `lobes` between frames. The
+        // specular half reprojects through the reflection's own point.
+        if reproject {
+            dispatch(
+                &mut encoder,
+                &history_pipeline.reproject_lobes,
+                &ab,
+                REPROJECT_SLOT,
+                (w.div_ceil(8), h.div_ceil(8)),
+                "History Reproject Lobes",
+            );
+        }
+        dispatch(
+            &mut encoder,
+            &history_pipeline.accumulate_lobes,
+            &ab,
+            0,
+            (bw.div_ceil(8), bh.div_ceil(8)),
+            "History Accumulate Lobes",
+        );
 
         // Keep this pass's depth/normal plane for the next one to reproject
         // against, for the rows the trace just refreshed — outside them the
@@ -1591,11 +1662,26 @@ impl RayTracePipeline {
             "History Bind Group B->A",
         );
 
+        // The split chain stands where the unsplit one stands, pass for
+        // pass, over both planes of the scratch pair.
+        let (demodulate, atrous, resolve) = if denoise.lobes {
+            (
+                &history_pipeline.demodulate_lobes,
+                &history_pipeline.atrous_lobes,
+                &history_pipeline.resolve_lobes,
+            )
+        } else {
+            (
+                &history_pipeline.demodulate,
+                &history_pipeline.atrous,
+                &history_pipeline.resolve,
+            )
+        };
         let groups = (w.div_ceil(8), h.div_ceil(8));
         if dispatched > 0 {
             dispatch(
                 &mut encoder,
-                &history_pipeline.demodulate,
+                demodulate,
                 &ab,
                 0,
                 groups,
@@ -1607,7 +1693,7 @@ impl RayTracePipeline {
                 let group = if it % 2 == 0 { &ab } else { &ba };
                 dispatch(
                     &mut encoder,
-                    &history_pipeline.atrous,
+                    atrous,
                     group,
                     1 + it,
                     groups,
@@ -1617,7 +1703,7 @@ impl RayTracePipeline {
         }
         dispatch(
             &mut encoder,
-            &history_pipeline.resolve,
+            resolve,
             &ab,
             0,
             groups,
@@ -1991,6 +2077,67 @@ impl RayTracePipeline {
     }
 }
 
+impl RayTracePipeline {
+    /// The split denoiser's two histories — diffuse, then specular — read
+    /// back off the device, in [`History`]'s layout each. The specular
+    /// history's `alpha` is not coverage but the running mean of the
+    /// reflection's distance from the surface, which its reprojection
+    /// steers by.
+    ///
+    /// For tests. Both are accumulated by every pass whether or not
+    /// [`GpuDenoiseParams::lobes`] is on, so this says something after any
+    /// accumulate call. `None` if no pass has built a history yet.
+    pub async fn read_history_lobes(
+        &self,
+        ctx: &GpuContext,
+        res: &mut ResidentScene,
+    ) -> Result<Option<(History, History)>, GpuError> {
+        let Some((w, h)) = res.history().map(|hi| (hi.width, hi.height)) else {
+            return Ok(None);
+        };
+        let n = (w as u64) * (h as u64);
+        let plane = n * 16;
+        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("History Lobe Readback"),
+            size: plane * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let hist = res.history().expect("just checked");
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("History Lobe Readback Encoder"),
+            });
+        encoder.copy_buffer_to_buffer(&hist.lobe_mean, 0, &staging, 0, plane * 2);
+        encoder.copy_buffer_to_buffer(&hist.lobe_stats, 0, &staging, plane * 2, plane * 2);
+        ctx.queue.submit(Some(encoder.finish()));
+
+        let raw = read_back_f32(ctx, &staging).await?;
+        let n = n as usize;
+        let unpack = |lobe: usize| {
+            let mut out = History {
+                width: w,
+                height: h,
+                rgb: vec![0.0; n * 3],
+                alpha: vec![0.0; n],
+                count: vec![0; n],
+                variance: vec![0.0; n],
+            };
+            for i in 0..n {
+                let m = &raw[(lobe * n + i) * 4..(lobe * n + i) * 4 + 4];
+                let s = &raw[((2 + lobe) * n + i) * 4..((2 + lobe) * n + i) * 4 + 4];
+                out.rgb[i * 3..i * 3 + 3].copy_from_slice(&m[..3]);
+                out.alpha[i] = m[3];
+                out.count[i] = s[0] as u32;
+                out.variance[i] = s[3];
+            }
+            out
+        };
+        Ok(Some((unpack(0), unpack(1))))
+    }
+}
+
 /// The guide planes a raw-sample pass wrote, brought back to the host.
 ///
 /// The same four quantities [`super::neural`] steers on, in the same
@@ -2018,6 +2165,14 @@ pub struct Guides {
     pub albedo: Vec<f32>,
     /// Biased hit id, one float per pixel; zero on background.
     pub id: Vec<f32>,
+    /// Directional albedo of the specular lobe at the view, 3 floats per
+    /// pixel — the split denoiser's specular demodulator.
+    pub spec_albedo: Vec<f32>,
+    /// Perceptual roughness, one float per pixel.
+    pub roughness: Vec<f32>,
+    /// How far the specular bounce off the primary hit travelled, one float
+    /// per pixel; zero when the path left through a diffuse lobe or escaped.
+    pub spec_dist: Vec<f32>,
 }
 
 impl RayTracePipeline {
@@ -2044,7 +2199,7 @@ impl RayTracePipeline {
 
         let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Guide Readback"),
-            size: (plane * 2).max(16),
+            size: (plane * 5).max(16),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -2054,8 +2209,9 @@ impl RayTracePipeline {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Guide Readback Encoder"),
             });
-        // Plane 0 is the shader's own (normal, t); the guides are 1 and 2.
-        encoder.copy_buffer_to_buffer(guides, plane, &staging, 0, plane * 2);
+        // Plane 0 is the shader's own (normal, t); the guides are 1 and 2,
+        // and — past the budget mask in 3 — the specular guides in 4 and 5.
+        encoder.copy_buffer_to_buffer(guides, plane, &staging, 0, plane * 5);
         ctx.queue.submit(Some(encoder.finish()));
 
         let raw = read_back_f32(ctx, &staging).await?;
@@ -2067,14 +2223,22 @@ impl RayTracePipeline {
             depth: vec![0.0; n],
             albedo: vec![0.0; n * 3],
             id: vec![0.0; n],
+            spec_albedo: vec![0.0; n * 3],
+            roughness: vec![0.0; n],
+            spec_dist: vec![0.0; n],
         };
         for i in 0..n {
             let a = &raw[i * 4..i * 4 + 4];
             let b = &raw[(n + i) * 4..(n + i) * 4 + 4];
+            let c = &raw[(3 * n + i) * 4..(3 * n + i) * 4 + 4];
+            let d = &raw[(4 * n + i) * 4..(4 * n + i) * 4 + 4];
             out.normal[i * 3..i * 3 + 3].copy_from_slice(&a[..3]);
             out.depth[i] = a[3];
             out.albedo[i * 3..i * 3 + 3].copy_from_slice(&b[..3]);
             out.id[i] = b[3];
+            out.spec_albedo[i * 3..i * 3 + 3].copy_from_slice(&c[..3]);
+            out.roughness[i] = c[3];
+            out.spec_dist[i] = d[0];
         }
         Ok(out)
     }

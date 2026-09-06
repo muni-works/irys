@@ -262,11 +262,11 @@ const REPROJ_NORMAL_DOT: f32 = 0.9;
 // The previous pass's *presented* frame, linear and re-modulated, before the
 // tonemap: (rgb, valid). What the second temporal pass blends toward.
 // Written by `resolve`, one pixel per invocation, and read by `reproject`.
-@group(0) @binding(14) var<storage, read_write> filtered: array<vec4<f32>>;
+@group(0) @binding(17) var<storage, read_write> filtered: array<vec4<f32>>;
 // The same, carried onto this pass's pixel grid by `reproject` with the
 // motion the history itself was carried with. A pixel the reprojection could
 // not carry has `valid` zero here.
-@group(0) @binding(15) var<storage, read_write> filtered_reproj: array<vec4<f32>>;
+@group(0) @binding(18) var<storage, read_write> filtered_reproj: array<vec4<f32>>;
 
 // Floor on the firefly clamp's local estimate, in demodulated luminance, so a
 // history that is still black does not cap the first light to reach it at
@@ -302,6 +302,21 @@ fn fresh_extra_iters_for(count: f32) -> u32 {
 fn fresh_lum_relax_for(count: f32) -> f32 {
     return mix(max(params.fresh_lum_relax, 1.0), 1.0, clamp((count - 1.0) / 3.0, 0.0, 1.0));
 }
+
+// ─── the split denoiser's own buffers ─────────────────────────────────────
+// Two planes each, diffuse then specular, in `mean`/`stats`' layouts: the
+// running mean of each lobe's history and its statistics. One departure:
+// the specular mean's `.w` is not coverage — the diffuse plane has that —
+// but the running mean of the reflection's distance, which the specular
+// reprojection steers by. The summed `mean`/`stats` above keep going
+// exactly as they did, so the neural path and every existing reader see
+// nothing new.
+@group(0) @binding(14) var<storage, read_write> lobe_mean: array<vec4<f32>>;
+@group(0) @binding(15) var<storage, read_write> lobe_stats: array<vec4<f32>>;
+// Where `reproject_lobes` gathers to: four planes, (diffuse mean, diffuse
+// stats, specular mean, specular stats), read back by `accumulate_lobes`
+// exactly as `accumulate` reads the scratch pair.
+@group(0) @binding(16) var<storage, read_write> lobe_gather: array<vec4<f32>>;
 
 fn luminance(c: vec3<f32>) -> f32 {
     return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
@@ -540,6 +555,269 @@ fn reproject(@builtin(global_invocation_id) gid: vec3<u32>) {
     filtered_reproj[i] = filtered[j];
 }
 
+// ─── the stabilizers, shared by the summed fold and the per-lobe folds ──
+
+// `lobe` for the summed history in `raw`/`mean`/`stats`, as against the two
+// lobes' own planes. What lets one stabilizer body serve both folds.
+const LOBE_SUM: u32 = 2u;
+
+fn hist_raw(lobe: u32, q: u32) -> vec4<f32> {
+    if lobe == LOBE_SUM {
+        return raw[q];
+    }
+    return raw_lobe(lobe, q);
+}
+
+fn hist_mean(lobe: u32, q: u32) -> vec4<f32> {
+    if lobe == LOBE_SUM {
+        return mean[q];
+    }
+    return lobe_mean[lobe * n_pixels() + q];
+}
+
+fn hist_stats(lobe: u32, q: u32) -> vec4<f32> {
+    if lobe == LOBE_SUM {
+        return stats[q];
+    }
+    return lobe_stats[lobe * n_pixels() + q];
+}
+
+fn hist_demod_lum(lobe: u32, q: u32) -> f32 {
+    if lobe == LOBE_SUM {
+        return demod_lum(q);
+    }
+    return lobe_demod_lum(lobe, q);
+}
+
+// Everything that stands between a raw sample and the fold: the firefly cap
+// on the sample, the neighbourhood clamp and the variance box on the history.
+// `c` is the sample, `m` and `st` the history it is about to be folded into;
+// all three may come back changed.
+fn stabilize_sample(
+    gid: vec3<u32>,
+    i: u32,
+    lobe: u32,
+    cp: ptr<function, vec4<f32>>,
+    mp: ptr<function, vec4<f32>>,
+    stp: ptr<function, vec4<f32>>,
+) {
+    var c = *cp;
+    var m = *mp;
+    var st = *stp;
+
+    // ─── the firefly clamp ───────────────────────────────────────────────
+    //
+    // A path that finds a small bright light through a glossy bounce comes
+    // back a thousand times brighter than its neighbours, and at weight 1/n
+    // it moves a converged pixel by more than the whole of its signal. Cap
+    // the sample's demodulated luminance at a multiple of what the pixel's
+    // neighbourhood has *already* settled to — the previous frame's 3x3 mean,
+    // which a firefly cannot widen because it has not been folded yet. A pixel
+    // whose neighbourhood has no history (the frame's first pass) is left
+    // alone: there is nothing robust to cap against, and a first pass is what
+    // the parity test compares to the CPU filter.
+    //
+    // `firefly_cap` is in demodulated luminance and is reused below to cap the
+    // neighbourhood's raw taps, so a firefly on a neighbour cannot widen the
+    // box the history is clamped into either.
+    //
+    // The cap is always taken from the *summed* sample and the summed
+    // neighbourhood, whichever lobe is being folded, and the lobe's sample
+    // is scaled by the same factor: a firefly is a property of the path, not
+    // of the half of it that happened to be specular, and a rough surface's
+    // specular half — small, and made of rare bright samples — capped
+    // against its own dim neighbourhood loses real energy. Measured on the
+    // court, a per-lobe cap took a percent off the back wall. The centre
+    // pixel is left out of the neighbourhood: by the time the lobes fold,
+    // the summed mean already holds this sample.
+    var firefly_cap = 1e30;
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    if params.firefly_k > 0.0 && st.x > 0.5 {
+        var hist_sum = 0.0;
+        var hist_k = 0.0;
+        var raw_sum = 0.0;
+        var raw_k = 0.0;
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            let qy = y + dy;
+            if qy < 0 || qy >= i32(params.height) {
+                continue;
+            }
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let qx = x + dx;
+                if qx < 0 || qx >= i32(params.width) {
+                    continue;
+                }
+                let q = u32(qy) * params.width + u32(qx);
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                if stats[q].x > 0.5 {
+                    hist_sum = hist_sum + luminance(mean[q].rgb) / demod_lum(q);
+                    hist_k = hist_k + 1.0;
+                }
+                raw_sum = raw_sum + luminance(raw[q].rgb) / demod_lum(q);
+                raw_k = raw_k + 1.0;
+            }
+        }
+        // The previous accumulated frame's neighbourhood where there is one;
+        // this pass's neighbours, centre excluded, where there is not.
+        var local = 0.0;
+        if hist_k > 0.0 {
+            local = hist_sum / hist_k;
+        } else if raw_k > 0.0 {
+            local = raw_sum / raw_k;
+        }
+        firefly_cap = firefly_k_for(st.x) * max(local, FIREFLY_FLOOR);
+        let ld = luminance(raw[i].rgb) / demod_lum(i);
+        if ld > firefly_cap {
+            c = vec4<f32>(c.rgb * (firefly_cap / ld), c.w);
+        }
+    }
+
+    // ─── neighbourhood clamping ──────────────────────────────────────────
+    //
+    // A carried history can be *stale* without being wrong about which
+    // surface it is on: the ball has moved off the floor and the floor is
+    // still holding the ball's shadow. Nothing in the depth/normal/id gates
+    // sees that, because the floor is still the floor.
+    //
+    // What does see it is this pass's own sample. Clamp the history into the
+    // range the raw 3x3 neighbourhood says the pixel plausibly is, and a
+    // shadow that has gone is out of range on the first frame and reeled in
+    // over the next few. The clamped pixel's history length drops with it, so
+    // the à-trous filter widens there and the reeling-in is not visible as
+    // noise.
+    if (params.clamp_k > 0.0 || params.variance_gamma > 0.0) && st.x > 0.5 {
+        var s1 = vec3<f32>(0.0);
+        var s2 = vec3<f32>(0.0);
+        var hsum = vec3<f32>(0.0);
+        var k = 0.0;
+        // The largest temporal luminance variance in the neighbourhood,
+        // over pixels with enough history to have one; the variance box's
+        // floor.
+        var vt = max(st.z - st.y * st.y, 0.0);
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            let qy = y + dy;
+            if qy < 0 || qy >= i32(params.height) {
+                continue;
+            }
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let qx = x + dx;
+                if qx < 0 || qx >= i32(params.width) {
+                    continue;
+                }
+                let q = u32(qy) * params.width + u32(qx);
+                var t = hist_raw(lobe, q).rgb;
+                if dx == 0 && dy == 0 {
+                    t = c.rgb;
+                } else {
+                    // The same cap the centre got, so one firefly among the
+                    // neighbours cannot widen the box.
+                    let lq = luminance(raw[q].rgb) / demod_lum(q);
+                    if lq > firefly_cap {
+                        t = t * (firefly_cap / lq);
+                    }
+                }
+                s1 = s1 + t;
+                s2 = s2 + t * t;
+                hsum = hsum + hist_mean(lobe, q).rgb;
+                k = k + 1.0;
+                let sq = hist_stats(lobe, q);
+                if sq.x >= 4.0 {
+                    vt = max(vt, sq.z - sq.y * sq.y);
+                }
+            }
+        }
+        if k > 0.0 {
+            let mu = s1 / k;
+            let sd = sqrt(max(s2 / k - mu * mu, vec3<f32>(0.0)));
+            // What is compared is the *history's* 3x3 mean against the raw
+            // sample's 3x3 mean, not the history's own pixel against the raw
+            // neighbourhood. The two are blurred by the same kernel, so the
+            // spatial bias that makes a plain TAA clamp fire on every gradient
+            // in the frame cancels, and what is left is the error bar on a
+            // nine-sample mean — three times tighter than one sample's, which
+            // is three times the sensitivity to lighting that really did
+            // change.
+            let hmu = hsum / k;
+            let tol = params.clamp_k * sd / sqrt(k) + 1e-5;
+            let d = abs(hmu - mu);
+            if params.clamp_k > 0.0 && max(d.x, max(d.y, d.z)) > max(tol.x, max(tol.y, tol.z)) {
+                // The history is *shortened*, not overwritten. Snapping the
+                // colour to the edge of the neighbourhood would be the usual
+                // TAA move and it is a biased one: on a still frame the
+                // clamp fires by chance a few percent of the time, always
+                // pulling towards a nine-sample mean, and a hundred passes of
+                // that is a visible tint. Shortening the history is unbiased —
+                // the next few samples are simply worth much more — and the
+                // stale value is gone in about `clamp_reset` frames either
+                // way.
+                st.x = min(st.x, f32(max(params.clamp_reset, 1u)));
+            }
+            // ─── the variance box ────────────────────────────────────────
+            //
+            // The test above sees a *smooth* change — a shadow that left —
+            // through nine-sample means. What it does not see is a history
+            // that is simply nowhere near what the pixel is now: a ghost
+            // carried onto the wrong shading, or the residue of a firefly
+            // folded before the cap was there. Those are outside
+            // mean ± γ·σ of the raw neighbourhood, with γ tight on a young
+            // history — one sample of it is worth little more than one of
+            // the neighbours — and loose on a long one, where the history is
+            // the better estimate and the box should only catch what is
+            // plainly wrong. A history outside the box is clipped to its edge
+            // and shortened; inside it, nothing is touched, so a still frame
+            // converges as if the box were not there. The σ is floored at a
+            // few percent of the mean so nine taps that happen to agree
+            // cannot collapse the box onto themselves.
+            //
+            // The test is in luminance, and the σ is the *larger* of the
+            // neighbourhood's spatial spread and the temporal spread any of
+            // its pixels has seen. Nine taps of one-sample path-tracing
+            // noise are a poor estimate of a heavy-tailed spread — most
+            // samples sit under the mean and the odd bright one carries it —
+            // and a box built on them alone sits low and narrow, so the
+            // history above it is clipped down far more often than up.
+            // Measured on the court that was a tenth off the back wall's
+            // brightness. The temporal moments have seen the tails; they set
+            // the floor, and the neighbours' rather than the pixel's own so
+            // that a pixel too young to have moments is held to what its
+            // surroundings know. What is left for the box is a history
+            // *grossly* outside the noise — a surface carried onto the wrong
+            // lighting, a light that came on — which is what it is for.
+            //
+            // Not on the specular lobe: its history is already held to its
+            // roughness, and its samples are the rare bright ones the box
+            // would read as ghosts.
+            if params.variance_gamma > 0.0 && st.x > 1.5 && lobe != LOBE_SPECULAR {
+                let gamma = variance_gamma_for(st.x);
+                let mu_l = luminance(mu);
+                let sd_l = luminance(sd);
+                let sd_t = sqrt(vt);
+                let width = gamma * max(max(sd_l, sd_t), 0.05 * abs(mu_l)) + 1e-4;
+                let l_m = luminance(m.rgb);
+                let edge = clamp(l_m, mu_l - width, mu_l + width);
+                if edge != l_m && l_m > 1e-6 {
+                    m = vec4<f32>(m.rgb * (edge / l_m), m.w);
+                    st.x = min(st.x, f32(max(params.clamp_reset, 1u)));
+                }
+            }
+            // `hist_mean(lobe, q)` for a neighbour is read while other invocations of
+            // this same dispatch may be folding their own sample into it. The
+            // race is deliberate and harmless: what comes back is that
+            // neighbour's history either side of one sample out of `n`, and
+            // the test is a comparison of nine-pixel means against an error
+            // bar. Synchronising it would cost a full-frame dispatch to buy a
+            // difference under the noise floor.
+        }
+    }
+
+    *cp = c;
+    *mp = m;
+    *stp = st;
+}
+
 // ─── pass 1: fold this sample into the history ────────────────────────────
 
 @compute @workgroup_size(8, 8)
@@ -623,199 +901,8 @@ fn accumulate(@builtin(global_invocation_id) lid: vec3<u32>) {
         }
     }
 
-    // ─── the firefly clamp ───────────────────────────────────────────────
-    //
-    // A path that finds a small bright light through a glossy bounce comes
-    // back a thousand times brighter than its neighbours, and at weight 1/n
-    // it moves a converged pixel by more than the whole of its signal. Cap
-    // the sample's demodulated luminance at a multiple of what the pixel's
-    // neighbourhood has *already* settled to — the previous frame's 3x3 mean,
-    // which a firefly cannot widen because it has not been folded yet. A pixel
-    // whose neighbourhood has no history (the frame's first pass) is left
-    // alone: there is nothing robust to cap against, and a first pass is what
-    // the parity test compares to the CPU filter.
-    //
-    // `firefly_cap` is in demodulated luminance and is reused below to cap the
-    // neighbourhood's raw taps, so a firefly on a neighbour cannot widen the
-    // box the history is clamped into either.
-    var firefly_cap = 1e30;
-    let x = i32(gid.x);
-    let y = i32(gid.y);
-    if params.firefly_k > 0.0 && st.x > 0.5 {
-        var hist_sum = 0.0;
-        var hist_k = 0.0;
-        var raw_sum = 0.0;
-        var raw_k = 0.0;
-        for (var dy = -1; dy <= 1; dy = dy + 1) {
-            let qy = y + dy;
-            if qy < 0 || qy >= i32(params.height) {
-                continue;
-            }
-            for (var dx = -1; dx <= 1; dx = dx + 1) {
-                let qx = x + dx;
-                if qx < 0 || qx >= i32(params.width) {
-                    continue;
-                }
-                let q = u32(qy) * params.width + u32(qx);
-                if stats[q].x > 0.5 {
-                    hist_sum = hist_sum + luminance(mean[q].rgb) / demod_lum(q);
-                    hist_k = hist_k + 1.0;
-                }
-                if dx != 0 || dy != 0 {
-                    raw_sum = raw_sum + luminance(raw[q].rgb) / demod_lum(q);
-                    raw_k = raw_k + 1.0;
-                }
-            }
-        }
-        // The previous accumulated frame's neighbourhood where there is one;
-        // this pass's neighbours, centre excluded, where there is not.
-        var local = 0.0;
-        if hist_k > 0.0 {
-            local = hist_sum / hist_k;
-        } else if raw_k > 0.0 {
-            local = raw_sum / raw_k;
-        }
-        firefly_cap = firefly_k_for(st.x) * max(local, FIREFLY_FLOOR);
-        let ld = luminance(c.rgb) / demod_lum(i);
-        if ld > firefly_cap {
-            c = vec4<f32>(c.rgb * (firefly_cap / ld), c.w);
-        }
-    }
+    stabilize_sample(gid, i, LOBE_SUM, &c, &m, &st);
     let l = luminance(c.rgb);
-
-    // ─── neighbourhood clamping ──────────────────────────────────────────
-    //
-    // A carried history can be *stale* without being wrong about which
-    // surface it is on: the ball has moved off the floor and the floor is
-    // still holding the ball's shadow. Nothing in the depth/normal/id gates
-    // sees that, because the floor is still the floor.
-    //
-    // What does see it is this pass's own sample. Clamp the history into the
-    // range the raw 3x3 neighbourhood says the pixel plausibly is, and a
-    // shadow that has gone is out of range on the first frame and reeled in
-    // over the next few. The clamped pixel's history length drops with it, so
-    // the à-trous filter widens there and the reeling-in is not visible as
-    // noise.
-    if (params.clamp_k > 0.0 || params.variance_gamma > 0.0) && st.x > 0.5 {
-        var s1 = vec3<f32>(0.0);
-        var s2 = vec3<f32>(0.0);
-        var hsum = vec3<f32>(0.0);
-        var k = 0.0;
-        // The largest temporal luminance variance in the neighbourhood,
-        // over pixels with enough history to have one; the variance box's
-        // floor.
-        var vt = max(st.z - st.y * st.y, 0.0);
-        for (var dy = -1; dy <= 1; dy = dy + 1) {
-            let qy = y + dy;
-            if qy < 0 || qy >= i32(params.height) {
-                continue;
-            }
-            for (var dx = -1; dx <= 1; dx = dx + 1) {
-                let qx = x + dx;
-                if qx < 0 || qx >= i32(params.width) {
-                    continue;
-                }
-                let q = u32(qy) * params.width + u32(qx);
-                var t = raw[q].rgb;
-                if dx == 0 && dy == 0 {
-                    t = c.rgb;
-                } else {
-                    // The same cap the centre got, so one firefly among the
-                    // neighbours cannot widen the box.
-                    let lq = luminance(t) / demod_lum(q);
-                    if lq > firefly_cap {
-                        t = t * (firefly_cap / lq);
-                    }
-                }
-                s1 = s1 + t;
-                s2 = s2 + t * t;
-                hsum = hsum + mean[q].rgb;
-                k = k + 1.0;
-                let sq = stats[q];
-                if sq.x >= 4.0 {
-                    vt = max(vt, sq.z - sq.y * sq.y);
-                }
-            }
-        }
-        if k > 0.0 {
-            let mu = s1 / k;
-            let sd = sqrt(max(s2 / k - mu * mu, vec3<f32>(0.0)));
-            // What is compared is the *history's* 3x3 mean against the raw
-            // sample's 3x3 mean, not the history's own pixel against the raw
-            // neighbourhood. The two are blurred by the same kernel, so the
-            // spatial bias that makes a plain TAA clamp fire on every gradient
-            // in the frame cancels, and what is left is the error bar on a
-            // nine-sample mean — three times tighter than one sample's, which
-            // is three times the sensitivity to lighting that really did
-            // change.
-            let hmu = hsum / k;
-            let tol = params.clamp_k * sd / sqrt(k) + 1e-5;
-            let d = abs(hmu - mu);
-            if params.clamp_k > 0.0 && max(d.x, max(d.y, d.z)) > max(tol.x, max(tol.y, tol.z)) {
-                // The history is *shortened*, not overwritten. Snapping the
-                // colour to the edge of the neighbourhood would be the usual
-                // TAA move and it is a biased one: on a still frame the
-                // clamp fires by chance a few percent of the time, always
-                // pulling towards a nine-sample mean, and a hundred passes of
-                // that is a visible tint. Shortening the history is unbiased —
-                // the next few samples are simply worth much more — and the
-                // stale value is gone in about `clamp_reset` frames either
-                // way.
-                st.x = min(st.x, f32(max(params.clamp_reset, 1u)));
-            }
-            // ─── the variance box ────────────────────────────────────────
-            //
-            // The test above sees a *smooth* change — a shadow that left —
-            // through nine-sample means. What it does not see is a history
-            // that is simply nowhere near what the pixel is now: a ghost
-            // carried onto the wrong shading, or the residue of a firefly
-            // folded before the cap was there. Those are outside
-            // mean ± γ·σ of the raw neighbourhood, with γ tight on a young
-            // history — one sample of it is worth little more than one of
-            // the neighbours — and loose on a long one, where the history is
-            // the better estimate and the box should only catch what is
-            // plainly wrong. A history outside the box is clipped to its edge
-            // and shortened; inside it, nothing is touched, so a still frame
-            // converges as if the box were not there. The σ is floored at a
-            // few percent of the mean so nine taps that happen to agree
-            // cannot collapse the box onto themselves.
-            //
-            // The test is in luminance, and the σ is the *larger* of the
-            // neighbourhood's spatial spread and the temporal spread any of
-            // its pixels has seen. Nine taps of one-sample path-tracing
-            // noise are a poor estimate of a heavy-tailed spread — most
-            // samples sit under the mean and the odd bright one carries it —
-            // and a box built on them alone sits low and narrow, so the
-            // history above it is clipped down far more often than up.
-            // Measured on the court that was a tenth off the back wall's
-            // brightness. The temporal moments have seen the tails; they set
-            // the floor, and the neighbours' rather than the pixel's own so
-            // that a pixel too young to have moments is held to what its
-            // surroundings know. What is left for the box is a history
-            // *grossly* outside the noise — a surface carried onto the wrong
-            // lighting, a light that came on — which is what it is for.
-            if params.variance_gamma > 0.0 && st.x > 1.5 {
-                let gamma = variance_gamma_for(st.x);
-                let mu_l = luminance(mu);
-                let sd_l = luminance(sd);
-                let sd_t = sqrt(vt);
-                let width = gamma * max(max(sd_l, sd_t), 0.05 * abs(mu_l)) + 1e-4;
-                let l_m = luminance(m.rgb);
-                let edge = clamp(l_m, mu_l - width, mu_l + width);
-                if edge != l_m && l_m > 1e-6 {
-                    m = vec4<f32>(m.rgb * (edge / l_m), m.w);
-                    st.x = min(st.x, f32(max(params.clamp_reset, 1u)));
-                }
-            }
-            // `mean[q]` for a neighbour is read while other invocations of
-            // this same dispatch may be folding their own sample into it. The
-            // race is deliberate and harmless: what comes back is that
-            // neighbour's history either side of one sample out of `n`, and
-            // the test is a comparison of nine-pixel means against an error
-            // bar. Synchronising it would cost a full-frame dispatch to buy a
-            // difference under the noise floor.
-        }
-    }
 
     // ─── the bounded fold ────────────────────────────────────────────────
     //
@@ -1096,6 +1183,43 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(linear_to_srgb1(c.x), linear_to_srgb1(c.y), linear_to_srgb1(c.z));
 }
 
+// The second temporal pass, and the record of what was presented: `rgb_in`
+// is the filtered, re-modulated linear colour, `var_l` its luminance
+// variance in the same units, `cnt` the history length the weight rides on.
+// Shared by `resolve` and `resolve_lobes`, so the presented frame is
+// stabilised the same way whichever chain produced it.
+fn present(i: u32, rgb_in: vec3<f32>, var_l: f32, cnt: f32) -> vec3<f32> {
+    // ─── the second temporal pass ────────────────────────────────────────
+    //
+    // The filter above is spatial and its weights read noisy luminance, so
+    // even where the radiance is stable the kernel is not, and the presented
+    // pixel flickers by a code or two a frame. Blend it toward what was
+    // presented last frame — carried across the same motion the history was
+    // — by a weight that grows with the history and collapses when the two
+    // disagree by more than the pixel's own error bar, so a change that is
+    // real gets through in a frame and a change that is the filter changing
+    // its mind does not. A one-sample pixel keeps none of it.
+    var rgb = rgb_in;
+    if params.temporal_filter > 0.0 && guide_depth(i) > 0.0 && cnt > 1.5 {
+        var prev: vec4<f32>;
+        if params.filtered_reprojected != 0u {
+            prev = filtered_reproj[i];
+        } else {
+            prev = filtered[i];
+        }
+        if prev.w > 0.5 {
+            let base = params.temporal_filter * (1.0 - 1.0 / cnt);
+            let d = abs(luminance(rgb) - luminance(prev.rgb));
+            let sigma = sqrt(var_l) + 0.02 * luminance(rgb) + 1e-4;
+            let r = d / (2.0 * sigma);
+            let w = base * exp(-r * r);
+            rgb = mix(rgb, prev.rgb, w);
+        }
+    }
+    filtered[i] = vec4<f32>(rgb, 1.0);
+    return rgb;
+}
+
 @compute @workgroup_size(8, 8)
 fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     if !in_bounds(gid) {
@@ -1129,34 +1253,540 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
         var_l = mix(var_l, max(filt.w, 0.0) * dl * dl, strength);
     }
 
-    // ─── the second temporal pass ────────────────────────────────────────
-    //
-    // The filter above is spatial and its weights read noisy luminance, so
-    // even where the radiance is stable the kernel is not, and the presented
-    // pixel flickers by a code or two a frame. Blend it toward what was
-    // presented last frame — carried across the same motion the history was
-    // — by a weight that grows with the history and collapses when the two
-    // disagree by more than the pixel's own error bar, so a change that is
-    // real gets through in a frame and a change that is the filter changing
-    // its mind does not. A one-sample pixel keeps none of it.
-    if params.temporal_filter > 0.0 && guide_depth(i) > 0.0 && cnt > 1.5 {
-        var prev: vec4<f32>;
-        if params.filtered_reprojected != 0u {
-            prev = filtered_reproj[i];
-        } else {
-            prev = filtered[i];
-        }
-        if prev.w > 0.5 {
-            let base = params.temporal_filter * (1.0 - 1.0 / cnt);
-            let d = abs(luminance(rgb) - luminance(prev.rgb));
-            let sigma = sqrt(var_l) + 0.02 * luminance(rgb) + 1e-4;
-            let r = d / (2.0 * sigma);
-            let w = base * exp(-r * r);
-            rgb = mix(rgb, prev.rgb, w);
-        }
-    }
-    filtered[i] = vec4<f32>(rgb, 1.0);
+    rgb = present(i, rgb, var_l, cnt);
 
     let mapped = linear_to_srgb(tonemap_aces(rgb * params.exposure));
     textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(mapped, m.w));
+}
+
+// ─── the split denoiser ───────────────────────────────────────────────────
+//
+// Everything above filters one buffer: the sample as the integrator summed
+// it. What follows filters it as *two*, the way NRD, Lumen and FidelityFX
+// do: the part that left the primary hit through a diffuse lobe, demodulated
+// by the albedo and held for a long history, and the part that left through
+// a specular lobe, demodulated by the lobe's own directional albedo, held
+// for a history no longer than its roughness warrants, reprojected through
+// the point the reflection actually shows, and filtered with an edge-stop
+// that is sharp on a mirror and wide on a rough floor. The two are
+// recombined in `resolve_lobes`.
+//
+// Five more entry points, dispatched in the same slots as their unsplit
+// twins: `reproject_lobes` (with `reproject`), `accumulate_lobes` (after
+// `accumulate`), then `demodulate_lobes`, `atrous_lobes` and `resolve_lobes`
+// *instead of* `demodulate`, `atrous` and `resolve`. Nothing above changes.
+
+// The specular history's bounds, in samples, interpolated by roughness: a
+// mirror keeps a handful, a rough surface keeps as many as a diffuse one.
+//
+// The floor is not 1. With the reflection reprojected through its own point
+// a mirror's history is *right* until the camera moves, and on the court a
+// floor of one left the backboard glass with no temporal history at all —
+// measured over the `--denoise-eval` sequence it was 21.8 codes off the
+// reference against 18.7 unsplit; a floor of 8 brought it to 19.4, and
+// lifting the cap altogether (32) drifted back out to 20.0.
+const SPEC_HISTORY_MIN: f32 = 8.0;
+const SPEC_HISTORY_MAX: f32 = 32.0;
+// What the luminance edge-stop is scaled by on the specular half, by
+// roughness: a mirror's reflection is an image and must not be blurred
+// across; a rough lobe's is a smear and should be.
+const SPEC_SIGMA_MIRROR: f32 = 0.25;
+const SPEC_SIGMA_ROUGH: f32 = 2.0;
+
+const LOBE_DIFFUSE: u32 = 0u;
+const LOBE_SPECULAR: u32 = 1u;
+
+fn guide_spec_albedo(i: u32) -> vec3<f32> {
+    return guides[4u * n_pixels() + i].xyz;
+}
+
+fn guide_roughness(i: u32) -> f32 {
+    return guides[4u * n_pixels() + i].w;
+}
+
+// A reflection further than this many times the surface's own distance is
+// the sky as far as parallax goes.
+const SPEC_FAR: f32 = 32.0;
+
+// How far *this pass's* specular bounce off pixel `i`'s surface went, made
+// usable: a hit's distance capped at `SPEC_FAR` surface distances, an
+// escaped bounce read as that cap, and a diffuse bounce — which says nothing
+// about the reflection — as 0.
+fn guide_spec_dist(i: u32) -> f32 {
+    let t = guides[5u * n_pixels() + i].x;
+    let far = SPEC_FAR * guide_depth(i);
+    if t < 0.0 {
+        return far;
+    }
+    return min(t, far);
+}
+
+// The reflection's distance as the specular history has averaged it: the
+// specular lobe mean's spare lane. One sample's bounce is one direction out
+// of a rough lobe, and the reprojection wants the lobe's centre, not its
+// last draw.
+fn spec_dist_smoothed(i: u32) -> f32 {
+    return lobe_mean[n_pixels() + i].w;
+}
+
+// How much of the reflection's parallax a lobe of this roughness shows:
+// all of it on a mirror, none of it on a Lambertian smear. The factor
+// NRD scales its virtual position by.
+fn spec_dominant(roughness: f32) -> f32 {
+    let r = clamp(roughness, 0.0, 1.0);
+    return (1.0 - r) * (sqrt(1.0 - r) + r);
+}
+
+// The demodulator for one lobe, floored as `demod_albedo` is.
+fn lobe_demod(lobe: u32, i: u32) -> vec3<f32> {
+    if lobe == LOBE_DIFFUSE {
+        return demod_albedo(i);
+    }
+    return max(guide_spec_albedo(i), vec3<f32>(DEMOD_FLOOR));
+}
+
+fn lobe_demod_lum(lobe: u32, i: u32) -> f32 {
+    return max(luminance(lobe_demod(lobe, i)), DEMOD_FLOOR);
+}
+
+// The longest history one lobe may hold at pixel `i`.
+fn lobe_history_cap(lobe: u32, i: u32) -> f32 {
+    let cap = f32(max(params.history_cap, 1u));
+    if lobe == LOBE_DIFFUSE {
+        return cap;
+    }
+    return min(cap, mix(SPEC_HISTORY_MIN, SPEC_HISTORY_MAX, guide_roughness(i)));
+}
+
+// This pass's raw sample for one lobe: the integrator's planes 1 and 2.
+fn raw_lobe(lobe: u32, i: u32) -> vec4<f32> {
+    return raw[(1u + lobe) * n_pixels() + i];
+}
+
+// Where pixel `i` was on the previous frame's film, validated as the same
+// surface, or -1 if there is nothing to carry. `reproject`'s test, made a
+// function so the specular half can run it twice.
+//
+// `virtual_t` is the specular twist. A reflection is not *on* the mirror:
+// it is the reflected scene seen through it, `t` further along the view
+// ray, and under a camera move it slides across the mirror with that
+// point's parallax rather than the mirror's. So the specular half projects
+// the point `virtual_t` behind the surface — surface plus the reflected ray
+// extended by the specular bounce's hit distance — and takes the history
+// from wherever *that* landed, still gated on the surface: the previous
+// pixel has to have been looking at this same object, in this same plane.
+// The virtual point is not carried by the object's own motion: a mirror
+// sliding in its own plane shows the same static world it did, and it is
+// the surface, not the reflection, that moved.
+fn reproject_find(gid: vec3<u32>, i: u32, virtual_t: f32) -> i32 {
+    let depth = guide_depth(i);
+    if depth <= 0.0 {
+        return -1;
+    }
+    let dir = view_ray(
+        params.cur_right.xyz, params.cur_up.xyz, params.cur_forward.xyz,
+        params.view_params.x, params.view_params.y, gid.x, gid.y,
+    );
+    let p_now = params.cur_eye.xyz + depth * dir;
+
+    let id = guide_id(i);
+    var inst = 0xFFFFFFFFu;
+    if params.motion_instances > 0u && id > 0u {
+        let cand = instance_of(id - 1u);
+        if cand < params.motion_instances {
+            inst = cand;
+        }
+    }
+    var p = p_now;
+    var n_now = guide_normal(i);
+    if inst != 0xFFFFFFFFu {
+        p = motion_point(inst, p_now);
+        n_now = motion_dir(inst, n_now);
+    }
+    // What is projected: the surface, or the point the reflection shows.
+    var proj = p;
+    if virtual_t > 0.0 {
+        proj = params.cur_eye.xyz + (depth + virtual_t) * dir;
+    }
+
+    let v = proj - params.prev_eye.xyz;
+    let z = dot(v, params.prev_forward.xyz);
+    if z <= 0.0 {
+        return -1;
+    }
+    let tan_fov = params.view_params.z;
+    let aspect = params.view_params.w;
+    let ndc_x = dot(v, params.prev_right.xyz) / (z * tan_fov * aspect);
+    let ndc_y = dot(v, params.prev_up.xyz) / (z * tan_fov);
+    let fx = (ndc_x + 1.0) * 0.5 * f32(params.width) - 0.5;
+    let fy = (1.0 - ndc_y) * 0.5 * f32(params.height) - 0.5;
+    let qx = i32(round(fx));
+    let qy = i32(round(fy));
+    if qx < 0 || qy < 0 || qx >= i32(params.width) || qy >= i32(params.height) {
+        return -1;
+    }
+    let j = u32(qy) * params.width + u32(qx);
+
+    let prev_depth = prev_guides[j].w;
+    if prev_depth <= 0.0 {
+        return -1;
+    }
+    if prev_guide_id(j) != id {
+        return -1;
+    }
+    let prev_n = prev_guides[j].xyz;
+    let prev_dir = view_ray(
+        params.prev_right.xyz, params.prev_up.xyz, params.prev_forward.xyz,
+        tan_fov, aspect, u32(qx), u32(qy),
+    );
+    let q = params.prev_eye.xyz + prev_depth * prev_dir;
+    // The surface's own distance sets the tolerance, whatever was projected.
+    let expected = length(p - params.prev_eye.xyz);
+    if abs(dot(p - q, prev_n)) > REPROJ_DEPTH_TOL * expected {
+        return -1;
+    }
+    if dot(n_now, prev_n) < REPROJ_NORMAL_DOT {
+        return -1;
+    }
+    return i32(j);
+}
+
+// ─── pass 0b: carry both lobes' histories across the frame ───────────────
+
+@compute @workgroup_size(8, 8)
+fn reproject_lobes(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if !in_bounds(gid) {
+        return;
+    }
+    let i = flat_index(gid);
+    let n = n_pixels();
+    lobe_gather[i] = vec4<f32>(0.0);
+    lobe_gather[n + i] = vec4<f32>(0.0);
+    lobe_gather[2u * n + i] = vec4<f32>(0.0);
+    lobe_gather[3u * n + i] = vec4<f32>(0.0);
+
+    // The diffuse half follows the surface, exactly as `reproject` does.
+    let jd = reproject_find(gid, i, 0.0);
+    if jd >= 0 {
+        lobe_gather[i] = lobe_mean[u32(jd)];
+        lobe_gather[n + i] = lobe_stats[u32(jd)];
+    }
+    // The specular half follows the reflection — and, where the virtual
+    // point lands on nothing it can use (a curved reflector, a point off the
+    // previous film), the surface, which is what it had before. The
+    // distance is the history's own average where it has one, and this
+    // pass's bounce where it does not.
+    var t = spec_dist_smoothed(i);
+    if t <= 0.0 {
+        t = guide_spec_dist(i);
+    }
+    var js = reproject_find(gid, i, t * spec_dominant(guide_roughness(i)));
+    if js < 0 {
+        js = jd;
+    }
+    if js >= 0 {
+        lobe_gather[2u * n + i] = lobe_mean[n + u32(js)];
+        lobe_gather[3u * n + i] = lobe_stats[n + u32(js)];
+    }
+}
+
+// ─── pass 1b: fold this sample into each lobe's history ──────────────────
+
+// `accumulate`'s fold, for one lobe. The budget's skip, the keep mask, the
+// neighbourhood clamp and the bounded fold are all as above; what differs is
+// the cap, which the specular half takes from its roughness.
+fn fold_lobe(gid: vec3<u32>, i: u32, lobe: u32) {
+    let n = n_pixels();
+    let slot = lobe * n + i;
+    var c = raw_lobe(lobe, i);
+
+    var m = lobe_mean[slot];
+    var st = lobe_stats[slot];
+    if params.reprojected != 0u {
+        m = lobe_gather[(2u * lobe) * n + i];
+        st = lobe_gather[(2u * lobe + 1u) * n + i];
+    }
+    if keep[i] == 0u {
+        m = vec4<f32>(0.0);
+        st = vec4<f32>(0.0);
+    }
+
+    if params.budget_enabled != 0u {
+        if (budget_mask_load(i) & (1u << params.budget_round)) == 0u {
+            lobe_mean[slot] = m;
+            lobe_stats[slot] = st;
+            return;
+        }
+    }
+
+    stabilize_sample(gid, i, lobe, &c, &m, &st);
+    let l = luminance(c.rgb);
+
+    let cap = lobe_history_cap(lobe, i);
+    let cnt = min(st.x + 1.0, cap);
+    let inv = 1.0 / cnt;
+    if lobe == LOBE_SPECULAR {
+        // The specular mean's spare lane is the reflection's distance, folded
+        // with the same weight — and left alone by a diffuse bounce, which
+        // saw no reflection to measure.
+        let t = guide_spec_dist(i);
+        var td = m.w;
+        if t > 0.0 {
+            td = select(td + (t - td) * inv, t, td <= 0.0);
+        }
+        m = vec4<f32>(m.rgb + (c.rgb - m.rgb) * inv, td);
+    } else {
+        m = m + (c - m) * inv;
+    }
+    let mu1 = st.y + (l - st.y) * inv;
+    let mu2 = st.z + (l * l - st.z) * inv;
+    var v: f32;
+    if cnt > 1.5 {
+        let sample_var = max(mu2 - mu1 * mu1, 0.0) * cnt / (cnt - 1.0);
+        v = sample_var * inv;
+    } else {
+        v = mu1 * mu1;
+    }
+    lobe_mean[slot] = m;
+    lobe_stats[slot] = vec4<f32>(cnt, mu1, mu2, v);
+}
+
+@compute @workgroup_size(8, 8)
+fn accumulate_lobes(@builtin(global_invocation_id) lid: vec3<u32>) {
+    let gid = vec3<u32>(lid.x + params.origin_x, lid.y + params.origin_y, lid.z);
+    if !in_bounds(gid) {
+        return;
+    }
+    if !in_scissor(gid) {
+        return;
+    }
+    let i = flat_index(gid);
+    fold_lobe(gid, i, LOBE_DIFFUSE);
+    fold_lobe(gid, i, LOBE_SPECULAR);
+}
+
+// ─── pass 2b: demodulate each lobe and prefilter its variance ────────────
+
+// `demodulate`, for one lobe, writing plane `lobe` of `scratch_src`.
+fn demod_lobe(gid: vec3<u32>, i: u32, lobe: u32) {
+    let n = n_pixels();
+    let slot = lobe * n + i;
+    let illum = lobe_mean[slot].rgb / lobe_demod(lobe, i);
+
+    var s = 0.0;
+    var k = 0.0;
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+        let qy = y + dy;
+        if qy < 0 || qy >= i32(params.height) {
+            continue;
+        }
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            let qx = x + dx;
+            if qx < 0 || qx >= i32(params.width) {
+                continue;
+            }
+            let q = u32(qy) * params.width + u32(qx);
+            if guide_depth(q) <= 0.0 {
+                continue;
+            }
+            let lq = lobe_demod_lum(lobe, q);
+            s = s + lobe_stats[lobe * n + q].w / (lq * lq);
+            k = k + 1.0;
+        }
+    }
+    let own_l = lobe_demod_lum(lobe, i);
+    var v = lobe_stats[slot].w / (own_l * own_l);
+    if k > 0.0 {
+        v = s / k;
+    }
+
+    if params.spatial_variance != 0u && lobe_stats[slot].x < 4.0 {
+        var s1 = 0.0;
+        var s2 = 0.0;
+        var kk = 0.0;
+        let z_p = guide_depth(i);
+        let n_p = guide_normal(i);
+        for (var dy = -3; dy <= 3; dy = dy + 1) {
+            let qy = y + dy;
+            if qy < 0 || qy >= i32(params.height) {
+                continue;
+            }
+            for (var dx = -3; dx <= 3; dx = dx + 1) {
+                let qx = x + dx;
+                if qx < 0 || qx >= i32(params.width) {
+                    continue;
+                }
+                let q = u32(qy) * params.width + u32(qx);
+                let z_q = guide_depth(q);
+                if z_q <= 0.0 {
+                    continue;
+                }
+                if abs(z_p - z_q) > 0.1 * z_p {
+                    continue;
+                }
+                if dot(n_p, guide_normal(q)) < 0.8 {
+                    continue;
+                }
+                let lq = luminance(lobe_mean[lobe * n + q].rgb / lobe_demod(lobe, q));
+                s1 = s1 + lq;
+                s2 = s2 + lq * lq;
+                kk = kk + 1.0;
+            }
+        }
+        if kk > 1.0 {
+            let mu = s1 / kk;
+            let spatial = max(s2 / kk - mu * mu, 0.0) * (4.0 - lobe_stats[slot].x);
+            v = max(spatial, 1e-8);
+        }
+    }
+
+    scratch_src[slot] = vec4<f32>(illum, v);
+}
+
+@compute @workgroup_size(8, 8)
+fn demodulate_lobes(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if !in_bounds(gid) {
+        return;
+    }
+    let i = flat_index(gid);
+    demod_lobe(gid, i, LOBE_DIFFUSE);
+    demod_lobe(gid, i, LOBE_SPECULAR);
+}
+
+// ─── pass 3b: one à-trous iteration over each lobe ───────────────────────
+
+// `atrous`, for one lobe, over plane `lobe` of the scratch pair. The
+// specular half's luminance tolerance is scaled by its roughness.
+fn atrous_lobe(gid: vec3<u32>, p: u32, lobe: u32) {
+    let n = n_pixels();
+    let slot = lobe * n + p;
+    let z_p = guide_depth(p);
+    let centre = scratch_src[slot];
+    if z_p <= 0.0 {
+        scratch_dst[slot] = centre;
+        return;
+    }
+    let count = lobe_stats[slot].x;
+    if params.iter_index >= atrous_iters_for(count) + fresh_extra_iters_for(count) {
+        scratch_dst[slot] = centre;
+        return;
+    }
+
+    let stride = i32(max(params.stride, 1u));
+    let sigma_n2 = max(params.sigma_normal, 1e-4) * max(params.sigma_normal, 1e-4);
+    var sigma_l = max(params.sigma_lum, 1e-6);
+    if lobe == LOBE_SPECULAR {
+        sigma_l = sigma_l * mix(SPEC_SIGMA_MIRROR, SPEC_SIGMA_ROUGH, guide_roughness(p));
+    }
+    let sigma_z = max(params.sigma_depth, 1e-6) * f32(stride);
+
+    let n_p = guide_normal(p);
+    let c_p = centre.xyz;
+    let l_p = luminance(c_p);
+    let l_tol = (sigma_l * sqrt(max(centre.w, 0.0)) + 1e-4) * fresh_lum_relax_for(count);
+
+    var sum = vec3<f32>(0.0);
+    var vsum = 0.0;
+    var wsum = 0.0;
+    let x = i32(gid.x);
+    let y = i32(gid.y);
+    for (var ky = 0; ky < 5; ky = ky + 1) {
+        let qy = y + (ky - 2) * stride;
+        if qy < 0 || qy >= i32(params.height) {
+            continue;
+        }
+        for (var kx = 0; kx < 5; kx = kx + 1) {
+            let qx = x + (kx - 2) * stride;
+            if qx < 0 || qx >= i32(params.width) {
+                continue;
+            }
+            let q = u32(qy) * params.width + u32(qx);
+            let z_q = guide_depth(q);
+            if z_q <= 0.0 {
+                continue;
+            }
+            let dn = n_p - guide_normal(q);
+            let w_n = exp(-dot(dn, dn) / sigma_n2);
+            let w_z = exp(-abs(z_p - z_q) / (sigma_z * z_p));
+            let tap = scratch_src[lobe * n + q];
+            let w_l = exp(-abs(l_p - luminance(tap.xyz)) / l_tol);
+            let weight = b3(kx) * b3(ky) * w_n * w_z * w_l;
+            if weight <= 0.0 {
+                continue;
+            }
+            sum = sum + tap.xyz * weight;
+            vsum = vsum + weight * weight * tap.w;
+            wsum = wsum + weight;
+        }
+    }
+    if wsum > 0.0 {
+        scratch_dst[slot] = vec4<f32>(sum / wsum, vsum / (wsum * wsum));
+    } else {
+        scratch_dst[slot] = centre;
+    }
+}
+
+@compute @workgroup_size(8, 8)
+fn atrous_lobes(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if !in_bounds(gid) {
+        return;
+    }
+    let p = flat_index(gid);
+    atrous_lobe(gid, p, LOBE_DIFFUSE);
+    atrous_lobe(gid, p, LOBE_SPECULAR);
+}
+
+// ─── pass 4b: recombine, tonemap, present ────────────────────────────────
+
+// `resolve`'s fade, for one lobe's history length.
+fn lobe_strength(count: f32) -> f32 {
+    let span = max(f32(params.count_cutoff) - 1.0, 1e-6);
+    return clamp((f32(params.count_cutoff) - count) / span, 0.0, 1.0);
+}
+
+@compute @workgroup_size(8, 8)
+fn resolve_lobes(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if !in_bounds(gid) {
+        return;
+    }
+    let i = flat_index(gid);
+    let n = n_pixels();
+    let md = lobe_mean[i];
+    let ms = lobe_mean[n + i];
+    var rgb = md.rgb + ms.rgb;
+    // The diffuse half's history length drives the second temporal pass:
+    // the specular half's is roughness-capped and says how long a
+    // reflection is trusted, not how settled the pixel is.
+    let cnt = lobe_stats[i].x;
+    var var_l = max(lobe_stats[i].w, 0.0) + max(lobe_stats[n + i].w, 0.0);
+
+    if params.iters > 0u && guide_depth(i) > 0.0 {
+        var fd: vec4<f32>;
+        var fs: vec4<f32>;
+        if params.src_is_b != 0u {
+            fd = scratch_dst[i];
+            fs = scratch_dst[n + i];
+        } else {
+            fd = scratch_src[i];
+            fs = scratch_src[n + i];
+        }
+        // diffuse * albedo + specular * specular albedo, each faded by its
+        // own history length: a rough floor's specular half is filtered long
+        // after its diffuse half has converged.
+        let sd = lobe_strength(lobe_stats[i].x);
+        let ss = lobe_strength(lobe_stats[n + i].x);
+        let d = mix(md.rgb, fd.xyz * lobe_demod(LOBE_DIFFUSE, i), sd);
+        let s = mix(ms.rgb, fs.xyz * lobe_demod(LOBE_SPECULAR, i), ss);
+        rgb = d + s;
+        let ld = lobe_demod_lum(LOBE_DIFFUSE, i);
+        let ls = lobe_demod_lum(LOBE_SPECULAR, i);
+        var_l = mix(max(lobe_stats[i].w, 0.0), max(fd.w, 0.0) * ld * ld, sd)
+            + mix(max(lobe_stats[n + i].w, 0.0), max(fs.w, 0.0) * ls * ls, ss);
+    }
+    rgb = present(i, rgb, var_l, cnt);
+
+    let mapped = linear_to_srgb(tonemap_aces(rgb * params.exposure));
+    textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(mapped, md.w));
 }

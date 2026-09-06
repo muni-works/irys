@@ -29,7 +29,7 @@
 
 use super::context::{GpuContext, GpuError};
 
-use bytemuck::Zeroable;
+use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use super::buffers::{
@@ -39,6 +39,7 @@ use super::buffers::{
 use super::history::HistoryBuffers;
 use super::pipeline::{RayTracePipeline, read_back_f32, read_back_rgba};
 use super::scene::SceneRef;
+use crate::caustics::{CausticMap, CausticPack};
 use crate::pathtrace::Film;
 
 /// Usage flags for a storage buffer this module rewrites in place.
@@ -81,6 +82,12 @@ impl Slab {
         true
     }
 }
+
+/// Planes of the depth/normal buffer in front of ReSTIR's reservoirs: the
+/// shader's own (normal, t), guide planes 1 and 2, the sample budget's
+/// selection mask, and the split denoiser's two specular guides. Mirrors
+/// `GUIDE_PLANES` in `integrator.wgsl`.
+pub(super) const GUIDE_PLANES: u32 = 6;
 
 /// Everything a pass needs that depends only on the frame size.
 struct FrameTargets {
@@ -134,11 +141,17 @@ impl FrameTargets {
             padded_bytes_per_row,
             output,
             output_view,
-            accum: mk("Resident Accumulation Buffer", per_pixel_vec4),
-            // Four planes: the shader's own (normal, t), the two guide planes
-            // a raw-sample pass fills, and the sample budget's per-pixel
-            // selection mask. See the binding's comment in `integrator.wgsl`.
-            depth_normal: mk("Resident Depth Normal Buffer", per_pixel_vec4 * 4),
+            // Three planes: the summed sample, then its diffuse and specular
+            // halves. See the binding's comment in `integrator.wgsl`.
+            accum: mk("Resident Accumulation Buffer", per_pixel_vec4 * 3),
+            // The shader's own (normal, t), the two guide planes a raw-sample
+            // pass fills, the sample budget's per-pixel selection mask, and
+            // the split denoiser's two specular guides. See the binding's
+            // comment in `integrator.wgsl`.
+            depth_normal: mk(
+                "Resident Depth Normal Buffer",
+                per_pixel_vec4 * GUIDE_PLANES as u64,
+            ),
             feature_id: mk(
                 "Resident Feature ID Buffer",
                 (width as u64) * (height as u64) * 4,
@@ -280,6 +293,210 @@ impl EnvTextures {
     }
 }
 
+/// The caustic uniform's device layout. Must match `CausticParams` in
+/// `integrator.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub(super) struct GpuCausticParams {
+    radius: f32,
+    inv_cell: f32,
+    table_size: u32,
+    enabled: u32,
+    photon_count: u32,
+    _pad: [u32; 3],
+    /// The photons' bounds grown by the radius, `.w` unused.
+    bounds_min: [f32; 4],
+    bounds_max: [f32; 4],
+}
+
+/// The photon map's bindings: the uniform at 15, the bucket table at 16 and
+/// the photons at 17. A scene without a map binds an empty one — 1x1 images
+/// and `enabled = 0` — so the layout is the same whether or not there are
+/// caustics, and the shader's guard is what decides.
+pub(super) struct CausticBinding {
+    pub(super) params: wgpu::Buffer,
+    pub(super) buckets: wgpu::TextureView,
+    pub(super) photons: wgpu::TextureView,
+}
+
+fn upload_tex_bytes(
+    ctx: &GpuContext,
+    label: &str,
+    w: u32,
+    h: u32,
+    fmt: wgpu::TextureFormat,
+    bytes_per_px: u32,
+    data: &[u8],
+) -> wgpu::TextureView {
+    let tex = ctx.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: fmt,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    ctx.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * bytes_per_px),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+impl CausticBinding {
+    /// Bind `pack`, or the empty map for `None`.
+    pub(super) fn new(ctx: &GpuContext, pack: Option<&CausticPack>) -> Self {
+        let (params, buckets, photons) = match pack.filter(|p| !p.is_empty()) {
+            Some(p) => {
+                let (bw, bh) = p.bucket_image_size();
+                let mut buckets: Vec<[u32; 2]> = p.buckets.clone();
+                buckets.resize((bw * bh) as usize, [0; 2]);
+                let (pw, ph) = p.photon_image_size();
+                let mut photons: Vec<f32> = p.photons.clone();
+                photons.resize((pw * ph * 4) as usize, 0.0);
+                (
+                    GpuCausticParams {
+                        radius: p.radius,
+                        inv_cell: p.inv_cell,
+                        table_size: p.table_size,
+                        enabled: 1,
+                        photon_count: p.photon_count,
+                        _pad: [0; 3],
+                        bounds_min: [p.bounds_min[0], p.bounds_min[1], p.bounds_min[2], 0.0],
+                        bounds_max: [p.bounds_max[0], p.bounds_max[1], p.bounds_max[2], 0.0],
+                    },
+                    upload_tex_bytes(
+                        ctx,
+                        "Caustic Buckets",
+                        bw,
+                        bh,
+                        wgpu::TextureFormat::Rg32Uint,
+                        8,
+                        bytemuck::cast_slice(&buckets),
+                    ),
+                    upload_tex_bytes(
+                        ctx,
+                        "Caustic Photons",
+                        pw,
+                        ph,
+                        wgpu::TextureFormat::Rgba32Float,
+                        16,
+                        bytemuck::cast_slice(&photons),
+                    ),
+                )
+            }
+            None => (
+                GpuCausticParams::default(),
+                upload_tex_bytes(
+                    ctx,
+                    "Caustic Buckets (unused)",
+                    1,
+                    1,
+                    wgpu::TextureFormat::Rg32Uint,
+                    8,
+                    &[0u8; 8],
+                ),
+                upload_tex_bytes(
+                    ctx,
+                    "Caustic Photons (unused)",
+                    1,
+                    1,
+                    wgpu::TextureFormat::Rgba32Float,
+                    16,
+                    &[0u8; 16],
+                ),
+            ),
+        };
+        let params = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Caustic Params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        Self {
+            params,
+            buckets,
+            photons,
+        }
+    }
+
+    /// The three layout entries, for the pipeline's bind group layout.
+    pub(super) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
+        [
+            wgpu::BindGroupLayoutEntry {
+                binding: 15,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 16,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 17,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ]
+    }
+
+    /// The three bind group entries.
+    pub(super) fn entries(&self) -> [wgpu::BindGroupEntry<'_>; 3] {
+        [
+            wgpu::BindGroupEntry {
+                binding: 15,
+                resource: self.params.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: wgpu::BindingResource::TextureView(&self.buckets),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: wgpu::BindingResource::TextureView(&self.photons),
+            },
+        ]
+    }
+}
+
 /// Pad a packed array to at least one element: WGSL cannot bind a zero-length
 /// storage array, and every one of these is indexed through a count that came
 /// from the same upload, so the filler is never read.
@@ -303,6 +520,8 @@ pub struct ResidentScene {
     materials: Slab,
     lights: Slab,
     env: EnvTextures,
+    /// The photon map, or the empty binding. See [`ResidentScene::set_caustics`].
+    caustics: CausticBinding,
     targets: FrameTargets,
     camera_buffer: wgpu::Buffer,
     render_state_buffer: wgpu::Buffer,
@@ -347,6 +566,7 @@ impl ResidentScene {
             ),
             lights: Slab::new(ctx, "Resident Area Lights", bytemuck::cast_slice(&lights)),
             env: EnvTextures::new(ctx, scene),
+            caustics: CausticBinding::new(ctx, None),
             targets: FrameTargets::new(ctx, width, height),
             camera_buffer: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Resident Camera Buffer"),
@@ -442,6 +662,22 @@ impl ResidentScene {
         self.light_count = lights.len() as u32;
     }
 
+    /// Bind a photon map — the caustic light next-event estimation cannot
+    /// find — or clear it with `None`.
+    ///
+    /// The map is [`crate::caustics::trace`]'s, packed for the device by
+    /// [`CausticPack`] and uploaded whole; the shader gathers it at every
+    /// diffuse hit exactly as [`crate::pathtrace::render_with_caustics`]
+    /// does. An empty map is the same as `None`: the shader's guard stays
+    /// off and the pass shades exactly as it did without one. Built once at
+    /// scene upload is the intended use — the map depends on the lights and
+    /// the refractive geometry, not on the camera or on anything that moves.
+    pub fn set_caustics(&mut self, ctx: &GpuContext, map: Option<&CausticMap>) {
+        let pack = map.filter(|m| !m.is_empty()).map(CausticPack::new);
+        self.caustics = CausticBinding::new(ctx, pack.as_ref());
+        self.bind_group = None;
+    }
+
     /// Reallocate the frame-sized targets for a new resolution.
     ///
     /// A no-op at the current size, so it is safe to call every frame.
@@ -462,8 +698,8 @@ impl ResidentScene {
 
     /// Grow `depth_normal` to carry ReSTIR's four reservoir slots.
     ///
-    /// Twelve planes above the four the denoiser's guides and the sample
-    /// budget's selection mask use — 192 bytes a pixel — allocated the first
+    /// Twelve planes above the [`GUIDE_PLANES`] the denoiser's guides and the
+    /// sample budget's selection mask use — 192 bytes a pixel — allocated the first
     /// time a pass asks for reservoirs and never for a scene that does not. They ride in this buffer rather than in storage
     /// buffers of their own because the shader already binds all ten a browser
     /// guarantees; see the `ReSTIR DI` block in `integrator.wgsl`.
@@ -474,7 +710,7 @@ impl ResidentScene {
         let per_pixel_vec4 = (self.targets.width as u64) * (self.targets.height as u64) * 16;
         self.targets.depth_normal = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Resident Depth Normal Buffer (+ ReSTIR reservoirs)"),
-            size: per_pixel_vec4 * 16,
+            size: per_pixel_vec4 * (GUIDE_PLANES as u64 + 12),
             usage: STORAGE_RW.union(wgpu::BufferUsages::COPY_SRC),
             mapped_at_creation: false,
         });
@@ -501,8 +737,9 @@ impl ResidentScene {
         self.history.as_mut()
     }
 
-    /// The buffers a raw-sample pass wrote: this pass's own linear sample, and
-    /// the three-plane depth/normal buffer whose planes 1 and 2 are the guides.
+    /// The buffers a raw-sample pass wrote: this pass's own linear sample
+    /// (three planes: summed, diffuse, specular), and the depth/normal buffer
+    /// whose planes 1, 2, 4 and 5 are the guides.
     pub(super) fn raw_and_guide_buffers(&self) -> (&wgpu::Buffer, &wgpu::Buffer) {
         (&self.targets.accum, &self.targets.depth_normal)
     }
@@ -585,6 +822,7 @@ impl ResidentScene {
             },
         ]
         .into_iter()
+        .chain(self.caustics.entries())
         .chain(
             self.geometry
                 .iter()
