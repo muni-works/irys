@@ -37,6 +37,7 @@ pub mod math;
 pub mod neural;
 pub mod optics;
 pub mod pathtrace;
+pub mod sampler;
 pub mod splats;
 mod ray;
 pub mod spectrum;

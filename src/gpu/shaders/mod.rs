@@ -22,6 +22,29 @@ pub const ENV_SHADER: &str = include_str!("env.wgsl");
 /// See [`super::analytic`].
 pub const ANALYTIC_SHADER: &str = include_str!("analytic.wgsl");
 
+/// The sample pattern: the blue-noise sampler's functions, minus the mask.
+/// Not valid WGSL on its own — [`sampler_shader`] splices the mask in.
+pub const SAMPLER_SHADER_BODY: &str = include_str!("sampler.wgsl");
+
+/// The sample pattern module, whole: the blue-noise mask as a `const` array
+/// and the functions that read it. See [`crate::sampler`].
+pub fn sampler_shader() -> String {
+    use std::fmt::Write;
+    let mask = crate::sampler::MASK;
+    let words = mask.len() / 4;
+    let mut out = String::with_capacity(words * 12 + SAMPLER_SHADER_BODY.len() + 128);
+    write!(out, "const BLUE_NOISE_MASK: array<u32, {words}> = array<u32, {words}>(").unwrap();
+    for (i, w) in mask.chunks_exact(4).enumerate() {
+        if i % 8 == 0 {
+            out.push('\n');
+        }
+        write!(out, "{:#010x}u,", u32::from_le_bytes([w[0], w[1], w[2], w[3]])).unwrap();
+    }
+    out.push_str("\n);\n");
+    out.push_str(SAMPLER_SHADER_BODY);
+    out
+}
+
 /// The integrator. Not valid WGSL on its own — see [`compose`].
 pub const INTEGRATOR_SHADER: &str = include_str!("integrator.wgsl");
 
@@ -62,5 +85,8 @@ pub fn compose_with(client_wgsl: &str, body: &str) -> String {
 /// The full trace shader: BSDF, prelude, the client's geometry module, the
 /// environment, then the integrator.
 pub fn trace_shader(geometry_wgsl: &str) -> String {
-    format!("{BSDF_SHADER}\n{PRELUDE_SHADER}\n{geometry_wgsl}\n{ENV_SHADER}\n{INTEGRATOR_SHADER}")
+    format!(
+        "{BSDF_SHADER}\n{PRELUDE_SHADER}\n{}\n{geometry_wgsl}\n{ENV_SHADER}\n{INTEGRATOR_SHADER}",
+        sampler_shader()
+    )
 }

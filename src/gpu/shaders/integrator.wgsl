@@ -162,6 +162,13 @@ const FLAG_CAMERA_VISIBLE_LIGHTS: u32 = 2u;
 // guide planes. Bits 8..11: which round this dispatch is.
 const FLAG_BUDGET_MASK: u32 = 4u;
 const FLAG_BUDGET_GUIDES: u32 = 8u;
+// Bit 4: draw the path's random numbers from the blue-noise pattern
+// (`sampler.wgsl`) instead of the white-noise hash.
+const FLAG_BLUE_NOISE: u32 = 16u;
+
+fn blue_noise_mode() -> bool {
+    return (render_state.raw_sample & FLAG_BLUE_NOISE) != 0u;
+}
 const BUDGET_ROUND_SHIFT: u32 = 8u;
 
 fn raw_sample_mode() -> bool {
@@ -237,6 +244,15 @@ fn ray_origin_and_direction_offset(pixel: vec2<u32>, offset: vec2<f32>) -> mat2x
 }
 
 // Ray generation using the Halton-sequence jitter from render_state (main pass).
+//
+// The jitter stays the host's one-per-frame Halton pair under the blue-noise
+// pattern too, and deliberately: `history.wgsl`'s reprojection rebuilds a
+// pixel's world point from the *centre* ray at the guide depth, so a jitter
+// that differs pixel to pixel puts a grazing pixel's point off its own
+// surface by more than the depth gate allows, and its history is dropped
+// every frame. Two horizon pixels in the budget's starvation test did exactly
+// that. Dimensions 0 and 1 of the pattern are reserved for the jitter all
+// the same, against the day the reprojection carries the jitter.
 fn ray_origin_and_direction(pixel: vec2<u32>) -> mat2x3<f32> {
     let jitter = vec2<f32>(render_state.jitter_x, render_state.jitter_y);
     return ray_origin_and_direction_offset(pixel, jitter);
@@ -380,12 +396,18 @@ fn in_shadow(p: vec3<f32>, light_dir: vec3<f32>, max_t: f32) -> bool {
 // PCG hash → uniform [0, 1) noise. Per-pixel + per-frame seed so the noise
 // decorrelates across pixels (prevents banding) and animates per frame
 // (so progressive accumulation averages out).
+//
+// `sample_idx` is a salt: which draw along the path this is. Under
+// FLAG_BLUE_NOISE it is the *dimension* of the low-discrepancy pattern —
+// every distinct salt is its own scrambled Sobol dimension, the pairs a
+// `rand_uniform2` draws are proper (0, 2)-sequences, and the per-pixel
+// blue-noise shift moves the frame's error to high frequencies. Salts 0 and
+// 1 are reserved for the pixel jitter; nothing else may use them.
 fn rand_uniform(pixel: vec2<u32>, sample_idx: u32) -> f32 {
-    var state = pixel.x * 1973u + pixel.y * 9277u + sample_idx * 26699u + render_state.frame_index * 12345u + 1u;
-    state = state * 747796405u + 2891336453u;
-    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    let r = (word >> 22u) ^ word;
-    return f32(r) / 4294967296.0;
+    if blue_noise_mode() {
+        return blue_noise_sample(pixel, render_state.frame_index, sample_idx);
+    }
+    return white_noise_sample(pixel, render_state.frame_index, sample_idx);
 }
 
 fn rand_uniform2(pixel: vec2<u32>, sample_idx: u32) -> vec2<f32> {
