@@ -152,6 +152,121 @@ struct GpuAreaLight {
 // Written at frame 1; read at frame 2+ by detect_edge_sobel.
 @group(0) @binding(12) var<storage, read_write> feature_id_buffer: array<u32>;
 
+// ─── caustics: the photon map, gathered ───────────────────────────────────
+//
+// The light next-event estimation cannot find — the sun through a refracting
+// solid — arrives here as a photon map built on the CPU by
+// `kosm_render::caustics` and packed by `CausticPack`. Two textures rather
+// than storage buffers: bindings 1..=12 already spend the ten storage
+// buffers a browser guarantees, so the map rides in sampled textures the way
+// the environment does.
+//
+// `caustic_photons` holds three `rgba32float` texels per photon — position,
+// normal, power — sorted by the hash bucket of the photon's cell.
+// `caustic_buckets` is one `rg32uint` texel per bucket: where that bucket's
+// run starts in the photon image, and how long it is. Both images are
+// `CAUSTIC_PACK_WIDTH` texels wide.
+//
+// `enabled` is zero for a scene without a map, and then nothing below runs:
+// the path is the one it was before caustics existed, to the bit.
+
+struct CausticParams {
+    // Gather radius in scene units; the cell size too.
+    radius: f32,
+    inv_cell: f32,
+    // Bucket count, a power of two.
+    table_size: u32,
+    // Non-zero when a map is bound.
+    enabled: u32,
+    photon_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    // The photons' bounding box grown by the radius; a point outside it
+    // gathers nothing, and the walk below is skipped. `.w` unused.
+    bounds_min: vec4<f32>,
+    bounds_max: vec4<f32>,
+}
+
+@group(0) @binding(15) var<uniform> caustics: CausticParams;
+@group(0) @binding(16) var caustic_buckets: texture_2d<u32>;
+@group(0) @binding(17) var caustic_photons: texture_2d<f32>;
+
+// Mirrors `caustics::PACK_WIDTH`.
+const CAUSTIC_PACK_WIDTH: u32 = 4096u;
+
+// Mirrors `caustics::cell_bucket`: Teschner's three primes over the cell's
+// integer coordinates, wrapping, masked to the table.
+fn caustic_bucket(c: vec3<i32>) -> u32 {
+    let h = (bitcast<u32>(c.x) * 73856093u)
+        ^ (bitcast<u32>(c.y) * 19349663u)
+        ^ (bitcast<u32>(c.z) * 83492791u);
+    return h & (caustics.table_size - 1u);
+}
+
+fn caustic_texel(i: u32) -> vec2<i32> {
+    return vec2<i32>(i32(i % CAUSTIC_PACK_WIDTH), i32(i / CAUSTIC_PACK_WIDTH));
+}
+
+// Irradiance at `p` on a surface with normal `n`, by density estimation over
+// the gather disc — `CausticMap::irradiance`, texel for texel: the constant
+// kernel, the 27 cells around the point, the radius test, and the 25° normal
+// test that keeps a caustic on the floor off the underside of the step next
+// to it.
+//
+// Two cells may hash to one bucket. Walking that bucket twice would count
+// its photons twice, so the buckets already walked are remembered and a
+// repeat is skipped — which is the only way this differs from a hash map
+// keyed on the exact cell.
+fn caustic_irradiance(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    if any(p < caustics.bounds_min.xyz) || any(p > caustics.bounds_max.xyz) {
+        return vec3<f32>(0.0);
+    }
+    let r2 = caustics.radius * caustics.radius;
+    let c = vec3<i32>(floor(p * caustics.inv_cell));
+    let bucket_w = min(caustics.table_size, CAUSTIC_PACK_WIDTH);
+    var seen: array<u32, 27>;
+    var n_seen = 0u;
+    var sum = vec3<f32>(0.0);
+    for (var dz = -1; dz <= 1; dz++) {
+        for (var dy = -1; dy <= 1; dy++) {
+            for (var dx = -1; dx <= 1; dx++) {
+                let b = caustic_bucket(c + vec3<i32>(dx, dy, dz));
+                var dup = false;
+                for (var k = 0u; k < n_seen; k++) {
+                    if seen[k] == b {
+                        dup = true;
+                        break;
+                    }
+                }
+                if dup {
+                    continue;
+                }
+                seen[n_seen] = b;
+                n_seen++;
+                let run = textureLoad(
+                    caustic_buckets,
+                    vec2<i32>(i32(b % bucket_w), i32(b / bucket_w)),
+                    0,
+                ).xy;
+                for (var i = run.x; i < run.x + run.y; i++) {
+                    let base = i * 3u;
+                    let d = textureLoad(caustic_photons, caustic_texel(base), 0).xyz - p;
+                    if dot(d, d) > r2 {
+                        continue;
+                    }
+                    let pn = textureLoad(caustic_photons, caustic_texel(base + 1u), 0).xyz;
+                    if dot(pn, n) < 0.9 {
+                        continue;
+                    }
+                    sum += textureLoad(caustic_photons, caustic_texel(base + 2u), 0).xyz;
+                }
+            }
+        }
+    }
+    return sum / (PI * r2);
+}
+
 // Helper functions for buffer indexing (2D coords to 1D index)
 // Bit 0 of the flag word: this pass writes its own raw sample.
 const FLAG_RAW_SAMPLE: u32 = 1u;
@@ -1756,6 +1871,23 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
             direct = min(direct, vec3<f32>(render_state.firefly_clamp));
         }
         l += throughput * direct;
+
+        // The caustic map's share: light that arrived here by refraction
+        // through a solid, which next-event estimation could not have found
+        // and which the shadow rays above therefore did not count. Outside
+        // the firefly clamp, as on the CPU — it is a density estimate with
+        // no long tail, and clamping it is indistinguishable from deleting
+        // the caustic. Guarded on `enabled` first so a scene without a map
+        // shades exactly as it did.
+        if caustics.enabled != 0u && surf.material.transmission <= 0.0 {
+            let rho = mat_diffuse_albedo(surf.material);
+            if max(max(rho.x, rho.y), rho.z) > 0.0 {
+                let e = caustic_irradiance(surf.point, n);
+                if max(max(e.x, e.y), e.z) > 0.0 {
+                    l += throughput * (rho * e * (1.0 / PI));
+                }
+            }
+        }
 
         // Continue the path.
         let r_lobe = rand_uniform(pixel, 211u + depth * 23u);

@@ -450,3 +450,195 @@ fn emit_from_sun(
 pub(crate) fn is_caustic_refractor(m: &Pbr) -> bool {
     m.transmission > 0.0 && !m.thin_walled
 }
+
+// ─── the device layout ─────────────────────────────────────────────────────
+
+/// Photons per texture row in [`CausticPack`]. Every WebGPU device allows a
+/// 2D texture at least 8192 wide; 4096 leaves the same headroom in height.
+pub const PACK_WIDTH: u32 = 4096;
+
+/// Texels one packed photon occupies: position, normal, power.
+pub const PACK_TEXELS_PER_PHOTON: u32 = 3;
+
+/// The map, re-laid for a shader: photons sorted by the hash of their cell,
+/// and a bucket table of `(start, count)` into that order.
+///
+/// The CPU map keys a `HashMap` by the exact cell. A device has no hash map,
+/// so the cell's key is hashed into a power-of-two table and the photons are
+/// sorted by that bucket. Two cells may share a bucket; that costs the
+/// gather a few extra distance tests and changes nothing about its answer,
+/// because every photon is still tested against the radius before it counts
+/// — exactly as in [`CausticMap::irradiance`]. The one hazard, two of the
+/// twenty-seven cells around a shading point sharing a bucket and so being
+/// walked twice, is the shader's to avoid; it remembers the buckets it has
+/// visited.
+///
+/// The layout is what the textures the GPU tier binds want: the bucket table
+/// as one `(start, count)` pair per texel of an `Rg32Uint` image, the photons
+/// as three `Rgba32Float` texels each. Both images are [`PACK_WIDTH`] texels
+/// wide and as tall as they need to be.
+#[derive(Debug, Clone)]
+pub struct CausticPack {
+    /// The gather radius, in scene units.
+    pub radius: f32,
+    /// `1 / radius`: the cell size is the radius, as on the CPU.
+    pub inv_cell: f32,
+    /// Bucket count, a power of two.
+    pub table_size: u32,
+    /// `(start, count)` per bucket, `table_size` of them.
+    pub buckets: Vec<[u32; 2]>,
+    /// Photons in bucket order: `position.xyz, 0`, `normal.xyz, 0`,
+    /// `power.rgb, 0` — twelve floats each.
+    pub photons: Vec<f32>,
+    /// How many photons `photons` holds.
+    pub photon_count: u32,
+    /// The photons' bounding box, grown by the radius on every side: a
+    /// point outside it gathers nothing, and the shader says so without
+    /// walking a bucket.
+    pub bounds_min: [f32; 3],
+    pub bounds_max: [f32; 3],
+}
+
+/// The bucket a cell hashes to. Mirrors `caustic_bucket` in
+/// `integrator.wgsl`: the three primes are Teschner's, and the arithmetic is
+/// wrapping `u32`, which is what WGSL's is.
+pub fn cell_bucket(cell: [i32; 3], table_size: u32) -> u32 {
+    let h = (cell[0] as u32)
+        .wrapping_mul(73_856_093)
+        ^ (cell[1] as u32).wrapping_mul(19_349_663)
+        ^ (cell[2] as u32).wrapping_mul(83_492_791);
+    h & (table_size - 1)
+}
+
+impl CausticPack {
+    /// Lay `map` out for the device.
+    ///
+    /// The table has at least twice as many buckets as occupied cells (and
+    /// never fewer than sixteen), so a bucket is usually one cell.
+    pub fn new(map: &CausticMap) -> Self {
+        let radius = map.radius as f32;
+        let inv_cell = 1.0 / radius;
+        let occupied = map.cells.len().max(1);
+        let table_size = (occupied * 2).next_power_of_two().max(16) as u32;
+
+        // Bucket each photon by the cell the CPU map put it in — the same
+        // `floor(p / r)` in f64 — so the two tiers agree on which photons
+        // live where, whatever f32 makes of a point on a cell boundary.
+        let mut keyed: Vec<(u32, u32)> = Vec::with_capacity(map.photons.len());
+        for (key, list) in &map.cells {
+            let cell = [key[0] as i32, key[1] as i32, key[2] as i32];
+            let b = cell_bucket(cell, table_size);
+            keyed.extend(list.iter().map(|&i| (b, i)));
+        }
+        keyed.sort_unstable();
+
+        let mut buckets = vec![[0u32; 2]; table_size as usize];
+        let mut photons = Vec::with_capacity(keyed.len() * 12);
+        for (slot, &(b, i)) in keyed.iter().enumerate() {
+            let entry = &mut buckets[b as usize];
+            if entry[1] == 0 {
+                entry[0] = slot as u32;
+            }
+            entry[1] += 1;
+            let ph = &map.photons[i as usize];
+            photons.extend_from_slice(&[
+                ph.point.x as f32,
+                ph.point.y as f32,
+                ph.point.z as f32,
+                0.0,
+                ph.normal.x as f32,
+                ph.normal.y as f32,
+                ph.normal.z as f32,
+                0.0,
+                ph.power[0],
+                ph.power[1],
+                ph.power[2],
+                0.0,
+            ]);
+        }
+        let mut bounds_min = [f32::INFINITY; 3];
+        let mut bounds_max = [f32::NEG_INFINITY; 3];
+        for ph in photons.chunks_exact(12) {
+            for k in 0..3 {
+                bounds_min[k] = bounds_min[k].min(ph[k] - radius);
+                bounds_max[k] = bounds_max[k].max(ph[k] + radius);
+            }
+        }
+        Self {
+            radius,
+            inv_cell,
+            table_size,
+            buckets,
+            photons,
+            photon_count: keyed.len() as u32,
+            bounds_min,
+            bounds_max,
+        }
+    }
+
+    /// Whether there is anything to gather.
+    pub fn is_empty(&self) -> bool {
+        self.photon_count == 0
+    }
+
+    /// The bucket image's size in texels.
+    pub fn bucket_image_size(&self) -> (u32, u32) {
+        let w = self.table_size.min(PACK_WIDTH);
+        (w, self.table_size.div_ceil(w))
+    }
+
+    /// The photon image's size in texels.
+    pub fn photon_image_size(&self) -> (u32, u32) {
+        let texels = (self.photon_count * PACK_TEXELS_PER_PHOTON).max(1);
+        (PACK_WIDTH, texels.div_ceil(PACK_WIDTH))
+    }
+
+    /// Irradiance at `p`, gathered exactly the way the shader does it — over
+    /// the twenty-seven buckets around the point's cell, each visited once,
+    /// every photon tested against the radius and the normal. The CPU map's
+    /// [`CausticMap::irradiance`] and this must agree; a test holds them to it.
+    pub fn irradiance(&self, p: [f32; 3], n: [f32; 3]) -> [f32; 3] {
+        if self.is_empty() {
+            return [0.0; 3];
+        }
+        if (0..3).any(|k| p[k] < self.bounds_min[k] || p[k] > self.bounds_max[k]) {
+            return [0.0; 3];
+        }
+        let r2 = self.radius * self.radius;
+        let c = [
+            (p[0] * self.inv_cell).floor() as i32,
+            (p[1] * self.inv_cell).floor() as i32,
+            (p[2] * self.inv_cell).floor() as i32,
+        ];
+        let mut seen: Vec<u32> = Vec::with_capacity(27);
+        let mut sum = [0.0f32; 3];
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let b = cell_bucket([c[0] + dx, c[1] + dy, c[2] + dz], self.table_size);
+                    if seen.contains(&b) {
+                        continue;
+                    }
+                    seen.push(b);
+                    let [start, count] = self.buckets[b as usize];
+                    for i in start..start + count {
+                        let base = (i * 12) as usize;
+                        let ph = &self.photons[base..base + 12];
+                        let d = [ph[0] - p[0], ph[1] - p[1], ph[2] - p[2]];
+                        if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > r2 {
+                            continue;
+                        }
+                        if ph[4] * n[0] + ph[5] * n[1] + ph[6] * n[2] < 0.9 {
+                            continue;
+                        }
+                        sum[0] += ph[8];
+                        sum[1] += ph[9];
+                        sum[2] += ph[10];
+                    }
+                }
+            }
+        }
+        let area = std::f32::consts::PI * r2;
+        [sum[0] / area, sum[1] / area, sum[2] / area]
+    }
+}
