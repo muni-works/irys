@@ -19,10 +19,15 @@ struct Camera {
     position: vec4<f32>,
     look_at: vec4<f32>,
     up: vec4<f32>,
+    // World direction mapping to screen +x. Only read when basis_mode == 1.
+    right: vec4<f32>,
     fov: f32,
     width: u32,
     height: u32,
-    _pad: u32,
+    // 0 = derive the basis right-handedly from `up` (the viewport default),
+    // 1 = use `right`/`up` verbatim, so a MIRRORED (left-handed) basis
+    //     survives the trip and an offline render does not flip left-for-right.
+    basis_mode: u32,
 }
 
 struct RenderState {
@@ -104,6 +109,18 @@ struct RenderState {
     // Previous camera target in .xyz, its vertical fov in radians in .w.
     prev_cam_look_at: vec4<f32>,
     prev_cam_up: vec4<f32>,
+    // Extra RNG decorrelation term; 0 reproduces the pre-seed noise exactly.
+    seed: u32,
+    // What a camera ray that hits nothing returns.
+    //   0 = `sky_color`, the themed viewport backdrop (default).
+    //   1 = `env_radiance`, the same sky the integrator lights with — what
+    //       the CPU renderer shows with `show_background`.
+    //   2 = black with zero coverage, the CPU's `show_background == false`.
+    background_mode: u32,
+    _pad_bg: vec2<u32>,
+    // The previous pass's screen +x in .xyz and its basis_mode in .w, so
+    // reprojection rebuilds the same — possibly mirrored — basis.
+    prev_cam_right: vec4<f32>,
 }
 
 // A rectangular area light. Layout must match GpuAreaLight in buffers.rs,
@@ -369,6 +386,25 @@ fn pixel_index_i32(coord: vec2<i32>) -> u32 {
 
 // Utility functions
 
+// The camera's screen basis, as columns (right, up, forward).
+//
+// In derived mode (basis_mode == 0) `right` is reconstructed right-handedly
+// from the up hint, which is what the viewport wants. In explicit mode the
+// supplied axes are used as given: a projection basis can be MIRRORED, and
+// re-deriving it would flip the render left-for-right.
+fn camera_basis() -> mat3x3<f32> {
+    let forward = normalize(camera.look_at.xyz - camera.position.xyz);
+    if camera.basis_mode == 1u {
+        return mat3x3<f32>(
+            normalize(camera.right.xyz),
+            normalize(camera.up.xyz),
+            forward,
+        );
+    }
+    let r = normalize(cross(forward, camera.up.xyz));
+    return mat3x3<f32>(r, cross(r, forward), forward);
+}
+
 // Core ray generation with an explicit sub-pixel offset.
 // offset is in pixels, typically in [-0.5, 0.5].
 fn ray_origin_and_direction_offset(pixel: vec2<u32>, offset: vec2<f32>) -> mat2x3<f32> {
@@ -382,9 +418,10 @@ fn ray_origin_and_direction_offset(pixel: vec2<u32>, offset: vec2<f32>) -> mat2x
     );
 
     // Build camera coordinate system
-    let forward = normalize(camera.look_at.xyz - camera.position.xyz);
-    let right = normalize(cross(forward, camera.up.xyz));
-    let up = cross(right, forward);
+    let basis = camera_basis();
+    let right = basis[0];
+    let up = basis[1];
+    let forward = basis[2];
 
     // Compute ray direction
     let dir = normalize(
@@ -556,11 +593,18 @@ fn in_shadow(p: vec3<f32>, light_dir: vec3<f32>, max_t: f32) -> bool {
 // `rand_uniform2` draws are proper (0, 2)-sequences, and the per-pixel
 // blue-noise shift moves the frame's error to high frequencies. Salts 0 and
 // 1 are reserved for the pixel jitter; nothing else may use them.
+// The RNG decorrelation term. `render_state.seed` is 0 in the viewport, which
+// makes this 0 and reproduces every earlier sequence bit for bit; an offline
+// render sets it to get a different but still reproducible estimate.
+fn sample_salt() -> u32 {
+    return render_state.seed * 2654435761u;
+}
+
 fn rand_uniform(pixel: vec2<u32>, sample_idx: u32) -> f32 {
     if blue_noise_mode() {
-        return blue_noise_sample(pixel, render_state.frame_index, sample_idx);
+        return blue_noise_sample(pixel, render_state.frame_index, sample_idx, sample_salt());
     }
-    return white_noise_sample(pixel, render_state.frame_index, sample_idx);
+    return white_noise_sample(pixel, render_state.frame_index, sample_idx, sample_salt());
 }
 
 fn rand_uniform2(pixel: vec2<u32>, sample_idx: u32) -> vec2<f32> {
@@ -621,9 +665,10 @@ fn world_pos_from_depth(pixel: vec2<u32>, t: f32) -> vec3<f32> {
         (f32(pixel.x) + 0.5) / f32(camera.width)  * 2.0 - 1.0,
         1.0 - (f32(pixel.y) + 0.5) / f32(camera.height) * 2.0
     );
-    let forward = normalize(camera.look_at.xyz - camera.position.xyz);
-    let right   = normalize(cross(forward, camera.up.xyz));
-    let up_cam  = cross(right, forward);
+    let basis   = camera_basis();
+    let right   = basis[0];
+    let up_cam  = basis[1];
+    let forward = basis[2];
     let dir = normalize(forward + right * ndc.x * fov_tan * aspect + up_cam * ndc.y * fov_tan);
     return camera.position.xyz + dir * t;
 }
@@ -631,9 +676,10 @@ fn world_pos_from_depth(pixel: vec2<u32>, t: f32) -> vec3<f32> {
 // Project a world-space point onto the screen. Returns pixel coords, or
 // (-1, -1) when the point is behind the camera or outside the viewport.
 fn world_to_screen_coords(world_pos: vec3<f32>) -> vec2<i32> {
-    let forward = normalize(camera.look_at.xyz - camera.position.xyz);
-    let right   = normalize(cross(forward, camera.up.xyz));
-    let up_cam  = cross(right, forward);
+    let basis   = camera_basis();
+    let right   = basis[0];
+    let up_cam  = basis[1];
+    let forward = basis[2];
     let fov_tan = tan(camera.fov * 0.5);
     let aspect  = f32(camera.width) / f32(camera.height);
     let p       = world_pos - camera.position.xyz;
@@ -1479,8 +1525,12 @@ fn restir_prev_screen(world_pos: vec3<f32>) -> vec2<i32> {
     }
     let eye = render_state.prev_cam_position.xyz;
     let forward = normalize(render_state.prev_cam_look_at.xyz - eye);
-    let right = normalize(cross(forward, render_state.prev_cam_up.xyz));
-    let up_cam = cross(right, forward);
+    var right = normalize(cross(forward, render_state.prev_cam_up.xyz));
+    var up_cam = cross(right, forward);
+    if render_state.prev_cam_right.w == 1.0 {
+        right = normalize(render_state.prev_cam_right.xyz);
+        up_cam = normalize(render_state.prev_cam_up.xyz);
+    }
     let fov_tan = tan(render_state.prev_cam_look_at.w * 0.5);
     let aspect = f32(camera.width) / f32(camera.height);
     let d = world_pos - eye;
@@ -2084,8 +2134,23 @@ fn shade(hit: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>) -> ve
                 return vec4<f32>(lights[lh.index].emission.rgb, 1.0);
             }
         }
+        // An offline render asks for the lighting environment instead: that
+        // is what the CPU renderer shows behind the subject, and compositing
+        // a different backdrop in afterwards is impossible once the two have
+        // been averaged together inside a partially-covered edge pixel.
+        if render_state.background_mode == 1u {
+            let e = env_radiance(dir);
+            g_lobe_diffuse = e;
+            return vec4<f32>(e, 0.0);
+        }
+        // Mode 2 is the CPU's `show_background == false`: leave the backdrop
+        // black so an RGBA render composites onto any page.
+        if render_state.background_mode == 2u {
+            g_lobe_diffuse = vec3<f32>(0.0);
+            return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        }
         // Draw the themed backdrop rather than the lighting environment — the
-        // backdrop is a viewport choice, and `vcad-render` composites its own.
+        // backdrop is a viewport choice, and a client composites its own.
         g_lobe_diffuse = sky_color(dir);
         return vec4<f32>(sky_color(dir), 0.0);
     }
@@ -2634,7 +2699,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // The refine pass may update this for edge pixels. A raw-sample pass keeps
     // `shade`'s coverage instead: nothing is going to average it, and the host
     // reading the buffer back wants the same alpha the CPU `Film` carries.
-    if !raw_sample_mode() {
+    // Written ONLY when refinement is enabled — with it off nothing reads the
+    // marker, and clobbering alpha throws away the integrator's coverage
+    // estimate, which is what an offline RGBA render turns into transparency.
+    if !raw_sample_mode() && render_state.refine_sample_count > 0u {
         accumulated.a = 1.0;
     }
 

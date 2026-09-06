@@ -27,8 +27,8 @@ fn parity(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let k = keys[i];
     out[i] = vec2<f32>(
-        blue_noise_sample(k.xy, k.z, k.w),
-        white_noise_sample(k.xy, k.z, k.w),
+        blue_noise_sample(k.xy, k.z, k.w, 0u),
+        white_noise_sample(k.xy, k.z, k.w, 0u),
     );
 }
 "#;

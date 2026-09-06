@@ -852,7 +852,7 @@ impl RayTracePipeline {
 
     /// Encode one pass over a resident scene into `encoder`, writing into
     /// `output`. Shared by both entry points.
-    fn encode_resident(
+    pub(super) fn encode_resident(
         &self,
         ctx: &GpuContext,
         res: &mut ResidentScene,
@@ -874,6 +874,15 @@ impl RayTracePipeline {
                     state.prev_cam_look_at =
                         [prev.target[0], prev.target[1], prev.target[2], prev.fov];
                     state.prev_cam_up = [prev.up[0], prev.up[1], prev.up[2], 0.0];
+                    // The basis mode travels with the axes: a mirrored camera
+                    // must reproject through the same mirrored basis it was
+                    // rendered from, not a re-derived right-handed one.
+                    state.prev_cam_right = [
+                        prev.right[0],
+                        prev.right[1],
+                        prev.right[2],
+                        prev.basis_mode as f32,
+                    ];
                 }
                 None => {
                     state.prev_cam_position = [0.0; 4];
