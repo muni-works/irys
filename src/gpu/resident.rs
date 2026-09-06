@@ -83,6 +83,12 @@ impl Slab {
     }
 }
 
+/// Planes of the depth/normal buffer in front of ReSTIR's reservoirs: the
+/// shader's own (normal, t), guide planes 1 and 2, the sample budget's
+/// selection mask, and the split denoiser's two specular guides. Mirrors
+/// `GUIDE_PLANES` in `integrator.wgsl`.
+pub(super) const GUIDE_PLANES: u32 = 6;
+
 /// Everything a pass needs that depends only on the frame size.
 struct FrameTargets {
     width: u32,
@@ -135,11 +141,17 @@ impl FrameTargets {
             padded_bytes_per_row,
             output,
             output_view,
-            accum: mk("Resident Accumulation Buffer", per_pixel_vec4),
-            // Four planes: the shader's own (normal, t), the two guide planes
-            // a raw-sample pass fills, and the sample budget's per-pixel
-            // selection mask. See the binding's comment in `integrator.wgsl`.
-            depth_normal: mk("Resident Depth Normal Buffer", per_pixel_vec4 * 4),
+            // Three planes: the summed sample, then its diffuse and specular
+            // halves. See the binding's comment in `integrator.wgsl`.
+            accum: mk("Resident Accumulation Buffer", per_pixel_vec4 * 3),
+            // The shader's own (normal, t), the two guide planes a raw-sample
+            // pass fills, the sample budget's per-pixel selection mask, and
+            // the split denoiser's two specular guides. See the binding's
+            // comment in `integrator.wgsl`.
+            depth_normal: mk(
+                "Resident Depth Normal Buffer",
+                per_pixel_vec4 * GUIDE_PLANES as u64,
+            ),
             feature_id: mk(
                 "Resident Feature ID Buffer",
                 (width as u64) * (height as u64) * 4,
@@ -686,8 +698,8 @@ impl ResidentScene {
 
     /// Grow `depth_normal` to carry ReSTIR's four reservoir slots.
     ///
-    /// Twelve planes above the four the denoiser's guides and the sample
-    /// budget's selection mask use — 192 bytes a pixel — allocated the first
+    /// Twelve planes above the [`GUIDE_PLANES`] the denoiser's guides and the
+    /// sample budget's selection mask use — 192 bytes a pixel — allocated the first
     /// time a pass asks for reservoirs and never for a scene that does not. They ride in this buffer rather than in storage
     /// buffers of their own because the shader already binds all ten a browser
     /// guarantees; see the `ReSTIR DI` block in `integrator.wgsl`.
@@ -698,7 +710,7 @@ impl ResidentScene {
         let per_pixel_vec4 = (self.targets.width as u64) * (self.targets.height as u64) * 16;
         self.targets.depth_normal = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Resident Depth Normal Buffer (+ ReSTIR reservoirs)"),
-            size: per_pixel_vec4 * 16,
+            size: per_pixel_vec4 * (GUIDE_PLANES as u64 + 12),
             usage: STORAGE_RW.union(wgpu::BufferUsages::COPY_SRC),
             mapped_at_creation: false,
         });
@@ -725,8 +737,9 @@ impl ResidentScene {
         self.history.as_mut()
     }
 
-    /// The buffers a raw-sample pass wrote: this pass's own linear sample, and
-    /// the three-plane depth/normal buffer whose planes 1 and 2 are the guides.
+    /// The buffers a raw-sample pass wrote: this pass's own linear sample
+    /// (three planes: summed, diffuse, specular), and the depth/normal buffer
+    /// whose planes 1, 2, 4 and 5 are the guides.
     pub(super) fn raw_and_guide_buffers(&self) -> (&wgpu::Buffer, &wgpu::Buffer) {
         (&self.targets.accum, &self.targets.depth_normal)
     }

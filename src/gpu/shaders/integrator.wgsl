@@ -127,6 +127,18 @@ struct GpuAreaLight {
 
 @group(0) @binding(6) var output: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(7) var<uniform> render_state: RenderState;
+// Three vec4 planes of width*height each:
+//   [0 .. n)      the accumulated (or, in raw-sample mode, this pass's own)
+//                 linear radiance and coverage — the summed buffer every
+//                 existing reader keeps reading.
+//   [n .. 2n)     raw-sample mode only: the part of that sample that left the
+//                 primary hit through a *diffuse* lobe, plus everything a
+//                 camera ray sees directly (emitters, the sky).
+//   [2n .. 3n)    raw-sample mode only: the part that left through a
+//                 *specular* lobe — the base specular, the coat, the
+//                 dielectric lobe reflected or transmitted.
+// The two lobe planes sum to the first to the float; the split denoiser in
+// `history.wgsl` filters them separately.
 @group(0) @binding(8) var<storage, read_write> accum_buffer: array<vec4<f32>>;
 @group(0) @binding(9) var<storage, read> materials: array<GpuMaterial>;
 // Three vec4 planes of width*height each:
@@ -134,8 +146,16 @@ struct GpuAreaLight {
 //                 (0,0,0, MAX_T) — read by the denoiser and the Sobel edges.
 //   [n .. 2n)     guide: (face-forwarded world normal, distance from the eye),
 //                 background (0,0,0, 0) — the CPU `Film` convention.
-//   [2n .. 3n)    guide: (denoise albedo, 0), background (0,0,0, 0).
-// The two guide planes are only written when `render_state.raw_sample` is set.
+//   [2n .. 3n)    guide: (denoise albedo, biased hit id), background (0,0,0, 0).
+//   [3n .. 4n)    the sample budget's per-pixel selection mask.
+//   [4n .. 5n)    guide: (directional albedo of the specular lobe at this
+//                 view, perceptual roughness) — what the split denoiser
+//                 demodulates its specular half by and scales its kernel by.
+//   [5n .. 6n)    guide: (.x = distance the specular bounce travelled from
+//                 the primary hit before it hit anything, 0 when the primary
+//                 hit's path left through a diffuse lobe, -1 when the bounce
+//                 escaped) — the parallax the specular reprojection corrects.
+// The guide planes are only written when `render_state.raw_sample` is set.
 @group(0) @binding(10) var<storage, read_write> depth_normal_buffer: array<vec4<f32>>;
 // Rectangular area lights ("softboxes"). Intersectable, so both BSDF sampling
 // and NEE find them and combine under MIS — that is what puts correctly-shaped
@@ -278,6 +298,24 @@ const FLAG_CAMERA_VISIBLE_LIGHTS: u32 = 2u;
 const FLAG_BUDGET_MASK: u32 = 4u;
 const FLAG_BUDGET_GUIDES: u32 = 8u;
 const BUDGET_ROUND_SHIFT: u32 = 8u;
+
+// How many planes of `depth_normal_buffer` the guides and the budget mask
+// take before the ReSTIR reservoirs start. Mirrors `GUIDE_PLANES` in
+// `resident.rs`.
+const GUIDE_PLANES: u32 = 6u;
+
+// ─── the split denoiser's two halves ─────────────────────────────────────
+//
+// `path_trace` sorts the sample it returns into the lobe it left the primary
+// hit through, so the denoiser can hold a long history on the diffuse half
+// and a short, roughness-bounded one on the specular half. Privates rather
+// than a wider return: `shade` has one caller and one signature to keep.
+var<private> g_lobe_diffuse: vec3<f32> = vec3<f32>(0.0);
+var<private> g_lobe_specular: vec3<f32> = vec3<f32>(0.0);
+// How far the specular bounce off the primary hit travelled before it hit
+// anything: 0 for a diffuse bounce, -1 for a specular one that escaped —
+// a reflection of the sky, which the reprojection treats as infinitely far.
+var<private> g_spec_hit_t: f32 = 0.0;
 
 fn raw_sample_mode() -> bool {
     return (render_state.raw_sample & FLAG_RAW_SAMPLE) != 0u;
@@ -1207,7 +1245,7 @@ fn oct_decode(e: u32) -> vec3<f32> {
 // ── the reservoir planes ─────────────────────────────────────────────────
 
 fn restir_plane(slot: u32) -> u32 {
-    return (4u + slot * 3u) * camera.width * camera.height;
+    return (GUIDE_PLANES + slot * 3u) * camera.width * camera.height;
 }
 
 fn restir_store(slot: u32, idx: u32, r: Reservoir, s: RSurface) {
@@ -1683,6 +1721,13 @@ fn subsurface_walk(
 
 fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>) -> vec4<f32> {
     var l = vec3<f32>(0.0);
+    // The same radiance, sorted by the lobe it left the primary hit through.
+    // Until that lobe is drawn everything the path picks up — a visible
+    // emitter, the sky, the primary hit's own diffuse light — is diffuse;
+    // after it, every bounce is the first bounce's lobe.
+    var l_d = vec3<f32>(0.0);
+    var l_s = vec3<f32>(0.0);
+    var bucket = LOBE_DIFFUSE;
     var throughput = vec3<f32>(1.0);
     var ray_o = origin;
     var ray_d = dir;
@@ -1743,7 +1788,13 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
                     light.center.w * lh.t * lh.t / (cos_light * light_area(light));
                 w = power_heuristic(prev_bsdf_pdf, light_pdf);
             }
-            l += throughput * light.emission.rgb * w;
+            let le = throughput * light.emission.rgb * w;
+            l += le;
+            if bucket == LOBE_DIFFUSE {
+                l_d += le;
+            } else {
+                l_s += le;
+            }
             if depth == 0u {
                 alpha = 1.0;
             }
@@ -1767,7 +1818,13 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
                 );
                 w = power_heuristic(prev_bsdf_pdf, epdf);
             }
-            l += throughput * env_radiance(ray_d) * w;
+            let env = throughput * env_radiance(ray_d) * w;
+            l += env;
+            if bucket == LOBE_DIFFUSE {
+                l_d += env;
+            } else {
+                l_s += env;
+            }
             // The sun disc, if this ray landed in it. NEE samples the same
             // cone, so the two strategies share the direction under the
             // balance heuristic; a specular chain had no other way in.
@@ -1777,7 +1834,13 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
                 if !specular_chain {
                     ws = power_heuristic(prev_bsdf_pdf, sun_pdf(ray_d));
                 }
-                l += throughput * sl * ws;
+                let sun = throughput * sl * ws;
+                l += sun;
+                if bucket == LOBE_DIFFUSE {
+                    l_d += sun;
+                } else {
+                    l_s += sun;
+                }
             }
             break;
         }
@@ -1838,17 +1901,38 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
         // reuse agreed was the one worth testing. Everything deeper keeps the
         // one-light NEE: a reservoir is a per-pixel object and there is no
         // pixel behind a second bounce.
-        var direct = sample_environment(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth)
-            + sample_sun(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth);
+        //
+        // Each strategy evaluates the BSDF once and leaves the diffuse share
+        // of that evaluation in `g_eval_diffuse_frac`, which is how the
+        // primary hit's direct light is split between the two halves without
+        // a second shadow ray.
+        let d_env = sample_environment(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth);
+        var direct_d = d_env * g_eval_diffuse_frac;
+        let d_sun = sample_sun(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth);
+        direct_d += d_sun * g_eval_diffuse_frac;
+        var direct = d_env + d_sun;
+        var d_lights: vec3<f32>;
         if restir_on() && depth == 0u {
-            direct += restir_direct(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel);
+            d_lights = restir_direct(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel);
         } else {
-            direct += sample_lights(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth);
+            d_lights = sample_lights(surf.point, frame, n, wo_local, surf.material, eta, lambda_nm, pixel, depth);
         }
+        direct += d_lights;
+        direct_d += d_lights * g_eval_diffuse_frac;
         if depth > 0u && render_state.firefly_clamp > 0.0 {
             direct = min(direct, vec3<f32>(render_state.firefly_clamp));
         }
         l += throughput * direct;
+        if depth == 0u {
+            // The primary hit's own direct light is the one contribution that
+            // is *both* lobes at once: split it by the BSDF's own share.
+            l_d += throughput * direct_d;
+            l_s += throughput * (direct - direct_d);
+        } else if bucket == LOBE_DIFFUSE {
+            l_d += throughput * direct;
+        } else {
+            l_s += throughput * direct;
+        }
 
         // The caustic map's share: light that arrived here by refraction
         // through a solid, which next-event estimation could not have found
@@ -1874,6 +1958,9 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
         let s = bsdf_sample(surf.material, wo_local, eta, lambda_nm, r_lobe, r12.x, r12.y, r_branch);
         if !s.ok {
             break;
+        }
+        if depth == 0u {
+            bucket = s.lobe;
         }
         if s.sss {
             // The path leaves the surface entirely: into the object, walk,
@@ -1947,8 +2034,16 @@ fn path_trace(first: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>
                 hit.uv = vec2<f32>(g.fade, 0.0);
             }
         }
+        // How far the specular bounce went: the reflection's parallax, for
+        // the specular reprojection. An escaped bounce is a reflection of
+        // the sky, and says so.
+        if depth == 0u && bucket == LOBE_SPECULAR {
+            g_spec_hit_t = select(-1.0, hit.t, hit.face_idx != 0xFFFFFFFFu);
+        }
     }
 
+    g_lobe_diffuse = l_d;
+    g_lobe_specular = l_s;
     return vec4<f32>(l, alpha);
 }
 
@@ -1963,11 +2058,13 @@ fn shade(hit: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>) -> ve
         if camera_visible_lights() {
             let lh = intersect_lights(origin, dir);
             if lh.hit {
+                g_lobe_diffuse = lights[lh.index].emission.rgb;
                 return vec4<f32>(lights[lh.index].emission.rgb, 1.0);
             }
         }
         // Draw the themed backdrop rather than the lighting environment — the
         // backdrop is a viewport choice, and `vcad-render` composites its own.
+        g_lobe_diffuse = sky_color(dir);
         return vec4<f32>(sky_color(dir), 0.0);
     }
 
@@ -1980,6 +2077,9 @@ fn shade(hit: RayHit, origin: vec3<f32>, dir: vec3<f32>, pixel: vec2<u32>) -> ve
     // pixels far from the subject.
     if hit.face_idx == FACE_IDX_GROUND {
         let fade = hit.uv.x;
+        // The fade is a blend towards a backdrop, which is diffuse.
+        g_lobe_diffuse = mix(sky_color(dir), g_lobe_diffuse, fade);
+        g_lobe_specular = g_lobe_specular * fade;
         return vec4<f32>(mix(sky_color(dir), traced.rgb, fade), traced.a);
     }
     return traced;
@@ -2295,6 +2395,8 @@ fn write_guides(pixel: vec2<u32>, hit: RayHit, dir: vec3<f32>) {
         var g_normal = vec3<f32>(0.0, 0.0, 0.0);
         var g_depth = 0.0;
         var g_albedo = vec3<f32>(0.0, 0.0, 0.0);
+        var g_spec = vec3<f32>(0.0, 0.0, 0.0);
+        var g_rough = 0.0;
         if hit.face_idx != 0xFFFFFFFFu {
             var gn: vec3<f32>;
             var gm: GpuMaterial;
@@ -2311,6 +2413,14 @@ fn write_guides(pixel: vec2<u32>, hit: RayHit, dir: vec3<f32>) {
             g_normal = gn;
             g_depth = hit.t;
             g_albedo = mix(mat_diffuse_albedo(gm), mat_f0(gm), gm.metallic);
+            // The specular half's demodulator: the lobe's directional albedo
+            // at this view. A transmissive material's lobe passes what it
+            // does not reflect, so its albedo tends to one with
+            // `transmission`.
+            let mu = max(dot(gn, -dir), 1e-3);
+            let spec = spec_albedo_lookup(mat_f0(gm), gm.roughness, mu);
+            g_spec = mix(spec, vec3<f32>(1.0), clamp(gm.transmission, 0.0, 1.0));
+            g_rough = clamp(gm.roughness, 0.0, 1.0);
         }
         depth_normal_buffer[n_px + gi] = vec4<f32>(g_normal, g_depth);
         // Guide plane 2's `.w` was spare. It carries the hit's *identity*
@@ -2323,6 +2433,7 @@ fn write_guides(pixel: vec2<u32>, hit: RayHit, dir: vec3<f32>) {
             g_id = f32((hit.face_idx & 0x00FFFFFFu) + 1u);
         }
         depth_normal_buffer[2u * n_px + gi] = vec4<f32>(g_albedo, g_id);
+        depth_normal_buffer[4u * n_px + gi] = vec4<f32>(g_spec, g_rough);
     }
 }
 
@@ -2385,6 +2496,17 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let pixel_coord = vec2<i32>(pixel);
     write_guides(pixel, hit, dir);
+
+    // The same sample, split by lobe, beside the summed one — and the
+    // specular bounce's reach, beside the guides. Raw-sample mode only: the
+    // progressive average below has no use for either.
+    if raw_sample_mode() {
+        let n_px = camera.width * camera.height;
+        let gi = pixel_index_i32(pixel_coord);
+        accum_buffer[n_px + gi] = vec4<f32>(g_lobe_diffuse, new_color.a);
+        accum_buffer[2u * n_px + gi] = vec4<f32>(g_lobe_specular, new_color.a);
+        depth_normal_buffer[5u * n_px + gi] = vec4<f32>(g_spec_hit_t, 0.0, 0.0, 0.0);
+    }
 
     // Progressive accumulation
     var accumulated: vec4<f32>;

@@ -42,6 +42,7 @@ mod ray;
 pub mod spectrum;
 mod sah;
 mod tables;
+pub use tables::spec_albedo;
 pub mod tlas;
 
 pub use analytic::{Analytic, Frame, Prim};
