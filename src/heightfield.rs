@@ -96,13 +96,7 @@ impl HeightField {
     /// If `heights.len() != nx * ny`, or if either cell size is not
     /// positive. Both are programmer errors at the seam — a mismatched
     /// slice would silently render a garbled surface.
-    pub fn new(
-        nx: usize,
-        ny: usize,
-        origin: Point3,
-        cell: (f64, f64),
-        heights: Vec<f64>,
-    ) -> Self {
+    pub fn new(nx: usize, ny: usize, origin: Point3, cell: (f64, f64), heights: Vec<f64>) -> Self {
         assert_eq!(heights.len(), nx * ny, "heights must be nx * ny, row-major");
         assert!(
             cell.0 > 0.0 && cell.1 > 0.0,
@@ -360,10 +354,10 @@ impl HeightField {
 
         // The cell standing under the entry point.
         let entry = ray.at(t_enter);
-        let mut i = (((entry.x - self.origin.x) / self.dx).floor() as isize)
-            .clamp(0, cx as isize - 1);
-        let mut j = (((entry.y - self.origin.y) / self.dy).floor() as isize)
-            .clamp(0, cy as isize - 1);
+        let mut i =
+            (((entry.x - self.origin.x) / self.dx).floor() as isize).clamp(0, cx as isize - 1);
+        let mut j =
+            (((entry.y - self.origin.y) / self.dy).floor() as isize).clamp(0, cy as isize - 1);
 
         // Per-axis stepping: which way, how far to the next boundary, and
         // how far between boundaries. A zero component never steps.
@@ -375,10 +369,8 @@ impl HeightField {
             let next = base + (idx + if dir > 0.0 { 1 } else { 0 }) as f64 * cell;
             (step, (next - o) / dir, (cell / dir).abs())
         };
-        let (step_i, mut next_i, delta_i) =
-            setup(ray.origin.x, d.x, self.origin.x, self.dx, i);
-        let (step_j, mut next_j, delta_j) =
-            setup(ray.origin.y, d.y, self.origin.y, self.dy, j);
+        let (step_i, mut next_i, delta_i) = setup(ray.origin.x, d.x, self.origin.x, self.dx, i);
+        let (step_j, mut next_j, delta_j) = setup(ray.origin.y, d.y, self.origin.y, self.dy, j);
 
         loop {
             if let Some(hit) =
@@ -581,12 +573,9 @@ mod tests {
                 let tree = bvh.trace_closest(&ray);
                 let march = field.intersect_march(&ray, 0.0, f64::INFINITY);
                 match (tree, march) {
-                    (Some(t), Some(m)) => assert!(
-                        (t.t - m.t).abs() < 1e-9,
-                        "tree {} vs march {}",
-                        t.t,
-                        m.t
-                    ),
+                    (Some(t), Some(m)) => {
+                        assert!((t.t - m.t).abs() < 1e-9, "tree {} vs march {}", t.t, m.t)
+                    }
                     (None, None) => {}
                     (t, m) => panic!("disagree: {:?} vs {:?}", t.map(|h| h.t), m.map(|h| h.t)),
                 }

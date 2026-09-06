@@ -33,12 +33,21 @@ pub fn sampler_shader() -> String {
     let mask = crate::sampler::MASK;
     let words = mask.len() / 4;
     let mut out = String::with_capacity(words * 12 + SAMPLER_SHADER_BODY.len() + 128);
-    write!(out, "const BLUE_NOISE_MASK: array<u32, {words}> = array<u32, {words}>(").unwrap();
+    write!(
+        out,
+        "const BLUE_NOISE_MASK: array<u32, {words}> = array<u32, {words}>("
+    )
+    .unwrap();
     for (i, w) in mask.chunks_exact(4).enumerate() {
         if i % 8 == 0 {
             out.push('\n');
         }
-        write!(out, "{:#010x}u,", u32::from_le_bytes([w[0], w[1], w[2], w[3]])).unwrap();
+        write!(
+            out,
+            "{:#010x}u,",
+            u32::from_le_bytes([w[0], w[1], w[2], w[3]])
+        )
+        .unwrap();
     }
     out.push_str("\n);\n");
     out.push_str(SAMPLER_SHADER_BODY);

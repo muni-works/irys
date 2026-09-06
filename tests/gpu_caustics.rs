@@ -99,7 +99,11 @@ fn gpu_render(ctx: &'static GpuContext, map: Option<&CausticMap>) -> Vec<f32> {
         prims: vec![
             AnalyticPrim::aabb(
                 [0.0, 0.0, 0.0],
-                [SLAB_HALF[0] as f32, SLAB_HALF[1] as f32, SLAB_HALF[2] as f32],
+                [
+                    SLAB_HALF[0] as f32,
+                    SLAB_HALF[1] as f32,
+                    SLAB_HALF[2] as f32,
+                ],
                 0,
             ),
             AnalyticPrim::plane([0.0, 0.0, FLOOR_Z as f32], [0.0, 0.0, 1.0], 1),
@@ -210,7 +214,10 @@ fn the_packed_map_gathers_what_the_hash_map_gathers() {
             worst = worst.max(rel);
         }
     }
-    assert!(worst < 1e-3, "packed gather differs from the hash map by {worst}");
+    assert!(
+        worst < 1e-3,
+        "packed gather differs from the hash map by {worst}"
+    );
 }
 
 /// The claim: the two tiers, handed one map, paint the same floor.

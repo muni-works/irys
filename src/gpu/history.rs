@@ -1701,14 +1701,7 @@ impl RayTracePipeline {
                 );
             }
         }
-        dispatch(
-            &mut encoder,
-            resolve,
-            &ab,
-            0,
-            groups,
-            "History Resolve",
-        );
+        dispatch(&mut encoder, resolve, &ab, 0, groups, "History Resolve");
 
         ctx.queue.submit(Some(encoder.finish()));
         Ok(())

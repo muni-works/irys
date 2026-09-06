@@ -105,8 +105,9 @@ impl Frame {
                 f.normal[p * 3 + 2] = nz;
                 for c in 0..3 {
                     f.albedo[p * 3 + c] = 0.15 + 0.25 * ((p + c * 5) % 7) as f32 / 7.0;
-                    f.mean[p * 3 + c] =
-                        0.05 + 1.6 * ((p * 13 + c * 29) % 31) as f32 / 31.0 + if bg { 3.0 } else { 0.0 };
+                    f.mean[p * 3 + c] = 0.05
+                        + 1.6 * ((p * 13 + c * 29) % 31) as f32 / 31.0
+                        + if bg { 3.0 } else { 0.0 };
                 }
                 // Every eleventh pixel is a firefly: one path that came back
                 // far too bright, which after the demodulation is exactly the
@@ -209,7 +210,9 @@ fn read_back(ctx: &GpuContext, src: &wgpu::Buffer, len: usize) -> Vec<f32> {
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
     });
-    ctx.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
     rx.recv().unwrap().unwrap();
     let view = slice.get_mapped_range().expect("the staging buffer maps");
     let out = bytemuck::cast_slice::<u8, f32>(&view).to_vec();

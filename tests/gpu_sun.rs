@@ -99,8 +99,8 @@ fn gpu_irradiance(ctx: &'static GpuContext, sun: &Sun) -> f64 {
 
 /// The same measurement from the CPU integrator, over the same plane.
 fn cpu_irradiance(sun: &Sun) -> f64 {
-    use kosm_render::pathtrace::{Environment, Ground, PathTraceOptions, Scene, render};
     use kosm_render::TriMesh;
+    use kosm_render::pathtrace::{Environment, Ground, PathTraceOptions, Scene, render};
 
     let scene = Scene::<TriMesh> {
         objects: Vec::new(),
@@ -156,8 +156,16 @@ fn the_device_sun_delivers_the_analytic_irradiance() {
             cpu_rel * 100.0,
             gpu_rel * 100.0
         );
-        assert!(cpu_rel < 0.01, "CPU irradiance off by {:.2}%", cpu_rel * 100.0);
-        assert!(gpu_rel < 0.01, "GPU irradiance off by {:.2}%", gpu_rel * 100.0);
+        assert!(
+            cpu_rel < 0.01,
+            "CPU irradiance off by {:.2}%",
+            cpu_rel * 100.0
+        );
+        assert!(
+            gpu_rel < 0.01,
+            "GPU irradiance off by {:.2}%",
+            gpu_rel * 100.0
+        );
         // ... and the two tiers agree with each other, which is the parity
         // claim: they may not both be wrong in the same direction.
         let parity = (gpu - cpu).abs() / expected;
@@ -180,5 +188,8 @@ fn no_sun_is_the_old_behaviour() {
     let mut state = GpuRenderState::new(1);
     state.set_sun(Some(&sun));
     state.set_sun(None);
-    assert_eq!(state.sun_radiance[3], 0.0, "clearing the sun must zero its PDF");
+    assert_eq!(
+        state.sun_radiance[3], 0.0,
+        "clearing the sun must zero its PDF"
+    );
 }

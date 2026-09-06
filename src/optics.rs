@@ -78,7 +78,6 @@ pub fn index<S: Scalar>(nd: S, lambda_um: f64) -> S {
     nd + sellmeier::<S>(lambda_um) - sellmeier::<S>(D_LINE_UM)
 }
 
-
 // ─── thin-film iridescence ────────────────────────────────────────────────
 //
 // Belcour and Barla, "A Practical Extension to Microfacet Theory for the
@@ -196,7 +195,11 @@ impl Film {
         // A reflection off a denser medium flips the wave; off a rarer one it
         // does not. That π is the difference between a film that looks blue
         // at 300 nm and one that looks orange, so it is not a detail.
-        let phi12 = if n1 < outside { std::f32::consts::PI } else { 0.0 };
+        let phi12 = if n1 < outside {
+            std::f32::consts::PI
+        } else {
+            0.0
+        };
         let phi21 = std::f32::consts::PI - phi12;
 
         let mut r23 = [0.0f32; 3];
@@ -254,7 +257,11 @@ pub fn thin_film_fresnel(
     // the sensitivity term decays as a Gaussian in the frequency, so the
     // third is already below the noise of the fit itself.
     for m in 1..=2u32 {
-        let shift = [f.phi[0] * m as f32, f.phi[1] * m as f32, f.phi[2] * m as f32];
+        let shift = [
+            f.phi[0] * m as f32,
+            f.phi[1] * m as f32,
+            f.phi[2] * m as f32,
+        ];
         let s = sensitivity(m as f32 * f.opd, shift);
         for c in 0..3 {
             cm[c] *= r[c];
@@ -368,7 +375,8 @@ mod tests {
         let (n0, n1, n2) = (1.0, 1.34, 1.5);
         let f0 = (((n0 - n2) / (n0 + n2)) as f32).powi(2);
         for lambda in [450.0f64, 550.0, 650.0] {
-            let ours = thin_film_fresnel_at(300.0, n1 as f32, 1.0, [f0; 3], lambda as f32)[1] as f64;
+            let ours =
+                thin_film_fresnel_at(300.0, n1 as f32, 1.0, [f0; 3], lambda as f32)[1] as f64;
             let want = airy_reference(n0, n1, n2, 300.0, lambda);
             assert!(
                 (ours - want).abs() <= 0.01 * want,

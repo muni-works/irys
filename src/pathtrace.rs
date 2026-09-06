@@ -1003,7 +1003,6 @@ impl Environment {
     }
 }
 
-
 /// A directional light of finite angular size: the sun.
 ///
 /// An [`AreaLight`] cannot express this — it is at a finite distance and its
@@ -1114,7 +1113,6 @@ impl Sun {
         )
     }
 }
-
 
 /// An infinite ground plane at a fixed Z, used as a studio sweep.
 #[derive(Debug, Clone, Copy)]
@@ -1305,7 +1303,6 @@ impl Camera {
     }
 }
 
-
 // ─── the pixel filter ─────────────────────────────────────────────────────
 
 /// Gaussian pixel filter standard deviation, in pixels.
@@ -1371,13 +1368,12 @@ impl PixelFilter {
         }
         match self {
             PixelFilter::Box => 1.0,
-            PixelFilter::Gaussian => {
-                (-(x * x) / (2.0 * GAUSSIAN_SIGMA * GAUSSIAN_SIGMA)).exp()
-            }
+            PixelFilter::Gaussian => (-(x * x) / (2.0 * GAUSSIAN_SIGMA * GAUSSIAN_SIGMA)).exp(),
             PixelFilter::BlackmanHarris => {
                 let t = (x + r) / (2.0 * r);
                 let tau = core::f64::consts::TAU;
-                BH[0] + BH[1] * (tau * t).cos()
+                BH[0]
+                    + BH[1] * (tau * t).cos()
                     + BH[2] * (2.0 * tau * t).cos()
                     + BH[3] * (3.0 * tau * t).cos()
             }
@@ -1505,6 +1501,18 @@ pub struct PathTraceOptions {
     pub show_background: bool,
     /// Random seed.
     pub seed: u64,
+    /// Stop sampling a pixel early once its own variance estimate says the
+    /// remaining budget cannot move it visibly.
+    ///
+    /// [`spp`](Self::spp) becomes a *ceiling* rather than a fixed count. Every
+    /// pixel still gets at least a floor of samples, and the decision is made
+    /// from the pixel's own running sums, so the film stays deterministic and
+    /// independent of how the frame was tiled — a pixel that stops early keeps
+    /// the unbiased mean of the samples it did take.
+    ///
+    /// Set `false` for a reference render, where a uniform sample count is
+    /// the point.
+    pub adaptive: bool,
     /// Reconstruction filter for primary-ray placement within the pixel.
     ///
     /// [`PixelFilter::Box`] — uniform jitter — is the default and reproduces
@@ -1542,6 +1550,7 @@ impl Default for PathTraceOptions {
             firefly_clamp_warmup: 16,
             show_background: true,
             seed: 0x5eed_1234,
+            adaptive: true,
             filter: PixelFilter::Box,
             denoise: true,
             denoise_iters: 5,
@@ -1586,6 +1595,65 @@ impl Rng {
         (self.next_u32() as f64) * (1.0 / 4294967296.0)
     }
 }
+
+// ─── low-discrepancy sampling ─────────────────────────────────────────────
+
+/// Van der Corput radical inverse of `i` in `BASE`.
+///
+/// Reflects `i`'s digits in `BASE` about the radix point, which spreads
+/// consecutive indices as far apart as the base allows. Successive prime
+/// bases give the Halton sequence, which is what the camera dimensions use.
+#[inline]
+pub(crate) fn radical_inverse<const BASE: u32>(mut i: u64) -> f64 {
+    let inv_base = 1.0 / BASE as f64;
+    let mut inv_bn = 1.0;
+    let mut acc = 0u64;
+    // Accumulate the reversed digits as an integer, then scale once: doing
+    // the division per digit accumulates rounding error over ~50 digits.
+    while i > 0 {
+        let digit = i % BASE as u64;
+        acc = acc * BASE as u64 + digit;
+        i /= BASE as u64;
+        inv_bn *= inv_base;
+    }
+    (acc as f64 * inv_bn).min(1.0 - f64::EPSILON)
+}
+
+/// Cranley-Patterson rotation: shift `x` by `offset` on the unit torus.
+///
+/// Preserves the point set's discrepancy while randomising its absolute
+/// placement, which is what lets every pixel share one low-discrepancy set
+/// without the shared structure showing up as a visible pattern.
+#[inline]
+pub(crate) fn cp_rotate(x: f64, offset: f64) -> f64 {
+    let v = x + offset;
+    if v >= 1.0 { v - 1.0 } else { v }
+}
+
+/// Samples traced between convergence checks.
+///
+/// The check needs a sample variance to be worth anything, so it cannot run
+/// after every sample; 16 gives a usable estimate and is fine enough that a
+/// converged pixel wastes at most 15 samples past the line.
+const ADAPTIVE_BATCH: u32 = 16;
+
+/// Minimum samples every pixel gets, whatever the variance estimate says.
+///
+/// A pixel that happens to draw several near-equal samples early reports a
+/// tiny variance and would quit while genuinely unconverged — the classic
+/// adaptive-sampling failure, and it shows up as blotching in exactly the
+/// smooth regions adaptivity was meant to speed up.
+const ADAPTIVE_FLOOR: u32 = 32;
+
+/// Relative tolerance on the 95% confidence half-width of pixel luminance.
+const ADAPTIVE_TOL: f32 = 0.10;
+
+/// Absolute luminance added to the mean before applying [`ADAPTIVE_TOL`].
+///
+/// Pure relative error never converges in shadow, where the mean approaches
+/// zero; pure absolute error over-samples highlights. Adding the two is the
+/// usual compromise.
+const ADAPTIVE_LUM_FLOOR: f32 = 0.02;
 
 // ─── small math helpers ───────────────────────────────────────────────────
 
@@ -1875,8 +1943,7 @@ fn e_fon(mu: f32, r: f32) -> f32 {
     let mu = mu.clamp(1e-6, 1.0);
     let a = fon_a(r);
     let si = (1.0 - mu * mu).max(0.0).sqrt();
-    let g = si * (mu.acos() - si * mu)
-        + (2.0 / 3.0) * ((si / mu) * (1.0 - si * si * si) - si);
+    let g = si * (mu.acos() - si * mu) + (2.0 / 3.0) * ((si / mu) * (1.0 - si * si * si) - si);
     a + (a * r) * std::f32::consts::FRAC_1_PI * g
 }
 
@@ -1898,7 +1965,11 @@ fn eon_diffuse(rho: [f32; 3], r: f32, wo: Vec3, wi: Vec3) -> [f32; 3] {
     // two sines; dividing by the larger cosine is what gives the model its
     // characteristic flat, edge-lit shape.
     let s = (wi.dot(wo) as f32) - mu_i * mu_o;
-    let s_over_t = if s > 0.0 { s / mu_i.max(mu_o).max(1e-6) } else { s };
+    let s_over_t = if s > 0.0 {
+        s / mu_i.max(mu_o).max(1e-6)
+    } else {
+        s
+    };
     let a = fon_a(r);
     let f_ss = scale3(rho, std::f32::consts::FRAC_1_PI * a * (1.0 + r * s_over_t));
 
@@ -2123,11 +2194,7 @@ fn ms_compensation(f0: [f32; 3], at: f32, ab: f32, mu_o: f32) -> [f32; 3] {
     let alpha = (at * ab).max(0.0).sqrt();
     let e = crate::tables::bilinear(&crate::tables::GGX_E, alpha, mu_o).clamp(1e-3, 1.0);
     let k = (1.0 - e) / e;
-    [
-        1.0 + f0[0] * k,
-        1.0 + f0[1] * k,
-        1.0 + f0[2] * k,
-    ]
+    [1.0 + f0[0] * k, 1.0 + f0[1] * k, 1.0 + f0[2] * k]
 }
 
 // ─── sheen: multiple-scattering LTC ───────────────────────────────────────
@@ -2159,7 +2226,11 @@ fn sheen_ltc_density(wi_std: Vec3, coeffs: [f32; 3]) -> f32 {
     if a_inv <= 0.0 {
         return 0.0;
     }
-    let w = Vec3::new(a_inv * wi_std.x + b_inv * wi_std.z, a_inv * wi_std.y, wi_std.z);
+    let w = Vec3::new(
+        a_inv * wi_std.x + b_inv * wi_std.z,
+        a_inv * wi_std.y,
+        wi_std.z,
+    );
     let len = w.norm();
     if len <= 0.0 {
         return 0.0;
@@ -2556,7 +2627,9 @@ fn bsdf_eval(m: &Pbr, wo: Vec3, wi: Vec3, eta: f32, lambda_nm: f32) -> ([f32; 3]
     // directions' losses keeps the layering reciprocal, which a bare
     // `1 - E(mu_o)` would not be.
     let sheen_atten = if m.sheen > 0.0 {
-        ((1.0 - sheen_albedo(m, n_dot_v)) * (1.0 - sheen_albedo(m, n_dot_l))).max(0.0).sqrt()
+        ((1.0 - sheen_albedo(m, n_dot_v)) * (1.0 - sheen_albedo(m, n_dot_l)))
+            .max(0.0)
+            .sqrt()
     } else {
         1.0
     };
@@ -2650,13 +2723,7 @@ fn bsdf_sample_surface(
 }
 
 /// Importance-sample the BSDF.
-fn bsdf_sample(
-    m: &Pbr,
-    wo: Vec3,
-    eta: f32,
-    lambda_nm: f32,
-    rng: &mut Rng,
-) -> Option<Sampled> {
+fn bsdf_sample(m: &Pbr, wo: Vec3, eta: f32, lambda_nm: f32, rng: &mut Rng) -> Option<Sampled> {
     if wo.z <= 0.0 {
         return None;
     }
@@ -2684,12 +2751,7 @@ fn bsdf_sample(
             return None;
         }
         let c = cosine_hemisphere(r1, r2);
-        let wi_std = Vec3::new(
-            c.x / a_inv - c.z * b_inv / a_inv,
-            c.y / a_inv,
-            c.z,
-        )
-        .normalize();
+        let wi_std = Vec3::new(c.x / a_inv - c.z * b_inv / a_inv, c.y / a_inv, c.z).normalize();
         let wi = sheen_unalign(wo, wi_std);
         if wi.z <= 0.0 {
             return None;
@@ -2729,7 +2791,11 @@ fn bsdf_sample(
                 return None;
             }
             // Reflect above, or mirror straight through below.
-            if (rng.f64() as f32) < f { wi } else { Vec3::new(wi.x, wi.y, -wi.z) }
+            if (rng.f64() as f32) < f {
+                wi
+            } else {
+                Vec3::new(wi.x, wi.y, -wi.z)
+            }
         } else {
             let f = fresnel_dielectric(wo.dot(wh).max(0.0) as f32, eta);
             if (rng.f64() as f32) < f {
@@ -3097,8 +3163,7 @@ impl<G: Geometry> Scene<G> {
             }
             crossed += 1;
             let m = &self.objects[found.payload].material;
-            let Some(sheet) = sheet_transmittance(m, found.hit.normal.into_inner().dot(dir))
-            else {
+            let Some(sheet) = sheet_transmittance(m, found.hit.normal.into_inner().dot(dir)) else {
                 return None;
             };
             tr = mul3(tr, sheet);
@@ -3496,7 +3561,8 @@ fn radiance<G: Geometry>(
         // cloud an *environment with depth*: a bounce ray that finds no
         // analytic surface comes back with the room's own colour, so the
         // marble is lit by the garage it is standing in.
-        if scene.splats.is_some() && !(depth == 0 && !opts.show_background && matches!(landing, Landing::Miss))
+        if scene.splats.is_some()
+            && !(depth == 0 && !opts.show_background && matches!(landing, Landing::Miss))
         {
             let t_hit = match &landing {
                 Landing::Surface { point, .. } => (*point - ray.origin).norm(),
@@ -3669,9 +3735,7 @@ fn radiance<G: Geometry>(
                             accel, point, &frame, wo_local, &material, eta, hero, rng,
                         ),
                     ),
-                    scene.sample_sun(
-                        accel, point, &frame, wo_local, &material, eta, hero, rng,
-                    ),
+                    scene.sample_sun(accel, point, &frame, wo_local, &material, eta, hero, rng),
                 );
                 let direct = if depth > 0 {
                     // The relative clamp, when armed, takes over from the
@@ -3715,16 +3779,14 @@ fn radiance<G: Geometry>(
                         // the object, walks, and comes back out somewhere
                         // else. Everything after this is about the *exit*.
                         throughput = mul3(throughput, entry_weight);
-                        let Some(exit) =
-                            subsurface_walk(&material, point, n, rng, |p, d| {
-                                match scene.intersect(accel, &Ray::new(p, d)) {
-                                    Landing::Surface { point, normal, .. } => {
-                                        Some(((point - p).norm(), normal))
-                                    }
-                                    _ => None,
+                        let Some(exit) = subsurface_walk(&material, point, n, rng, |p, d| {
+                            match scene.intersect(accel, &Ray::new(p, d)) {
+                                Landing::Surface { point, normal, .. } => {
+                                    Some(((point - p).norm(), normal))
                                 }
-                            })
-                        else {
+                                _ => None,
+                            }
+                        }) else {
                             break;
                         };
                         throughput = mul3(throughput, exit.weight);
@@ -3852,7 +3914,7 @@ fn trace_pixel<G: Geometry>(
     px: usize,
     py: usize,
     out: &mut PixelOut<'_>,
-) {
+) -> u32 {
     let aspect = width as f64 / height as f64;
     let spp = opts.spp.max(1);
     let mut rng =
@@ -3862,67 +3924,132 @@ fn trace_pixel<G: Geometry>(
     // Running sums for the estimator's own variance.
     let mut lsum = 0.0f32;
     let mut lsum2 = 0.0f32;
+    // Cranley-Patterson rotations for the four camera dimensions, drawn once
+    // per pixel. The low-discrepancy point set below is the *same* for every
+    // pixel; rotating it by a per-pixel random offset keeps each pixel's
+    // stratification intact while decorrelating neighbours, so the residual
+    // error looks like noise rather than a repeating pattern locked to the
+    // pixel grid. Drawing them from the existing PCG is what keeps seed
+    // determinism: no global state, no thread-dependent order.
+    let rot = [rng.f64(), rng.f64(), rng.f64(), rng.f64()];
 
-    for s in 0..spp {
-        // Sample position within the pixel, drawn from the reconstruction
-        // filter so that the plain mean below *is* the filtered estimate.
-        let jx = 0.5 + opts.filter.warp(rng.f64());
-        let jy = 0.5 + opts.filter.warp(rng.f64());
-        let sx = 2.0 * ((px as f64 + jx) / width as f64) - 1.0;
-        let sy = 1.0 - 2.0 * ((py as f64 + jy) / height as f64);
-        let (lu, lv) = concentric_disc(rng.f64(), rng.f64());
+    // Sample in batches so the estimator can be asked, between batches,
+    // whether it has already resolved this pixel. `traced` is the count
+    // actually spent, which is <= spp under adaptive sampling.
+    let mut traced = 0u32;
+    'batches: while traced < spp {
+        let batch = ADAPTIVE_BATCH.min(spp - traced);
+        for k in 0..batch {
+            let s = traced + k;
+            // Pixel jitter and lens position come from a 4D Halton set rotated
+            // into this pixel's frame, not from four fresh uniforms. Four
+            // independent uniforms can clump — at low sample counts a purely
+            // random jitter leaves visibly uneven coverage of the pixel
+            // footprint, and that shows up as extra aliasing on every
+            // silhouette. A low-discrepancy set covers the square evenly by
+            // construction.
+            //
+            // Halton rather than Hammersley: Hammersley's first dimension is
+            // `s / N`, which needs the final sample count up front. Adaptive
+            // sampling does not know it, and a set that changes shape when the
+            // loop stops early is worse than a slightly weaker set that is
+            // correct at every prefix.
+            //
+            // The uniforms still go through the reconstruction filter's warp, so
+            // the plain mean below is the filtered estimate exactly as before.
+            let jx = 0.5
+                + opts
+                    .filter
+                    .warp(cp_rotate(radical_inverse::<2>(s as u64), rot[0]));
+            let jy = 0.5
+                + opts
+                    .filter
+                    .warp(cp_rotate(radical_inverse::<3>(s as u64), rot[1]));
+            let sx = 2.0 * ((px as f64 + jx) / width as f64) - 1.0;
+            let sy = 1.0 - 2.0 * ((py as f64 + jy) / height as f64);
+            let (lu, lv) = concentric_disc(
+                cp_rotate(radical_inverse::<5>(s as u64), rot[2]),
+                cp_rotate(radical_inverse::<7>(s as u64), rot[3]),
+            );
 
-        let ray = cam.ray(sx, sy, aspect, lu, lv);
-        // The relative clamp's threshold, from what this pixel has measured
-        // so far. It is deliberately a *running* mean and not a two-pass
-        // estimate: a pixel is its own scale, and one pass is what keeps the
-        // integrator streaming.
-        let clamp_scale = opts.firefly_clamp_relative.and_then(|k| {
-            if s >= opts.firefly_clamp_warmup && s > 0 {
-                Some((k * lsum / s as f32).max(1e-6))
-            } else {
-                None
+            let ray = cam.ray(sx, sy, aspect, lu, lv);
+            // The relative clamp's threshold, from what this pixel has measured
+            // so far. It is deliberately a *running* mean and not a two-pass
+            // estimate: a pixel is its own scale, and one pass is what keeps the
+            // integrator streaming.
+            let clamp_scale = opts.firefly_clamp_relative.and_then(|k| {
+                if s >= opts.firefly_clamp_warmup && s > 0 {
+                    Some((k * lsum / s as f32).max(1e-6))
+                } else {
+                    None
+                }
+            });
+            let (l, primary) = radiance(scene, accel, opts, caustics, clamp_scale, ray, &mut rng);
+            acc = add3(acc, l);
+            let ls = luminance(l);
+            lsum += ls;
+            lsum2 += ls * ls;
+            if primary.hit {
+                cov += 1.0;
             }
-        });
-        let (l, primary) = radiance(scene, accel, opts, caustics, clamp_scale, ray, &mut rng);
-        acc = add3(acc, l);
-        let ls = luminance(l);
-        lsum += ls;
-        lsum2 += ls * ls;
-        if primary.hit {
-            cov += 1.0;
+            if s == 0 {
+                // Guide buffers come from one primary ray, not an average:
+                // averaging normals and depths across samples would soften
+                // exactly the silhouettes the edge-stopping weights exist to
+                // protect.
+                out.normal[px * 3] = primary.normal[0];
+                out.normal[px * 3 + 1] = primary.normal[1];
+                out.normal[px * 3 + 2] = primary.normal[2];
+                out.depth[px] = primary.depth;
+                out.albedo[px * 3] = primary.albedo[0];
+                out.albedo[px * 3 + 1] = primary.albedo[1];
+                out.albedo[px * 3 + 2] = primary.albedo[2];
+            }
         }
-        if s == 0 {
-            // Guide buffers come from one primary ray, not an average:
-            // averaging normals and depths across samples would soften
-            // exactly the silhouettes the edge-stopping weights exist to
-            // protect.
-            out.normal[px * 3] = primary.normal[0];
-            out.normal[px * 3 + 1] = primary.normal[1];
-            out.normal[px * 3 + 2] = primary.normal[2];
-            out.depth[px] = primary.depth;
-            out.albedo[px * 3] = primary.albedo[0];
-            out.albedo[px * 3 + 1] = primary.albedo[1];
-            out.albedo[px * 3 + 2] = primary.albedo[2];
+        traced += batch;
+
+        // Stop once the estimator's own error bar says the remaining samples
+        // cannot move this pixel by anything a viewer could see. The mean kept
+        // below is still the unbiased mean of the samples actually taken, so
+        // stopping early costs precision, never accuracy. The floor is
+        // non-negotiable: a pixel that happened to draw several near-equal
+        // samples early would otherwise report a tiny variance and quit while
+        // genuinely unconverged.
+        if opts.adaptive && traced >= ADAPTIVE_FLOOR.min(spp) && traced < spp {
+            let n = traced as f32;
+            let mean = lsum / n;
+            // The clamp is load-bearing, not defensive: once the samples agree
+            // closely, `lsum2 / n` and `mean * mean` cancel to within f32
+            // rounding and can land just below zero, which would put a NaN
+            // through the sqrt below — and a NaN compares false, so the pixel
+            // would never converge.
+            let sample_var = (lsum2 / n - mean * mean).max(0.0) * n / (n - 1.0);
+            // Half-width of the 95% confidence interval on the mean.
+            let ci = 1.96 * (sample_var / n).sqrt();
+            if ci <= ADAPTIVE_TOL * (mean + ADAPTIVE_LUM_FLOOR) {
+                break 'batches;
+            }
         }
     }
 
-    let inv = 1.0 / spp as f32;
+    let inv = 1.0 / traced as f32;
     out.rgb[px * 3] = acc[0] * inv;
     out.rgb[px * 3 + 1] = acc[1] * inv;
     out.rgb[px * 3 + 2] = acc[2] * inv;
     out.alpha[px] = cov * inv;
-    // Variance of the *mean*: sample variance / spp. A single sample carries
+    // Variance of the *mean*: sample variance / n. A single sample carries
     // no information about its own spread, so fall back to the estimate
     // itself as a scale.
-    out.variance[px] = if spp > 1 {
+    out.variance[px] = if traced > 1 {
+        let n = traced as f32;
         let mean = lsum * inv;
-        let sample_var = (lsum2 * inv - mean * mean).max(0.0) * spp as f32 / (spp - 1) as f32;
-        sample_var / spp as f32
+        let sample_var = (lsum2 * inv - mean * mean).max(0.0) * n / (n - 1.0);
+        sample_var / n
     } else {
         let mean = lsum;
         mean * mean
     };
+    traced
 }
 
 /// Render `scene` from `cam` into a linear-space [`Film`].
@@ -3994,7 +4121,7 @@ pub fn render_with_caustics<G: Geometry + Send + Sync>(
                 variance: vrow,
             };
             for px in 0..width as usize {
-                trace_pixel(
+                let _ = trace_pixel(
                     scene, &accel, caustics, cam, opts, width, height, px, py, &mut out,
                 );
             }
@@ -4105,9 +4232,9 @@ pub fn render_into_with_caustics<G: Geometry + Send + Sync>(
                     variance: vrow,
                 };
                 for px in x0..x1 {
-                    trace_pixel(
-                    scene, &accel, caustics, cam, opts, width, height, px, py, &mut out,
-                );
+                    let _ = trace_pixel(
+                        scene, &accel, caustics, cam, opts, width, height, px, py, &mut out,
+                    );
                 }
             });
     }
@@ -4650,7 +4777,12 @@ mod tests {
     /// An axis-aligned quad in the z = `z` plane, spanning ±`half` in x and y.
     fn pane_mesh(z: f64, half: f64) -> TriMesh {
         let p = |x, y| Point3::new(x, y, z);
-        let positions = vec![p(-half, -half), p(half, -half), p(half, half), p(-half, half)];
+        let positions = vec![
+            p(-half, -half),
+            p(half, -half),
+            p(half, half),
+            p(-half, half),
+        ];
         TriMesh::new(positions, Vec::new(), &[0, 1, 2, 0, 2, 3])
     }
 
@@ -4848,11 +4980,8 @@ mod tests {
             let film = render(&scene, &camera, 24, 24, &opts);
             let mut sum = 0.0f64;
             for i in 0..(24 * 24) {
-                sum += luminance([
-                    film.rgb[i * 3],
-                    film.rgb[i * 3 + 1],
-                    film.rgb[i * 3 + 2],
-                ]) as f64;
+                sum +=
+                    luminance([film.rgb[i * 3], film.rgb[i * 3 + 1], film.rgb[i * 3 + 2]]) as f64;
             }
             sum / (24.0 * 24.0)
         };
@@ -5259,7 +5388,8 @@ mod tests {
                 ] {
                     let mut rng = Rng::new(7);
                     for _ in 0..256 {
-                        if let Some((wi, _f, pdf)) = bsdf_sample_surface(&m, wo, 1.0, 0.0, &mut rng) {
+                        if let Some((wi, _f, pdf)) = bsdf_sample_surface(&m, wo, 1.0, 0.0, &mut rng)
+                        {
                             let (_f2, pdf2) = bsdf_eval(&m, wo, wi, 1.0, 0.0);
                             assert!(
                                 (pdf - pdf2).abs() <= 1e-4 * pdf.max(1.0),
@@ -5783,7 +5913,10 @@ mod tests {
             thin_film_ior: 1.45,
             ..Default::default()
         };
-        let plain = Pbr { thin_film_thickness: 0.0, ..m };
+        let plain = Pbr {
+            thin_film_thickness: 0.0,
+            ..m
+        };
         for lambda in [0.0f32, 500.0] {
             for a in view_directions() {
                 for b in view_directions() {
@@ -5827,9 +5960,8 @@ mod tests {
                 };
                 for wo in view_directions() {
                     for lambda in [0.0f32, 480.0] {
-                        let e = integrate_hemisphere(220, |wi| {
-                            bsdf_eval(&m, wo, wi, 1.0, lambda).0[1]
-                        });
+                        let e =
+                            integrate_hemisphere(220, |wi| bsdf_eval(&m, wo, wi, 1.0, lambda).0[1]);
                         assert!(e <= 1.02, "albedo {e} at d {thickness} r {roughness}");
                     }
                 }
@@ -5948,11 +6080,7 @@ mod tests {
                     None => {}
                 }
             }
-            totals.push([
-                acc[0] / n as f64,
-                acc[1] / n as f64,
-                acc[2] / n as f64,
-            ]);
+            totals.push([acc[0] / n as f64, acc[1] / n as f64, acc[2] / n as f64]);
         }
         for t in &totals {
             for c in 0..3 {
@@ -6087,7 +6215,10 @@ mod tests {
         assert_eq!(m.subsurface, 0.0);
         let w = lobe_weights(&m);
         assert_eq!(w[5], 0.0, "no subsurface lobe to pick");
-        let plain = Pbr { subsurface_color: [1.0; 3], ..m };
+        let plain = Pbr {
+            subsurface_color: [1.0; 3],
+            ..m
+        };
         for wo in view_directions() {
             for wi in view_directions() {
                 assert_eq!(
@@ -6271,7 +6402,10 @@ mod tests {
             for c in 0..3 {
                 let got = (-sigma[c] * t).exp();
                 let want = m.attenuation_color[c].powf(t / m.attenuation_distance);
-                assert!((got - want).abs() < 1e-6, "channel {c} at {t}: {got} vs {want}");
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "channel {c} at {t}: {got} vs {want}"
+                );
             }
         }
         // One attenuation distance reproduces the colour that named it.
@@ -6335,7 +6469,9 @@ mod tests {
             let wo2 = Vec3::new(r2.sin(), 0.0, r2.cos());
             let mut i2 = None;
             for _ in 0..8000 {
-                if let Some((wi, _, _)) = bsdf_sample_surface(&m, wo2, (1.0 / n) as f32, 0.0, &mut rng) {
+                if let Some((wi, _, _)) =
+                    bsdf_sample_surface(&m, wo2, (1.0 / n) as f32, 0.0, &mut rng)
+                {
                     if wi.z < 0.0 {
                         i2 = Some((wi.x * wi.x + wi.y * wi.y).sqrt().asin());
                         break;
@@ -6384,7 +6520,10 @@ mod tests {
             green[1] > green[0] && green[1] > green[2],
             "540nm reads {green:?}"
         );
-        assert!(blue[2] > blue[0] && blue[2] > blue[1], "450nm reads {blue:?}");
+        assert!(
+            blue[2] > blue[0] && blue[2] > blue[1],
+            "450nm reads {blue:?}"
+        );
     }
 
     /// The invariant MIS depends on: the PDF `bsdf_sample` returns is the PDF
@@ -6405,7 +6544,8 @@ mod tests {
                 for _ in 0..2000 {
                     let theta = rng.f64() * 1.4;
                     let wo = Vec3::new(theta.sin(), 0.0, theta.cos());
-                    let Some((wi, f, pdf)) = bsdf_sample_surface(&m, wo, 1.52, 0.0, &mut rng) else {
+                    let Some((wi, f, pdf)) = bsdf_sample_surface(&m, wo, 1.52, 0.0, &mut rng)
+                    else {
                         continue;
                     };
                     let (f2, pdf2) = bsdf_eval(&m, wo, wi, 1.52, 0.0);
@@ -6441,7 +6581,10 @@ mod tests {
             if wi.z >= 0.0 {
                 continue;
             }
-            assert!((wi.x + wo.x).abs() < 5e-3 && (wi.z + wo.z).abs() < 5e-3, "{wi:?}");
+            assert!(
+                (wi.x + wo.x).abs() < 5e-3 && (wi.z + wo.z).abs() < 5e-3,
+                "{wi:?}"
+            );
             n += 1;
         }
         assert!(n > 3000, "a sheet should mostly transmit, got {n}/4000");
@@ -6471,11 +6614,45 @@ mod tests {
             ..Default::default()
         };
         let cases: [(&str, Pbr); 6] = [
-            ("diffuse-rough", Pbr { diffuse_roughness: 0.9, ..base }),
-            ("subsurface", Pbr { subsurface: 0.8, diffuse_roughness: 0.4, ..base }),
-            ("sheen", Pbr { sheen: 0.8, sheen_roughness: 0.35, ..base }),
-            ("coat", Pbr { clearcoat: 0.9, clearcoat_roughness: 0.12, ..base }),
-            ("metal", Pbr { metallic: 1.0, roughness: 0.6, ..base }),
+            (
+                "diffuse-rough",
+                Pbr {
+                    diffuse_roughness: 0.9,
+                    ..base
+                },
+            ),
+            (
+                "subsurface",
+                Pbr {
+                    subsurface: 0.8,
+                    diffuse_roughness: 0.4,
+                    ..base
+                },
+            ),
+            (
+                "sheen",
+                Pbr {
+                    sheen: 0.8,
+                    sheen_roughness: 0.35,
+                    ..base
+                },
+            ),
+            (
+                "coat",
+                Pbr {
+                    clearcoat: 0.9,
+                    clearcoat_roughness: 0.12,
+                    ..base
+                },
+            ),
+            (
+                "metal",
+                Pbr {
+                    metallic: 1.0,
+                    roughness: 0.6,
+                    ..base
+                },
+            ),
             (
                 "everything",
                 Pbr {
@@ -6498,7 +6675,8 @@ mod tests {
                 Vec3::new(0.6, 0.2, 0.77).normalize(),
                 Vec3::new(0.9, 0.1, 0.42).normalize(),
             ] {
-                let reference = integrate_hemisphere(200, |wi| bsdf_eval(&m, wo, wi, 1.0, 0.0).0[0]);
+                let reference =
+                    integrate_hemisphere(200, |wi| bsdf_eval(&m, wo, wi, 1.0, 0.0).0[0]);
                 let mut rng = Rng::new(29);
                 let n = 200_000;
                 let mut sum = 0.0f64;
@@ -6842,18 +7020,23 @@ mod tests {
         // Radiance times solid angle is irradiance, by construction.
         let l = sun.radiance()[0] as f64;
         assert!((l * sun.solid_angle() - 1.0).abs() < 1e-6);
-        assert_eq!(sun.radiance_in(Vec3::new(0.0, 0.0, 1.0))[0], sun.radiance()[0]);
+        assert_eq!(
+            sun.radiance_in(Vec3::new(0.0, 0.0, 1.0))[0],
+            sun.radiance()[0]
+        );
         assert_eq!(sun.radiance_in(Vec3::new(1.0, 0.0, 0.0))[0], 0.0);
         assert!(sun.pdf(Vec3::new(0.0, 0.0, 1.0)) > 0.0);
         assert_eq!(sun.pdf(Vec3::new(0.0, 1.0, 0.0)), 0.0);
         // Every sample must land inside the cone.
         for k in 0..64 {
             let (d, _, pdf) = sun.sample(k as f64 / 64.0, (k * 7 % 64) as f64 / 64.0);
-            assert!(d.z >= sun.cos_radius() - 1e-12, "sample outside the cone: {d:?}");
+            assert!(
+                d.z >= sun.cos_radius() - 1e-12,
+                "sample outside the cone: {d:?}"
+            );
             assert!(((pdf as f64) * sun.solid_angle() - 1.0).abs() < 1e-5);
         }
     }
-
 
     // ─── the splat volume in the integrator ───────────────────────────────
     //
@@ -7025,5 +7208,233 @@ mod tests {
             assert!((l[0] - 0.3).abs() < 1e-4, "{l:?}");
             assert!((l[2] - 0.5).abs() < 1e-4, "{l:?}");
         }
+    }
+
+    // ─── low-discrepancy camera sampling and adaptive sampling ────────────
+
+    #[test]
+    fn radical_inverse_matches_hand_computed_values() {
+        // Base 2: 1 -> 0.1b = 1/2, 2 -> 0.01b = 1/4, 3 -> 0.11b = 3/4.
+        assert_eq!(radical_inverse::<2>(0), 0.0);
+        assert!((radical_inverse::<2>(1) - 0.5).abs() < 1e-12);
+        assert!((radical_inverse::<2>(2) - 0.25).abs() < 1e-12);
+        assert!((radical_inverse::<2>(3) - 0.75).abs() < 1e-12);
+        // Base 3: 1 -> 1/3, 2 -> 2/3, 4 = 11_3 -> 0.11_3 = 4/9.
+        assert!((radical_inverse::<3>(1) - 1.0 / 3.0).abs() < 1e-12);
+        assert!((radical_inverse::<3>(2) - 2.0 / 3.0).abs() < 1e-12);
+        assert!((radical_inverse::<3>(4) - 4.0 / 9.0).abs() < 1e-12);
+        // The rotation stays on the torus whatever the offset.
+        for &x in &[0.0, 0.25, 0.99] {
+            for &o in &[0.0, 0.5, 0.999] {
+                let v = cp_rotate(x, o);
+                assert!((0.0..1.0).contains(&v), "cp_rotate({x}, {o}) = {v}");
+            }
+        }
+    }
+
+    /// The whole point of the point set: no gaps and no clumps. A purely
+    /// random 2D sample would routinely leave a stratum empty at these
+    /// counts, which is the aliasing this replaced.
+    #[test]
+    fn camera_point_set_covers_every_stratum() {
+        let n = 64u32;
+        let sample = |s: u32, ox: f64, oy: f64| {
+            (
+                cp_rotate(radical_inverse::<2>(s as u64), ox),
+                cp_rotate(radical_inverse::<3>(s as u64), oy),
+            )
+        };
+        for &(ox, oy) in &[(0.0, 0.0), (0.317, 0.61), (0.94, 0.02)] {
+            let mut hits = [[0u32; 8]; 8];
+            for s in 0..n {
+                let (x, y) = sample(s, ox, oy);
+                assert!((0.0..1.0).contains(&x) && (0.0..1.0).contains(&y));
+                hits[(y * 8.0) as usize][(x * 8.0) as usize] += 1;
+            }
+            let worst = hits.iter().flatten().copied().max().unwrap();
+            assert!(
+                worst <= 3,
+                "rotated set clumped {worst} samples in a stratum"
+            );
+        }
+    }
+
+    /// The Halton camera set beats four fresh uniforms at the job the camera
+    /// dimensions actually do: estimating how much of a pixel's footprint a
+    /// silhouette covers, on a scene that is flat either side of the edge.
+    ///
+    /// Measured per pixel and pooled, because the per-pixel Cranley-Patterson
+    /// rotation makes a *single* sample of the Halton set exactly as random
+    /// as a uniform draw — the two sets only separate once a pixel takes more
+    /// than one, which is the smallest count at which the comparison means
+    /// anything. Each "pixel" here is one draw of the rotation.
+    #[test]
+    fn the_halton_camera_set_beats_random_jitter_on_a_flat_edge() {
+        // Coverage of the unit pixel square by the half-plane x + y < c, for
+        // a random edge offset c per pixel — a silhouette crossing the pixel
+        // footprint anywhere. The exact area is known, and the estimator is
+        // the fraction of samples that land under the edge.
+        let n = 16u32;
+        let pixels = 8192u32;
+        let mut halton_err = 0.0f64;
+        let mut random_err = 0.0f64;
+        for pixel in 0..pixels {
+            let mut rng = Rng::new(0xA17E_u64 ^ pixel as u64);
+            let rot = [rng.f64(), rng.f64()];
+            let c = 2.0 * rng.f64();
+            let exact = if c <= 1.0 {
+                0.5 * c * c
+            } else {
+                1.0 - 0.5 * (2.0 - c) * (2.0 - c)
+            };
+            let mut h = 0.0f64;
+            let mut r = 0.0f64;
+            for s in 0..n {
+                let hx = cp_rotate(radical_inverse::<2>(s as u64), rot[0]);
+                let hy = cp_rotate(radical_inverse::<3>(s as u64), rot[1]);
+                if hx + hy < c {
+                    h += 1.0;
+                }
+                if rng.f64() + rng.f64() < c {
+                    r += 1.0;
+                }
+            }
+            halton_err += (h / n as f64 - exact).powi(2);
+            random_err += (r / n as f64 - exact).powi(2);
+        }
+        let halton_rmse = (halton_err / pixels as f64).sqrt();
+        let random_rmse = (random_err / pixels as f64).sqrt();
+        eprintln!(
+            "edge coverage RMSE at {n} spp: halton {halton_rmse:.5}, random {random_rmse:.5}"
+        );
+        assert!(
+            halton_rmse < random_rmse,
+            "the low-discrepancy set is no better than random: {halton_rmse} vs {random_rmse}"
+        );
+    }
+
+    /// Below the floor, adaptive sampling must be a no-op — not "almost" a
+    /// no-op. A low-spp render is exactly where an early stop would do the
+    /// most damage, so the option must not touch it at all.
+    #[test]
+    fn adaptive_is_inert_below_the_sample_floor() {
+        let scene = test_scene();
+        let cam = test_camera();
+        let base = PathTraceOptions {
+            spp: ADAPTIVE_FLOOR,
+            max_depth: 3,
+            denoise: false,
+            seed: 11,
+            ..Default::default()
+        };
+        let fixed = render(
+            &scene,
+            &cam,
+            16,
+            16,
+            &PathTraceOptions {
+                adaptive: false,
+                ..base
+            },
+        );
+        let adaptive = render(
+            &scene,
+            &cam,
+            16,
+            16,
+            &PathTraceOptions {
+                adaptive: true,
+                ..base
+            },
+        );
+        assert_eq!(
+            fixed.rgb, adaptive.rgb,
+            "adaptive sampling fired at or below the floor"
+        );
+    }
+
+    /// Total samples spent, tracing every pixel the way [`render`] does.
+    fn spend(scene: &Scene<TriMesh>, cam: &Camera, w: u32, h: u32, opts: &PathTraceOptions) -> u64 {
+        let accel = SceneAccel::build(scene);
+        let mut total = 0u64;
+        for py in 0..h as usize {
+            let mut rgb = vec![0.0f32; w as usize * 3];
+            let mut alpha = vec![0.0f32; w as usize];
+            let mut normal = vec![0.0f32; w as usize * 3];
+            let mut depth = vec![0.0f32; w as usize];
+            let mut albedo = vec![0.0f32; w as usize * 3];
+            let mut variance = vec![0.0f32; w as usize];
+            let mut out = PixelOut {
+                rgb: &mut rgb,
+                alpha: &mut alpha,
+                normal: &mut normal,
+                depth: &mut depth,
+                albedo: &mut albedo,
+                variance: &mut variance,
+            };
+            for px in 0..w as usize {
+                total += trace_pixel(scene, &accel, None, cam, opts, w, h, px, py, &mut out) as u64;
+            }
+        }
+        total
+    }
+
+    /// A converged pixel keeps the unbiased mean of the samples it took, so
+    /// the adaptive film must land on the fixed-count film's estimate — it
+    /// just gets there for less.
+    #[test]
+    fn adaptive_matches_the_fixed_count_mean_for_fewer_samples() {
+        // A flat, softly lit scene: nearly every pixel resolves early, which
+        // is exactly the case adaptivity exists for.
+        let scene = Scene::<TriMesh> {
+            objects: Vec::new(),
+            lights: studio_rig(Point3::new(5.0, 5.0, 5.0), 9.0),
+            env: Environment::default(),
+            sun: None,
+            ground: None,
+            splats: None,
+        };
+        let cam = test_camera();
+        let (w, h) = (24u32, 24u32);
+        let base = PathTraceOptions {
+            spp: 256,
+            max_depth: 3,
+            denoise: false,
+            seed: 5,
+            ..Default::default()
+        };
+        let fixed_opts = PathTraceOptions {
+            adaptive: false,
+            ..base
+        };
+        let adaptive_opts = PathTraceOptions {
+            adaptive: true,
+            ..base
+        };
+
+        let fixed = render(&scene, &cam, w, h, &fixed_opts);
+        let adaptive = render(&scene, &cam, w, h, &adaptive_opts);
+
+        let mean = |f: &Film| {
+            f.rgb
+                .chunks_exact(3)
+                .map(|p| luminance([p[0], p[1], p[2]]) as f64)
+                .sum::<f64>()
+                / (f.rgb.len() / 3) as f64
+        };
+        let (mf, ma) = (mean(&fixed), mean(&adaptive));
+        let n_fixed = spend(&scene, &cam, w, h, &fixed_opts);
+        let n_adaptive = spend(&scene, &cam, w, h, &adaptive_opts);
+        eprintln!(
+            "mean luminance: fixed {mf:.6} ({n_fixed} samples), adaptive {ma:.6} ({n_adaptive} samples)"
+        );
+        assert!(
+            (ma - mf).abs() <= 0.02 * mf.abs().max(1e-3),
+            "adaptive biased the estimate: {mf} -> {ma}"
+        );
+        assert!(
+            n_adaptive < n_fixed / 2,
+            "adaptive spent {n_adaptive} of {n_fixed} samples — no real saving"
+        );
     }
 }

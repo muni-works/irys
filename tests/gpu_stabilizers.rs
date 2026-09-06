@@ -89,7 +89,14 @@ impl Fixture {
 }
 
 fn camera() -> GpuCamera {
-    GpuCamera::new([5.0, -5.0, 3.5], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], 0.7, W, H)
+    GpuCamera::new(
+        [5.0, -5.0, 3.5],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+        0.7,
+        W,
+        H,
+    )
 }
 
 fn state(frame: u32) -> GpuRenderState {
@@ -225,11 +232,7 @@ impl<'a> Rig<'a> {
             .expect("pass");
     }
 
-    fn converge(
-        &self,
-        passes: u32,
-        denoise: &GpuDenoiseParams,
-    ) -> kosm_render::gpu::ResidentScene {
+    fn converge(&self, passes: u32, denoise: &GpuDenoiseParams) -> kosm_render::gpu::ResidentScene {
         let mut res = self
             .pipeline
             .resident_scene(self.ctx, self.fx.scene(), W, H);
@@ -323,7 +326,11 @@ fn the_stabilizer_ramps_are_pinned() {
     assert_eq!(fresh_lum_relax_for(1.0, 3.0), 3.0);
     assert_eq!(fresh_lum_relax_for(4.0, 3.0), 1.0);
     assert!((fresh_lum_relax_for(2.5, 3.0) - 2.0).abs() < 1e-5);
-    assert_eq!(fresh_lum_relax_for(1.0, 0.5), 1.0, "a relax under 1 is no relax");
+    assert_eq!(
+        fresh_lum_relax_for(1.0, 0.5),
+        1.0,
+        "a relax under 1 is no relax"
+    );
 }
 
 /// A firefly moves the mean by no more than the cap allows.
@@ -395,7 +402,8 @@ fn a_firefly_moves_the_mean_by_no_more_than_the_cap() {
         "the capped fold moved the mean from {l0:.4} to {l1:.4}, past the cap's bound {bound:.4}"
     );
     assert_eq!(
-        after.count[p], before.count[p] + 1,
+        after.count[p],
+        before.count[p] + 1,
         "the cap should fold the sample, not throw it away"
     );
 
@@ -529,9 +537,7 @@ fn the_second_temporal_pass_takes_the_flicker_out() {
     const FROM: u32 = 4;
 
     let run = |denoise: &GpuDenoiseParams| {
-        let mut res = rig
-            .pipeline
-            .resident_scene(rig.ctx, rig.fx.scene(), W, H);
+        let mut res = rig.pipeline.resident_scene(rig.ctx, rig.fx.scene(), W, H);
         let mut frames = Vec::new();
         for f in 1..=PASSES {
             rig.pass(&mut res, f, &[], denoise);
@@ -582,7 +588,10 @@ fn the_second_temporal_pass_takes_the_flicker_out() {
         "frame-to-frame movement over passes {FROM}..={PASSES}: {m_off:.3} codes without the \
          temporal pass, {m_on:.3} with; the last frames differ by {diff:.3} codes mean, {worst} worst"
     );
-    assert!(m_off > 0.0, "the still sequence did not move at all; nothing to measure");
+    assert!(
+        m_off > 0.0,
+        "the still sequence did not move at all; nothing to measure"
+    );
     assert!(
         m_on < m_off * 0.6,
         "the second temporal pass took the flicker from {m_off:.3} only to {m_on:.3} codes"
@@ -642,7 +651,11 @@ fn a_fresh_pixel_is_blurry_rather_than_grainy() {
             }
         }
     }
-    assert_eq!(fresh, ((bx1 - bx0) * (by1 - by0)) as usize, "the keep mask did not restart the box");
+    assert_eq!(
+        fresh,
+        ((bx1 - bx0) * (by1 - by0)) as usize,
+        "the keep mask did not restart the box"
+    );
 
     // Mean 3x3 deviation inside the box, per channel, in codes.
     let roughness = |px: &[u8]| {
@@ -666,7 +679,9 @@ fn a_fresh_pixel_is_blurry_rather_than_grainy() {
         s / n as f64
     };
     let (r_with, r_without) = (roughness(&px_with), roughness(&px_without));
-    println!("3x3 deviation inside the restarted box: {r_without:.3} codes without the fallback, {r_with:.3} with");
+    println!(
+        "3x3 deviation inside the restarted box: {r_without:.3} codes without the fallback, {r_with:.3} with"
+    );
     assert!(
         r_with < r_without * 0.85,
         "the disocclusion fallback bought nothing: {r_with:.3} codes with it, {r_without:.3} without"

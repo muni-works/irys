@@ -140,9 +140,7 @@ fn run(ctx: &GpuContext, inputs: &[ParityIn]) -> Vec<ParityOut> {
         // The BSDF alone, not `shaders::compose`: the environment module in
         // the full composition wants texture bindings this harness has no use
         // for, and the point here is to isolate the shading model.
-        source: wgpu::ShaderSource::Wgsl(
-            format!("{}\n{HARNESS}", shaders::BSDF_SHADER).into(),
-        ),
+        source: wgpu::ShaderSource::Wgsl(format!("{}\n{HARNESS}", shaders::BSDF_SHADER).into()),
     });
 
     let out_size = (inputs.len() * std::mem::size_of::<ParityOut>()) as u64;
@@ -219,7 +217,9 @@ fn run(ctx: &GpuContext, inputs: &[ParityIn]) -> Vec<ParityOut> {
     let slice = read_buf.slice(..);
     slice.map_async(wgpu::MapMode::Read, |_| {});
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
-    let data = slice.get_mapped_range().expect("readback buffer did not map");
+    let data = slice
+        .get_mapped_range()
+        .expect("readback buffer did not map");
     let out: Vec<ParityOut> = bytemuck::cast_slice(&data).to_vec();
     drop(data);
     read_buf.unmap();
@@ -236,20 +236,55 @@ fn materials() -> Vec<Pbr> {
     };
     let mut out = vec![base, Pbr::default()];
     for r in [0.05f32, 0.3, 0.7, 1.0] {
-        out.push(Pbr { roughness: r, ..base });
+        out.push(Pbr {
+            roughness: r,
+            ..base
+        });
     }
     for v in [0.0f32, 0.3, 0.7, 1.0] {
-        out.push(Pbr { metallic: v, ..base });
-        out.push(Pbr { diffuse_roughness: v, ..base });
-        out.push(Pbr { subsurface: v, diffuse_roughness: 0.5, ..base });
-        out.push(Pbr { specular_tint: v, specular: 0.9, ..base });
-        out.push(Pbr { sheen: v, sheen_roughness: 0.4, ..base });
-        out.push(Pbr { sheen: 0.8, sheen_roughness: v.max(0.05), ..base });
-        out.push(Pbr { clearcoat: v, clearcoat_roughness: 0.12, ..base });
-        out.push(Pbr { anisotropy: v * 2.0 - 1.0, ..base });
+        out.push(Pbr {
+            metallic: v,
+            ..base
+        });
+        out.push(Pbr {
+            diffuse_roughness: v,
+            ..base
+        });
+        out.push(Pbr {
+            subsurface: v,
+            diffuse_roughness: 0.5,
+            ..base
+        });
+        out.push(Pbr {
+            specular_tint: v,
+            specular: 0.9,
+            ..base
+        });
+        out.push(Pbr {
+            sheen: v,
+            sheen_roughness: 0.4,
+            ..base
+        });
+        out.push(Pbr {
+            sheen: 0.8,
+            sheen_roughness: v.max(0.05),
+            ..base
+        });
+        out.push(Pbr {
+            clearcoat: v,
+            clearcoat_roughness: 0.12,
+            ..base
+        });
+        out.push(Pbr {
+            anisotropy: v * 2.0 - 1.0,
+            ..base
+        });
     }
     for s in [0.0f32, 0.25, 0.5, 1.0] {
-        out.push(Pbr { specular: s, ..base });
+        out.push(Pbr {
+            specular: s,
+            ..base
+        });
     }
     for ior in [1.0f32, 1.33, 1.52, 2.4] {
         out.push(Pbr { ior, ..base });
@@ -310,7 +345,10 @@ fn materials() -> Vec<Pbr> {
     // Thin films across the whole visible range of thicknesses, over a
     // dielectric and over metals — the two Fresnel paths the film modulates.
     for d in [40.0f32, 180.0, 320.0, 550.0, 900.0] {
-        out.push(Pbr { thin_film_thickness: d, ..base });
+        out.push(Pbr {
+            thin_film_thickness: d,
+            ..base
+        });
         out.push(Pbr {
             thin_film_thickness: d,
             thin_film_ior: 2.0,
@@ -452,7 +490,12 @@ fn gpu_bsdf_eval_matches_the_cpu_reference() {
         // outright.
         let cw = reference_lobe_weights(m);
         let gw = [
-            o.lobes_a[0], o.lobes_a[1], o.lobes_a[2], o.lobes_a[3], o.lobes_b[0], o.lobes_b[1],
+            o.lobes_a[0],
+            o.lobes_a[1],
+            o.lobes_a[2],
+            o.lobes_a[3],
+            o.lobes_b[0],
+            o.lobes_b[1],
         ];
         for i in 0..6 {
             assert!(
@@ -469,7 +512,10 @@ fn gpu_bsdf_eval_matches_the_cpu_reference() {
             o.eval[3]
         );
     }
-    eprintln!("worst relative disagreement over {} cases: {worst:e}", meta.len());
+    eprintln!(
+        "worst relative disagreement over {} cases: {worst:e}",
+        meta.len()
+    );
 }
 
 /// The dispersion half: the device's Sellmeier/Cauchy index and its CIE fit

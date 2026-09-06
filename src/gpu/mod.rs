@@ -29,10 +29,10 @@ pub use analytic::{AnalyticGeometry, AnalyticPrim};
 pub use budget::{Budget, SampleBudget};
 pub use buffers::{
     BACKGROUND_BLACK, BACKGROUND_ENVIRONMENT, BACKGROUND_SKY, CAMERA_BASIS_DERIVED,
-    CAMERA_BASIS_EXPLICIT, DEFAULT_ENV_INTENSITY, DEFAULT_FIREFLY_CLAMP, DEFAULT_MAX_DEPTH, DEFAULT_RR_START,
-    FLAG_BUDGET_GUIDES, FLAG_BUDGET_MASK, FLAG_CAMERA_VISIBLE_LIGHTS, FLAG_RAW_SAMPLE,
-    GpuAreaLight, GpuCamera, GpuMaterial, GpuRenderState, depth_for_frame, halton_jitter,
-    pack_light_power_table,
+    CAMERA_BASIS_EXPLICIT, DEFAULT_ENV_INTENSITY, DEFAULT_FIREFLY_CLAMP, DEFAULT_MAX_DEPTH,
+    DEFAULT_RR_START, FLAG_BUDGET_GUIDES, FLAG_BUDGET_MASK, FLAG_CAMERA_VISIBLE_LIGHTS,
+    FLAG_RAW_SAMPLE, GpuAreaLight, GpuCamera, GpuMaterial, GpuRenderState, depth_for_frame,
+    halton_jitter, pack_light_power_table,
 };
 pub use context::{GpuContext, GpuError};
 pub use geometry::{
@@ -41,8 +41,8 @@ pub use geometry::{
 };
 pub use history::{
     GpuDenoiseParams, Guides, History, HistoryBuffers, HistoryPipeline, InstanceMotion,
-    MAX_DENOISE_ITERS, atrous_iters_for, firefly_k_for, fresh_extra_iters_for,
-    fresh_lum_relax_for, variance_gamma_for,
+    MAX_DENOISE_ITERS, atrous_iters_for, firefly_k_for, fresh_extra_iters_for, fresh_lum_relax_for,
+    variance_gamma_for,
 };
 pub use neural::{NeuralDenoiser, NeuralPipeline};
 pub use pipeline::RayTracePipeline;

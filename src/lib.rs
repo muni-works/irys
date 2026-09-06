@@ -37,11 +37,11 @@ pub mod math;
 pub mod neural;
 pub mod optics;
 pub mod pathtrace;
-pub mod sampler;
-pub mod splats;
 mod ray;
-pub mod spectrum;
 mod sah;
+pub mod sampler;
+pub mod spectrum;
+pub mod splats;
 mod tables;
 pub use tables::spec_albedo;
 pub mod tlas;
@@ -53,11 +53,11 @@ pub use geometry::{Geometry, TriMesh, TriangleHit, intersect_triangle};
 pub use heightfield::HeightField;
 pub use math::{Aabb, Dir3, Point2, Point3, Transform, Vec2, Vec3, transform_from_column_major};
 pub use optics::{fresnel, index, reflect, refract, sellmeier};
-pub use spectrum::{cauchy_index, cie_xyz, hero_weight, sellmeier_index, BK7_SELLMEIER};
 pub use pathtrace::{
     AreaLight, Camera, EnvMap, Environment, Film, GradientEnv, Ground, Object, PathTraceOptions,
     Pbr, PixelFilter, Scene, Sun, denoise, render, render_into, studio_rig,
 };
 pub use ray::{Hit, Ray};
+pub use spectrum::{BK7_SELLMEIER, cauchy_index, cie_xyz, hero_weight, sellmeier_index};
 pub use splats::{Splats, unpack_payload};
 pub use tlas::{FlatTlasNode, Instance, InstanceHit, Tlas};

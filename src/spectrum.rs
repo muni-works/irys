@@ -60,10 +60,10 @@ pub fn cie_xyz(lambda_nm: f64) -> [f64; 3] {
     let x = 1.056 * gauss(lambda_nm, 599.8, 37.9, 31.0)
         + 0.362 * gauss(lambda_nm, 442.0, 16.0, 26.7)
         - 0.065 * gauss(lambda_nm, 501.1, 20.4, 26.2);
-    let y = 0.821 * gauss(lambda_nm, 568.8, 46.9, 40.5)
-        + 0.286 * gauss(lambda_nm, 530.9, 16.3, 31.1);
-    let z = 1.217 * gauss(lambda_nm, 437.0, 11.8, 36.0)
-        + 0.681 * gauss(lambda_nm, 459.0, 26.0, 13.8);
+    let y =
+        0.821 * gauss(lambda_nm, 568.8, 46.9, 40.5) + 0.286 * gauss(lambda_nm, 530.9, 16.3, 31.1);
+    let z =
+        1.217 * gauss(lambda_nm, 437.0, 11.8, 36.0) + 0.681 * gauss(lambda_nm, 459.0, 26.0, 13.8);
     [x, y, z]
 }
 
@@ -177,7 +177,11 @@ mod tests {
             }
         }
         for c in 0..3 {
-            assert!((acc[c] - 1.0).abs() < 2e-3, "channel {c} averaged {}", acc[c]);
+            assert!(
+                (acc[c] - 1.0).abs() < 2e-3,
+                "channel {c} averaged {}",
+                acc[c]
+            );
         }
     }
 
@@ -187,7 +191,10 @@ mod tests {
         for l in [0.45, 0.5876, 0.65] {
             let general = sellmeier_index(b, c, l);
             let hardcoded: f64 = crate::optics::sellmeier(l);
-            assert!((general - hardcoded).abs() < 1e-12, "{general} vs {hardcoded}");
+            assert!(
+                (general - hardcoded).abs() < 1e-12,
+                "{general} vs {hardcoded}"
+            );
         }
     }
 
@@ -201,7 +208,10 @@ mod tests {
         for l in [LINE_F_UM, 0.55, LINE_D_UM, LINE_C_UM] {
             let cauchy = cauchy_index(1.5168, 64.17, l);
             let exact = sellmeier_index(b, c, l);
-            assert!((cauchy - exact).abs() < 1e-3, "at {l}um: {cauchy} vs {exact}");
+            assert!(
+                (cauchy - exact).abs() < 1e-3,
+                "at {l}um: {cauchy} vs {exact}"
+            );
         }
     }
 

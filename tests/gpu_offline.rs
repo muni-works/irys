@@ -237,7 +237,11 @@ fn luma(p: [f32; 3]) -> f32 {
 
 /// Mean luminance of a vertical half of the image.
 fn half_mean(r: &OfflineResult, left: bool) -> f32 {
-    let (lo, hi) = if left { (0, r.width / 2) } else { (r.width / 2, r.width) };
+    let (lo, hi) = if left {
+        (0, r.width / 2)
+    } else {
+        (r.width / 2, r.width)
+    };
     let mut sum = 0.0f64;
     let mut n = 0usize;
     for y in 0..r.height {
@@ -428,7 +432,10 @@ fn the_backdrop_modes_do_what_show_background_does() {
         "the covered centre pixel reads as transparent: {centre_alpha}"
     );
     let (cb, ce) = (luma(black.pixel(cx, cy)), luma(env.pixel(cx, cy)));
-    assert!(cb > 0.0 && ce > 0.0, "the subject is black on one of the two");
+    assert!(
+        cb > 0.0 && ce > 0.0,
+        "the subject is black on one of the two"
+    );
 }
 
 /// `to_film` hands the accumulation buffer to the CPU `Film` so the caller's

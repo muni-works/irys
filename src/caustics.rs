@@ -68,8 +68,8 @@ use std::collections::HashMap;
 use crate::geometry::Geometry;
 use crate::math::{Point3, Vec3};
 use crate::pathtrace::{
-    AreaLight, Pbr, Rng, Scene, Sun, caustic_bounds, cosine_hemisphere, luminance, onb,
-    trace_photon, CausticContext,
+    AreaLight, CausticContext, Pbr, Rng, Scene, Sun, caustic_bounds, cosine_hemisphere, luminance,
+    onb, trace_photon,
 };
 
 /// How the caustic pass is shot.
@@ -226,10 +226,7 @@ impl CausticMap {
 /// Returns an empty map when the scene has no transmissive geometry, which
 /// makes calling this unconditionally free for the scenes that do not need
 /// it.
-pub fn trace<G: Geometry + Send + Sync>(
-    scene: &Scene<G>,
-    opts: &CausticOptions,
-) -> CausticMap {
+pub fn trace<G: Geometry + Send + Sync>(scene: &Scene<G>, opts: &CausticOptions) -> CausticMap {
     let Some((center, extent)) = caustic_bounds(scene) else {
         return CausticMap::empty();
     };
@@ -270,8 +267,10 @@ pub fn trace<G: Geometry + Send + Sync>(
         // is deterministic however rayon schedules it — the same property the
         // pixel loop has, for the same reason.
         let shoot = |k: usize| -> ([f32; 3], Option<Photon>) {
-            let mut rng =
-                Rng::new(seed.wrapping_add(k as u64).wrapping_mul(0x2545_f491_4f6c_dd1d));
+            let mut rng = Rng::new(
+                seed.wrapping_add(k as u64)
+                    .wrapping_mul(0x2545_f491_4f6c_dd1d),
+            );
             let Some((origin, dir, power)) = (match em {
                 Emitter::Area { index, .. } => {
                     emit_from_area(&scene.lights[*index], center, extent, n, &mut rng)
@@ -282,14 +281,12 @@ pub fn trace<G: Geometry + Send + Sync>(
             }) else {
                 return ([0.0; 3], None);
             };
-            let landed =
-                trace_photon(scene, &ctx, origin, dir, power, opts.max_bounces, &mut rng).map(
-                    |(point, normal, power)| Photon {
-                        point,
-                        normal,
-                        power,
-                    },
-                );
+            let landed = trace_photon(scene, &ctx, origin, dir, power, opts.max_bounces, &mut rng)
+                .map(|(point, normal, power)| Photon {
+                    point,
+                    normal,
+                    power,
+                });
             (power, landed)
         };
 
@@ -387,11 +384,15 @@ fn emit_from_area(
         let c = cosine_hemisphere(rng.f64(), rng.f64());
         let dir = t * c.x + b * c.y + ln * c.z;
         let scale = (std::f64::consts::PI * l.area() / n as f64) as f32;
-        return Some((p, dir, [
-            l.emission[0] * scale,
-            l.emission[1] * scale,
-            l.emission[2] * scale,
-        ]));
+        return Some((
+            p,
+            dir,
+            [
+                l.emission[0] * scale,
+                l.emission[1] * scale,
+                l.emission[2] * scale,
+            ],
+        ));
     }
     let w = to / d;
     let sin_max = extent / d;
@@ -438,11 +439,7 @@ fn emit_from_sun(
     let area = std::f64::consts::PI * extent * extent;
     let scale = (area / n as f64) as f32;
     let e = sun.irradiance;
-    Some((
-        origin,
-        -w,
-        [e[0] * scale, e[1] * scale, e[2] * scale],
-    ))
+    Some((origin, -w, [e[0] * scale, e[1] * scale, e[2] * scale]))
 }
 
 /// Whether a material is the kind of refractor the caustic pass exists for:
@@ -503,8 +500,7 @@ pub struct CausticPack {
 /// `integrator.wgsl`: the three primes are Teschner's, and the arithmetic is
 /// wrapping `u32`, which is what WGSL's is.
 pub fn cell_bucket(cell: [i32; 3], table_size: u32) -> u32 {
-    let h = (cell[0] as u32)
-        .wrapping_mul(73_856_093)
+    let h = (cell[0] as u32).wrapping_mul(73_856_093)
         ^ (cell[1] as u32).wrapping_mul(19_349_663)
         ^ (cell[2] as u32).wrapping_mul(83_492_791);
     h & (table_size - 1)
