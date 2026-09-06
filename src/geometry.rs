@@ -183,6 +183,14 @@ impl TriMesh {
     }
 
     /// The surviving triangles, as corner indices.
+    /// Per-vertex shading normals, one per position, or empty when the mesh
+    /// was built without a usable set (see [`TriMesh::new`]). Exposed so a
+    /// client that de-indexes triangles for its own GPU layout reads them
+    /// from here rather than carrying a second copy.
+    pub fn normals(&self) -> &[Vec3] {
+        &self.normals
+    }
+
     pub fn triangles(&self) -> &[[u32; 3]] {
         &self.tris
     }
