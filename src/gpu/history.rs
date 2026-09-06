@@ -1768,3 +1768,92 @@ impl RayTracePipeline {
         Ok(Some(out))
     }
 }
+
+/// The guide planes a raw-sample pass wrote, brought back to the host.
+///
+/// The same four quantities [`super::neural`] steers on, in the same
+/// conventions: `normal` is the face-forwarded world normal, `depth` is the
+/// distance from the eye along the primary ray with zero for background,
+/// `albedo` is the denoise albedo, and `id` is the biased hit id the
+/// reprojection validates against — zero on background, and otherwise a
+/// stable label for the surface under the pixel.
+///
+/// This exists for one caller: the offline dataset builder, which has to
+/// record what the neural pass will be *handed*, not what a CPU film would
+/// have computed. Training on the second and running on the first is the
+/// whole of the v1 denoiser's failure. Nothing in the render path reads it.
+#[derive(Debug, Clone)]
+pub struct Guides {
+    /// Frame width in pixels.
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
+    /// Face-forwarded world normal, 3 floats per pixel.
+    pub normal: Vec<f32>,
+    /// Distance to the first hit; zero is the background sentinel.
+    pub depth: Vec<f32>,
+    /// Denoise albedo, 3 floats per pixel.
+    pub albedo: Vec<f32>,
+    /// Biased hit id, one float per pixel; zero on background.
+    pub id: Vec<f32>,
+}
+
+impl RayTracePipeline {
+    /// Read the resident scene's guide planes back.
+    ///
+    /// The companion of [`RayTracePipeline::read_history`], and like it a
+    /// debug and offline path: the render never wants these on the host. It
+    /// copies planes 1 and 2 of the depth/normal buffer — `(normal, depth)`
+    /// and `(albedo, biased id)` — which are exactly bindings the neural
+    /// pass reads.
+    ///
+    /// A staging buffer is allocated per call rather than kept on the scene.
+    /// This runs once per dataset sample, beside a render of a thousand
+    /// passes, and a buffer that is only ever alive during a `--dump-dataset`
+    /// has no business sitting in a viewport's working set.
+    pub async fn read_guides(
+        &self,
+        ctx: &GpuContext,
+        res: &mut ResidentScene,
+    ) -> Result<Guides, GpuError> {
+        let (w, h) = res.size();
+        let n = (w as u64) * (h as u64);
+        let plane = n * 16;
+
+        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Guide Readback"),
+            size: (plane * 2).max(16),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let (_, guides) = res.raw_and_guide_buffers();
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Guide Readback Encoder"),
+            });
+        // Plane 0 is the shader's own (normal, t); the guides are 1 and 2.
+        encoder.copy_buffer_to_buffer(guides, plane, &staging, 0, plane * 2);
+        ctx.queue.submit(Some(encoder.finish()));
+
+        let raw = read_back_f32(ctx, &staging).await?;
+        let n = n as usize;
+        let mut out = Guides {
+            width: w,
+            height: h,
+            normal: vec![0.0; n * 3],
+            depth: vec![0.0; n],
+            albedo: vec![0.0; n * 3],
+            id: vec![0.0; n],
+        };
+        for i in 0..n {
+            let a = &raw[i * 4..i * 4 + 4];
+            let b = &raw[(n + i) * 4..(n + i) * 4 + 4];
+            out.normal[i * 3..i * 3 + 3].copy_from_slice(&a[..3]);
+            out.depth[i] = a[3];
+            out.albedo[i * 3..i * 3 + 3].copy_from_slice(&b[..3]);
+            out.id[i] = b[3];
+        }
+        Ok(out)
+    }
+}
