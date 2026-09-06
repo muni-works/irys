@@ -570,6 +570,11 @@ pub const FLAG_BUDGET_MASK: u32 = 1 << 2;
 /// a path-traced sample's cost is.
 pub const FLAG_BUDGET_GUIDES: u32 = 1 << 3;
 
+/// `GpuRenderState`'s flag word, bit 4: draw the path's random numbers from
+/// [`crate::sampler::SamplePattern::BlueNoise`] rather than the white-noise
+/// hash. See [`GpuRenderState::set_sample_pattern`].
+pub const FLAG_BLUE_NOISE: u32 = 1 << 4;
+
 /// Where the budget round index sits in `GpuRenderState`'s flag word.
 const BUDGET_ROUND_SHIFT: u32 = 8;
 
@@ -707,6 +712,29 @@ impl GpuRenderState {
         }
     }
 
+    /// Which pattern the shader draws its random numbers from.
+    ///
+    /// [`crate::sampler::SamplePattern::White`] is the hash the shader has
+    /// always used. [`crate::sampler::SamplePattern::BlueNoise`] is the
+    /// Owen-scrambled Sobol sequence shifted per pixel by the blue-noise
+    /// mask. The sub-pixel jitter stays the host's `jitter_x`/`jitter_y`
+    /// either way; see `ray_origin_and_direction` in the integrator for why.
+    pub fn set_sample_pattern(&mut self, pattern: crate::sampler::SamplePattern) {
+        match pattern {
+            crate::sampler::SamplePattern::White => self._pad3[0] &= !FLAG_BLUE_NOISE,
+            crate::sampler::SamplePattern::BlueNoise => self._pad3[0] |= FLAG_BLUE_NOISE,
+        }
+    }
+
+    /// What [`GpuRenderState::set_sample_pattern`] was last given.
+    pub fn sample_pattern(&self) -> crate::sampler::SamplePattern {
+        if self._pad3[0] & FLAG_BLUE_NOISE != 0 {
+            crate::sampler::SamplePattern::BlueNoise
+        } else {
+            crate::sampler::SamplePattern::White
+        }
+    }
+
     /// Whether [`GpuRenderState::set_camera_visible_lights`] is on.
     pub fn camera_visible_lights(&self) -> bool {
         self._pad3[0] & FLAG_CAMERA_VISIBLE_LIGHTS != 0
@@ -746,7 +774,10 @@ impl GpuRenderState {
             env_marg_int: 0.0,
             scissor_xy: 0,
             scissor_wh: 0,
-            _pad3: [0; 1],
+            _pad3: [match crate::sampler::SamplePattern::default() {
+                crate::sampler::SamplePattern::White => 0,
+                crate::sampler::SamplePattern::BlueNoise => FLAG_BLUE_NOISE,
+            }; 1],
             env_zenith: rgba(DEFAULT_GRADIENT.zenith),
             env_horizon: rgba(DEFAULT_GRADIENT.horizon),
             env_ground: rgba(DEFAULT_GRADIENT.ground),
@@ -1007,7 +1038,10 @@ impl GpuRenderState {
             env_marg_int: 0.0,
             scissor_xy: 0,
             scissor_wh: 0,
-            _pad3: [0; 1],
+            _pad3: [match crate::sampler::SamplePattern::default() {
+                crate::sampler::SamplePattern::White => 0,
+                crate::sampler::SamplePattern::BlueNoise => FLAG_BLUE_NOISE,
+            }; 1],
             env_zenith: rgba(DEFAULT_GRADIENT.zenith),
             env_horizon: rgba(DEFAULT_GRADIENT.horizon),
             env_ground: rgba(DEFAULT_GRADIENT.ground),
