@@ -2,7 +2,7 @@
 name = "kosm-render"
 # Published on its own cadence: vcad depends on this by version, and the
 # workspace's 0.0.1 is the game's number, not the renderer's.
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 description = "The light: rays, acceleration structures and a path tracer over any geometry that can be bounded and hit"
