@@ -22,6 +22,7 @@ repository = "https://github.com/ecto/kosm"
 readme = "README.md"
 keywords = ["raytracing", "pathtracing", "renderer", "bvh", "graphics"]
 categories = ["graphics", "rendering", "rendering::engine"]
+exclude = ["out/", "tests/snapshots/"]
 
 [dependencies]
 # The registry tang, not the workspace's path: vcad consumes this crate by git,
