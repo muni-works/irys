@@ -7,7 +7,7 @@
 //! the interpolated surface to machine precision instead of to the chord
 //! error of a triangulation, and it makes the surface C0 across cell edges
 //! with an analytic gradient inside them. Two triangles would also have
-//! disagreed with the physics: [`kosm-spike`]'s pool marches
+//! disagreed with the physics: [`kosm`]'s pool marches
 //! `p.z - surface.height(p.x, p.y)` against a *bilinear* sample of the same
 //! grid, so a triangulated renderer and the simulator would have been
 //! looking at two different water surfaces.
@@ -54,7 +54,7 @@
 //! client that animates the grid must call `update_heights` then `refit`,
 //! and must not hold a hit from the previous frame across that call.
 //!
-//! [`kosm-spike`]: https://docs.rs/kosm-spike
+//! [`kosm`]: https://docs.rs/kosm
 //! [`Bvh::refit`]: crate::Bvh::refit
 
 use crate::geometry::Geometry;

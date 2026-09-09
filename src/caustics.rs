@@ -575,6 +575,7 @@ pub struct CausticPack {
     /// point outside it gathers nothing, and the shader says so without
     /// walking a bucket.
     pub bounds_min: [f32; 3],
+    /// The far corner of that box.
     pub bounds_max: [f32; 3],
 }
 

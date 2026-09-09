@@ -2,7 +2,19 @@
 name = "kosm-render"
 # Published on its own cadence: vcad depends on this by version, and the
 # workspace's 0.0.1 is the game's number, not the renderer's.
-version = "0.1.0"
+#
+# Held at 0.1.x, and that is load-bearing rather than laziness. vcad's pinned
+# rev (504047fb) requires `kosm-render = { git = ..., version = "0.1.0" }`,
+# and a `[patch]` may only replace a dependency with one that SATISFIES its
+# requirement. At 0.2.0 the workspace patch silently stopped applying, cargo
+# added a second kosm-render (the old git rev) beside this one, and
+# `kosm/src/brep/mod.rs` stopped compiling: `pathtrace::Scene` came from
+# vcad's copy while `kosm_render::caustics::trace` came from this one. Two
+# `Scene<G>` types, one call, E0308 — on `main`, for every consumer.
+#
+# This goes to 0.2.0 in the same commit that bumps the vcad rev to one
+# tracking the kosm-render-v0.2.0 tag, and not before.
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 description = "The light: rays, acceleration structures and a path tracer over any geometry that can be bounded and hit"
@@ -10,6 +22,7 @@ repository = "https://github.com/ecto/kosm"
 readme = "README.md"
 keywords = ["raytracing", "pathtracing", "renderer", "bvh", "graphics"]
 categories = ["graphics", "rendering", "rendering::engine"]
+exclude = ["out/", "tests/snapshots/"]
 
 [dependencies]
 # The registry tang, not the workspace's path: vcad consumes this crate by git,
