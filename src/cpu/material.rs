@@ -75,6 +75,28 @@ pub struct Pbr {
     /// travels furthest through most organic media, which is the whole
     /// reason a hand held to a light goes red at the edges.
     pub subsurface_radius: [f64; 3],
+    /// Henyey–Greenstein asymmetry `g` of the medium's phase function, in
+    /// `-1..1` — OpenPBR's `subsurface_scatter_anisotropy`.
+    ///
+    /// `0` — the default — is the isotropic scattering the walk has always
+    /// done, and reduces to it exactly. Positive `g` is forward scattering:
+    /// each event deflects the ray only a little, so light drives *deeper*
+    /// before it turns around and a thin part reads as more translucent than
+    /// its mean free path alone would say. Skin runs about `0.8`, marble and
+    /// most minerals near `0`, and a few pigmented media are mildly backward.
+    ///
+    /// The albedo inversion behind [`Self::subsurface_color`] was fitted for
+    /// an isotropic medium, so it is applied under **similarity theory**:
+    /// [`Self::subsurface_radius`] is read as the *reduced* (transport) mean
+    /// free path and the fit's answer as the reduced single-scattering
+    /// albedo, and the true `(sigma_s, sigma_t)` are derived back out through
+    /// `sigma_s' = sigma_s (1 - g)`. That is what keeps the colour the artist
+    /// wrote when the anisotropy knob turns — see
+    /// `anisotropy_keeps_the_surface_colour`.
+    ///
+    /// The GPU tier ignores this, along with every other subsurface field;
+    /// its walk is a separate and much shorter one.
+    pub subsurface_anisotropy: f32,
     /// Incident specular amount in Disney's normalised range — `0.5` means
     /// `F0 = 0.04`. See [`Self::f0`] for how it and [`Self::ior`] combine.
     pub specular: f32,
@@ -194,6 +216,7 @@ impl Default for Pbr {
             subsurface: 0.0,
             subsurface_color: [1.0; 3],
             subsurface_radius: [1.0; 3],
+            subsurface_anisotropy: 0.0,
             specular: 0.5,
             specular_tint: 0.0,
             sheen: 0.0,
@@ -830,6 +853,31 @@ pub(crate) fn scatter_albedo(a: f32) -> f32 {
     1.0 - (-5.094_06 * a + 2.611_88 * a * a - 4.318_05 * a * a * a).exp()
 }
 
+/// Draw a scattered direction from the Henyey–Greenstein phase function
+/// about `w`, the direction the ray was already travelling.
+///
+/// HG is one lobe with one parameter and a closed-form inverse CDF, which is
+/// why it has outlived every more faithful phase function in production
+/// renderers: the draw is exact, so the estimator's weight for the event is
+/// `p / pdf = 1` and the phase function adds no variance at all.
+///
+/// `g` is the mean cosine of the deflection. `g = 0` collapses the expression
+/// to `cos = 1 - 2u`, uniform on the sphere; the branch is taken on a
+/// tolerance rather than on equality because the closed form divides by `g`.
+#[inline]
+pub(crate) fn henyey_greenstein(w: Vec3, g: f64, u1: f64, u2: f64) -> Vec3 {
+    let cos_theta = if g.abs() < 1e-3 {
+        1.0 - 2.0 * u1
+    } else {
+        let s = (1.0 - g * g) / (1.0 - g + 2.0 * g * u1);
+        ((1.0 + g * g - s * s) / (2.0 * g)).clamp(-1.0, 1.0)
+    };
+    let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+    let phi = std::f64::consts::TAU * u2;
+    let (t_ax, b_ax) = onb(w);
+    (t_ax * (sin_theta * phi.cos()) + b_ax * (sin_theta * phi.sin()) + w * cos_theta).normalize()
+}
+
 /// Where a subsurface walk came back out, and what it carries.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Exit {
@@ -872,6 +920,15 @@ pub(crate) fn subsurface_walk(
     mut trace: impl FnMut(Point3, Vec3) -> Option<(f64, Vec3)>,
 ) -> Option<Exit> {
     // The medium the surface colour and the mean free path imply.
+    //
+    // The inversion is fitted for isotropic scattering, so what it returns is
+    // read as the *reduced* albedo of the *reduced* medium whose transport
+    // mean free path is `subsurface_radius`. Similarity theory then gives the
+    // real one back: absorption is invariant under the reduction, and
+    // `sigma_s' = sigma_s (1 - g)` undoes to `sigma_s = sigma_s' / (1 - g)`.
+    // At `g = 0` every line below is the identity and the medium is bit for
+    // bit the one the walk used before the knob existed.
+    let g = (m.subsurface_anisotropy as f64).clamp(-0.95, 0.95);
     let mut sigma_t = [0.0f64; 3];
     let mut sigma_s = [0.0f64; 3];
     for c in 0..3 {
@@ -879,8 +936,12 @@ pub(crate) fn subsurface_walk(
         if !(r > 0.0) || !r.is_finite() {
             return None;
         }
-        sigma_t[c] = 1.0 / r;
-        sigma_s[c] = sigma_t[c] * scatter_albedo(m.subsurface_color[c]) as f64;
+        let sigma_t_reduced = 1.0 / r;
+        let albedo_reduced = scatter_albedo(m.subsurface_color[c]) as f64;
+        // sigma_a is the same medium either way.
+        let sigma_a = (1.0 - albedo_reduced) * sigma_t_reduced;
+        sigma_s[c] = albedo_reduced * sigma_t_reduced / (1.0 - g);
+        sigma_t[c] = sigma_a + sigma_s[c];
     }
 
     // In through the surface, cosine-distributed about the inward normal —
@@ -933,12 +994,15 @@ pub(crate) fn subsurface_walk(
             weight[c] *= sigma_s[c] * (-sigma_t[c] * t).exp() / pdf;
         }
         pos = pos + dir * t;
-        // Isotropic phase function: the medium has no memory of which way the
-        // light was going, which is what a dense scattering medium is.
-        let z = 1.0 - 2.0 * rng.f64();
-        let r = (1.0 - z * z).max(0.0).sqrt();
-        let phi = std::f64::consts::TAU * rng.f64();
-        dir = Vec3::new(r * phi.cos(), r * phi.sin(), z).normalize();
+        // Henyey–Greenstein, sampled exactly, so `f / pdf` is 1 and the phase
+        // function costs the walk nothing but a direction. At `g = 0` the
+        // cosine drawn is `1 - 2u`, uniform on the sphere — the same
+        // *distribution* the isotropic draw this replaced had, from the same
+        // two numbers in the same order. It is not the same direction for a
+        // given pair, because it is now built around the incoming ray rather
+        // than around the world axes, so a `g = 0` walk matches the old one
+        // statistically and not sample for sample.
+        dir = henyey_greenstein(dir, g, rng.f64(), rng.f64());
 
         // Russian roulette on what is left, so a dark medium costs a few
         // steps rather than all of them. The survival probability is capped
@@ -2333,6 +2397,97 @@ mod tests {
         assert!(through > 0.2, "a 0.4-mfp slab transmitted only {through}");
         assert!(back > 0.05, "and it must still reflect some: {back}");
         assert!(through + back <= 1.0, "energy {} > 1", through + back);
+    }
+
+    /// A slab many mean free paths thick has to stop the light, or the walk
+    /// is not attenuating at all. The counterpart to `a_thin_slab_transmits`:
+    /// between them they pin that the transmission is a function of the ratio
+    /// of thickness to mean free path and not a constant — 0.4 mfp passes
+    /// about 28% and 40 mfp passes 0.33%, a factor of ~85 for a factor of 100
+    /// in thickness.
+    ///
+    /// It is not zero, and it should not be: at `subsurface_color = 0.9` the
+    /// medium's single-scattering albedo is 0.9964, absorption is nearly nil
+    /// and the light gets across by diffusion rather than by any straight
+    /// path. That last third of a percent is the physics, so it is stated
+    /// here rather than tightened away.
+    #[test]
+    fn a_thick_slab_does_not_transmit() {
+        let m = Pbr {
+            subsurface: 1.0,
+            subsurface_color: [0.9; 3],
+            subsurface_radius: [0.05; 3],
+            ..Default::default()
+        };
+        let n = Vec3::new(0.0, 0.0, 1.0);
+        let mut rng = Rng::new(0x5b55_0006);
+        let trials = 20_000;
+        // 40 mean free paths, against the thin slab's 0.4.
+        let (mut through, mut back) = (0.0f64, 0.0f64);
+        for _ in 0..trials {
+            let Some(e) = subsurface_walk(
+                &m,
+                Point3::new(0.0, 0.0, 0.0),
+                n,
+                &mut rng,
+                slab_trace(2.0),
+            ) else {
+                continue;
+            };
+            if e.normal.z < 0.0 {
+                through += e.weight[1] as f64;
+            } else {
+                back += e.weight[1] as f64;
+            }
+        }
+        let (through, back) = (through / trials as f64, back / trials as f64);
+        assert!(through < 0.01, "a 40-mfp slab leaked {through}");
+        assert!(back > 0.8, "and it must reflect nearly all of it: {back}");
+    }
+
+    /// The anisotropy knob changes how the light gets around inside; it must
+    /// not change what colour comes back out.
+    ///
+    /// That is the whole job of the similarity-theory correction in
+    /// [`subsurface_walk`]: without it, a forward-scattering medium built
+    /// from the isotropic fit's numbers travels further per event and comes
+    /// back visibly brighter than the colour that was asked for.
+    #[test]
+    fn anisotropy_keeps_the_surface_colour() {
+        let want = [0.65f32, 0.5, 0.4];
+        for g in [-0.5f32, 0.0, 0.4, 0.8] {
+            let m = Pbr {
+                subsurface: 1.0,
+                subsurface_color: want,
+                subsurface_radius: [0.01; 3],
+                subsurface_anisotropy: g,
+                ..Default::default()
+            };
+            let mut rng = Rng::new(0x5b55_0007);
+            let trials = 60_000;
+            let mut acc = [0.0f64; 3];
+            for _ in 0..trials {
+                if let Some(e) = subsurface_walk(
+                    &m,
+                    Point3::new(0.0, 0.0, 0.0),
+                    Vec3::new(0.0, 0.0, 1.0),
+                    &mut rng,
+                    slab_trace(f64::INFINITY),
+                ) {
+                    for c in 0..3 {
+                        acc[c] += e.weight[c] as f64;
+                    }
+                }
+            }
+            for c in 0..3 {
+                let got = acc[c] / trials as f64;
+                let target = want[c] as f64;
+                assert!(
+                    (got - target).abs() <= 0.05 * target,
+                    "g={g}, channel {c}: walked {got}, asked for {target}"
+                );
+            }
+        }
     }
 
     /// The walk moves light; it does not make any. Even a white medium in a

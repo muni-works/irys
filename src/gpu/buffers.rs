@@ -228,6 +228,12 @@ impl GpuMaterial {
             specular_tint: self.specular_tint,
             diffuse_roughness: self.diffuse_roughness,
             subsurface: self.subsurface,
+            // The device has no phase-function knob: its walk is isotropic,
+            // which is exactly `0`. Round-tripping a CPU material with an
+            // anisotropy through the GPU layout therefore loses it, and
+            // saying so here is better than carrying a field the shader
+            // would ignore.
+            subsurface_anisotropy: 0.0,
             sheen: self.sheen,
             sheen_roughness: self.sheen_roughness,
             sheen_color: self.sheen_color,
