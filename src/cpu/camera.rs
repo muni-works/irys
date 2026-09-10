@@ -28,6 +28,44 @@ pub struct Camera {
     pub focus_dist: f64,
     /// When set, render orthographically with this half-height instead.
     pub ortho_half_height: Option<f64>,
+    /// How screen coordinates become ray directions.
+    ///
+    /// [`Projection::Rectilinear`] is the default and is what every render
+    /// before this field existed did, to the bit.
+    pub projection: Projection,
+}
+
+/// How a camera maps the screen onto directions.
+///
+/// A projection is a property of the ray generator, not a post-process. A
+/// fisheye is not a barrel-distorted pinhole render: it is a different map
+/// from pixel to direction, so the geometry at the edge of the frame is
+/// traced correctly rather than resampled from a picture that never had it.
+///
+/// Both variants agree exactly on the **vertical edge of the frame**: a ray
+/// through the middle of the top row makes an angle of `fov_deg / 2` with
+/// `forward` under either map. What differs is everything between the axis
+/// and that edge — rectilinear goes as `tan θ`, equidistant as `θ`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Projection {
+    /// A pinhole: the screen is a plane at unit distance, `r = f·tan θ`.
+    /// Straight lines stay straight; the corners stretch without bound as the
+    /// field of view opens.
+    #[default]
+    Rectilinear,
+    /// An equidistant fisheye: `r = f·θ`, the `f θ` map a real fisheye lens is
+    /// built to. Angle is linear in radius, so a 180° field fits in a finite
+    /// frame and nothing at the edge is stretched.
+    ///
+    /// **Offline only, for now.** `kosm_view::temporal::View` — and the
+    /// reprojection in `kosm_view::history` built on its `project` and
+    /// `ray_dir` — is a pinhole frustum by construction: it stores `tan(fov/2)`
+    /// half-extents and divides by the forward depth. A fisheye frame handed
+    /// to that history would reproject through the wrong map and smear its
+    /// own past across the frame. Fixing that is a change to kosm-view's
+    /// `View`, not to this enum; until then a fisheye belongs in a still, not
+    /// in the live window.
+    Equidistant,
 }
 
 impl Camera {
@@ -45,6 +83,7 @@ impl Camera {
             aperture: 0.0,
             focus_dist: (target - eye).norm(),
             ortho_half_height: None,
+            projection: Projection::Rectilinear,
         }
     }
 
@@ -67,7 +106,14 @@ impl Camera {
             aperture: 0.0,
             focus_dist,
             ortho_half_height: None,
+            projection: Projection::Rectilinear,
         }
+    }
+
+    /// The same camera under a different projection.
+    pub fn with_projection(mut self, projection: Projection) -> Self {
+        self.projection = projection;
+        self
     }
 
     /// Generate a primary ray through normalised screen coords in [-1, 1],
@@ -81,11 +127,33 @@ impl Camera {
             return Ray::new(origin, fwd);
         }
 
-        let half_h = (self.fov_deg.to_radians() * 0.5).tan();
-        let half_w = half_h * aspect;
-
         // Point on the focal plane this pixel maps to.
-        let dir = fwd + right * (sx * half_w) + up * (sy * half_h);
+        let dir = match self.projection {
+            Projection::Rectilinear => {
+                let half_h = (self.fov_deg.to_radians() * 0.5).tan();
+                let half_w = half_h * aspect;
+                fwd + right * (sx * half_w) + up * (sy * half_h)
+            }
+            Projection::Equidistant => {
+                // r = f·θ, with the vertical edge of the frame (|sy| = 1, on
+                // the axis) at exactly half the field of view — the same
+                // angle the rectilinear map puts there, so the two framings
+                // are comparable and `fov_deg` keeps one meaning.
+                let (u, v) = (sx * aspect, sy);
+                let r = (u * u + v * v).sqrt();
+                let theta = (self.fov_deg.to_radians() * 0.5) * r;
+                if theta <= 0.0 {
+                    fwd
+                } else {
+                    let theta = theta.min(core::f64::consts::PI);
+                    let (st, ct) = theta.sin_cos();
+                    // The azimuth around the optical axis, from the screen
+                    // radius; `r > 0` here, so the divide is safe.
+                    let (cp, sp) = (u / r, v / r);
+                    fwd * ct + (right * cp + up * sp) * st
+                }
+            }
+        };
         let focal_point = self.eye + dir * self.focus_dist;
 
         if self.aperture <= 0.0 {
@@ -285,5 +353,106 @@ mod tests {
             (rhs - camera.right).norm() > 1.0,
             "expected this basis to be mirrored"
         );
+    }
+
+    /// The rectilinear branch is the *old* expression, unmoved: every ray it
+    /// generates is bit-for-bit the one the pre-`Projection` generator did.
+    /// This is the promise that adding a projection changed no existing
+    /// picture — the snapshots elsewhere would catch a drift, this catches it
+    /// at the source.
+    #[test]
+    fn rectilinear_rays_are_the_old_generator_to_the_bit() {
+        let cam = test_camera();
+        assert_eq!(cam.projection, Projection::Rectilinear, "the default moved");
+        let aspect = 16.0 / 9.0;
+        let half_h = (cam.fov_deg.to_radians() * 0.5).tan();
+        let half_w = half_h * aspect;
+        for i in 0..17 {
+            for j in 0..17 {
+                let sx = -1.0 + i as f64 / 8.0;
+                let sy = -1.0 + j as f64 / 8.0;
+                let old = cam.forward + cam.right * (sx * half_w) + cam.up * (sy * half_h);
+                let want = Ray::new(cam.eye, (cam.eye + old * cam.focus_dist) - cam.eye);
+                let got = cam.ray(sx, sy, aspect, 0.0, 0.0);
+                assert_eq!(got.direction.x, want.direction.x);
+                assert_eq!(got.direction.y, want.direction.y);
+                assert_eq!(got.direction.z, want.direction.z);
+            }
+        }
+    }
+
+    /// A whole reference frame, rendered under the default projection and
+    /// under an explicitly rectilinear one: identical bytes.
+    #[test]
+    fn a_reference_render_is_identical_under_the_default_and_explicit_rectilinear() {
+        let scene = test_scene();
+        let cam = test_camera();
+        let opts = PathTraceOptions { spp: 4, seed: 0xbeef, ..Default::default() };
+        let a = crate::cpu::render(&scene, &cam, 48, 32, &opts);
+        let b = crate::cpu::render(
+            &scene,
+            &cam.with_projection(Projection::Rectilinear),
+            48,
+            32,
+            &opts,
+        );
+        assert_eq!(a.rgb, b.rgb, "an explicit Rectilinear changed the picture");
+        assert_eq!(a.depth, b.depth);
+
+        // …and the fisheye is a different picture, or it would not be one.
+        let f = crate::cpu::render(
+            &scene,
+            &cam.with_projection(Projection::Equidistant),
+            48,
+            32,
+            &opts,
+        );
+        assert_ne!(a.rgb, f.rgb, "the fisheye traced the same rays");
+    }
+
+    /// `fov_deg` keeps one meaning across the two maps: the ray through the
+    /// middle of the top row is half a field of view off the axis under
+    /// either. Rectilinear gets there through `atan(tan θ)`, equidistant by
+    /// construction — so this is a real agreement, not a tautology.
+    #[test]
+    fn both_projections_put_the_frame_edge_at_half_the_field_of_view() {
+        let cam = test_camera();
+        let half = cam.fov_deg.to_radians() * 0.5;
+        for aspect in [1.0, 16.0 / 9.0, 0.5] {
+            for p in [Projection::Rectilinear, Projection::Equidistant] {
+                let r = cam.with_projection(p).ray(0.0, 1.0, aspect, 0.0, 0.0);
+                let cos = r.direction.as_ref().dot(&cam.forward);
+                assert!(
+                    (cos.acos() - half).abs() < 1e-12,
+                    "{p:?} at aspect {aspect}: edge ray is {:.6}° off, wanted {:.6}°",
+                    cos.acos().to_degrees(),
+                    half.to_degrees()
+                );
+            }
+        }
+    }
+
+    /// The fisheye is linear in angle: twice the screen radius is twice the
+    /// angle off the axis. That is the whole of `r = f·θ`, and it is what a
+    /// rectilinear camera cannot do.
+    #[test]
+    fn the_fisheye_is_linear_in_angle() {
+        let cam = test_camera().with_projection(Projection::Equidistant);
+        let half = cam.fov_deg.to_radians() * 0.5;
+        let angle = |sy: f64| {
+            cam.ray(0.0, sy, 1.0, 0.0, 0.0)
+                .direction
+                .as_ref()
+                .dot(&cam.forward)
+                .clamp(-1.0, 1.0)
+                .acos()
+        };
+        for k in 1..=8 {
+            let f = k as f64 / 8.0;
+            assert!((angle(f) - half * f).abs() < 1e-12, "θ was not linear at r = {f}");
+        }
+        // On the axis there is no azimuth to speak of, and the ray is forward.
+        let on_axis = cam.ray(0.0, 0.0, 1.0, 0.0, 0.0);
+        assert!((on_axis.direction.as_ref().dot(&cam.forward) - 1.0).abs() < 1e-15);
     }
 }
