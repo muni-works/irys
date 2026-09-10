@@ -2,19 +2,7 @@
 name = "kosm-render"
 # Published on its own cadence: vcad depends on this by version, and the
 # workspace's 0.0.1 is the game's number, not the renderer's.
-#
-# Held at 0.1.x, and that is load-bearing rather than laziness. vcad's pinned
-# rev (504047fb) requires `kosm-render = { git = ..., version = "0.1.0" }`,
-# and a `[patch]` may only replace a dependency with one that SATISFIES its
-# requirement. At 0.2.0 the workspace patch silently stopped applying, cargo
-# added a second kosm-render (the old git rev) beside this one, and
-# `kosm/src/brep/mod.rs` stopped compiling: `pathtrace::Scene` came from
-# vcad's copy while `kosm_render::caustics::trace` came from this one. Two
-# `Scene<G>` types, one call, E0308 — on `main`, for every consumer.
-#
-# This goes to 0.2.0 in the same commit that bumps the vcad rev to one
-# tracking the kosm-render-v0.2.0 tag, and not before.
-version = "0.1.1"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 description = "The light: rays, acceleration structures and a path tracer over any geometry that can be bounded and hit"
@@ -25,10 +13,8 @@ categories = ["graphics", "rendering", "rendering::engine"]
 exclude = ["out/", "tests/snapshots/"]
 
 [dependencies]
-# The registry tang, not the workspace's path: vcad consumes this crate by git,
-# and a path outside the repo would resolve to nothing on any other machine (or
-# to a second `tang` here). The workspace's `[patch.crates-io]` still redirects
-# it to the local checkout for every build in this repo.
+# The registry tang: vcad consumes this crate by version, so everything in the
+# graph must name the same published tang.
 tang = "0.2"
 # The GPU tier. `bytemuck` and `wgpu` only; the wasm glue below is what a
 # browser needs to await a buffer mapping without blocking.
