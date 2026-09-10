@@ -2,6 +2,16 @@
 name = "kosm-render"
 # Published on its own cadence: vcad depends on this by version, and the
 # workspace's 0.0.1 is the game's number, not the renderer's.
+#
+# 0.2.0: on crates.io, and vcad 0.10 depends on the registry crate
+# (`kosm-render = "0.2"`). The workspace no longer
+# carries a `[patch."https://github.com/ecto/kosm"]` back-edge — with vcad and
+# this workspace agreeing on 0.2, cargo resolves exactly one kosm-render.
+#
+# The history worth keeping: while vcad pinned an old rev requiring 0.1.0, a
+# bump to 0.2.0 made that patch silently stop applying, cargo added a second
+# kosm-render beside this one, and `kosm/src/brep/mod.rs` stopped compiling —
+# two `Scene<G>` types, one call, E0308. Version and vcad rev move together.
 version = "0.2.0"
 edition.workspace = true
 license.workspace = true
@@ -13,8 +23,10 @@ categories = ["graphics", "rendering", "rendering::engine"]
 exclude = ["out/", "tests/snapshots/"]
 
 [dependencies]
-# The registry tang: vcad consumes this crate by version, so everything in the
-# graph must name the same published tang.
+# The registry tang, not the workspace's path: vcad consumes this crate by git,
+# and a path outside the repo would resolve to nothing on any other machine (or
+# to a second `tang` here). The workspace's `[patch.crates-io]` still redirects
+# it to the local checkout for every build in this repo.
 tang = "0.2"
 # The GPU tier. `bytemuck` and `wgpu` only; the wasm glue below is what a
 # browser needs to await a buffer mapping without blocking.

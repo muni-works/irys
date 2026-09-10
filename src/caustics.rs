@@ -103,6 +103,13 @@ impl Default for CausticOptions {
     }
 }
 
+/// How nearly a photon's surface must face the way the gather does before it
+/// counts: about 25°. It is what keeps a caustic on the pool floor off the
+/// underside of the step beside it, and every reader of the map — the
+/// integrator's irradiance, a score's power — has to apply the same rule or
+/// they are not looking at the same caustic.
+const ONE_SIDED: f64 = 0.9;
+
 /// One deposited photon.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Photon {
@@ -197,7 +204,7 @@ impl CausticMap {
                         if (ph.point - p).norm_squared() > r2 {
                             continue;
                         }
-                        if ph.normal.dot(n) < 0.9 {
+                        if ph.normal.dot(n) < ONE_SIDED {
                             continue;
                         }
                         sum[0] += ph.power[0];
@@ -209,6 +216,81 @@ impl CausticMap {
         }
         let area = (std::f64::consts::PI * r2) as f32;
         [sum[0] / area, sum[1] / area, sum[2] / area]
+    }
+
+    /// The power deposited within `r` of `centre` on a surface facing
+    /// `normal` — watts, not watts per square metre.
+    ///
+    /// [`CausticMap::irradiance`] divides by the disc's area because it is
+    /// answering the integrator's question. A score does not want that: the
+    /// rune asks how much of the sun is going through the keyhole, and the
+    /// numerator of that fraction is power. Same photons, same one-sided
+    /// rejection, one fewer division.
+    ///
+    /// The grid is walked when the disc spans only a few cells, which is the
+    /// case the grid is for; past that the walk touches more cells than there
+    /// are photons and a straight scan is both simpler and faster.
+    pub fn power_within(&self, centre: Point3, normal: Vec3, r: f64) -> [f32; 3] {
+        if self.photons.is_empty() || !r.is_finite() || r <= 0.0 {
+            return [0.0; 3];
+        }
+        let r2 = r * r;
+        let mut sum = [0.0f32; 3];
+        let mut add = |ph: &Photon| {
+            if (ph.point - centre).norm_squared() <= r2 && ph.normal.dot(normal) >= ONE_SIDED {
+                sum[0] += ph.power[0];
+                sum[1] += ph.power[1];
+                sum[2] += ph.power[2];
+            }
+        };
+        let k = (r * self.inv_cell).ceil() as i64;
+        if k > 3 {
+            self.photons.iter().for_each(add);
+            return sum;
+        }
+        let c = self.cell(centre);
+        for dz in -k..=k {
+            for dy in -k..=k {
+                for dx in -k..=k {
+                    let Some(list) = self.cells.get(&[c[0] + dx, c[1] + dy, c[2] + dz]) else {
+                        continue;
+                    };
+                    for &i in list {
+                        add(&self.photons[i as usize]);
+                    }
+                }
+            }
+        }
+        sum
+    }
+
+    /// A map built straight from a photon list, so a test can know the
+    /// answer before it asks. The grid is laid out exactly as [`trace`] lays
+    /// it out; that is the point of building it here rather than by hand.
+    #[cfg(test)]
+    pub(crate) fn from_photons(radius: f64, photons: Vec<Photon>) -> Self {
+        let inv_cell = 1.0 / radius;
+        let mut cells: HashMap<[i64; 3], Vec<u32>> = HashMap::new();
+        let mut deposited = [0.0f32; 3];
+        for (i, ph) in photons.iter().enumerate() {
+            let key = [
+                (ph.point.x * inv_cell).floor() as i64,
+                (ph.point.y * inv_cell).floor() as i64,
+                (ph.point.z * inv_cell).floor() as i64,
+            ];
+            cells.entry(key).or_default().push(i as u32);
+            for k in 0..3 {
+                deposited[k] += ph.power[k];
+            }
+        }
+        Self {
+            radius,
+            inv_cell,
+            photons,
+            cells,
+            emitted: deposited,
+            deposited,
+        }
     }
 
     #[inline]
@@ -493,6 +575,7 @@ pub struct CausticPack {
     /// point outside it gathers nothing, and the shader says so without
     /// walking a bucket.
     pub bounds_min: [f32; 3],
+    /// The far corner of that box.
     pub bounds_max: [f32; 3],
 }
 
@@ -636,5 +719,88 @@ impl CausticPack {
         }
         let area = std::f32::consts::PI * r2;
         [sum[0] / area, sum[1] / area, sum[2] / area]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn photon(p: [f64; 3], n: [f64; 3], w: f32) -> Photon {
+        Photon {
+            point: Point3::new(p[0], p[1], p[2]),
+            normal: Vec3::new(n[0], n[1], n[2]),
+            power: [w, 2.0 * w, 3.0 * w],
+        }
+    }
+
+    /// A map whose photons are all on the floor `z = 0` at known radii from
+    /// the origin, plus one on the wall next to them.
+    fn floor_map(radius: f64) -> CausticMap {
+        let up = [0.0, 0.0, 1.0];
+        CausticMap::from_photons(
+            radius,
+            vec![
+                photon([0.0, 0.0, 0.0], up, 1.0),
+                photon([0.03, 0.0, 0.0], up, 2.0),
+                photon([0.0, -0.04, 0.0], up, 4.0),
+                photon([0.09, 0.0, 0.0], up, 8.0),
+                photon([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 16.0),
+                photon([0.4, 0.4, 0.0], up, 32.0),
+            ],
+        )
+    }
+
+    #[test]
+    fn power_within_sums_the_photons_in_the_disc() {
+        let map = floor_map(0.05);
+        let (o, up) = (Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
+        // nothing but the photon at the centre; the wall photon is edge-on
+        // and rejected, as the irradiance gather rejects it
+        assert_eq!(map.power_within(o, up, 0.01), [1.0, 2.0, 3.0]);
+        // out to 35 mm picks up the second, to 45 mm the third
+        assert_eq!(map.power_within(o, up, 0.035), [3.0, 6.0, 9.0]);
+        assert_eq!(map.power_within(o, up, 0.045), [7.0, 14.0, 21.0]);
+        // the boundary is inclusive, at exactly the photon's distance
+        assert_eq!(map.power_within(o, up, 0.03), [3.0, 6.0, 9.0]);
+        // and the wall photon is the only thing a wall-facing gather sees
+        assert_eq!(map.power_within(o, Vec3::new(1.0, 0.0, 0.0), 0.01), [16.0, 32.0, 48.0]);
+    }
+
+    #[test]
+    fn power_within_is_zero_where_no_photon_landed() {
+        let map = floor_map(0.05);
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        assert_eq!(map.power_within(Point3::new(1.0, 1.0, 0.0), up, 0.05), [0.0; 3]);
+        assert_eq!(map.power_within(Point3::new(0.0, 0.0, 1.0), up, 0.05), [0.0; 3]);
+        assert_eq!(map.power_within(Point3::new(0.0, 0.0, 0.0), up, 0.0), [0.0; 3]);
+        assert_eq!(CausticMap::empty().power_within(Point3::new(0.0, 0.0, 0.0), up, 1.0), [0.0; 3]);
+    }
+
+    /// The grid walk and the scan are two ways of asking one question, and a
+    /// radius of a few cells is where the code switches between them.
+    #[test]
+    fn the_grid_walk_and_the_scan_agree() {
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let o = Point3::new(0.0, 0.0, 0.0);
+        for r in [0.005, 0.02, 0.031, 0.05, 0.12, 0.5, 1.0] {
+            // the same photons in a coarse map (grid walk) and a fine one
+            // (scan, because the disc spans more than three cells)
+            let coarse = floor_map(1.0).power_within(o, up, r);
+            let fine = floor_map(0.001).power_within(o, up, r);
+            assert_eq!(coarse, fine, "at r = {r}");
+        }
+    }
+
+    #[test]
+    fn the_disc_is_the_irradiance_gather_without_the_area() {
+        let map = floor_map(0.05);
+        let (o, up) = (Point3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
+        let area = (std::f64::consts::PI * map.radius() * map.radius()) as f32;
+        let want = map.power_within(o, up, map.radius());
+        let got = map.irradiance(o, up);
+        for k in 0..3 {
+            assert!((got[k] - want[k] / area).abs() < 1e-5, "{got:?} vs {want:?} / {area}");
+        }
     }
 }

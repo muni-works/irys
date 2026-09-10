@@ -464,6 +464,91 @@ impl<G: Geometry> Scene<G> {
         scale3(mul3(mul3(f, light.emission), tr), w / light_pdf)
     }
 
+    /// Next-event estimation from the point a subsurface walk left the
+    /// object, against every emitter at once.
+    ///
+    /// The exit is not a BSDF event: the walk crossed an index-matched
+    /// boundary and the path leaves cosine-distributed about the outward
+    /// normal, carrying the colour the medium already gave it. So the
+    /// "BRDF" here is exactly `cos / pi` and its sampling PDF is exactly
+    /// `cos / pi` — the same number twice, which is why the continuation's
+    /// `f / pdf` is 1 and why this can be written once for all three
+    /// emitters instead of three times through [`bsdf_eval`].
+    ///
+    /// Without it a translucent object is lit only by the exit ray happening
+    /// to fly at a light, and against a sun disc — a few milliradians wide —
+    /// it essentially never does. That is the difference between a creature
+    /// backlit by the sun and a creature that is simply dark.
+    pub(crate) fn sample_lights_at_exit(
+        &self,
+        accel: &SceneAccel<G>,
+        p: Point3,
+        n: Vec3,
+        rng: &mut Rng,
+    ) -> [f32; 3] {
+        let inv_pi = std::f32::consts::FRAC_1_PI;
+        let mut sum = [0.0f32; 3];
+
+        // One rectangle, picked by power.
+        if let Some((index, pick_pdf)) = accel.pick_light(rng.f64() as f32) {
+            let light = &self.lights[index];
+            let to_light = light.sample(rng.f64(), rng.f64()) - p;
+            let dist = to_light.norm();
+            if dist > 1e-9 {
+                let wi = to_light / dist;
+                let cos_light = -wi.dot(light.normal());
+                let cos_exit = wi.dot(n);
+                if cos_light > 1e-9 && cos_exit > 0.0 {
+                    let light_pdf =
+                        pick_pdf * (dist * dist / (cos_light * light.area())) as f32;
+                    if light_pdf.is_finite() && light_pdf > 0.0 {
+                        if let Some(tr) =
+                            self.shadow_transmittance(accel, p + n * 1e-5, wi, dist)
+                        {
+                            let f = cos_exit as f32 * inv_pi;
+                            let w = power_heuristic(light_pdf, f);
+                            sum = add3(
+                                sum,
+                                scale3(mul3(mul3(tr, light.emission), [f; 3]), w / light_pdf),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // The environment, when it is importance-sampled at all.
+        if let Some((wi, li, env_pdf)) = self.env.sample(rng.f64(), rng.f64()) {
+            let cos_exit = wi.dot(n);
+            if env_pdf.is_finite() && env_pdf > 0.0 && max3(li) > 0.0 && cos_exit > 0.0 {
+                if let Some(tr) =
+                    self.shadow_transmittance(accel, p + n * 1e-5, wi, f64::INFINITY)
+                {
+                    let f = cos_exit as f32 * inv_pi;
+                    let w = power_heuristic(env_pdf, f);
+                    sum = add3(sum, scale3(mul3(mul3(tr, li), [f; 3]), w / env_pdf));
+                }
+            }
+        }
+
+        // The sun disc.
+        if let Some(sun) = &self.sun {
+            let (wi, li, sun_pdf) = sun.sample(rng.f64(), rng.f64());
+            let cos_exit = wi.dot(n);
+            if sun_pdf.is_finite() && sun_pdf > 0.0 && max3(li) > 0.0 && cos_exit > 0.0 {
+                if let Some(tr) =
+                    self.shadow_transmittance(accel, p + n * 1e-5, wi, f64::INFINITY)
+                {
+                    let f = cos_exit as f32 * inv_pi;
+                    let w = power_heuristic(sun_pdf, f);
+                    sum = add3(sum, scale3(mul3(mul3(tr, li), [f; 3]), w / sun_pdf));
+                }
+            }
+        }
+
+        sum
+    }
+
     /// Next-event estimation against the environment, MIS-weighted against
     /// BSDF sampling.
     ///

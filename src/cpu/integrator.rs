@@ -401,6 +401,22 @@ pub(crate) fn radiance<G: Geometry>(
                             break;
                         };
                         throughput = mul3(throughput, exit.weight);
+
+                        // Next-event estimation from the exit. The walk left
+                        // an ordinary diffuse point on the surface, so there
+                        // is every reason to sample the lights from it — and
+                        // with a sun disc there is no other way to find them.
+                        let direct = scene.sample_lights_at_exit(
+                            accel, exit.point, exit.normal, rng,
+                        );
+                        let direct = match (clamp_scale, opts.firefly_clamp) {
+                            (Some(c), _) | (None, Some(c)) => {
+                                [direct[0].min(c), direct[1].min(c), direct[2].min(c)]
+                            }
+                            (None, None) => direct,
+                        };
+                        l = add3(l, mul3(throughput, direct));
+
                         // Out through the boundary, cosine-distributed: the
                         // index-matched exit the inversion was fitted with,
                         // whose f/pdf is exactly 1.
@@ -408,12 +424,14 @@ pub(crate) fn radiance<G: Geometry>(
                         let c = cosine_hemisphere(rng.f64(), rng.f64());
                         let wi_world = to_world(t_ax, b_ax, exit.normal, c);
                         ray = Ray::new(exit.point + exit.normal * 1e-5, wi_world);
-                        // No NEE strategy found this direction — there was no
-                        // surface event at the exit to sample lights from — so
-                        // an emitter downstream takes full MIS weight, which
-                        // is what a specular chain means here.
-                        specular_chain = true;
-                        prev_bsdf_pdf = 0.0;
+                        // The exit *is* a sampling strategy now, so an emitter
+                        // found downstream is MIS-weighted against it rather
+                        // than taken whole. The PDF is the cosine one the draw
+                        // above used, which is the same `cos / pi` the NEE
+                        // above evaluated — the two halves of one estimator.
+                        specular_chain = false;
+                        prev_bsdf_pdf =
+                            c.z.max(0.0) as f32 * std::f32::consts::FRAC_1_PI;
                         if depth >= opts.rr_start {
                             let q = max3(throughput).clamp(0.0, 0.95);
                             if (rng.f64() as f32) > q {
@@ -811,6 +829,105 @@ mod tests {
     use crate::cpu::testing::*;
     #[allow(unused_imports)]
     use crate::geometry::TriMesh;
+
+    /// A white subsurface object in a white furnace must read exactly white.
+    ///
+    /// This is the one test that exercises the whole feature end to end — the
+    /// lobe split, the entry weight, the random walk through real geometry,
+    /// the exit, the exit's next-event estimation and its MIS weight against
+    /// the cosine draw — and it is the one that catches energy being created,
+    /// because in a furnace *any* double counting shows up as a number above
+    /// one. The exit NEE and the exit's `prev_bsdf_pdf` are two halves of one
+    /// estimator, and getting either wrong brightens this immediately.
+    #[test]
+    fn a_subsurface_furnace_stays_white() {
+        let scene = Scene {
+            objects: vec![Object::new(
+                Arc::new(Bvh::build(cube_mesh())),
+                Pbr {
+                    base_color: [1.0; 3],
+                    roughness: 1.0,
+                    specular: 0.0,
+                    ior: 1.0,
+                    subsurface: 1.0,
+                    subsurface_color: [1.0; 3],
+                    // A couple of mean free paths across the 10-unit cube, so
+                    // the walk really walks rather than leaving on step one.
+                    subsurface_radius: [4.0; 3],
+                    ..Default::default()
+                },
+            )],
+            lights: Vec::new(),
+            env: Environment::constant([1.0; 3]),
+            sun: None,
+            ground: None,
+            splats: None,
+        };
+        let film = render(
+            &scene,
+            &test_camera(),
+            24,
+            24,
+            &PathTraceOptions {
+                spp: 256,
+                max_depth: 24,
+                ..Default::default()
+            },
+        );
+        // Only the pixels that actually landed on the cube; the background is
+        // the environment and trivially 1.
+        let mut n = 0usize;
+        let mut sum = 0.0f64;
+        for i in 0..(24 * 24) {
+            if film.alpha[i] > 0.99 {
+                sum += film.rgb[i * 3 + 1] as f64;
+                n += 1;
+            }
+        }
+        assert!(n > 40, "the cube is not in frame: {n} pixels");
+        let mean = sum / n as f64;
+        assert!(
+            (mean - 1.0).abs() < 0.03,
+            "a white subsurface furnace read {mean}, not 1"
+        );
+    }
+
+    /// `subsurface = 0` is what every scene written before the walk existed
+    /// relies on, so it is checked on a rendered image and not only on the
+    /// lobe weights: the same scene with the subsurface *parameters* set to
+    /// something loud, and the *weight* left at zero, must come back bit for
+    /// bit identical.
+    #[test]
+    fn subsurface_off_renders_the_image_it_always_did() {
+        let render_it = |m: Pbr| {
+            let mut scene = test_scene();
+            scene.objects[0].material = m;
+            render(
+                &scene,
+                &test_camera(),
+                32,
+                32,
+                &PathTraceOptions {
+                    spp: 8,
+                    ..Default::default()
+                },
+            )
+            .rgb
+        };
+        let plain = Pbr::plastic([0.8, 0.3, 0.2], 0.35, 0.0);
+        let loud = Pbr {
+            subsurface: 0.0,
+            subsurface_color: [0.1, 0.9, 0.4],
+            subsurface_radius: [7.0, 3.0, 0.5],
+            subsurface_anisotropy: 0.8,
+            ..plain
+        };
+        assert_eq!(
+            render_it(plain),
+            render_it(loud),
+            "a subsurface weight of zero changed the picture"
+        );
+    }
 
     #[test]
     fn an_opaque_scene_occludes_exactly_as_the_any_hit_test_did() {
