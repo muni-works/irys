@@ -57,14 +57,11 @@ pub enum Projection {
     /// built to. Angle is linear in radius, so a 180° field fits in a finite
     /// frame and nothing at the edge is stretched.
     ///
-    /// **Offline only, for now.** `kosm_view::temporal::View` — and the
-    /// reprojection in `kosm_view::history` built on its `project` and
-    /// `ray_dir` — is a pinhole frustum by construction: it stores `tan(fov/2)`
-    /// half-extents and divides by the forward depth. A fisheye frame handed
-    /// to that history would reproject through the wrong map and smear its
-    /// own past across the frame. Fixing that is a change to kosm-view's
-    /// `View`, not to this enum; until then a fisheye belongs in a still, not
-    /// in the live window.
+    /// Live as well as offline: `kosm_view::temporal::View` carries the
+    /// projection and states its half-extents in the units the map measures
+    /// screen radius in (a tangent for the pinhole, radians here), so the
+    /// history's reprojection and its mask follow whichever map the camera
+    /// was made with.
     Equidistant,
 }
 
