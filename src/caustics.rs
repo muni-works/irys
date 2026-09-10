@@ -264,6 +264,51 @@ impl CausticMap {
         sum
     }
 
+    /// The map gathered onto a rectangle of a plane: irradiance at each
+    /// texel centre, row major, `res[0]` texels across `u` and `res[1]` down
+    /// `v`.
+    ///
+    /// The caustic is a *density* in the world, and a rasteriser wants it as
+    /// a texture on the surface that receives it — the door's face, the patch
+    /// of sand under the focus. This is that projection and nothing more:
+    /// [`CausticMap::irradiance`] evaluated at `plane_origin + u·s + v·t`,
+    /// with the receiver's normal taken as `u × v`, so the one-sided
+    /// rejection that keeps a pool caustic off the underside of a step keeps
+    /// it off the back of the door too.
+    ///
+    /// `plane_origin` is the rectangle's **corner**, `u` and `v` are its
+    /// in-plane axes (normalised here, so they may arrive at any length) and
+    /// `w_m`, `h_m` are its extent along them, in whatever units the map's
+    /// photons are in. Texel `(i, j)` is centred at `(i + 0.5)/res[0]` of the
+    /// width and `(j + 0.5)/res[1]` of the height, which is the convention a
+    /// sampler with half-texel offsets expects.
+    pub fn to_texture(
+        &self,
+        plane_origin: Point3,
+        u: Vec3,
+        v: Vec3,
+        w_m: f64,
+        h_m: f64,
+        res: [u32; 2],
+    ) -> Vec<[f32; 3]> {
+        let (nu, nv) = (res[0] as usize, res[1] as usize);
+        let mut out = vec![[0.0f32; 3]; nu * nv];
+        if nu == 0 || nv == 0 {
+            return out;
+        }
+        let (uh, vh) = (u.normalize(), v.normalize());
+        let n = uh.cross(&vh).normalize();
+        for j in 0..nv {
+            let t = (j as f64 + 0.5) / nv as f64 * h_m;
+            for i in 0..nu {
+                let s = (i as f64 + 0.5) / nu as f64 * w_m;
+                let p = plane_origin + uh * s + vh * t;
+                out[j * nu + i] = self.irradiance(p, n);
+            }
+        }
+        out
+    }
+
     /// A map built straight from a photon list, so a test can know the
     /// answer before it asks. The grid is laid out exactly as [`trace`] lays
     /// it out; that is the point of building it here rather than by hand.
@@ -749,6 +794,55 @@ mod tests {
                 photon([0.4, 0.4, 0.0], up, 32.0),
             ],
         )
+    }
+
+    #[test]
+    fn to_texture_gathers_the_map_onto_a_plane() {
+        // A 200 mm square of the floor at 4x4 texels: the photons sit near
+        // the origin, which is the corner texel's own centre-ish, so the
+        // texture is bright there and dark at the far corner.
+        let map = floor_map(0.05);
+        let tex = map.to_texture(
+            Point3::new(-0.1, -0.1, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            0.2,
+            0.2,
+            [4, 4],
+        );
+        assert_eq!(tex.len(), 16);
+        // Every texel is exactly what `irradiance` says at its centre, which
+        // is the whole claim: the projection adds no filtering of its own.
+        for j in 0..4 {
+            for i in 0..4 {
+                let p = Point3::new(
+                    -0.1 + (i as f64 + 0.5) * 0.05,
+                    -0.1 + (j as f64 + 0.5) * 0.05,
+                    0.0,
+                );
+                assert_eq!(tex[j * 4 + i], map.irradiance(p, Vec3::new(0.0, 0.0, 1.0)));
+            }
+        }
+        // The photons are at the origin, which is the centre of the square:
+        // the four middle texels carry light and the corners do not.
+        assert!(tex[5][0] > 0.0 || tex[10][0] > 0.0);
+        assert_eq!(tex[0], [0.0; 3]);
+        // The channels keep their ratio, 1 : 2 : 3, through the gather.
+        let lit = tex.iter().max_by(|a, b| a[0].total_cmp(&b[0])).unwrap();
+        assert!((lit[1] / lit[0] - 2.0).abs() < 1e-5);
+        assert!((lit[2] / lit[0] - 3.0).abs() < 1e-5);
+        // A rectangle read from the other side sees nothing: the one-sided
+        // rejection is the gather's, and `to_texture` takes u x v as the
+        // receiver's normal.
+        let back = map.to_texture(
+            Point3::new(-0.1, -0.1, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            0.2,
+            0.2,
+            [4, 4],
+        );
+        assert!(back.iter().all(|t| *t == [0.0; 3]));
     }
 
     #[test]
