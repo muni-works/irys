@@ -1823,3 +1823,134 @@ mod tests {
         );
     }
 }
+
+// ─── one ray at a time ────────────────────────────────────────────────────
+
+/// What a ray first met: the surface query behind an "am I inside a solid?"
+/// test, and the only part of [`Landing`] a caller outside this crate needs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceHit {
+    /// Distance along the ray.
+    pub distance: f64,
+    /// Where it landed, world space.
+    pub point: [f64; 3],
+    /// The surface's own outward normal, *not* face-forwarded.
+    pub normal: [f64; 3],
+    /// Whether the ray met the outside of the surface (`normal · d < 0`).
+    /// A ray that starts inside a closed solid meets a back face, whichever
+    /// way it points, which is exactly how [`crate::pathtrace`]'s callers
+    /// decide that a point is inside one.
+    pub front: bool,
+}
+
+/// A scene prepared for single-ray questions rather than for a frame.
+///
+/// [`render`] answers "what does this camera see"; a light bake, an ambient
+/// probe or an inside-a-solid test all want the smaller question — the
+/// radiance along *one* ray, and what that ray first hit. The acceleration
+/// structure is built once here, the same one [`render`] builds per frame,
+/// and every query traverses it.
+///
+/// ```no_run
+/// # use kosm_render::pathtrace::{PathTraceOptions, Scene, Tracer};
+/// # use kosm_render::{Ray, TriMesh, math::{Point3, Vec3}};
+/// # let scene: Scene<TriMesh> = unimplemented!();
+/// let tracer = Tracer::new(&scene, PathTraceOptions::default());
+/// let up = Ray::new(Point3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, 1.0));
+/// let l = tracer.radiance(up, 7);          // linear RGB along the ray
+/// let inside = tracer.first_hit(&up).is_some_and(|h| !h.front);
+/// ```
+pub struct Tracer<'a, G> {
+    scene: &'a Scene<G>,
+    accel: SceneAccel<G>,
+    opts: PathTraceOptions,
+    caustics: Option<&'a CausticMap>,
+}
+
+impl<'a, G: Geometry> Tracer<'a, G> {
+    /// Build the acceleration structure once for a run of queries.
+    pub fn new(scene: &'a Scene<G>, opts: PathTraceOptions) -> Self {
+        Self {
+            scene,
+            accel: SceneAccel::build(scene),
+            opts,
+            caustics: None,
+        }
+    }
+
+    /// Read a caustic map as direct light at every diffuse hit, exactly as
+    /// [`render_with_caustics`] does.
+    pub fn with_caustics(mut self, map: &'a CausticMap) -> Self {
+        self.caustics = Some(map);
+        self
+    }
+
+    /// The options every query runs under.
+    pub fn options(&self) -> &PathTraceOptions {
+        &self.opts
+    }
+
+    /// The radiance along one ray: one path, `seed` its whole random state.
+    ///
+    /// The estimate is unbiased and noisy — it is *one* sample, so a caller
+    /// that wants a number averages many with different seeds. `opts.spp` is
+    /// not read; this is the sample the film would have accumulated.
+    ///
+    /// The path traces a hero wavelength wherever the material it meets is
+    /// dispersive, so the answer is linear RGB and not a spectrum: a caller
+    /// that wants bands gets the tracer's own spectral resolution, which is
+    /// three.
+    pub fn radiance(&self, ray: Ray, seed: u64) -> [f32; 3] {
+        let mut rng = Rng::new(seed);
+        radiance(
+            self.scene,
+            &self.accel,
+            &self.opts,
+            self.caustics,
+            None,
+            ray,
+            &mut rng,
+        )
+        .0
+    }
+
+    /// What the ray first meets, geometry and ground only — lights are not
+    /// surfaces. `None` when it escapes.
+    pub fn first_hit(&self, ray: &Ray) -> Option<SurfaceHit> {
+        let mut best: Option<SurfaceHit> = None;
+        if let Some(found) = self.scene.tlas_hit(&self.accel, ray, 1e-7) {
+            let n = found.hit.normal.into_inner();
+            best = Some(SurfaceHit {
+                distance: found.hit.t,
+                point: [found.hit.point.x, found.hit.point.y, found.hit.point.z],
+                normal: [n.x, n.y, n.z],
+                front: n.dot(ray.direction.as_ref()) < 0.0,
+            });
+        }
+        if let Some(g) = &self.scene.ground {
+            let d = ray.direction.into_inner();
+            if d.z.abs() > 1e-12 {
+                let t = (g.z - ray.origin.z) / d.z;
+                if t > 1e-6 && best.is_none_or(|b| t < b.distance) {
+                    let p = ray.at(t);
+                    best = Some(SurfaceHit {
+                        distance: t,
+                        point: [p.x, p.y, p.z],
+                        normal: [0.0, 0.0, 1.0],
+                        front: d.z < 0.0,
+                    });
+                }
+            }
+        }
+        best
+    }
+
+    /// Whether anything stands between `from` and `from + dir · distance`.
+    pub fn occluded(&self, from: [f64; 3], dir: [f64; 3], distance: f64) -> bool {
+        let ray = Ray::new(
+            Point3::new(from[0], from[1], from[2]),
+            Vec3::new(dir[0], dir[1], dir[2]),
+        );
+        self.first_hit(&ray).is_some_and(|h| h.distance < distance)
+    }
+}
