@@ -880,6 +880,53 @@ clip).
 | arm mask, depth 1 | z −0.52, +1.69, +1.72, +1.25, −2.74, −0.28, +0.80. The reference itself moves by a few per cent with the rotation step (c4: 6.5, 5.3, 4.3 at h = 0.01, 0.004, 0.025 rad) |
 | shaded arm, depth 4 + NEE (ignored test, measured) | translations and the roll disagree by 5–14σ (c0: 5.16 ± 0.25 vs 0.57 ± 0.21) — the arm's shadows on itself and the post are image discontinuities that are no triangle's edge, and every one of them moves when the camera does |
 
+### 5. Shadow edges: deferred
+
+Not built. What the gates measured it is worth: ~15 % of the shoulder
+pitch on the arm over a floor (−31.1 vs −36.9 ± 1.4), and for the camera on
+the shaded arm it dominates the translations (c0: 5.2 vs 0.6). Why not now:
+
+- The light is an environment (a vMF sun lobe plus the sky), so a shadow
+  edge is not a curve on a light source but the occluders' silhouettes as
+  seen from each shading point, over the whole sphere. Li et al. 2018's
+  secondary edge sampling needs, per shading point, a sample of a point on
+  an occluder silhouette edge with a density over all edges of the scene —
+  a per-vertex edge hierarchy (their 3D edge tree with cone bounds), not
+  the per-frame screen-space list pieces 2–3 built.
+- Each sample needs its own pair of shadow rays (`ω ± ε`), a weight with
+  the edge's motion projected onto the unit sphere around the shading
+  point, and the path's throughput up to it — so the replay's per-vertex
+  state, or a third pass. On the device that is a new kernel per bounce.
+- With a smooth environment the visibility integral is smooth in `x`; its
+  per-sample discontinuity is an artefact of point-sampling the light.
+  Warped-area reparameterisation of the shadow ray alone (Bangaru et al.
+  2020, restricted to NEE) is the cheaper candidate here, because a shadow
+  ray has one discontinuity family and no image-formation change.
+
+The camera and the floor arm stay as measured (ignored) tests, so the term
+has its gates waiting.
+
+### Phase 2e risks and next
+
+1. **Shadow edges** (above): the largest error left on any shaded scene
+   with contact or cast shadows, and for every camera parameter.
+2. **Interpenetration.** Intersection curves of overlapping instances are
+   discontinuities no edge list contains. Rose's links bolt plate to plate;
+   if they overlap in the tessellation, the edge term is biased there. A
+   check (instances' meshes intersecting) belongs in `Edges::new`.
+3. **Variance.** Piece 2 gave 1.7–1.9×, not 10×: per-sample variance now
+   dominates. Importance ∝ `|v_n|` per parameter, and fewer, fatter crease
+   samples, are next.
+4. **The interior term is CPU f64 only** (~0.25 s for 48×36×4 spp × depth 4
+   in debug); the fit on the device would need a dual (or adjoint) trace in
+   WGSL, or the IR graph extended to take the shading frame's tangents.
+5. **The CD references** are good to a few per cent at best (the rotation
+   step moves them by that much); gates at 3σ of combined error are as
+   tight as they can be made without a much costlier reference.
+6. The rose arm itself was not re-run (its files belonged to another
+   agent); the crease bug fixed in piece 1 changes 2d's shaded rose
+   numbers (`edge (+650, +479, +167)`), which should be re-measured.
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.
