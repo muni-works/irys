@@ -508,3 +508,74 @@ impl Lobes {
         [g, g * sun, g * mirror]
     }
 }
+
+/// Where one instance's triangle edge passes through another instance's
+/// surface: evidence that the two interpenetrate, so their intersection
+/// curve — a discontinuity that is no triangle's edge — exists.
+#[derive(Debug, Clone, Copy)]
+pub struct Pierce {
+    /// The instance whose edge pierces.
+    pub from: usize,
+    /// The instance pierced.
+    pub into: usize,
+    /// World point.
+    pub at: Point3,
+    /// `|cos|` between the edge and the pierced face's normal (0: grazing).
+    pub cos: f64,
+    /// The piercing edge: a triangle of `from` and its edge.
+    pub tri: usize,
+    /// Edge `e → e + 1` of `tri`.
+    pub e: usize,
+    /// The pierced triangle of `into`.
+    pub prim: usize,
+}
+
+/// Every transversal crossing of an edge of placement `k` through a face of
+/// another placement (edges touching a face in its plane, as bolted plates
+/// do, are not crossings: `|cos| > 1e-3`, and the crossing must be inside
+/// the edge by `1e-6` of its length).
+pub fn pierces(scene: &Scene, _edges: &Edges, k: usize) -> Vec<Pierce> {
+    let place = &scene.placements()[k];
+    let m = scene.blas()[place.blas].geometry().mesh();
+    let (pos, tris) = (m.positions(), m.triangles());
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (ti, t) in tris.iter().enumerate() {
+        for e in 0..3 {
+            let (i0, i1) = (t[e].min(t[(e + 1) % 3]), t[e].max(t[(e + 1) % 3]));
+            if !seen.insert((i0, i1)) {
+                continue;
+            }
+            let a = place.to_world.apply_point(&pos[i0 as usize]);
+            let b = place.to_world.apply_point(&pos[i1 as usize]);
+            let len = (b - a).norm();
+            if len <= 0.0 {
+                continue;
+            }
+            let d = (b - a) / len;
+            let (mut t0, t1) = (len * 1e-6, len * (1.0 - 1e-6));
+            while t0 < t1 {
+                let ray = irys_core::Ray::new(a, d);
+                let Some(ih) = scene.tlas().trace_closest_range(&ray, t0, t1) else {
+                    break;
+                };
+                if ih.payload != k {
+                    let cos = d.dot(ih.hit.normal.as_ref()).abs();
+                    if cos > 1e-3 {
+                        out.push(Pierce {
+                            from: k,
+                            into: ih.payload,
+                            at: ih.hit.point,
+                            cos,
+                            tri: ti,
+                            e,
+                            prim: ih.hit.prim as usize,
+                        });
+                    }
+                }
+                t0 = ih.hit.t + len * 1e-9;
+            }
+        }
+    }
+    out
+}

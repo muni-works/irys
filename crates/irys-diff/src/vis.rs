@@ -1003,3 +1003,268 @@ pub fn about(c: Point3, axis: Vec3, angle: f64) -> Transform {
     );
     Transform::from_matrix(m)
 }
+
+/// Phase 2f: one piece of an intersection curve — where triangle `ta` of
+/// placement `ka` passes through triangle `tb` of placement `kb` (world
+/// ends `a`, `b`, at the current pose).
+#[derive(Debug, Clone, Copy)]
+pub struct CurveSeg {
+    /// First placement and its triangle.
+    pub ka: usize,
+    /// Triangle of `ka`.
+    pub ta: usize,
+    /// Second placement and its triangle.
+    pub kb: usize,
+    /// Triangle of `kb`.
+    pub tb: usize,
+    /// World ends.
+    pub a: Point3,
+    /// World ends.
+    pub b: Point3,
+}
+
+fn tri_world(scene: &Scene, k: usize, t: usize, place: Option<&Transform>) -> [Point3; 3] {
+    let p = &scene.placements()[k];
+    let m = scene.blas()[p.blas].geometry().mesh();
+    let tr = place.unwrap_or(&p.to_world);
+    m.triangles()[t].map(|i| tr.apply_point(&m.positions()[i as usize]))
+}
+
+/// The segment where two triangles cross, if they do (Möller 1997's
+/// interval overlap on the planes' common line).
+pub fn tri_tri(ta: [Point3; 3], tb: [Point3; 3]) -> Option<(Point3, Point3)> {
+    let plane = |t: &[Point3; 3]| {
+        let n = (t[1] - t[0]).cross(&(t[2] - t[0]));
+        let l = n.norm();
+        (l > 0.0).then(|| (n / l, n.dot(&t[0].coords()) / l))
+    };
+    let (na, da) = plane(&ta)?;
+    let (nb, db) = plane(&tb)?;
+    let dir = na.cross(&nb);
+    if dir.norm() < 1e-9 {
+        return None;
+    }
+    let dir = dir.normalize();
+    // The part of `t` on the other plane, as an interval along `dir`.
+    let clip = |t: &[Point3; 3], n: Vec3, d: f64| -> Option<(f64, f64, Point3, Point3)> {
+        let s: Vec<f64> = t.iter().map(|p| n.dot(&p.coords()) - d).collect();
+        let mut pts = Vec::new();
+        for i in 0..3 {
+            let j = (i + 1) % 3;
+            if (s[i] > 0.0) != (s[j] > 0.0) {
+                let u = s[i] / (s[i] - s[j]);
+                pts.push(t[i] + (t[j] - t[i]) * u);
+            }
+        }
+        if pts.len() < 2 {
+            return None;
+        }
+        let (p, q) = (pts[0], pts[1]);
+        let (u, v) = (dir.dot(&p.coords()), dir.dot(&q.coords()));
+        Some(if u <= v { (u, v, p, q) } else { (v, u, q, p) })
+    };
+    let (a0, a1, pa0, pa1) = clip(&ta, nb, db)?;
+    let (b0, b1, pb0, pb1) = clip(&tb, na, da)?;
+    let lo = if a0 >= b0 { pa0 } else { pb0 };
+    let hi = if a1 <= b1 { pa1 } else { pb1 };
+    (a0.max(b0) < a1.min(b1)).then_some((lo, hi))
+}
+
+/// Every intersection-curve piece between a moving placement and anything
+/// else (or another moving one), at the scene's pose: from
+/// [`crate::secondary::pierces`]' crossings, each piercing edge's two
+/// triangles against the pierced triangle.
+pub fn curves(scene: &Scene, edges: &Edges, moving: &[usize]) -> Vec<CurveSeg> {
+    let mut pairs = std::collections::BTreeSet::new();
+    let mut add = |ka: usize, ta: usize, kb: usize, tb: usize| {
+        let key = if (ka, ta) < (kb, tb) { (ka, ta, kb, tb) } else { (kb, tb, ka, ta) };
+        pairs.insert(key);
+    };
+    let mut from: Vec<usize> = moving.to_vec();
+    // Static instances pierced by a moving one may pierce back.
+    let mut extra = std::collections::BTreeSet::new();
+    for &k in moving {
+        for p in crate::secondary::pierces(scene, edges, k) {
+            if !moving.contains(&p.into) {
+                extra.insert(p.into);
+            }
+        }
+    }
+    from.extend(extra);
+    for &k in &from {
+        let blas = scene.placements()[k].blas;
+        for p in crate::secondary::pierces(scene, edges, k) {
+            if !moving.contains(&k) && !moving.contains(&p.into) {
+                continue;
+            }
+            add(k, p.tri, p.into, p.prim);
+            let nb = edges.nbr[blas][p.tri][p.e];
+            if nb != NONE && nb != FLAT {
+                add(k, nb as usize, p.into, p.prim);
+            } else if nb == FLAT {
+                // The coplanar neighbour across a flat edge: find it by
+                // the shared corners.
+                let m = scene.blas()[blas].geometry().mesh();
+                let t = m.triangles()[p.tri];
+                let (i0, i1) = (t[p.e], t[(p.e + 1) % 3]);
+                for (q, tq) in m.triangles().iter().enumerate() {
+                    if q != p.tri && tq.contains(&i0) && tq.contains(&i1) {
+                        add(k, q, p.into, p.prim);
+                    }
+                }
+            }
+        }
+    }
+    pairs
+        .into_iter()
+        .filter_map(|(ka, ta, kb, tb)| {
+            let (a, b) = tri_tri(tri_world(scene, ka, ta, None), tri_world(scene, kb, tb, None))?;
+            ((b - a).norm() > 0.0).then_some(CurveSeg { ka, ta, kb, tb, a, b })
+        })
+        .collect()
+}
+
+impl EdgeSamples {
+    /// Phase 2f: samples on the intersection curves `segs` (from
+    /// [`curves`] at the scene's pose `phi`), `n` of them by screen length.
+    /// Each side of the curve shows a different instance; the jump is
+    /// `f(s − εn) − f(s + εn)` like any edge's, and the curve's normal
+    /// speed comes from re-intersecting the two triangles' planes at
+    /// `φ ± RIG_H`. A sample counts only where the two rays land on the
+    /// two instances at the curve's depth.
+    pub fn for_curves(scene: &Scene, rig: &Rig, phi: &[f64], segs: &[CurveSeg], n: usize, seed: u64) -> Self {
+        let np = phi.len();
+        let (w, h) = (scene.size.0 as f64, scene.size.1 as f64);
+        let (eye, fwd, right, up, _) = scene.camera();
+        let shifted: Vec<[Vec<Transform>; 2]> = (0..np)
+            .map(|j| {
+                let mut p = phi.to_vec();
+                p[j] += RIG_H;
+                let plus = (rig.place)(&p);
+                p[j] -= 2.0 * RIG_H;
+                [plus, (rig.place)(&p)]
+            })
+            .collect();
+        let placement = |k: usize, j: usize, side: usize| -> Option<&Transform> {
+            rig.moving.iter().position(|&m| m == k).map(|mi| &shifted[j][side][mi])
+        };
+        let mut proj = Vec::new();
+        let mut cum = Vec::new();
+        let mut total = 0.0;
+        for (si, sg) in segs.iter().enumerate() {
+            let (Some((pa, _)), Some((pb, _))) = (scene.project(sg.a), scene.project(sg.b)) else {
+                continue;
+            };
+            let Some((t0, t1)) = clip(pa, pb, w, h) else {
+                continue;
+            };
+            let len = (pb[0] - pa[0]).hypot(pb[1] - pa[1]) * (t1 - t0);
+            if len <= 0.0 {
+                continue;
+            }
+            total += len;
+            cum.push(total);
+            proj.push((si, pa, pb, t0, t1));
+        }
+        let mut out = Self {
+            points: Vec::with_capacity(2 * n),
+            pixel: Vec::with_capacity(n),
+            weight: Vec::with_capacity(n),
+            total_len: total,
+            silhouette_len: 0.0,
+            segments: proj.len(),
+            visible: 0,
+            halved: 0,
+        };
+        for i in 0..n {
+            let put = |o: &mut Self, s: [f64; 2], nrm: [f64; 2], wt: Vec<f64>| {
+                let at = |d: f64| scene.screen(s[0] + d * nrm[0], s[1] + d * nrm[1]);
+                o.points.push(at(-EPS_PX));
+                o.points.push(at(EPS_PX));
+                let x = (s[0].floor().clamp(0.0, w - 1.0)) as usize;
+                let y = (s[1].floor().clamp(0.0, h - 1.0)) as usize;
+                o.pixel.push(y * scene.size.0 + x);
+                o.weight.push(wt);
+            };
+            if proj.is_empty() {
+                put(&mut out, [0.0, 0.0], [1.0, 0.0], vec![0.0; np]);
+                continue;
+            }
+            let u = (i as f64 + Rng::new(seed ^ 0x6375_7276, i as u64).uniform()) / n as f64 * total;
+            let pi = cum.partition_point(|&c| c <= u).min(proj.len() - 1);
+            let (si, pa, pb, t0, t1) = proj[pi];
+            let start = if pi == 0 { 0.0 } else { cum[pi - 1] };
+            let frac = ((u - start) / (cum[pi] - start)).clamp(0.0, 1.0);
+            let t = t0 + frac * (t1 - t0);
+            let d = [pb[0] - pa[0], pb[1] - pa[1]];
+            let s = [pa[0] + t * d[0], pa[1] + t * d[1]];
+            let dl = d[0].hypot(d[1]);
+            let nrm = [d[1] / dl, -d[0] / dl];
+            let sg = segs[si];
+            // The 3D point under `s`: the segment line's closest approach
+            // to the camera ray through `s`.
+            let [sx, sy] = scene.screen(s[0], s[1]);
+            let r = fwd + right * sx + up * sy;
+            let e = sg.b - sg.a;
+            let w0 = eye - sg.a;
+            let (aa, bb, cc, dd, ee) = (r.dot(&r), r.dot(&e), e.dot(&e), r.dot(&w0), e.dot(&w0));
+            let den = aa * cc - bb * bb;
+            let v = if den.abs() > 0.0 { ((aa * ee - bb * dd) / den).clamp(0.0, 1.0) } else { t };
+            let x = sg.a + e * v;
+            let depth = (x - eye).norm();
+            let hit = |q: [f64; 2]| {
+                let r = fwd + right * q[0] + up * q[1];
+                scene.tlas().trace_closest_range(&Ray::new(eye, r), 0.0, f64::INFINITY)
+            };
+            let near = |ih: &Option<irys_core::InstanceHit>| -> Option<usize> {
+                let ih = ih.as_ref()?;
+                (((ih.hit.point - eye).norm() - depth).abs() < 1e-4 * depth.max(1e-9)
+                    && (ih.payload == sg.ka || ih.payload == sg.kb))
+                    .then_some(ih.payload)
+            };
+            let hi = hit(scene.screen(s[0] - EPS_PX * nrm[0], s[1] - EPS_PX * nrm[1]));
+            let ho = hit(scene.screen(s[0] + EPS_PX * nrm[0], s[1] + EPS_PX * nrm[1]));
+            let (Some(a), Some(b), Some(jac)) = (near(&hi), near(&ho), scene.project(x).map(|p| p.1)) else {
+                put(&mut out, s, nrm, vec![0.0; np]);
+                continue;
+            };
+            if a == b {
+                put(&mut out, s, nrm, vec![0.0; np]);
+                continue;
+            }
+            out.visible += 1;
+            // The curve's motion: re-intersect the two planes at φ ± h and
+            // take the point on the new line nearest `x`.
+            let line_at = |j: usize, side: usize| -> Option<Point3> {
+                let ta = tri_world(scene, sg.ka, sg.ta, placement(sg.ka, j, side));
+                let tb = tri_world(scene, sg.kb, sg.tb, placement(sg.kb, j, side));
+                let n1 = (ta[1] - ta[0]).cross(&(ta[2] - ta[0])).normalize();
+                let n2 = (tb[1] - tb[0]).cross(&(tb[2] - tb[0])).normalize();
+                let dir = n1.cross(&n2);
+                let l2 = dir.norm_squared();
+                if l2 < 1e-18 {
+                    return None;
+                }
+                // Point on both planes nearest x: x minus its plane
+                // offsets, solved in the planes' normal space.
+                let (d1, d2) = (n1.dot(&(x - ta[0])), n2.dot(&(x - tb[0])));
+                let c = n1.dot(&n2);
+                let det = 1.0 - c * c;
+                let (g1, g2) = ((d1 - c * d2) / det, (d2 - c * d1) / det);
+                Some(x - n1 * g1 - n2 * g2)
+            };
+            let wt: Vec<f64> = (0..np)
+                .map(|j| match (line_at(j, 0), line_at(j, 1)) {
+                    (Some(p), Some(q)) => {
+                        let dx = (p - q) / (2.0 * RIG_H);
+                        let vel = [jac[0].dot(&dx), jac[1].dot(&dx)];
+                        (vel[0] * nrm[0] + vel[1] * nrm[1]) * total / n as f64
+                    }
+                    _ => 0.0,
+                })
+                .collect();
+            put(&mut out, s, nrm, wt);
+        }
+        out
+    }
+}

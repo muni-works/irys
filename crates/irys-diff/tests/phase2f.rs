@@ -417,3 +417,45 @@ fn secondary_estimators_compared() {
         );
     }
 }
+
+/// Piece 2: links sunk into each other (negative gaps at both joints) —
+/// the intersection curves are discontinuities no triangle owns. Edge +
+/// interior + secondary + curve samples against central differences.
+#[test]
+fn interpenetrating_arm_with_curve_samples() {
+    let (w, h) = (48, 36);
+    let rig = arm_rig_gap(-0.06);
+    let g = Weighted::new(w, h);
+    let mut s = arm_scene_with(w, h, 4, 4, false);
+    rig.pose(&mut s, &PHI);
+    let edges = Edges::new(&s);
+    let segs = vis::curves(&s, &edges, &rig.moving);
+    assert!(!segs.is_empty(), "the links should interpenetrate");
+    let sec = Secondary::new(&s);
+    let seeds: u64 = std::env::var("SEEDS").map_or(24, |v| v.parse().unwrap());
+    let (e, i, sc, t, _) = terms(&mut s, &rig, &g, &sec, seeds);
+    let n = 8192;
+    let mut kc = Kernels::new(2 * 2 * n * s.wavelengths, true);
+    let cr: Vec<Vec<f64>> = (0..seeds)
+        .map(|sd| {
+            let cs = vis::EdgeSamples::for_curves(&s, &rig, &PHI, &segs, n, 300 + sd);
+            s.set_points(Some(cs.points().to_vec()));
+            let l = prb::forward(&s, &THETA, 300 + sd, &mut kc).0;
+            s.set_points(None);
+            cs.gradient(&s, 300 + sd, &l, &g.0)
+        })
+        .collect();
+    let c = stats(&cr);
+    let cd = cd_rig(&mut s, &rig, &g);
+    let without = report("sunk, no curves", &e, &i, &sc, &t, &cd);
+    let tot: Vec<f64> = (0..3).map(|j| t.mean[j] + c.mean[j]).collect();
+    for j in 0..3 {
+        let sig = t.stderr[j].hypot(c.stderr[j]).hypot(cd.stderr[j]);
+        let z = (tot[j] - cd.mean[j]) / sig;
+        eprintln!(
+            "sunk φ{j}: curves {:+.3} ± {:.3}, all {:+.3} vs CD {:+.3}: z {z:+.2} (without curves z {:+.2}; {} pieces)",
+            c.mean[j], c.stderr[j], tot[j], cd.mean[j], without[j], segs.len()
+        );
+        assert!(z.abs() < 3.0, "φ{j}: z {z}");
+    }
+}
