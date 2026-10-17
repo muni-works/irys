@@ -23,6 +23,16 @@
 //!   `--target-only` (write `target.ppm` and `start.ppm`, then stop).
 //! - `--blur R`: coarse to fine, the pose-only phase's pose loss on R-px
 //!   box-blurred images.
+//! - phase 2f: the secondary edge term ([`irys_diff::secondary`], drawn
+//!   from the interior term's paths; `IRYS_SEC_N=4` samples per vertex is
+//!   what the 2f runs used) is on unless `--no-secondary` or `--edge-only`;
+//!   `--pyramid` fits the pose-only phase on 8×/4×/2× block-averaged images;
+//!   `--check` adds the intersection-curve term (`--no-curves` drops it).
+//!   2f diagnostics: `EDGE_POLICY=2d|front|vis` (host edge samples,
+//!   `CPU_TRACE` to trace them in f64), `CMP` (device vs host samples),
+//!   `MASK=r` / `MASK=-r` (loss only off / only on the arm), `CD_H`,
+//!   `CD_SEEDS`, `IRYS_SEC_DUMP` (largest secondary samples), `PIERCE`
+//!   (which instances interpenetrate).
 //! - diagnostics: `--check` (the pose gradient at the start, or `--at
 //!   p,r,e` degrees, against central differences of the 256-spp MSE; `SEEDS`
 //!   and `DUMP` in the environment), `SCAN=1` (the MSE along the elbow),
@@ -47,6 +57,7 @@ use std::{
 use irys_diff::gpu::{self, GpuEdges, GpuPrb};
 use irys_diff::interior::{self, Tangents};
 use irys_diff::prb::Scene;
+use irys_diff::secondary::Secondary;
 use irys_diff::vis::{self, Edges};
 
 const SIZE: (usize, usize) = (192, 192);
@@ -134,6 +145,52 @@ fn blur(img: &[f32], r: usize) -> Vec<f64> {
     a
 }
 
+/// The image averaged over `f × f` blocks: one level of a pyramid
+/// (`SIZE` divides by every `f` used).
+fn down(img: &[f64], f: usize) -> Vec<f64> {
+    let (w, h) = SIZE;
+    let (wd, hd) = (w / f, h / f);
+    let mut o = vec![0.0; wd * hd * 3];
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..3 {
+                o[((y / f) * wd + x / f) * 3 + c] += img[(y * w + x) * 3 + c] / (f * f) as f64;
+            }
+        }
+    }
+    o
+}
+
+/// `down`'s adjoint: every coarse value spread back over its block.
+fn down_adjoint(g: &[f64], f: usize) -> Vec<f64> {
+    let (w, h) = SIZE;
+    let wd = w / f;
+    let mut o = vec![0.0; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..3 {
+                o[(y * w + x) * 3 + c] = g[((y / f) * wd + x / f) * 3 + c] / (f * f) as f64;
+            }
+        }
+    }
+    o
+}
+
+/// The coarse-to-fine schedule (`--pyramid`): during the pose-only phase,
+/// the pose loss is the MSE of 8×, then 4×, then 2× block-averaged images,
+/// a third of the phase each; full resolution after.
+fn level(it: usize, pose_only: usize) -> usize {
+    if it > pose_only {
+        1
+    } else if it <= pose_only / 3 {
+        8
+    } else if it <= 2 * pose_only / 3 {
+        4
+    } else {
+        2
+    }
+}
+
 fn npx_of() -> f64 {
     (SIZE.0 * SIZE.1 * 3) as f64
 }
@@ -144,6 +201,9 @@ fn main() {
     let (mut interior_spp, mut iters, mut pose_only) = (1usize, 300usize, 100usize);
     let (mut check, mut depth, mut no_nee, mut no_sun, mut at) = (false, None, false, false, None);
     let mut blur_r = 0usize;
+    let mut no_secondary = false;
+    let mut no_curves = false;
+    let mut pyramid = false;
     let mut sun: Option<[f64; 3]> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -152,6 +212,9 @@ fn main() {
             "--control" => control = true,
             "--edge-only" => edge_only = true,
             "--vis" => use_vis = true,
+            "--no-secondary" => no_secondary = true,
+            "--no-curves" => no_curves = true,
+            "--pyramid" => pyramid = true,
             "--target-only" => target_only = true,
             "--check" => check = true,
             "--blur" => blur_r = val().parse().unwrap(),
@@ -257,7 +320,7 @@ fn main() {
             gr.update_geometry(&reference);
             let img = accumulate(&mut gr, &reference, &truth_theta, 3000, 4);
             let l = img.iter().zip(&target).map(|(a, b)| ((a - b) as f64).powi(2)).sum::<f64>() / npx_of();
-            let r: Vec<String> = [4usize, 8, 16]
+            let mut r: Vec<String> = [4usize, 8, 16]
                 .iter()
                 .map(|&rad| {
                     let (bi, bt) = (blur(&img, rad), blur(&target, rad));
@@ -265,6 +328,13 @@ fn main() {
                     format!("blur{rad} {lb:.4e}")
                 })
                 .collect();
+            let (i64v, t64v): (Vec<f64>, Vec<f64>) =
+                (img.iter().map(|&x| x as f64).collect(), target.iter().map(|&x| x as f64).collect());
+            for f in [2usize, 4, 8] {
+                let (a, b) = (down(&i64v, f), down(&t64v, f));
+                let l = a.iter().zip(&b).map(|(a, b)| (a - b).powi(2)).sum::<f64>() / a.len() as f64;
+                r.push(format!("pyr{f} {l:.4e}"));
+            }
             eprintln!("scan elbow {:+6.1}°  mse {l:.4e}  {}", e.to_degrees(), r.join("  "));
         }
         return;
@@ -290,6 +360,35 @@ fn main() {
     let mut ge = GpuPrb::new(ctx, &scene);
     let mut gedges = GpuEdges::new(&ge, &scene, &edges, &rig.moving, n_edge, 3, true);
     scene.set_points(None);
+    // Phase 2f: the secondary edge term (shadows and reflections moving),
+    // drawn from the interior term's own paths.
+    let sec = (!edge_only && !no_secondary).then(|| {
+        let t = Instant::now();
+        let s = Secondary::new(&scene);
+        eprintln!("secondary edge trees: {} candidates in {:.1?}", s.candidates(), t.elapsed());
+        s
+    });
+
+    if std::env::var("PIERCE").is_ok() {
+        // Piece 2 of phase 2f: do the arm's instances interpenetrate each
+        // other or the body, at the start pose and at the truth?
+        for (name, p) in [("start", phi0), ("truth", truth_phi)] {
+            rig.pose(&mut scene, &p);
+            let mut by: std::collections::BTreeMap<(usize, usize), (usize, f64)> = Default::default();
+            for &k in &rig.moving {
+                for pc in irys_diff::secondary::pierces(&scene, &edges, k) {
+                    let e = by.entry((pc.from, pc.into)).or_insert((0, 0.0));
+                    e.0 += 1;
+                    e.1 = e.1.max(pc.cos);
+                }
+            }
+            eprintln!("{name}: {} instance pairs pierce", by.len());
+            for ((a, b), (n, c)) in by {
+                eprintln!("  {a:2} → {b:2}: {n:6} edge crossings (max |cos| {c:.2})");
+            }
+        }
+        return;
+    }
 
     if check {
         // The pose gradient at phi0 (θ held at truth, so only the pose
@@ -300,17 +399,79 @@ fn main() {
         rig.pose(&mut reference, &phi0);
         gr.update_geometry(&reference);
         let base = accumulate(&mut gr, &reference, &th, 100, 8);
+        // `MASK=r` (2f diagnostic): weigh the loss only on pixels whose
+        // (2r+1)² neighbourhood shows no moving instance at the start pose
+        // — the torso, the floor, the sky — so what is left of the pose
+        // gradient is what the arm does to them: shadows and reflections.
+        rig.pose(&mut scene, &phi0);
+        let mask: Vec<f64> = match std::env::var("MASK") {
+            Ok(r) => {
+                let r: isize = r.parse().unwrap();
+                let invert = r < 0;
+                let r = r.abs();
+                let vb = vis::Visibility::new(&scene);
+                let (w, h) = SIZE;
+                let ids = vb.ids();
+                let mut m = vec![0.0; w * h * 3];
+                for y in 0..h as isize {
+                    for x in 0..w as isize {
+                        let mut ok = true;
+                        for dy in -r..=r {
+                            for dx in -r..=r {
+                                let (xx, yy) = ((x + dx).clamp(0, w as isize - 1), (y + dy).clamp(0, h as isize - 1));
+                                let id = ids[yy as usize * w + xx as usize];
+                                if id != vis::SKY && rig.moving.contains(&(id as usize)) {
+                                    ok = false;
+                                }
+                            }
+                        }
+                        if ok != invert {
+                            for c in 0..3 {
+                                m[(y as usize * w + x as usize) * 3 + c] = 1.0;
+                            }
+                        }
+                    }
+                }
+                eprintln!("mask: {} of {} pixels", m.iter().sum::<f64>() / 3.0, w * h);
+                m
+            }
+            Err(_) => vec![1.0; SIZE.0 * SIZE.1 * 3],
+        };
         let d_img: Vec<f64> = base
             .iter()
             .zip(&target)
-            .map(|(a, b)| 2.0 * (a - b) as f64 / npx_of())
+            .zip(&mask)
+            .map(|((a, b), m)| m * 2.0 * (a - b) as f64 / npx_of())
             .collect();
-        rig.pose(&mut scene, &phi0);
         ge.update_geometry(&scene);
         let (mut er, mut ir, mut cr) = (Vec::new(), Vec::new(), Vec::new());
+        let mut sr = Vec::new();
+        let mut qr = Vec::new();
+        let segs = vis::curves(&scene, &edges, &rig.moving);
+        eprintln!("intersection curves: {} pieces", segs.len());
         for sd in 0..seeds {
             let es = 300 + sd;
-            if use_vis {
+            if let Ok(pol) = std::env::var("EDGE_POLICY") {
+                // Diagnostics: host samples under a named importance,
+                // traced on the device or (CPU_TRACE) on the host in f64.
+                let smp = match pol.as_str() {
+                    "2d" => vis::EdgeSamples::new(&scene, &edges, &rig, &phi0, n_edge, es),
+                    "front" => vis::EdgeSamples::with_policy(&scene, &edges, &rig, &phi0, n_edge, es, true),
+                    _ => vis::EdgeSamples::with_visibility(&scene, &edges, &rig, &phi0, n_edge, es, Some(&vis::Visibility::new(&scene))),
+                };
+                scene.set_points(Some(smp.points().to_vec()));
+                let l = if std::env::var("CPU_TRACE").is_ok() {
+                    let mut k = irys_diff::prb::Kernels::for_scene(&scene, true);
+                    irys_diff::prb::forward(&scene, &th, es, &mut k).0
+                } else {
+                    gpu::widen(&ge.forward(&scene, &th, es))
+                };
+                if sd == 0 {
+                    eprintln!("host {pol}: {} of {} samples visible", smp.visible, smp.len());
+                }
+                er.push(smp.gradient(&scene, es, &l, &d_img));
+                scene.set_points(None);
+            } else if use_vis {
                 let vb = vis::Visibility::new(&scene);
                 er.push(
                     vis::boundary_with(&mut scene, &edges, &rig, &phi0, &d_img, n_edge, es, Some(&vb), |s| {
@@ -321,18 +482,58 @@ fn main() {
             } else {
                 scene.set_points(Some(points0.clone()));
                 let smp = gedges.sample(&ge, &scene, &rig, &phi0, es);
+                if sd == 0 {
+                    eprintln!("device: {} of {} samples visible", smp.visible, smp.len());
+                    if std::env::var("CMP").is_ok() {
+                        let h = vis::EdgeSamples::with_policy(&scene, &edges, &rig, &phi0, n_edge, es, true);
+                        let (mut lost, mut gained, mut same_pt, mut wdiff) = (0, 0, 0, 0);
+                        for i in 0..n_edge {
+                            let (hw, dw) = (&h.weights()[i], &smp.weights()[i]);
+                            let hv = hw.iter().any(|x| *x != 0.0);
+                            let dv = dw.iter().any(|x| *x != 0.0);
+                            let hp = h.points()[2 * i];
+                            if hv == dv { same_pt += 1; }
+                            if hv && !dv { lost += 1; if lost <= 12 { eprintln!("  lost {i}: host pt {hp:?} w {hw:?}"); } }
+                            if dv && !hv { gained += 1; }
+                            if hv && dv && (hw[0] - dw[0]).abs() > 1e-2 * hw[0].abs() { wdiff += 1; if wdiff <= 10 { eprintln!("  w {i}: host {hw:?} dev {dw:?}"); } }
+                        }
+                        let sh: Vec<f64> = (0..3).map(|j| h.weights().iter().map(|w| w[j]).sum()).collect();
+                        let sd2: Vec<f64> = (0..3).map(|j| smp.weights().iter().map(|w| w[j]).sum()).collect();
+                        eprintln!("  Σ|w| host {sh:?} device {sd2:?}");
+                        eprintln!("  host-only {lost}, device-only {gained}, same visibility: {same_pt}, weights differ >1%: {wdiff}");
+                    }
+                }
                 let l = gpu::widen(&ge.forward(&scene, &th, es));
                 er.push(smp.gradient(&scene, es, &l, &d_img));
                 scene.set_points(None);
             }
+            if !no_curves {
+                let cs = vis::EdgeSamples::for_curves(&scene, &rig, &phi0, &segs, 4096, es);
+                if sd == 0 {
+                    eprintln!("curve samples: {} of {} visible, {:.1} px of curve", cs.visible, cs.len(), cs.total_len);
+                }
+                scene.set_points(Some(cs.points().to_vec()));
+                let mut sp = scene.points().unwrap().to_vec();
+                sp.resize(points0.len(), [0.0, 0.0]);
+                scene.set_points(Some(sp));
+                let l = gpu::widen(&ge.forward(&scene, &th, es ^ 0xc0));
+                let l = &l[..2 * cs.len() * scene.wavelengths];
+                qr.push(cs.gradient(&scene, es ^ 0xc0, l, &d_img));
+                scene.set_points(None);
+            } else {
+                qr.push(vec![0.0; 3]);
+            }
             let spp = scene.spp;
             scene.spp = 4;
             let tan = Tangents::rig(&scene, &rig, &phi0);
-            ir.push(interior::interior(&scene, &tan, &th, 600 + sd, &d_img));
+            let (gi, gs) = interior::interior_with(&scene, &tan, &th, 600 + sd, &d_img, sec.as_ref());
+            ir.push(gi);
+            sr.push(gs);
             scene.spp = spp;
         }
-        let hh = 0.01;
-        for sd in 0..8u64 {
+        let hh: f64 = std::env::var("CD_H").map_or(0.01, |v| v.parse().unwrap());
+        let cd_seeds: u64 = std::env::var("CD_SEEDS").map_or(8, |v| v.parse().unwrap());
+        for sd in 0..cd_seeds {
             let mut r = Vec::new();
             for j in 0..3 {
                 let mut side = |d: f64| {
@@ -343,7 +544,8 @@ fn main() {
                     let img = accumulate(&mut gr, &reference, &th, 900 + 8 * sd, 8);
                     img.iter()
                         .zip(&target)
-                        .map(|(a, b)| ((a - b) as f64).powi(2))
+                        .zip(&mask)
+                        .map(|((a, b), m)| m * ((a - b) as f64).powi(2))
                         .sum::<f64>()
                         / npx_of()
                 };
@@ -361,18 +563,25 @@ fn main() {
                 })
                 .collect::<Vec<_>>()
         };
+        if std::env::var("IRYS_SEC_DUMP").is_ok() {
+            interior::dump_secondary(40);
+        }
         if std::env::var("DUMP").is_ok() {
             for (k, x) in er.iter().enumerate() {
                 eprintln!("  edge seed {k}: {:+.3e} {:+.3e} {:+.3e}", x[0], x[1], x[2]);
             }
         }
-        let (e, i, c) = (stat(&er), stat(&ir), stat(&cr));
-        let tot: Vec<Vec<f64>> = er.iter().zip(&ir).map(|(a, b)| (0..3).map(|j| a[j] + b[j]).collect()).collect();
+        let (e, i, c, sc, qc) = (stat(&er), stat(&ir), stat(&cr), stat(&sr), stat(&qr));
+        let tot: Vec<Vec<f64>> = (0..er.len())
+            .map(|k| (0..3).map(|j| er[k][j] + ir[k][j] + sr[k][j] + qr[k][j]).collect())
+            .collect();
         let t = stat(&tot);
         let f = |v: &[(f64, f64)]| v.iter().map(|(m, s)| format!("{m:+.3e} ± {s:.1e}")).collect::<Vec<_>>().join(", ");
         eprintln!("check at φ° {:+.2?} (depth {}, nee {}, sun {})", phi0.map(f64::to_degrees), scene.depth, scene.nee, scene.env.sun_radiance);
         eprintln!("  edge      {}", f(&e));
         eprintln!("  interior  {}", f(&i));
+        eprintln!("  secondary {}", f(&sc));
+        eprintln!("  curves    {}", f(&qc));
         eprintln!("  sum       {}", f(&t));
         eprintln!("  CD        {}", f(&c));
         eprintln!(
@@ -393,7 +602,7 @@ fn main() {
         csv,
         "iter,loss,sho_pitch,sho_roll,elbow,alpha,f0_450,f0_550,f0_650,\
          g_edge_pitch,g_edge_roll,g_edge_elbow,g_int_pitch,g_int_roll,g_int_elbow,\
-         ms_theta,ms_edge,ms_interior"
+         g_sec_pitch,g_sec_roll,g_sec_elbow,ms_theta,ms_edge,ms_interior"
     )
     .unwrap();
     let mut strip = fs::File::create(out.join("filmstrip.csv")).unwrap();
@@ -449,7 +658,14 @@ fn main() {
         // Coarse to fine (`--blur R`): while the pose fits alone, its loss
         // compares box-blurred images, `|B I − B T|²`, whose adjoint is
         // `Bᵀ 2 (B I − B T)` (B is symmetric up to the clamped border).
-        let d_img: Vec<f64> = if blur_r > 0 && it <= pose_only {
+        let lv = if pyramid { level(it, pose_only) } else { 1 };
+        let d_img: Vec<f64> = if lv > 1 {
+            let i64v: Vec<f64> = img.iter().map(|&x| x as f64).collect();
+            let (a, b) = (down(&i64v, lv), down(&target64, lv));
+            let nd = a.len() as f64;
+            let g: Vec<f64> = a.iter().zip(&b).map(|(a, b)| 2.0 * (a - b) / nd).collect();
+            down_adjoint(&g, lv)
+        } else if blur_r > 0 && it <= pose_only {
             let r: Vec<f32> = blur(&img, blur_r)
                 .iter()
                 .zip(&target_blur)
@@ -497,13 +713,13 @@ fn main() {
         // loss adjoint is the 8-spp image's, the derivative an independent
         // estimate, so the product stays unbiased.
         let ti = Instant::now();
-        let g_int = if edge_only {
-            vec![0.0; 3]
+        let (g_int, g_sec) = if edge_only {
+            (vec![0.0; 3], vec![0.0; 3])
         } else {
             let spp = scene.spp;
             scene.spp = interior_spp;
             let tan = Tangents::rig(&scene, &rig, &phi);
-            let gi = interior::interior(&scene, &tan, &theta, 50_000 + it as u64, &d_img);
+            let gi = interior::interior_with(&scene, &tan, &theta, 50_000 + it as u64, &d_img, sec.as_ref());
             scene.spp = spp;
             gi
         };
@@ -513,7 +729,7 @@ fn main() {
         t_int += d_int;
         writeln!(
             csv,
-            "{it},{loss:e},{},{},{},{},{},{},{},{:e},{:e},{:e},{:e},{:e},{:e},{:.2},{:.2},{:.2}",
+            "{it},{loss:e},{},{},{},{},{},{},{},{:e},{:e},{:e},{:e},{:e},{:e},{:e},{:e},{:e},{:.2},{:.2},{:.2}",
             phi[0],
             phi[1],
             phi[2],
@@ -527,13 +743,16 @@ fn main() {
             g_int[0],
             g_int[1],
             g_int[2],
+            g_sec[0],
+            g_sec[1],
+            g_sec[2],
             ms(d_theta),
             ms(d_edge),
             ms(d_int)
         )
         .unwrap();
         let grad: Vec<f64> = (0..3)
-            .map(|j| g_edge[j] + g_int[j])
+            .map(|j| g_edge[j] + g_int[j] + g_sec[j])
             .chain(gtheta.iter().copied())
             .collect();
         for p in 0..7 {
