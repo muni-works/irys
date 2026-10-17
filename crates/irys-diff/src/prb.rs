@@ -342,6 +342,12 @@ pub struct Scene {
     pub nee: bool,
     /// The sky and sun.
     pub env: Env,
+    /// When set, the frame is these primary rays instead of the image's:
+    /// path `i` leaves the camera through camera-plane point `points[i]`
+    /// (`(sx, sy)`, [`Scene::screen`]) and is keyed `i / 2`, so the two rays
+    /// of a pair — the two sides of an edge sample ([`crate::vis`]) — draw
+    /// the same wavelengths and the same uniforms after the camera.
+    pub(crate) points: Option<Vec<[f64; 2]>>,
     pub(crate) tan_half: f64,
     pub(crate) eye: Point3,
     pub(crate) forward: Vec3,
@@ -507,6 +513,7 @@ impl Scene {
             frozen_alpha: None,
             nee: false,
             env: Env::default(),
+            points: None,
             tan_half: half_fov_deg.to_radians().tan(),
             eye,
             forward,
@@ -557,9 +564,87 @@ impl Scene {
         }
     }
 
-    /// Paths in one frame.
+    /// Paths in one frame: the image's, or one per [`Scene::set_points`]
+    /// point.
     pub fn paths(&self) -> usize {
-        self.size.0 * self.size.1 * self.spp
+        match &self.points {
+            Some(p) => p.len(),
+            None => self.size.0 * self.size.1 * self.spp,
+        }
+    }
+
+    /// The generator key of path `i`: `i`, or in point mode the pair `i / 2`.
+    pub fn path_key(&self, i: usize) -> u64 {
+        match self.points {
+            Some(_) => (i / 2) as u64,
+            None => i as u64,
+        }
+    }
+
+    /// Trace these camera-plane points ([`Scene::screen`]) instead of the
+    /// image, two per pair; `None` goes back to the image.
+    pub fn set_points(&mut self, points: Option<Vec<[f64; 2]>>) {
+        if let Some(p) = &points {
+            assert!(p.len() % 2 == 0, "points come in pairs");
+        }
+        self.points = points;
+    }
+
+    /// The points being traced, if any.
+    pub fn points(&self) -> Option<&[[f64; 2]]> {
+        self.points.as_deref()
+    }
+
+    /// Move placements: `(payload, object → world)` each, then rebuild the
+    /// top-level tree. The bottom-level trees are untouched.
+    pub fn place(&mut self, moves: &[(usize, Transform)]) {
+        for (k, t) in moves {
+            self.placements[*k].to_world = t.clone();
+        }
+        let instances = self
+            .placements
+            .iter()
+            .enumerate()
+            .map(|(k, p)| {
+                Instance::new(self.blas[p.blas].clone(), p.to_world.clone(), k)
+                    .unwrap_or_else(|| panic!("placement {k}: singular transform"))
+            })
+            .collect();
+        self.tlas = Tlas::build(instances);
+    }
+
+    /// Pixel coordinates (`x` right, `y` down, `[0, w) × [0, h)`) to the
+    /// camera plane: the ray through them is `forward + right sx + up sy`.
+    pub fn screen(&self, x: f64, y: f64) -> [f64; 2] {
+        let (w, h) = (self.size.0 as f64, self.size.1 as f64);
+        [
+            (2.0 * x / w - 1.0) * self.tan_half * w / h,
+            (1.0 - 2.0 * y / h) * self.tan_half,
+        ]
+    }
+
+    /// The pinhole: eye, forward, right, up, `tan` of the half field of view.
+    pub fn camera(&self) -> (Point3, Vec3, Vec3, Vec3, f64) {
+        (self.eye, self.forward, self.right, self.up, self.tan_half)
+    }
+
+    /// Where world point `p` lands in pixel coordinates, and the 2 × 3
+    /// Jacobian of that map; `None` behind the eye.
+    pub fn project(&self, p: Point3) -> Option<([f64; 2], [Vec3; 2])> {
+        let d = p - self.eye;
+        let z = d.dot(&self.forward);
+        if z <= 0.0 {
+            return None;
+        }
+        let (a, b) = (d.dot(&self.right), d.dot(&self.up));
+        let (w, h) = (self.size.0 as f64, self.size.1 as f64);
+        let kx = w / (2.0 * self.tan_half * w / h);
+        let ky = h / (2.0 * self.tan_half);
+        let x = (a / z) * kx + w / 2.0;
+        let y = h / 2.0 - (b / z) * ky;
+        let jx = (self.right * z - self.forward * a) * (kx / (z * z));
+        let jy = (self.up * z - self.forward * b) * (-ky / (z * z));
+        Some(([x, y], [jx, jy]))
     }
 
     /// Lanes in one frame: a lane is one (path, wavelength), and is what
@@ -582,6 +667,10 @@ impl Scene {
             (px % w) as f64 + rng.uniform(),
             (px / w) as f64 + rng.uniform(),
         );
+        if let Some(p) = &self.points {
+            let [sx, sy] = p[path];
+            return Ray::new(self.eye, self.forward + self.right * sx + self.up * sy);
+        }
         let tan = self.tan_half;
         let sx = (2.0 * x / w as f64 - 1.0) * tan * w as f64 / h as f64;
         let sy = (1.0 - 2.0 * y / h as f64) * tan;
@@ -618,6 +707,30 @@ pub fn uv_sphere(lat: usize, lon: usize) -> TriMesh {
             idx.extend([a, b, c, a, c, d]);
         }
     }
+    TriMesh::new(positions, Vec::new(), &idx)
+}
+
+/// An axis-aligned box of half-extents `(hx, hy, hz)` about the origin,
+/// twelve triangles wound outward.
+pub fn cuboid(hx: f64, hy: f64, hz: f64) -> TriMesh {
+    let positions = (0..8)
+        .map(|i| {
+            Point3::new(
+                if i & 1 == 0 { -hx } else { hx },
+                if i & 2 == 0 { -hy } else { hy },
+                if i & 4 == 0 { -hz } else { hz },
+            )
+        })
+        .collect();
+    #[rustfmt::skip]
+    let idx = [
+        0, 2, 3, 0, 3, 1, // -z
+        4, 5, 7, 4, 7, 6, // +z
+        0, 1, 5, 0, 5, 4, // -y
+        2, 6, 7, 2, 7, 3, // +y
+        0, 4, 6, 0, 6, 2, // -x
+        1, 3, 7, 1, 7, 5, // +x
+    ];
     TriMesh::new(positions, Vec::new(), &idx)
 }
 
@@ -849,7 +962,7 @@ fn trace(
     let env = scene.env;
     let mut paths: Vec<Path> = (0..n)
         .map(|i| {
-            let mut rng = Rng::new(seed, i as u64);
+            let mut rng = Rng::new(seed, scene.path_key(i));
             let lambda = wavelengths(rng.uniform(), nw);
             let ray = scene.camera_ray(i, &mut rng);
             Path {

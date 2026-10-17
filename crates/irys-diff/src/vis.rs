@@ -1,0 +1,463 @@
+//! Phase 2d: primary-visibility gradients with respect to the pose of
+//! instances, by sampling the edges that move.
+//!
+//! # What is differentiated
+//!
+//! A pose `φ` (joint angles, say) places some instances ([`Rig`]); `θ`
+//! ([`crate::prb`]) is the conductor's finish. A pixel is the box integral
+//! `I_p = ∫_p f(x) dx` of the radiance `f` arriving through camera-plane
+//! point `x`. Moving an instance moves the curves across which `f` jumps —
+//! its silhouette against what is behind it, and its own creases (flat
+//! shaded: every edge between faces that are not coplanar) — and Reynolds'
+//! transport theorem gives the part of `∂I_p/∂φ` that PRB cannot see:
+//!
+//! ```text
+//! ∂I_p/∂φ ⊇ ∫_{E ∩ p} (f(s − εn) − f(s + εn)) · v_n(s) dℓ(s)
+//! ```
+//!
+//! over the screen-space edges `E` of the moving triangles, `n` the edge's
+//! outward normal (away from its own triangle) and `v_n = n · ∂π(X(s))/∂φ`
+//! the normal speed of the edge point `X(s)` (a material point of the mesh,
+//! carried by its instance; `π` the pinhole). A loss `ℒ(I)` takes
+//! `Σ_p ∂ℒ/∂I_p` of it.
+//!
+//! # The estimator (Li et al. 2018's edge sampling, primary rays)
+//!
+//! Every triangle edge of every moving instance is projected and clipped to
+//! the frame; an edge sample picks a point uniformly in total screen length
+//! (stratified, `n` per call), and weighs
+//! `(Σℓ / n) · v_n · ½?` the difference of two full paths traced through
+//! `s ∓ εn` ([`Scene::set_points`]; the pair shares its generator, so
+//! the difference is common random numbers). Each triangle owns its edges:
+//! the inner ray must hit *that* triangle (otherwise the edge is hidden at
+//! `s` and the sample is 0), and where the outer ray lands on the same
+//! instance right next to `X` — a crease, which the neighbour also samples
+//! from its side — each side takes half. Edges shared by two coplanar
+//! triangles are never candidates: `f` is continuous across them. No mesh
+//! adjacency is assumed beyond that filter, so unwelded and T-junctioned
+//! tessellations stay correct.
+//!
+//! What it leaves out, by design for this phase: the interior derivative
+//! of `f` at fixed `x` (shading at the hit moving with the pose) and every
+//! secondary discontinuity (shadows and reflections moving). Against the
+//! sky at depth 1 — where `f` is the instance's mask — the estimator is the
+//! whole gradient, and that is the test.
+
+use irys_core::{Point3, Ray, Transform, Vec3};
+use irys_light::spectrum::hero_weight;
+
+use crate::prb::{HERO, Rng, Scene, wavelengths};
+
+/// The half-width of an edge sample, in pixels: the two rays leave the
+/// camera this far either side of the edge. Small against a pixel, large
+/// against the device's f32 camera plane.
+pub const EPS_PX: f64 = 1e-3;
+
+/// A pose: which placements it moves, and where it puts them.
+pub struct Rig<'a> {
+    /// Payloads of the moving placements.
+    pub moving: Vec<usize>,
+    /// `φ` → object → world of each of `moving`, in order.
+    pub place: Box<dyn Fn(&[f64]) -> Vec<Transform> + 'a>,
+}
+
+/// The step `Rig::place` is differenced at for the edges' velocities. The
+/// placement is a closed form in `φ`, so central differences of it are
+/// exact to ~1e-10 — this is a derivative of the rig, not of the image.
+pub const RIG_H: f64 = 1e-6;
+
+impl Rig<'_> {
+    /// Put `scene`'s moving instances at `phi`.
+    pub fn pose(&self, scene: &mut Scene, phi: &[f64]) {
+        let t = (self.place)(phi);
+        assert_eq!(
+            t.len(),
+            self.moving.len(),
+            "one transform per moving placement"
+        );
+        let moves: Vec<(usize, Transform)> = self.moving.iter().copied().zip(t).collect();
+        scene.place(&moves);
+    }
+}
+
+/// Per bottom-level tree, which triangle edges can never be a
+/// discontinuity: shared (by welded position) with exactly one coplanar
+/// triangle.
+pub struct Edges {
+    skip: Vec<Vec<[bool; 3]>>,
+}
+
+impl Edges {
+    /// Weld every tree of `scene` and mark its flat interior edges.
+    pub fn new(scene: &Scene) -> Self {
+        let skip = scene
+            .blas()
+            .iter()
+            .map(|b| {
+                let m = b.geometry().mesh();
+                let (pos, tris) = (m.positions(), m.triangles());
+                let mut bb = irys_core::Aabb::empty();
+                for p in pos {
+                    bb.include_point(p);
+                }
+                let tol = if pos.is_empty() {
+                    1.0
+                } else {
+                    ((bb.max - bb.min).norm() * 1e-7).max(1e-12)
+                };
+                let key = |i: u32| {
+                    let p = pos[i as usize];
+                    [p.x, p.y, p.z].map(|c| (c / tol).round() as i64)
+                };
+                let normal = |t: &[u32; 3]| {
+                    let [a, b, c] = t.map(|i| pos[i as usize]);
+                    (b - a).cross(&(c - a))
+                };
+                let mut map: std::collections::HashMap<_, Vec<(usize, usize)>> =
+                    std::collections::HashMap::new();
+                for (ti, t) in tris.iter().enumerate() {
+                    for e in 0..3 {
+                        let (a, b) = (key(t[e]), key(t[(e + 1) % 3]));
+                        map.entry(if a < b { (a, b) } else { (b, a) })
+                            .or_default()
+                            .push((ti, e));
+                    }
+                }
+                let mut skip = vec![[false; 3]; tris.len()];
+                for v in map.values() {
+                    if let [(t0, e0), (t1, e1)] = v[..] {
+                        let (n0, n1) = (normal(&tris[t0]), normal(&tris[t1]));
+                        let (l0, l1) = (n0.norm(), n1.norm());
+                        if l0 > 0.0 && l1 > 0.0 && n0.dot(&n1) / (l0 * l1) > 1.0 - 1e-10 {
+                            skip[t0][e0] = true;
+                            skip[t1][e1] = true;
+                        }
+                    }
+                }
+                skip
+            })
+            .collect();
+        Self { skip }
+    }
+
+    /// Edges that are candidates, over every tree.
+    pub fn candidates(&self) -> usize {
+        self.skip
+            .iter()
+            .flatten()
+            .map(|s| s.iter().filter(|x| !**x).count())
+            .sum()
+    }
+}
+
+/// One frame's edge samples: the ray pairs to trace and what each pair is
+/// worth per pose parameter.
+pub struct EdgeSamples {
+    points: Vec<[f64; 2]>,
+    pixel: Vec<usize>,
+    /// Per sample, per parameter: `½? · v_n · Σℓ / n`.
+    weight: Vec<Vec<f64>>,
+    /// Screen length of every candidate edge in the frame, pixels.
+    pub total_len: f64,
+    /// Candidate edge pieces inside the frame.
+    pub segments: usize,
+    /// Samples whose edge was visible at the sample (inner ray hit its own
+    /// triangle).
+    pub visible: usize,
+    /// Of those, crease samples split with the neighbour.
+    pub halved: usize,
+}
+
+struct Seg {
+    mi: usize,
+    k: usize,
+    tri: usize,
+    e: usize,
+    pa: [f64; 2],
+    pb: [f64; 2],
+    pc: [f64; 2],
+    t0: f64,
+    t1: f64,
+}
+
+/// The part of the segment `a → b` inside `[0, w] × [0, h]`, as parameters.
+fn clip(a: [f64; 2], b: [f64; 2], w: f64, h: f64) -> Option<(f64, f64)> {
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    let d = [b[0] - a[0], b[1] - a[1]];
+    for (p, q) in [
+        (-d[0], a[0]),
+        (d[0], w - a[0]),
+        (-d[1], a[1]),
+        (d[1], h - a[1]),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return None;
+            }
+        } else {
+            let r = q / p;
+            if p < 0.0 {
+                t0 = t0.max(r);
+            } else {
+                t1 = t1.min(r);
+            }
+        }
+    }
+    (t0 < t1).then_some((t0, t1))
+}
+
+impl EdgeSamples {
+    /// Draw `n` edge samples of `scene` as posed at `phi` (the caller has
+    /// [`Rig::pose`]d it) with generator `seed`.
+    pub fn new(scene: &Scene, edges: &Edges, rig: &Rig, phi: &[f64], n: usize, seed: u64) -> Self {
+        let np = phi.len();
+        // ± RIG_H placements per parameter, for the edges' velocities.
+        let shifted: Vec<[Vec<Transform>; 2]> = (0..np)
+            .map(|j| {
+                let mut p = phi.to_vec();
+                p[j] += RIG_H;
+                let plus = (rig.place)(&p);
+                p[j] -= 2.0 * RIG_H;
+                [plus, (rig.place)(&p)]
+            })
+            .collect();
+        let (w, h) = (scene.size.0 as f64, scene.size.1 as f64);
+        let mut segs = Vec::new();
+        let mut cum = Vec::new();
+        let mut total = 0.0;
+        for (mi, &k) in rig.moving.iter().enumerate() {
+            let place = &scene.placements()[k];
+            let m = scene.blas()[place.blas].geometry().mesh();
+            let pos = m.positions();
+            let skip = &edges.skip[place.blas];
+            for (tri, t) in m.triangles().iter().enumerate() {
+                let Some(px) = t
+                    .iter()
+                    .map(|&i| {
+                        scene
+                            .project(place.to_world.apply_point(&pos[i as usize]))
+                            .map(|p| p.0)
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                for e in 0..3 {
+                    if skip[tri][e] {
+                        continue;
+                    }
+                    let (pa, pb, pc) = (px[e], px[(e + 1) % 3], px[(e + 2) % 3]);
+                    let Some((t0, t1)) = clip(pa, pb, w, h) else {
+                        continue;
+                    };
+                    let len = (pb[0] - pa[0]).hypot(pb[1] - pa[1]) * (t1 - t0);
+                    if len <= 0.0 {
+                        continue;
+                    }
+                    total += len;
+                    cum.push(total);
+                    segs.push(Seg {
+                        mi,
+                        k,
+                        tri,
+                        e,
+                        pa,
+                        pb,
+                        pc,
+                        t0,
+                        t1,
+                    });
+                }
+            }
+        }
+        let mut out = Self {
+            points: Vec::with_capacity(2 * n),
+            pixel: Vec::with_capacity(n),
+            weight: Vec::with_capacity(n),
+            total_len: total,
+            segments: segs.len(),
+            visible: 0,
+            halved: 0,
+        };
+        let (eye, fwd, right, up, _) = scene.camera();
+        let mut rng = Rng::new(seed ^ 0x6564_6765, u64::MAX);
+        for i in 0..n {
+            let put = |o: &mut Self, s: [f64; 2], nrm: [f64; 2], wt: Vec<f64>| {
+                let at = |d: f64| scene.screen(s[0] + d * nrm[0], s[1] + d * nrm[1]);
+                o.points.push(at(-EPS_PX));
+                o.points.push(at(EPS_PX));
+                let x = (s[0].floor().clamp(0.0, w - 1.0)) as usize;
+                let y = (s[1].floor().clamp(0.0, h - 1.0)) as usize;
+                o.pixel.push(y * scene.size.0 + x);
+                o.weight.push(wt);
+            };
+            let u = (i as f64 + rng.uniform()) / n as f64 * total;
+            if segs.is_empty() {
+                put(&mut out, [0.0, 0.0], [1.0, 0.0], vec![0.0; np]);
+                continue;
+            }
+            let si = cum.partition_point(|&c| c <= u).min(segs.len() - 1);
+            let seg = &segs[si];
+            let start = if si == 0 { 0.0 } else { cum[si - 1] };
+            let frac = ((u - start) / (cum[si] - start)).clamp(0.0, 1.0);
+            let t = seg.t0 + frac * (seg.t1 - seg.t0);
+            let d = [seg.pb[0] - seg.pa[0], seg.pb[1] - seg.pa[1]];
+            let s = [seg.pa[0] + t * d[0], seg.pa[1] + t * d[1]];
+            let dl = d[0].hypot(d[1]);
+            let mut nrm = [d[1] / dl, -d[0] / dl];
+            if nrm[0] * (seg.pc[0] - seg.pa[0]) + nrm[1] * (seg.pc[1] - seg.pa[1]) > 0.0 {
+                nrm = [-nrm[0], -nrm[1]];
+            }
+            // The material point under `s`: the edge line's closest approach
+            // to the camera ray through `s`.
+            let place = &scene.placements()[seg.k];
+            let m = scene.blas()[place.blas].geometry().mesh();
+            let tri = m.triangles()[seg.tri];
+            let (la, lb) = (
+                m.positions()[tri[seg.e] as usize],
+                m.positions()[tri[(seg.e + 1) % 3] as usize],
+            );
+            let (a, b) = (
+                place.to_world.apply_point(&la),
+                place.to_world.apply_point(&lb),
+            );
+            let [sx, sy] = scene.screen(s[0], s[1]);
+            let r = fwd + right * sx + up * sy;
+            let e = b - a;
+            let w0 = eye - a;
+            let (aa, bb, cc, dd, ee) = (r.dot(&r), r.dot(&e), e.dot(&e), r.dot(&w0), e.dot(&w0));
+            let den = aa * cc - bb * bb;
+            let v = if den.abs() > 0.0 {
+                ((aa * ee - bb * dd) / den).clamp(0.0, 1.0)
+            } else {
+                t
+            };
+            let x = a + e * v;
+            let xl = la + (lb - la) * v;
+            let jac = scene.project(x).map(|p| p.1);
+            // Visibility at `s`: the inner ray must land on this triangle.
+            let hit = |q: [f64; 2]| {
+                let r = fwd + right * q[0] + up * q[1];
+                scene
+                    .tlas()
+                    .trace_closest_range(&Ray::new(eye, r), 0.0, f64::INFINITY)
+            };
+            let inner = scene.screen(s[0] - EPS_PX * nrm[0], s[1] - EPS_PX * nrm[1]);
+            let outer = scene.screen(s[0] + EPS_PX * nrm[0], s[1] + EPS_PX * nrm[1]);
+            let own =
+                hit(inner).is_some_and(|ih| ih.payload == seg.k && ih.hit.prim as usize == seg.tri);
+            let (Some(jac), true) = (jac, own) else {
+                put(&mut out, s, nrm, vec![0.0; np]);
+                continue;
+            };
+            out.visible += 1;
+            let crease = hit(outer).is_some_and(|oh| {
+                oh.payload == seg.k && (oh.hit.point - x).norm() < 1e-4 * (x - eye).norm()
+            });
+            let half = if crease {
+                out.halved += 1;
+                0.5
+            } else {
+                1.0
+            };
+            let wt = (0..np)
+                .map(|j| {
+                    let [p, q] = &shifted[j];
+                    let dx =
+                        (p[seg.mi].apply_point(&xl) - q[seg.mi].apply_point(&xl)) / (2.0 * RIG_H);
+                    let vn = jac[0].dot(&dx) * nrm[0] + jac[1].dot(&dx) * nrm[1];
+                    half * vn * total / n as f64
+                })
+                .collect();
+            put(&mut out, s, nrm, wt);
+        }
+        out
+    }
+
+    /// The ray pairs, inner then outer, as camera-plane points.
+    pub fn points(&self) -> &[[f64; 2]] {
+        &self.points
+    }
+
+    /// Samples drawn.
+    pub fn len(&self) -> usize {
+        self.pixel.len()
+    }
+
+    /// Whether none were drawn.
+    pub fn is_empty(&self) -> bool {
+        self.pixel.is_empty()
+    }
+
+    /// `∂ℒ/∂φ`'s edge term from the pairs' traced `L` (per lane, as the
+    /// points frame lays them out, generator `seed`) and the loss adjoint
+    /// per pixel channel.
+    pub fn gradient(&self, scene: &Scene, seed: u64, l: &[f64], d_img: &[f64]) -> Vec<f64> {
+        let nw = scene.wavelengths;
+        assert_eq!(l.len(), 2 * self.len() * nw, "L of the points frame");
+        let np = self.weight.first().map_or(0, Vec::len);
+        let mut g = vec![0.0; np];
+        for (i, (&px, wt)) in self.pixel.iter().zip(&self.weight).enumerate() {
+            if wt.iter().all(|&x| x == 0.0) {
+                continue;
+            }
+            let lam: [f64; HERO] = wavelengths(Rng::new(seed, i as u64).uniform(), nw);
+            let mut s = 0.0;
+            for k in 0..nw {
+                let d = l[2 * i * nw + k] - l[(2 * i + 1) * nw + k];
+                let hw = hero_weight(lam[k]);
+                for c in 0..3 {
+                    s += d * hw[c] as f64 / nw as f64 * d_img[px * 3 + c];
+                }
+            }
+            for (gj, wj) in g.iter_mut().zip(wt) {
+                *gj += wj * s;
+            }
+        }
+        g
+    }
+}
+
+/// The edge term in one call: sample, trace the pairs with `trace` (which
+/// gets `scene` in point mode and returns `L` per lane — [`crate::prb::forward`]
+/// or the GPU's), weigh. `scene` is left as it came.
+pub fn boundary(
+    scene: &mut Scene,
+    edges: &Edges,
+    rig: &Rig,
+    phi: &[f64],
+    d_img: &[f64],
+    n: usize,
+    seed: u64,
+    trace: impl FnOnce(&Scene) -> Vec<f64>,
+) -> (Vec<f64>, EdgeSamples) {
+    let es = EdgeSamples::new(scene, edges, rig, phi, n, seed);
+    scene.set_points(Some(es.points.clone()));
+    let l = trace(scene);
+    scene.set_points(None);
+    (es.gradient(scene, seed, &l, d_img), es)
+}
+
+/// Rotation by `angle` about the line through `c` along unit `axis`.
+pub fn about(c: Point3, axis: Vec3, angle: f64) -> Transform {
+    let (s, co) = angle.sin_cos();
+    let (x, y, z) = (axis.x, axis.y, axis.z);
+    let t = 1.0 - co;
+    let r = [
+        [t * x * x + co, t * x * y - s * z, t * x * z + s * y],
+        [t * x * y + s * z, t * y * y + co, t * y * z - s * x],
+        [t * x * z - s * y, t * y * z + s * x, t * z * z + co],
+    ];
+    let cv = c.coords();
+    let rc = Vec3::new(
+        r[0][0] * cv.x + r[0][1] * cv.y + r[0][2] * cv.z,
+        r[1][0] * cv.x + r[1][1] * cv.y + r[1][2] * cv.z,
+        r[2][0] * cv.x + r[2][1] * cv.y + r[2][2] * cv.z,
+    );
+    let tr = cv - rc;
+    let m = tang::Mat4::new(
+        r[0][0], r[0][1], r[0][2], tr.x, r[1][0], r[1][1], r[1][2], tr.y, r[2][0], r[2][1],
+        r[2][2], tr.z, 0.0, 0.0, 0.0, 1.0,
+    );
+    Transform::from_matrix(m)
+}

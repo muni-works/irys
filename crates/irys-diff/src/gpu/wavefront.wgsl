@@ -42,7 +42,7 @@ struct Params {
     cap: u32,             // paths a chunk holds: light lanes start at cap × nw
     base: u32,            // this chunk's first path in the frame
     total: u32,           // paths in the frame
-    _p0: u32,
+    points: u32,          // point mode: camera-plane points from `points_in`, pairs keyed together
     _p1: u32,
     sun: vec4<f32>,       // unit sun direction, κ
     env: vec4<f32>,       // sun radiance, sky scale, SUN_PICK, vMF normaliser κ / (2π (1 − e^{−2κ}))
@@ -95,6 +95,8 @@ struct Path {
 @group(0) @binding(23) var<storage, read> nodes: array<vec4<f32>>;
 @group(0) @binding(24) var<storage, read> prim_ids: array<u32>;
 @group(0) @binding(25) var<storage, read> geo: array<vec4<f32>>;
+// Phase 2d: the camera-plane points of a point-mode frame (`Scene::set_points`).
+@group(0) @binding(26) var<storage, read> points_in: array<vec2<f32>>;
 
 const PI: f32 = 3.14159265358979;
 
@@ -677,15 +679,19 @@ fn gen(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let g = params.base + i;
-    var s = rng_new(g);
+    var s = rng_new(select(g, g >> 1u, params.points != 0u));
     let lam = lambdas(&s);
     let w = params.size.x;
     let h = params.size.y;
     let px = g / params.spp;
     let x = f32(px % w) + rand(&s);
     let y = f32(px / w) + rand(&s);
-    let sx = (2.0 * x / f32(w) - 1.0) * params.tan_half * f32(w) / f32(h);
-    let sy = (1.0 - 2.0 * y / f32(h)) * params.tan_half;
+    var sx = (2.0 * x / f32(w) - 1.0) * params.tan_half * f32(w) / f32(h);
+    var sy = (1.0 - 2.0 * y / f32(h)) * params.tan_half;
+    if (params.points != 0u) {
+        sx = points_in[g].x;
+        sy = points_in[g].y;
+    }
     let d = normalize(params.fwd.xyz + params.right.xyz * sx + params.up.xyz * sy);
     paths[i] = Path(
         vec4<f32>(params.eye.xyz, 0.0),

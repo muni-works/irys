@@ -72,7 +72,8 @@ struct Params {
     cap: u32,
     base: u32,
     total: u32,
-    _pad: [u32; 2],
+    points: u32,
+    _pad: u32,
     sun: [f32; 4],
     env: [f32; 4],
 }
@@ -239,6 +240,10 @@ pub struct GpuPrb {
     target: wgpu::Buffer,
     img: wgpu::Buffer,
     loss: wgpu::Buffer,
+    nodes: wgpu::Buffer,
+    ids: wgpu::Buffer,
+    geo: wgpu::Buffer,
+    points: wgpu::Buffer,
     eval: Ir,
     adjoint: Ir,
     f: TensorId,
@@ -453,16 +458,27 @@ impl GpuPrb {
         let loss = storage("loss", 4);
         let path_buf = storage("paths", paths as u64 * PATH_BYTES);
         let (nodes, ids, geo, layout) = pack(scene);
-        let init = |label: &str, bytes: &[u8]| {
-            dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        // Room for the top-level tree to change shape when instances move
+        // (`update_geometry`): at most two nodes (four vec4s) per instance.
+        let room = 8 * (scene.placements().len() as u64 + 1) * 16;
+        let init = |label: &str, bytes: &[u8], extra: u64| {
+            let b = dev.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
-                contents: bytes,
-                usage: wgpu::BufferUsages::STORAGE,
-            })
+                size: (bytes.len() as u64 + extra).max(16),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: true,
+            });
+            b.slice(..bytes.len() as u64)
+                .get_mapped_range_mut()
+                .expect("mapped")
+                .copy_from_slice(bytes);
+            b.unmap();
+            b
         };
-        let nodes = init("nodes", bytemuck::cast_slice(&nodes));
-        let ids = init("prim ids", bytemuck::cast_slice(&ids));
-        let geo = init("prims", bytemuck::cast_slice(&geo));
+        let nodes = init("nodes", bytemuck::cast_slice(&nodes), room);
+        let ids = init("prim ids", bytemuck::cast_slice(&ids), room / 4);
+        let geo = init("prims", bytemuck::cast_slice(&geo), 0);
+        let points = storage("points", scene.points().map_or(0, |p| p.len() as u64 * 8));
         let params = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
             size: std::mem::size_of::<Params>() as u64,
@@ -545,7 +561,7 @@ impl GpuPrb {
         ];
         bounce.extend(cols.iter().enumerate().map(|(c, b)| (2 + c as u32, b)));
         let groups = [
-            bind(&pipes[0], &[(0, &params), (1, &path_buf)]),
+            bind(&pipes[0], &[(0, &params), (1, &path_buf), (26, &points)]),
             bind(&pipes[1], &bounce),
             bind(
                 &pipes[2],
@@ -594,6 +610,10 @@ impl GpuPrb {
             target,
             img,
             loss,
+            nodes,
+            ids,
+            geo,
+            points,
             layout,
             eval,
             adjoint,
@@ -650,7 +670,8 @@ impl GpuPrb {
             cap: self.paths,
             base,
             total: scene.paths() as u32,
-            _pad: [0; 2],
+            points: scene.points().is_some() as u32,
+            _pad: 0,
             sun: {
                 let e = &scene.env;
                 [
@@ -730,6 +751,14 @@ impl GpuPrb {
             0,
             bytemuck::cast_slice(&theta.map(|x| x as f32)),
         );
+        if let Some(p) = scene.points() {
+            let p32: Vec<[f32; 2]> = p.iter().map(|q| [q[0] as f32, q[1] as f32]).collect();
+            assert!(
+                p32.len() as u64 * 8 <= self.points.size(),
+                "points frame size"
+            );
+            q.write_buffer(&self.points, 0, bytemuck::cast_slice(&p32));
+        }
         for c in 0..self.chunks {
             q.write_buffer(
                 &self.params,
@@ -750,6 +779,25 @@ impl GpuPrb {
         pass.set_bind_group(0, &self.groups[b], &[]);
         let x = groups.min(65535);
         pass.dispatch_workgroups(x, groups.div_ceil(x.max(1)), 1);
+    }
+
+    /// Re-upload the scene's geometry after [`Scene::place`] moved
+    /// instances: the top-level tree and the instance records. The trees
+    /// must be the ones this wavefront was built with.
+    pub fn update_geometry(&mut self, scene: &Scene) {
+        let (nodes, ids, geo, layout) = pack(scene);
+        let fits = |b: &wgpu::Buffer, n: usize| (n as u64) <= b.size();
+        assert!(
+            fits(&self.nodes, nodes.len() * 16)
+                && fits(&self.ids, ids.len() * 4)
+                && fits(&self.geo, geo.len() * 16),
+            "update_geometry: not the scene this wavefront was built for"
+        );
+        let q = &self.ctx.queue;
+        q.write_buffer(&self.nodes, 0, bytemuck::cast_slice(&nodes));
+        q.write_buffer(&self.ids, 0, bytemuck::cast_slice(&ids));
+        q.write_buffer(&self.geo, 0, bytemuck::cast_slice(&geo));
+        self.layout = layout;
     }
 
     /// Chunks a frame is traced in.

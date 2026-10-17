@@ -19,3 +19,4 @@ pub mod ggx;
 pub mod gpu;
 pub mod ir;
 pub mod prb;
+pub mod vis;
