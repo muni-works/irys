@@ -81,8 +81,10 @@ pub fn xyz_to_linear_srgb(c: [f64; 3]) -> [f64; 3] {
 /// that make the response integrate to white.
 ///
 /// Quadrature over the fit above at 1 pm; `hero_weight_integrates_to_white`
-/// re-derives them at test time, so they cannot silently rot.
-const RESPONSE_NORM: [f64; 3] = [
+/// re-derives them at test time, so they cannot silently rot. Public so a
+/// device port of [`hero_weight`] (irys-diff's wavefront) carries the same
+/// numbers rather than a second copy.
+pub const RESPONSE_NORM: [f64; 3] = [
     1.0 / 128.361_021_397_897_6,
     1.0 / 101.538_081_160_242_4,
     1.0 / 97.064_804_112_803_7,

@@ -61,6 +61,10 @@ struct Params {
     albedo: f32,
     alpha: f32,
     eps: f32,
+    resp: [f32; 4],
+    pixels: u32,
+    inv_n: f32,
+    _pad: [u32; 2],
 }
 
 /// Offset off a surface for the next ray. f32 cannot hold the CPU's 1e-6 at
@@ -186,6 +190,18 @@ impl Ir {
     }
 }
 
+/// What runs on the device after a forward pass.
+#[derive(Clone, Copy, PartialEq)]
+enum Score {
+    None,
+    /// The image, the loss against the target, and `∂loss/∂image`.
+    Loss,
+    /// δL per lane from the last `∂loss/∂image`.
+    LaneAdjoint,
+    /// Both, for one seed.
+    Both,
+}
+
 /// What the last pass cost on the device (submit to readback).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Timing {
@@ -206,12 +222,16 @@ pub struct GpuPrb {
     l: wgpu::Buffer,
     l2: wgpu::Buffer,
     grad: wgpu::Buffer,
+    target: wgpu::Buffer,
+    img: wgpu::Buffer,
+    loss: wgpu::Buffer,
     eval: Ir,
     adjoint: Ir,
     f: TensorId,
-    pipes: [wgpu::ComputePipeline; 5],
-    // gen, bounce, update, finish→l, finish→l2, accumulate
-    groups: [wgpu::BindGroup; 6],
+    pipes: [wgpu::ComputePipeline; 8],
+    // gen, bounce, update, finish→l, finish→l2, accumulate, score,
+    // loss_sum, lane_adjoint
+    groups: [wgpu::BindGroup; 9],
     /// Timings of the last forward and replay.
     pub timing: Timing,
 }
@@ -248,6 +268,12 @@ impl GpuPrb {
         let l = storage("l", lane_bytes);
         let l2 = storage("l replayed", lane_bytes);
         let grad = storage("grad", PARAMS as u64 * 4);
+        let pixels = (scene.size.0 * scene.size.1) as u64;
+        let target = storage("target", pixels * 12);
+        let img = storage("image", pixels * 12);
+        let d_img = storage("d image", pixels * 12);
+        let sq = storage("squared error", pixels * 4);
+        let loss = storage("loss", 4);
         let path_buf = storage("paths", paths as u64 * PATH_BYTES);
         let params = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
@@ -293,7 +319,17 @@ impl GpuPrb {
                 cache: None,
             })
         };
-        let pipes = ["gen", "bounce", "update", "finish", "accumulate"].map(pipe);
+        let pipes = [
+            "gen",
+            "bounce",
+            "update",
+            "finish",
+            "accumulate",
+            "score",
+            "loss_sum",
+            "lane_adjoint",
+        ]
+        .map(pipe);
         let bind = |p: &wgpu::ComputePipeline, e: &[(u32, &wgpu::Buffer)]| {
             dev.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
@@ -327,6 +363,23 @@ impl GpuPrb {
             bind(&pipes[3], &[(0, &params), (1, &path_buf), (13, &l)]),
             bind(&pipes[3], &[(0, &params), (1, &path_buf), (13, &l2)]),
             bind(&pipes[4], &[(14, &grad), (15, adjoint.buffer(g.dtheta))]),
+            bind(
+                &pipes[5],
+                &[
+                    (0, &params),
+                    (1, &path_buf),
+                    (10, &l),
+                    (17, &img),
+                    (18, &target),
+                    (19, &d_img),
+                    (20, &sq),
+                ],
+            ),
+            bind(&pipes[6], &[(0, &params), (20, &sq), (21, &loss)]),
+            bind(
+                &pipes[7],
+                &[(0, &params), (1, &path_buf), (19, &d_img), (22, &dl)],
+            ),
         ];
         let f = g.f;
         if let Some(e) = pollster::block_on(scope.pop()) {
@@ -342,6 +395,9 @@ impl GpuPrb {
             l,
             l2,
             grad,
+            target,
+            img,
+            loss,
             eval,
             adjoint,
             f,
@@ -373,10 +429,23 @@ impl GpuPrb {
             albedo: scene.floor_albedo as f32,
             alpha: scene.frozen_alpha.unwrap_or(theta[0]) as f32,
             eps: EPS,
+            resp: {
+                let k = (irys_light::spectrum::LAMBDA_MAX_NM - irys_light::spectrum::LAMBDA_MIN_NM)
+                    / (scene.spp * scene.wavelengths) as f64;
+                let r = irys_light::spectrum::RESPONSE_NORM;
+                [(r[0] * k) as f32, (r[1] * k) as f32, (r[2] * k) as f32, 0.0]
+            },
+            pixels: (scene.size.0 * scene.size.1) as u32,
+            inv_n: 1.0 / (scene.size.0 * scene.size.1 * 3) as f32,
+            _pad: [0; 2],
         }
     }
 
     fn encode(&self, scene: &Scene, replay: bool) -> wgpu::CommandBuffer {
+        self.encode_with(scene, replay, Score::None)
+    }
+
+    fn encode_with(&self, scene: &Scene, replay: bool, score: Score) -> wgpu::CommandBuffer {
         let mut enc = self
             .ctx
             .device
@@ -395,6 +464,21 @@ impl GpuPrb {
                 }
             }
             self.dispatch(&mut pass, 3, if replay { 4 } else { 3 }, groups);
+            match score {
+                Score::None => {}
+                Score::Loss => {
+                    let px = (scene.size.0 * scene.size.1) as u32;
+                    self.dispatch(&mut pass, 5, 6, px.div_ceil(WG));
+                    self.dispatch(&mut pass, 6, 7, 1);
+                }
+                Score::LaneAdjoint => self.dispatch(&mut pass, 7, 8, groups),
+                Score::Both => {
+                    let px = (scene.size.0 * scene.size.1) as u32;
+                    self.dispatch(&mut pass, 5, 6, px.div_ceil(WG));
+                    self.dispatch(&mut pass, 6, 7, 1);
+                    self.dispatch(&mut pass, 7, 8, groups);
+                }
+            }
         }
         enc.finish()
     }
@@ -469,14 +553,107 @@ impl GpuPrb {
         (std::array::from_fn(|p| g[p] as f64), l2)
     }
 
+    fn upload(&self, scene: &Scene, theta: &[f64; PARAMS], seed: u64, replay: bool) {
+        let q = &self.ctx.queue;
+        q.write_buffer(
+            &self.params,
+            0,
+            bytemuck::bytes_of(&self.params(scene, theta, seed, replay)),
+        );
+        q.write_buffer(
+            &self.theta,
+            0,
+            bytemuck::cast_slice(&theta.map(|x| x as f32)),
+        );
+    }
+
+    /// The image [`gradient_l2`] and [`loss_l2`] score against, linear sRGB
+    /// `w·h·3` as [`prb::image`] lays it out. Until set, it is black.
+    pub fn set_target(&mut self, target: &[f64]) {
+        assert_eq!(target.len() as u64 * 4, self.target.size(), "target size");
+        let t: Vec<f32> = target.iter().map(|&x| x as f32).collect();
+        self.ctx
+            .queue
+            .write_buffer(&self.target, 0, bytemuck::cast_slice(&t));
+    }
+
+    /// Piece 1's gradient, scored on the device: forward the primal frame,
+    /// splat its image, take the L2 loss and `∂loss/∂image`; forward the
+    /// adjoint frame, turn that into δL per lane; replay. The host writes
+    /// the uniforms and reads back five floats, `loss` and `δθ`.
+    pub fn gradient_l2(
+        &mut self,
+        scene: &Scene,
+        theta: &[f64; PARAMS],
+        seeds: (u64, u64),
+    ) -> (f64, [f64; PARAMS]) {
+        self.check(scene);
+        let (primal, adjoint) = seeds;
+        let t = Instant::now();
+        let ctx = self.ctx;
+        let q = &ctx.queue;
+        self.upload(scene, theta, primal, false);
+        if adjoint == primal {
+            q.submit([self.encode_with(scene, false, Score::Both)]);
+        } else {
+            q.submit([self.encode_with(scene, false, Score::Loss)]);
+            self.upload(scene, theta, adjoint, false);
+            q.submit([self.encode_with(scene, false, Score::LaneAdjoint)]);
+        }
+        self.timing.forward = t.elapsed();
+        let t = Instant::now();
+        self.upload(scene, theta, adjoint, true);
+        q.write_buffer(&self.grad, 0, bytemuck::cast_slice(&[0.0f32; PARAMS]));
+        q.submit([self.encode(scene, true)]);
+        let out = self.read_many(&[(&self.loss, 1), (&self.grad, PARAMS)]);
+        self.timing.replay = t.elapsed();
+        (out[0] as f64, std::array::from_fn(|p| out[1 + p] as f64))
+    }
+
+    /// The L2 loss against the target, scored on the device. Reads back one
+    /// float.
+    pub fn loss_l2(&mut self, scene: &Scene, theta: &[f64; PARAMS], seed: u64) -> f64 {
+        self.check(scene);
+        self.upload(scene, theta, seed, false);
+        self.ctx
+            .queue
+            .submit([self.encode_with(scene, false, Score::Loss)]);
+        self.read(&self.loss, 1)[0] as f64
+    }
+
+    /// Render one frame and splat it on the device: linear sRGB `w·h·3`.
+    pub fn image(&mut self, scene: &Scene, theta: &[f64; PARAMS], seed: u64) -> Vec<f32> {
+        self.check(scene);
+        self.upload(scene, theta, seed, false);
+        self.ctx
+            .queue
+            .submit([self.encode_with(scene, false, Score::Loss)]);
+        self.last_image()
+    }
+
+    /// The image the last scoring pass splatted.
+    pub fn last_image(&self) -> Vec<f32> {
+        self.read(&self.img, (self.img.size() / 4) as usize)
+    }
+
+    /// δL per lane as the last [`gradient_l2`](Self::gradient_l2) computed it.
+    pub fn last_lane_adjoint(&self) -> Vec<f32> {
+        self.read(&self.dl, self.lanes)
+    }
+
     /// `f` per lane from the last bounce, for debugging.
     pub fn last_f(&self) -> Vec<f32> {
         self.read(self.eval.buffer(self.f), self.lanes)
     }
 
     fn read(&self, src: &wgpu::Buffer, n: usize) -> Vec<f32> {
+        self.read_many(&[(src, n)])
+    }
+
+    /// Several buffers' heads into one staging buffer, one map.
+    fn read_many(&self, srcs: &[(&wgpu::Buffer, usize)]) -> Vec<f32> {
         let dev = &self.ctx.device;
-        let bytes = n as u64 * 4;
+        let bytes = srcs.iter().map(|(_, n)| *n as u64 * 4).sum::<u64>();
         let staging = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: bytes,
@@ -484,7 +661,11 @@ impl GpuPrb {
             mapped_at_creation: false,
         });
         let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        enc.copy_buffer_to_buffer(src, 0, &staging, 0, bytes);
+        let mut at = 0;
+        for (src, n) in srcs {
+            enc.copy_buffer_to_buffer(src, 0, &staging, at, *n as u64 * 4);
+            at += *n as u64 * 4;
+        }
         self.ctx.queue.submit([enc.finish()]);
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -508,7 +689,9 @@ impl GpuPrb {
 }
 
 /// [`prb::gradient`] on the GPU: `(loss, ∂loss/∂θ)`, scored on the host in
-/// f64 from the device's `L`.
+/// f64 from the device's `L` — phase 2a's path, kept as the reference the
+/// device scoring ([`GpuPrb::gradient_l2`]) is tested against, and for losses
+/// other than L2.
 pub fn gradient(
     gpu: &mut GpuPrb,
     scene: &Scene,

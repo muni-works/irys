@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use irys_diff::ggx::PARAMS;
 use irys_diff::gpu::{self, GpuPrb};
-use irys_diff::prb::{self, Kernels, L2, Scene};
+use irys_diff::prb::{self, Kernels, L2, Loss, Scene};
 
 const THETA0: [f64; PARAMS] = [0.35, 0.95, 0.75, 0.45];
 
@@ -137,6 +137,62 @@ fn gpu_gradient_matches_gpu_central_differences() {
     }
 }
 
+/// Piece 1: the image, the L2 loss and δL per lane on the device agree with
+/// the host's f64 scoring of the same `L`, to f32.
+#[test]
+fn device_scoring_matches_the_host() {
+    let ctx = device!();
+    let scene = frozen(32, 32, 4);
+    let t = target(&scene);
+    let mut g = GpuPrb::new(ctx, &scene);
+    g.set_target(&t);
+    let (vd, gd) = g.gradient_l2(&scene, &THETA0, (7, 7));
+    let dl_dev = g.last_lane_adjoint();
+    let img_dev = g.last_image();
+
+    let l = gpu::widen(&g.forward(&scene, &THETA0, 7));
+    let img = prb::image(&scene, 7, &l);
+    let (vh, d_img) = L2(&t).eval(&img);
+    let dl = prb::lane_adjoint(&scene, 7, &d_img);
+    let worst = |a: &[f32], b: &[f64]| {
+        let scale = b.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        a.iter()
+            .zip(b)
+            .fold(0.0f64, |m, (x, y)| m.max((*x as f64 - y).abs()))
+            / scale
+    };
+    let (ei, ed) = (worst(&img_dev, &img), worst(&dl_dev, &dl));
+    eprintln!(
+        "image max err / max {ei:.1e}; δL max err / max {ed:.1e}; loss device {vd:.7e} host {vh:.7e} rel {:.1e}",
+        rel(vd, vh)
+    );
+    assert!(ei < 1e-5 && ed < 1e-5);
+    assert!(rel(vd, vh) < 1e-5);
+    let (_, gh) = gpu::gradient(&mut g, &scene, &THETA0, (7, 7), &L2(&t));
+    for p in 0..PARAMS {
+        let e = rel(gd[p], gh[p]);
+        eprintln!(
+            "θ{p}: device-scored {:+.6e}  host-scored {:+.6e}  rel {e:.1e}",
+            gd[p], gh[p]
+        );
+        assert!(e < 1e-4, "θ{p}");
+    }
+}
+
+/// Piece 1: the device-scored gradient, two seeds, is the same bits twice.
+#[test]
+fn device_scored_gradient_is_deterministic() {
+    let ctx = device!();
+    let scene = Scene::new(48, 48, 4);
+    let t = target(&scene);
+    let mut g = GpuPrb::new(ctx, &scene);
+    g.set_target(&t);
+    let a = g.gradient_l2(&scene, &THETA0, (3, 4));
+    let b = g.gradient_l2(&scene, &THETA0, (3, 4));
+    assert_eq!(a.0.to_bits(), b.0.to_bits(), "loss");
+    assert_eq!(a.1.map(f64::to_bits), b.1.map(f64::to_bits), "δθ");
+}
+
 /// Throughput at the fit's size, 96×96×8, against the CPU compiled path.
 #[test]
 fn gpu_throughput() {
@@ -160,6 +216,18 @@ fn gpu_throughput() {
         rep += g.timing.replay.as_secs_f64();
     }
     let grad = t0.elapsed().as_secs_f64() / N as f64;
+    g.set_target(&t);
+    g.gradient_l2(&scene, &THETA0, (1, 2)); // warm
+    let t3 = Instant::now();
+    for i in 0..N {
+        g.gradient_l2(&scene, &THETA0, (2 * i as u64, 2 * i as u64 + 1));
+    }
+    let dev = t3.elapsed().as_secs_f64() / N as f64;
+    eprintln!(
+        "gpu gradient, scored on the host {:.1} ms, scored on the device {:.1} ms",
+        grad * 1e3,
+        dev * 1e3
+    );
     let (fwd, rep) = (fwd / (2 * N) as f64, rep / N as f64);
     let paths = scene.paths() as f64;
     eprintln!(
@@ -179,11 +247,11 @@ fn gpu_throughput() {
     prb::gradient(&scene, &THETA0, (0, 1), &mut k, &L2(&t));
     let cg = t2.elapsed().as_secs_f64();
     eprintln!(
-        "cpu (compiled C f32 kernels, native {}, this profile): forward {:.0} ms ({:.2} Mpaths/s), gradient {:.0} ms; gpu {:.0}× on the gradient",
+        "cpu (compiled C f32 kernels, native {}, this profile): forward {:.0} ms ({:.2} Mpaths/s), gradient {:.0} ms; gpu {:.0}× on the gradient (device-scored)",
         k.is_native(),
         cf * 1e3,
         paths / cf / 1e6,
         cg * 1e3,
-        cg / grad
+        cg / dev
     );
 }

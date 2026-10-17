@@ -6,7 +6,7 @@
 //! schedule, seeds and Adam as `fit`.
 
 use irys_diff::gpu::{self, GpuPrb};
-use irys_diff::prb::{self, L2, Scene};
+use irys_diff::prb::{self, Scene};
 use std::{fs, io::Write, path::Path, time::Instant};
 
 fn ppm(path: &Path, (w, h): (usize, usize), img: &[f64]) {
@@ -50,6 +50,7 @@ fn main() {
 
     let scene = Scene::new(96, 96, 8);
     let mut g = GpuPrb::new(ctx, &scene);
+    g.set_target(&target);
     let (lr, b1, b2) = (0.04, 0.9, 0.99);
     let (mut m, mut v) = ([0.0; 4], [0.0; 4]);
     let mut csv = fs::File::create(out.join("loss.csv")).unwrap();
@@ -57,7 +58,8 @@ fn main() {
     let t = Instant::now();
     for it in 1..=60 {
         let seeds = (2 * it as u64, 2 * it as u64 + 1);
-        let (loss, grad) = gpu::gradient(&mut g, &scene, &theta, seeds, &L2(&target));
+        // Scored on the device: the host reads back the loss and δθ only.
+        let (loss, grad) = g.gradient_l2(&scene, &theta, seeds);
         writeln!(
             csv,
             "{it},{loss:e},{},{},{},{}",

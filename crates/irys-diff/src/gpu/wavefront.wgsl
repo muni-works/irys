@@ -25,6 +25,10 @@ struct Params {
     albedo: f32,
     alpha: f32,           // the roughness the sampler draws at
     eps: f32,             // ray offset off a surface, and the hit's t_min / 10
+    resp: vec4<f32>,      // spectrum::RESPONSE_NORM × band / (spp × nw)
+    pixels: u32,
+    inv_n: f32,           // 1 / (pixels × 3), the L2 mean
+    _pad: vec2<u32>,
 }
 
 struct Path {
@@ -55,6 +59,13 @@ struct Path {
 @group(0) @binding(13) var<storage, read_write> l_out: array<f32>;
 @group(0) @binding(14) var<storage, read_write> grad: array<f32>;
 @group(0) @binding(15) var<storage, read> dtheta: array<f32>;
+// Scoring on the device (piece 1): image, L2 loss, per-lane δL.
+@group(0) @binding(17) var<storage, read_write> img: array<f32>;
+@group(0) @binding(18) var<storage, read> target_img: array<f32>;
+@group(0) @binding(19) var<storage, read_write> d_img: array<f32>;
+@group(0) @binding(20) var<storage, read_write> sq: array<f32>;
+@group(0) @binding(21) var<storage, read_write> loss_out: array<f32>;
+@group(0) @binding(22) var<storage, read_write> dl_out: array<f32>;
 
 const PI: f32 = 3.14159265358979;
 
@@ -376,4 +387,92 @@ fn finish(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(4)
 fn accumulate(@builtin(local_invocation_id) lid: vec3<u32>) {
     grad[lid.x] = grad[lid.x] + dtheta[lid.x];
+}
+
+// ---- scoring: the image, the L2 loss and δL per lane, on the device ----
+//
+// `spectrum::hero_weight`, ported: the Wyman/Sloan/Shirley CIE fit, XYZ to
+// linear sRGB, and the host's normalisation constants through `params.resp`
+// (which also carries the 1 / (spp × nw) the image averages by).
+
+fn skew_gauss(x: f32, mu: f32, s1: f32, s2: f32) -> f32 {
+    let s = select(s2, s1, x < mu);
+    let t = (x - mu) / s;
+    return exp(-0.5 * t * t);
+}
+
+fn lane_rgb(l: f32) -> vec3<f32> {
+    let x = 1.056 * skew_gauss(l, 599.8, 37.9, 31.0)
+        + 0.362 * skew_gauss(l, 442.0, 16.0, 26.7)
+        - 0.065 * skew_gauss(l, 501.1, 20.4, 26.2);
+    let y = 0.821 * skew_gauss(l, 568.8, 46.9, 40.5) + 0.286 * skew_gauss(l, 530.9, 16.3, 31.1);
+    let z = 1.217 * skew_gauss(l, 437.0, 11.8, 36.0) + 0.681 * skew_gauss(l, 459.0, 26.0, 13.8);
+    let rgb = vec3<f32>(
+        3.2404542 * x - 1.5371385 * y - 0.4985314 * z,
+        -0.969266 * x + 1.8760108 * y + 0.041556 * z,
+        0.0556434 * x - 0.2040259 * y + 1.0572252 * z,
+    );
+    return rgb * params.resp.xyz;
+}
+
+// One thread per pixel: its `spp × nw` lanes are contiguous and summed in
+// lane order (as `prb::image`), then the residual against the target, the
+// pixel's share of `∂loss/∂image`, and its squared error for `loss_sum`.
+@compute @workgroup_size(64)
+fn score(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let px = gid.x;
+    if (px >= params.pixels) { return; }
+    var c = vec3<f32>(0.0);
+    for (var s = 0u; s < params.spp; s = s + 1u) {
+        let i = px * params.spp + s;
+        let lam = paths[i].lam;
+        for (var k = 0u; k < params.nw; k = k + 1u) {
+            c = c + l_in[i * params.nw + k] * lane_rgb(lam[k]);
+        }
+    }
+    let r = c - vec3<f32>(target_img[px * 3u], target_img[px * 3u + 1u], target_img[px * 3u + 2u]);
+    for (var ch = 0u; ch < 3u; ch = ch + 1u) {
+        img[px * 3u + ch] = c[ch];
+        d_img[px * 3u + ch] = 2.0 * r[ch] * params.inv_n;
+    }
+    sq[px] = dot(r, r);
+}
+
+var<workgroup> red: array<f32, 256>;
+
+// The L2 mean in one workgroup: each thread sums a fixed stride of pixels in
+// order, then a fixed tree. No atomics, so the loss is the same bits every
+// run.
+@compute @workgroup_size(256)
+fn loss_sum(@builtin(local_invocation_id) lid: vec3<u32>) {
+    var acc = 0.0;
+    for (var p = lid.x; p < params.pixels; p = p + 256u) {
+        acc = acc + sq[p];
+    }
+    red[lid.x] = acc;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (lid.x < s) {
+            red[lid.x] = red[lid.x] + red[lid.x + s];
+        }
+        workgroupBarrier();
+    }
+    if (lid.x == 0u) {
+        loss_out[0] = red[0] * params.inv_n;
+    }
+}
+
+// `prb::lane_adjoint`: δL per lane from the pixel adjoint and the lane's own
+// wavelength response. Runs after the adjoint seed's forward pass, so the
+// wavelengths in `paths` are that frame's.
+@compute @workgroup_size(64)
+fn lane_adjoint(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.paths) { return; }
+    let px = i / params.spp;
+    let g = vec3<f32>(d_img[px * 3u], d_img[px * 3u + 1u], d_img[px * 3u + 2u]);
+    let lam = paths[i].lam;
+    for (var k = 0u; k < params.nw; k = k + 1u) {
+        dl_out[i * params.nw + k] = dot(g, lane_rgb(lam[k]));
+    }
 }
