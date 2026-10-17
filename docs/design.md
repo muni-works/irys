@@ -248,8 +248,27 @@ What the spike says the design got wrong or left out:
 6. **tang-gpu is out.** Its `CpuProgram` links wgpu 25 (principle 4); `ir.rs`
    carries the forty-line loader instead.
 7. Not done: PRB inside `irys-light`'s integrator (the spike has its own
-   200-line wavefront), the floor's BSDF as a graph, four rotated hero
-   wavelengths, NEE/MIS, Russian roulette, visibility (reparam) gradients.
+   200-line wavefront), the floor's BSDF as a graph, NEE/MIS, Russian roulette, visibility (reparam) gradients.
+
+### Hero wavelengths ×4 (2026-10-17)
+
+Each path now carries four stratified wavelengths, the hero and three
+rotated by `k/4` of the band (Wilkie+ 2014). The hero alone draws the
+direction; the graph runs per *lane* (path × wavelength, so the wavefront is
+4× wider) and the image splats each lane at `hero_weight(λ_k) / (4 spp)`.
+GGX's sampler is λ-free, so all four share the hero's pdf and the MIS weight
+is a flat ¼. Each lane is its own PRB path (`L`, `L_j`, `δL`).
+
+| | |
+|---|---|
+| per-pixel variance, 24×24×2, 16 seeds, 1 λ → 4 λ | total 7.4× lower, chroma (channel − grey) 28.7× lower |
+| frozen-sampler gradient vs CRN central differences | rel ≤ 6.1e-10, unchanged gate |
+| live sampler, 64 seeds | α 0.4σ, F0 bands rel ≤ 1e-6 |
+| replay vs forward | bit-identical on every lane, both backends; 63.1 words/path at depth 2 and 8 |
+| inverse α 0.6 → 0.25 | within 0.02 at iteration 13; last-10 mean 0.234 |
+| `examples/fit`, 96×96×8, 60 its | θ = [0.188, 0.334, 0.783, 0.997] vs truth [0.2, 0.34, 0.78, 1.0] |
+
+No tolerance changed.
 
 ## Open questions
 

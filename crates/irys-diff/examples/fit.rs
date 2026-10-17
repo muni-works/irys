@@ -12,10 +12,15 @@ fn ppm(path: &Path, (w, h): (usize, usize), img: &[f64]) {
     write!(f, "P6\n{w} {h}\n255\n").unwrap();
     let srgb = |x: f64| {
         let x = x.clamp(0.0, 1.0);
-        let s = if x <= 0.0031308 { 12.92 * x } else { 1.055 * x.powf(1.0 / 2.4) - 0.055 };
+        let s = if x <= 0.0031308 {
+            12.92 * x
+        } else {
+            1.055 * x.powf(1.0 / 2.4) - 0.055
+        };
         (s * 255.0 + 0.5) as u8
     };
-    f.write_all(&img.iter().map(|&x| srgb(x)).collect::<Vec<_>>()).unwrap();
+    f.write_all(&img.iter().map(|&x| srgb(x)).collect::<Vec<_>>())
+        .unwrap();
 }
 
 fn main() {
@@ -28,12 +33,16 @@ fn main() {
     let mut theta = [0.7, 0.5, 0.5, 0.5];
 
     let reference = Scene::new(96, 96, 64);
-    let mut kr = Kernels::new(reference.paths(), true);
-    let target = prb::image(&reference, 1000, &prb::forward(&reference, &truth, 1000, &mut kr).0);
+    let mut kr = Kernels::new(reference.lanes(), true);
+    let target = prb::image(
+        &reference,
+        1000,
+        &prb::forward(&reference, &truth, 1000, &mut kr).0,
+    );
     ppm(&out.join("target.ppm"), reference.size, &target);
 
     let scene = Scene::new(96, 96, 8);
-    let mut k = Kernels::new(scene.paths(), true);
+    let mut k = Kernels::new(scene.lanes(), true);
     let (lr, b1, b2) = (0.04, 0.9, 0.99);
     let (mut m, mut v) = ([0.0; 4], [0.0; 4]);
     let mut csv = fs::File::create(out.join("loss.csv")).unwrap();
@@ -41,11 +50,20 @@ fn main() {
     for it in 1..=60 {
         let seeds = (2 * it as u64, 2 * it as u64 + 1);
         let (loss, g) = prb::gradient(&scene, &theta, seeds, &mut k, &L2(&target));
-        writeln!(csv, "{it},{loss:e},{},{},{},{}", theta[0], theta[1], theta[2], theta[3]).unwrap();
+        writeln!(
+            csv,
+            "{it},{loss:e},{},{},{},{}",
+            theta[0], theta[1], theta[2], theta[3]
+        )
+        .unwrap();
         if it == 1 || it % 10 == 0 {
             // Previewed at the reference's spp, so the frame shows θ, not the noise.
             let l = prb::forward(&reference, &theta, 1000, &mut kr).0;
-            ppm(&out.join(format!("iter_{it:03}.ppm")), reference.size, &prb::image(&reference, 1000, &l));
+            ppm(
+                &out.join(format!("iter_{it:03}.ppm")),
+                reference.size,
+                &prb::image(&reference, 1000, &l),
+            );
         }
         for p in 0..4 {
             m[p] = b1 * m[p] + (1.0 - b1) * g[p];

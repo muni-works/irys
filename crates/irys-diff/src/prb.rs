@@ -44,12 +44,36 @@
 //! wavefront's state is [`Path`] × paths plus one column buffer of the same
 //! width, reused at every bounce. [`Stats::state_words`] counts it, and a
 //! test holds it fixed while the depth changes.
+//!
+//! # Hero wavelengths
+//!
+//! A path carries [`Scene::wavelengths`] (default [`HERO`] = 4) stratified
+//! wavelengths: the hero `λ₀` from the path's first uniform, the rest
+//! rotated by `k/4` of the band (Wilkie et al. 2014). Directions are drawn
+//! by the hero alone; every vertex is evaluated per (vertex, wavelength) —
+//! a *lane* — so the graph's batch is `paths × 4` wide. GGX's sampler does
+//! not depend on λ, so all four share the hero's pdf and the hero MIS
+//! weight `p_k / Σ p` is `1/4` for each: the image averages the four lanes.
+//! Each lane is a path in the PRB sense, with its own `L`, `L_j`, `δL`.
 
 use irys_core::{Bvh, Point3, Ray, Vec3};
 use irys_light::spectrum::{hero_weight, sample_lambda_nm};
 use irys_prims::analytic::{Analytic, Prim};
 
 use crate::ggx::{self, COLUMNS, DF, Graph, PARAMS, THETA, band_weights, normalize};
+
+/// Most wavelengths a path carries (Wilkie et al., "Hero Wavelength Spectral
+/// Sampling", EGSR 2014).
+pub const HERO: usize = 4;
+
+/// The `w` wavelengths of a path whose hero draw is `u`: the hero, then
+/// `w − 1` more rotated by `k/w` of the band, so the set is stratified.
+pub fn wavelengths(u: f64, w: usize) -> [f64; HERO] {
+    std::array::from_fn(|k| {
+        let v = u + k as f64 / w as f64;
+        sample_lambda_nm(v - v.floor())
+    })
+}
 use crate::ir::Program;
 
 /// SplitMix64, keyed per path. Replay determinism is this generator being
@@ -88,6 +112,8 @@ pub struct Scene {
     pub spp: usize,
     /// Longest path, in surface vertices.
     pub depth: usize,
+    /// Wavelengths per path, `1 ..= HERO`. One is plain hero sampling.
+    pub wavelengths: usize,
     /// The floor's (grey, θ-free) albedo.
     pub floor_albedo: f64,
     /// When set, the conductor samples at this roughness instead of the
@@ -126,6 +152,7 @@ impl Scene {
             size: (w, h),
             spp,
             depth: 4,
+            wavelengths: HERO,
             floor_albedo: 0.5,
             frozen_alpha: None,
             eye,
@@ -138,6 +165,13 @@ impl Scene {
     /// Paths in one frame.
     pub fn paths(&self) -> usize {
         self.size.0 * self.size.1 * self.spp
+    }
+
+    /// Lanes in one frame: a lane is one (path, wavelength), and is what
+    /// the graph is batched over and what the forward pass keeps an `L` for.
+    /// Lane `i · wavelengths + k` is path `i`'s `k`-th wavelength.
+    pub fn lanes(&self) -> usize {
+        self.paths() * self.wavelengths
     }
 
     fn camera_ray(&self, path: usize, rng: &mut Rng) -> Ray {
@@ -166,10 +200,10 @@ pub fn sky(d: Vec3, lambda_nm: f64) -> f64 {
 #[derive(Debug, Clone, Copy)]
 struct Path {
     ray: Ray,
-    throughput: f64,
-    /// `L_j`: radiance collected so far.
-    radiance: f64,
-    lambda: f64,
+    throughput: [f64; HERO],
+    /// `L_j`: radiance collected so far, per wavelength.
+    radiance: [f64; HERO],
+    lambda: [f64; HERO],
     rng: Rng,
     alive: bool,
 }
@@ -180,7 +214,7 @@ pub struct Stats {
     /// f64 words of wavefront state the pass held, all told. Independent of
     /// depth by construction; tests check it.
     pub state_words: usize,
-    /// Conductor vertices evaluated.
+    /// Conductor vertices evaluated (per path, not per wavelength).
     pub vertices: usize,
 }
 
@@ -192,7 +226,7 @@ pub struct Kernels {
 
 impl Kernels {
     /// Compiled C when `native` (and a compiler exists), the f64
-    /// interpreter otherwise.
+    /// interpreter otherwise. `n` is lanes ([`Scene::lanes`]).
     pub fn new(n: usize, native: bool) -> Self {
         let g = Graph::new(n);
         Self {
@@ -230,29 +264,32 @@ fn trace(
     grad: &mut [f64; PARAMS],
 ) -> (Vec<f64>, Stats) {
     let n = scene.paths();
+    let nw = scene.wavelengths;
+    assert!((1..=HERO).contains(&nw), "wavelengths {nw}");
+    let lanes = scene.lanes();
     let mut paths: Vec<Path> = (0..n)
         .map(|i| {
             let mut rng = Rng::new(seed, i as u64);
-            let lambda = sample_lambda_nm(rng.uniform());
+            let lambda = wavelengths(rng.uniform(), nw);
             let ray = scene.camera_ray(i, &mut rng);
             Path {
                 ray,
-                throughput: 1.0,
-                radiance: 0.0,
+                throughput: [1.0; HERO],
+                radiance: [0.0; HERO],
                 lambda,
                 rng,
                 alive: true,
             }
         })
         .collect();
-    // The column buffer: one row of COLUMNS + pdf + δf per path, reused.
-    let mut cols = vec![vec![0.0; n]; COLUMNS];
-    let mut df = vec![0.0; n];
+    // The column buffer: one row of COLUMNS + δf per lane, reused.
+    let mut cols = vec![vec![0.0; lanes]; COLUMNS];
+    let mut df = vec![0.0; lanes];
     let mut sampled = vec![(Vec3::zeros(), 0.0f64, 0.0f64); n]; // (wi, cos_i, pdf)
     let mut ball = vec![false; n];
     let mut stats = Stats {
         state_words: n * (std::mem::size_of::<Path>() + std::mem::size_of_val(&sampled[0]) + 1) / 8
-            + (COLUMNS + 1) * n,
+            + (COLUMNS + 1) * lanes,
         vertices: 0,
     };
     k.eval.write(THETA, theta);
@@ -262,16 +299,20 @@ fn trace(
         let mut any = false;
         for (i, p) in paths.iter_mut().enumerate() {
             // Inactive slots get a harmless vertex and no adjoint.
-            for (c, v) in cols.iter_mut().zip([1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]) {
-                c[i] = v;
+            for j in i * nw..(i + 1) * nw {
+                for (c, v) in cols.iter_mut().zip([1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]) {
+                    c[j] = v;
+                }
+                df[j] = 0.0;
             }
-            df[i] = 0.0;
             ball[i] = false;
             if !p.alive {
                 continue;
             }
             let Some(hit) = scene.bvh.trace_closest_range(&p.ray, 1e-6, f64::INFINITY) else {
-                p.radiance += p.throughput * sky(*p.ray.direction.as_ref(), p.lambda);
+                for w in 0..nw {
+                    p.radiance[w] += p.throughput[w] * sky(*p.ray.direction.as_ref(), p.lambda[w]);
+                }
                 p.alive = false;
                 continue;
             };
@@ -285,10 +326,15 @@ fn trace(
                 let (r, phi) = (u1.sqrt(), 2.0 * std::f64::consts::PI * u2);
                 let wi =
                     t * (r * phi.cos()) + b * (r * phi.sin()) + nrm * (1.0 - u1).max(0.0).sqrt();
-                p.throughput *= scene.floor_albedo;
+                for tp in &mut p.throughput[..nw] {
+                    *tp *= scene.floor_albedo;
+                }
                 p.ray = Ray::new(origin, wi);
                 continue;
             }
+            // The hero alone picks the direction. GGX's sampling does not
+            // depend on λ, so every wavelength's pdf is the hero's and the
+            // hero-wavelength MIS weight reduces to `f_k cos / p`.
             let lo = [wo.dot(&t), wo.dot(&b), wo.dot(&nrm)];
             let u = [p.rng.uniform(), p.rng.uniform()];
             let alpha = scene.frozen_alpha.unwrap_or(theta[0]);
@@ -299,12 +345,14 @@ fn trace(
             }
             let h = normalize([li[0] + lo[0], li[1] + lo[1], li[2] + lo[2]]);
             let oh = lo[0] * h[0] + lo[1] * h[1] + lo[2] * h[2];
-            let bw = band_weights(p.lambda);
-            for (c, v) in cols
-                .iter_mut()
-                .zip([li[2], lo[2], h[2], oh, bw[0], bw[1], bw[2]])
-            {
-                c[i] = v;
+            for w in 0..nw {
+                let bw = band_weights(p.lambda[w]);
+                for (c, v) in cols
+                    .iter_mut()
+                    .zip([li[2], lo[2], h[2], oh, bw[0], bw[1], bw[2]])
+                {
+                    c[i * nw + w] = v;
+                }
             }
             sampled[i] = (t * li[0] + b * li[1] + nrm * li[2], li[2], pdf);
             p.ray = Ray::new(origin, sampled[i].0);
@@ -325,15 +373,18 @@ fn trace(
                 continue;
             }
             stats.vertices += 1;
-            if let Some((l, dl)) = replay
-                && f[i] > 0.0
-            {
-                df[i] = dl[i] * (l[i] - p.radiance) / f[i];
-                need_adjoint |= df[i] != 0.0;
-            }
             let (_, cos_i, pdf) = sampled[i];
-            p.throughput *= f[i] * cos_i / pdf;
-            if !(p.throughput > 0.0) {
+            for w in 0..nw {
+                let j = i * nw + w;
+                if let Some((l, dl)) = replay
+                    && f[j] > 0.0
+                {
+                    df[j] = dl[j] * (l[j] - p.radiance[w]) / f[j];
+                    need_adjoint |= df[j] != 0.0;
+                }
+                p.throughput[w] *= f[j] * cos_i / pdf;
+            }
+            if !p.throughput[..nw].iter().any(|&t| t > 0.0) {
                 p.alive = false;
             }
         }
@@ -348,10 +399,16 @@ fn trace(
             }
         }
     }
-    (paths.iter().map(|p| p.radiance).collect(), stats)
+    (
+        paths
+            .iter()
+            .flat_map(|p| p.radiance[..nw].iter().copied())
+            .collect(),
+        stats,
+    )
 }
 
-/// The forward pass: `L` per path, and what it cost.
+/// The forward pass: `L` per lane ([`Scene::lanes`]), and what it cost.
 pub fn forward(
     scene: &Scene,
     theta: &[f64; PARAMS],
@@ -377,24 +434,29 @@ pub fn replay(
     (grad, l2, stats)
 }
 
-/// Linear-sRGB image (`w·h·3`, row-major) from per-path `L`.
+/// Linear-sRGB image (`w·h·3`, row-major) from per-lane `L`.
 pub fn image(scene: &Scene, seed: u64, l: &[f64]) -> Vec<f64> {
     let mut img = vec![0.0; scene.size.0 * scene.size.1 * 3];
-    for (i, &li) in l.iter().enumerate() {
-        let w = path_weight(scene, seed, i);
+    for (j, &lj) in l.iter().enumerate() {
+        let w = lane_weight(scene, seed, j);
+        let px = j / scene.wavelengths / scene.spp;
         for c in 0..3 {
-            img[(i / scene.spp) * 3 + c] += li * w[c];
+            img[px * 3 + c] += lj * w[c];
         }
     }
     img
 }
 
-/// What one path's `L` is worth to each channel of its pixel: its hero
-/// wavelength's sRGB response over `spp`. Re-derived from the seed, because
-/// the forward pass keeps nothing per path but `L`.
-fn path_weight(scene: &Scene, seed: u64, path: usize) -> [f64; 3] {
-    let lambda = sample_lambda_nm(Rng::new(seed, path as u64).uniform());
-    hero_weight(lambda).map(|w| w as f64 / scene.spp as f64)
+/// What one lane's `L` is worth to each channel of its pixel: its
+/// wavelength's sRGB response over `spp × wavelengths`. Each wavelength is
+/// a uniform draw over the band on its own (the rotation keeps that), so
+/// the hero estimator is the plain average of the `w`. Re-derived from the
+/// seed, because the forward pass keeps nothing per path but `L`.
+pub fn lane_weight(scene: &Scene, seed: u64, lane: usize) -> [f64; 3] {
+    let nw = scene.wavelengths;
+    let u = Rng::new(seed, (lane / nw) as u64).uniform();
+    let lambda = wavelengths(u, nw)[lane % nw];
+    hero_weight(lambda).map(|w| w as f64 / (scene.spp * nw) as f64)
 }
 
 /// A loss over the image: its value and its adjoint per pixel channel.
@@ -463,9 +525,10 @@ pub fn gradient(
         forward(scene, theta, adjoint, k).0
     };
     let dl: Vec<f64> = (0..l.len())
-        .map(|i| {
-            let w = path_weight(scene, adjoint, i);
-            (0..3).map(|c| d_img[(i / scene.spp) * 3 + c] * w[c]).sum()
+        .map(|j| {
+            let w = lane_weight(scene, adjoint, j);
+            let px = j / scene.wavelengths / scene.spp;
+            (0..3).map(|c| d_img[px * 3 + c] * w[c]).sum()
         })
         .collect();
     let (grad, _, _) = replay(scene, theta, adjoint, k, &l, &dl);

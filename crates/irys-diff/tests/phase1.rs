@@ -35,7 +35,7 @@ fn central(
 fn gradient_matches_central_differences_frozen_sampler() {
     let mut scene = Scene::new(16, 16, 2);
     scene.frozen_alpha = Some(0.3);
-    let mut k = Kernels::new(scene.paths(), false);
+    let mut k = Kernels::new(scene.lanes(), false);
     let target = prb::image(
         &scene,
         99,
@@ -65,7 +65,7 @@ fn gradient_matches_central_differences_frozen_sampler() {
 fn gradient_matches_central_differences_live_sampler() {
     const SEEDS: u64 = 64;
     let scene = Scene::new(16, 16, 4);
-    let mut k = Kernels::new(scene.paths(), true);
+    let mut k = Kernels::new(scene.lanes(), true);
     let (mut g, mut fd) = (vec![[0.0; PARAMS]; 0], vec![[0.0; PARAMS]; 0]);
     for s in 0..SEEDS {
         g.push(prb::gradient(&scene, &THETA0, (s, s), &mut k, &Mean).1);
@@ -202,7 +202,7 @@ fn graph_pdf_is_the_samplers() {
 fn replay_is_bit_exact_and_constant_memory() {
     for native in [false, true] {
         let mut scene = Scene::new(16, 16, 2);
-        let mut k = Kernels::new(scene.paths(), native);
+        let mut k = Kernels::new(scene.lanes(), native);
         let mut words = Vec::new();
         for depth in [2, 8] {
             scene.depth = depth;
@@ -241,11 +241,11 @@ fn replay_is_bit_exact_and_constant_memory() {
 #[test]
 fn recovers_roughness() {
     let scene = Scene::new(32, 32, 4);
-    let mut k = Kernels::new(scene.paths(), true);
+    let mut k = Kernels::new(scene.lanes(), true);
     let truth = [0.25, THETA0[1], THETA0[2], THETA0[3]];
     // The target is the same view at 64 spp: its noise only shifts the loss.
     let reference = Scene::new(32, 32, 64);
-    let mut kr = Kernels::new(reference.paths(), true);
+    let mut kr = Kernels::new(reference.lanes(), true);
     let target = prb::image(
         &reference,
         1000,
@@ -293,4 +293,49 @@ fn recovers_roughness() {
         "α never got within 0.02 in 30 iterations"
     );
     assert!((settled - truth[0]).abs() < 0.03, "α settled at {settled}");
+}
+
+/// Hero wavelengths: at the same spp, four rotated wavelengths per path cut
+/// the per-pixel variance — most of it chroma noise from one-λ paths —
+/// against one wavelength per path.
+#[test]
+fn hero_wavelengths_cut_colour_noise() {
+    const SEEDS: u64 = 16;
+    let variance = |wavelengths: usize| {
+        let mut scene = Scene::new(24, 24, 2);
+        scene.wavelengths = wavelengths;
+        let mut k = Kernels::new(scene.lanes(), true);
+        let imgs: Vec<Vec<f64>> = (0..SEEDS)
+            .map(|s| prb::image(&scene, s, &prb::forward(&scene, &THETA0, s, &mut k).0))
+            .collect();
+        let n = imgs[0].len();
+        let (mut total, mut chroma) = (0.0, 0.0);
+        for px in 0..n / 3 {
+            let mean = |f: &dyn Fn(&[f64]) -> f64| {
+                imgs.iter().map(|i| f(&i[px * 3..px * 3 + 3])).sum::<f64>() / SEEDS as f64
+            };
+            let var = |f: &dyn Fn(&[f64]) -> f64| {
+                let m = mean(f);
+                imgs.iter()
+                    .map(|i| (f(&i[px * 3..px * 3 + 3]) - m).powi(2))
+                    .sum::<f64>()
+                    / (SEEDS - 1) as f64
+            };
+            total += (0..3).map(|c| var(&|p: &[f64]| p[c])).sum::<f64>();
+            // Chroma: each channel less the pixel's grey.
+            chroma += (0..3)
+                .map(|c| var(&|p: &[f64]| p[c] - (p[0] + p[1] + p[2]) / 3.0))
+                .sum::<f64>();
+        }
+        (total, chroma)
+    };
+    let (t1, c1) = variance(1);
+    let (t4, c4) = variance(4);
+    eprintln!(
+        "per-pixel variance at 2 spp, 1 λ vs 4 λ: total {:.2}×, chroma {:.2}× lower",
+        t1 / t4,
+        c1 / c4
+    );
+    assert!(c1 / c4 > 3.0, "chroma variance only {:.2}× lower", c1 / c4);
+    assert!(t1 / t4 > 1.5, "total variance only {:.2}× lower", t1 / t4);
 }
