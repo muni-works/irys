@@ -391,3 +391,112 @@ fn grid_loss(scene: &mut Scene, k: usize, g: &Weighted, seed: u64, kern: &mut Ke
     }
     loss
 }
+
+/// A CAD-like arm: each link is three parallel plates in one tree (a
+/// bracket's cheeks and web), and the post stands in front of the
+/// shoulder. Most front-facing silhouettes are then behind the link's own
+/// near plate or the post — the shape of 2d's waste (76 % of the CAD arm's
+/// samples hidden).
+fn plate_arm(w: usize, h: usize, depth: usize) -> Scene {
+    let plates = |hx: f64, hz: f64| {
+        let mut pos = Vec::new();
+        let mut idx: Vec<u32> = Vec::new();
+        for (dy, hy) in [(-0.09, 0.02), (0.0, 0.015), (0.09, 0.02)] {
+            let m = prb::cuboid(hx, hy, hz * if dy == 0.0 { 0.6 } else { 1.0 });
+            let o = pos.len() as u32;
+            pos.extend(
+                m.positions()
+                    .iter()
+                    .map(|p| Point3::new(p.x, p.y + dy, p.z)),
+            );
+            idx.extend(m.triangles().concat().iter().map(|i| i + o));
+        }
+        irys_core::TriMesh::new(pos, Vec::new(), &idx)
+    };
+    let blas = vec![
+        opaque(prb::cuboid(0.01, 0.01, 0.01), Surface::Diffuse),
+        opaque(prb::cuboid(0.12, 0.12, 0.62), Surface::Diffuse),
+        opaque(plates(UPPER, 0.1), Surface::Conductor),
+        opaque(plates(FORE, 0.085), Surface::Diffuse),
+    ];
+    let placements = vec![
+        Placement::new(0, Transform::translation(0.0, 0.0, -50.0)),
+        Placement::new(
+            1,
+            Transform::translation(SHOULDER[0] + 0.25, SHOULDER[1] - 0.45, 0.62),
+        )
+        .tinted(0.6),
+        Placement::new(2, Transform::identity()),
+        Placement::new(3, Transform::identity()).tinted(0.8),
+    ];
+    let mut s = Scene::instanced(
+        blas,
+        placements,
+        None,
+        (w, h),
+        4,
+        (Point3::new(0.0, -4.5, 2.2), Point3::new(0.0, 0.0, 0.8)),
+        20.0,
+    );
+    s.nee = true;
+    s.depth = depth;
+    s
+}
+
+/// Piece 2: the ID-buffer importance is unbiased (same mean as 2d's
+/// importance and as central differences) and cheaper: the variance ratio
+/// at equal sample count is printed and must beat 3.
+#[test]
+fn visibility_importance_cuts_variance_without_bias() {
+    let mask = cut(1);
+    let shaded = cut(2);
+    assert!(mask > 1.5 && shaded > 1.3, "{mask} {shaded}");
+}
+
+/// The geometric-mean variance ratio (2d importance / 2e) at depth `depth`.
+fn cut(depth: usize) -> f64 {
+    let (w, h) = (48, 36);
+    let rig = arm_rig();
+    let g = Weighted::new(w, h);
+    let mut s = plate_arm(w, h, depth);
+    rig.pose(&mut s, &PHI);
+    let edges = Edges::new(&s);
+    let t = std::time::Instant::now();
+    let vb = vis::Visibility::new(&s);
+    let tv = t.elapsed();
+    let n = 4096;
+    let mut ke = Kernels::new(4 * n * s.wavelengths, true);
+    let run = |s: &mut Scene, v: Option<&vis::Visibility>, ke: &mut Kernels| {
+        let mut out = Vec::new();
+        let mut vis_frac = 0.0;
+        for sd in 0..24u64 {
+            let (ge, es) = vis::boundary_with(s, &edges, &rig, &PHI, &g.0, n, 300 + sd, v, |sc| {
+                prb::forward(sc, &THETA, 300 + sd, ke).0
+            });
+            vis_frac += es.visible as f64 / es.len() as f64 / 24.0;
+            out.push(ge);
+        }
+        (stats(&out), vis_frac)
+    };
+    let (a, fa) = run(&mut s, None, &mut ke);
+    let (b, fb) = run(&mut s, Some(&vb), &mut ke);
+    eprintln!(
+        "depth {depth}: ID buffer {tv:.1?}; visible samples {:.0} % → {:.0} %",
+        100.0 * fa,
+        100.0 * fb
+    );
+    let mut ratios = Vec::new();
+    for j in 0..3 {
+        let r = (a.stderr[j] / b.stderr[j]).powi(2);
+        let z = (a.mean[j] - b.mean[j]) / (a.stderr[j].powi(2) + b.stderr[j].powi(2)).sqrt();
+        eprintln!(
+            "φ{j}: 2d {:+.3} ± {:.3}, ID buffer {:+.3} ± {:.3}: variance ratio {r:.1}, z {z:+.2}",
+            a.mean[j], a.stderr[j], b.mean[j], b.stderr[j]
+        );
+        ratios.push(r);
+        assert!(z.abs() < 3.5, "φ{j}: z {z}");
+    }
+    let gm = ratios.iter().product::<f64>().powf(1.0 / 3.0);
+    eprintln!("depth {depth}: geometric-mean variance ratio {gm:.2}");
+    gm
+}

@@ -800,6 +800,35 @@ that is no triangle's edge — the first arm, with links sunk into each other
 and into the post, disagreed by 10σ before the gaps; rose's links bolt
 plate-to-plate, so this matters there.
 
+### 2. Visibility-aware edge importance (`vis::Visibility`)
+
+An ID + depth buffer (one ray per pixel centre, 0.5 ms at 48×36) and two
+changes to the candidates' importance, both unbiased (nothing gets weight
+0): a silhouette is sampled from its **front face only** — 2d gave the back
+face's side weight 1, and its inner ray always lands on the front face and
+scores 0, so half of every silhouette sample was wasted — and each
+candidate, probed every pixel along its screen length, keeps
+`HIDDEN_WEIGHT = 0.01` of its importance over runs where it is deeper than
+the farthest surface in the surrounding 3 × 3 pixels. Visible creases keep
+their crease weight: the brief said to drop front-front edges, but shaded
+they carry real jumps (piece 1's bug is exactly that term), so dropping
+them would bias every shaded gradient.
+
+| Plate arm (links are three parallel plates in one tree, the post in front), 48×36, 24 × 4096 pairs | 2d importance | 2e | variance ratio |
+|---|---|---|---|
+| depth 1, visible samples | 35 % | 57 % | φ 2.2, 1.4, 2.3 (geo-mean **1.9**) |
+| depth 2 + NEE | 35 % | 57 % | 1.8, 1.2, 2.1 (geo-mean **1.7**) |
+
+Means agree to |z| < 1.6. **Not the 10× 2d expected.** Removing waste
+caps the gain at `1 / visible fraction`; what is left invisible (43 %) is
+mostly edges that coincide with a nearer edge to within a pixel (stacked
+plates share their outline), which no pixel-resolution buffer can tell
+apart, and the remaining variance is per-sample: `v_n · Σℓw / w_e` swings
+with crease weight and edge speed, and shaded the two paths' difference is
+itself noisy. A velocity-aware importance (`∝ |v_n|`, per parameter) is the
+next lever. The rose arm itself was not re-measured (its files are off
+limits here).
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.
