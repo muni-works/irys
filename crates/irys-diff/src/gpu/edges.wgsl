@@ -341,10 +341,19 @@ fn edge_sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         let nh = cross(obj(hit.prim, 1u) - obj(hit.prim, 0u), obj(hit.prim, 2u) - obj(hit.prim, 0u));
         let ln = length(nt);
         let lh = length(nh);
-        if (!(ln > 0.0 && lh > 0.0 && dot(nt, nh) / (ln * lh) > 1.0 - 1e-6)) { return; }
+        // f32 (2f): a sliver's cross product carries its corners' rounding
+        // (~1e-7 of their magnitude over its own size), so the host's
+        // 1e-6 on the cosine and 1e-4 of the edge on the plane distance
+        // refused real coplanar neighbours on rose's mm-scale CAD — 7 % of
+        // its visible samples, a quarter of the shoulder pitch's mask
+        // gradient. Tolerances in units of the coordinates' own rounding.
+        let mag = max(max(abs(la.x), abs(la.y)), max(abs(la.z), 1e-9));
+        let cos_tol = max(1e-6, 64.0 * 1.2e-7 * mag * mag / max(ln * lh, 1e-30) * 4.0);
+        if (!(ln > 0.0 && lh > 0.0 && dot(nt, nh) / (ln * lh) > 1.0 - min(cos_tol, 1e-3))) { return; }
         let l = to_local(hit.inst, eye, dir);
         let q = l[0] + l[1] * hit.t;
-        if (abs(dot(nt / ln, q - la)) >= 1e-4 * max(length(lb - la), 1e-9)) { return; }
+        let dtol = max(1e-4 * max(length(lb - la), 1e-9), 64.0 * 1.2e-7 * (mag + length(q)));
+        if (abs(dot(nt / ln, q - la)) >= dtol) { return; }
     }
     // The pinhole's Jacobian at x.
     let dx = x - eye;
