@@ -48,7 +48,8 @@
 use irys_core::{Point3, Ray, Transform, Vec3};
 
 use crate::ggx::PARAMS;
-use crate::prb::{Rng, Scene, Surface, lane_adjoint, offset, wavelengths};
+use crate::prb::{HERO, Rng, Scene, Surface, lane_adjoint, offset, wavelengths};
+use crate::secondary::{Frame, Lobes, Secondary};
 use crate::vis::{RIG_H, Rig};
 
 /// Most parameters a tangent carries.
@@ -533,10 +534,61 @@ fn mis_d(a: D, b: D) -> D {
     }
 }
 
+/// What a walk owes phase 2f's secondary edge term, when it draws one per
+/// vertex ([`crate::secondary`]).
+struct SecCall<'a> {
+    sec: &'a Secondary,
+    frame: &'a Frame,
+    /// Nothing moves: the continuations' tangents.
+    none: &'a Tangents,
+    seed: u64,
+    key: u64,
+    /// Placements that move with the parameters.
+    moving: &'a [usize],
+    /// Every placement.
+    all: &'a [usize],
+    mode: SecMode,
+    /// Edge samples per vertex.
+    samples: usize,
+}
+
+/// Which estimator of the secondary boundary term a walk runs (phase 2f's
+/// comparison; [`SecMode::Edges`] is the one kept).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SecMode {
+    /// Secondary edge sampling, both strategies (light and BSDF samples).
+    Edges,
+    /// Edge sampling, the light sample's jump only: what [`SecMode::WarpNee`]
+    /// estimates, for the comparison.
+    EdgesNee,
+    /// Warped-area reparameterisation (Bangaru et al. 2020) of the light
+    /// sample alone: `K` auxiliary rays per shadow ray for the warp,
+    /// central differences of the warp for its divergence.
+    WarpNee {
+        /// Auxiliary rays.
+        k: usize,
+        /// Their vMF concentration around the shadow ray.
+        kappa: f64,
+    },
+}
+
+/// Per wavelength, per parameter: the secondary edge term of `∂L/∂φ`.
+type SecOut = [[f64; MAXP]; HERO];
+
 /// One path's `L` per wavelength, as duals.
 fn path(scene: &Scene, tan: &Tangents, theta: &[f64; PARAMS], seed: u64, i: usize) -> [D; 4] {
+    path_sec(scene, tan, theta, seed, i, None).0
+}
+
+fn path_sec(
+    scene: &Scene,
+    tan: &Tangents,
+    theta: &[f64; PARAMS],
+    seed: u64,
+    i: usize,
+    sec: Option<&SecCall>,
+) -> ([D; 4], SecOut) {
     let nw = scene.wavelengths;
-    let env = scene.env;
     let mut rng = Rng::new(seed, scene.path_key(i));
     let lambda = wavelengths(rng.uniform(), nw);
     // The camera ray, as `Scene::camera_ray` draws it.
@@ -550,19 +602,75 @@ fn path(scene: &Scene, tan: &Tangents, theta: &[f64; PARAMS], seed: u64, i: usiz
     let (wf, hf) = (w as f64, h as f64);
     let sx = (2.0 * x / wf - 1.0) * c.tan_half * (wf / hf);
     let sy = (1.0 - 2.0 * y / hf) * c.tan_half;
-    let mut o = c.eye;
-    let mut o_trace = pt(c.eye.v());
-    let mut d = (c.forward + c.right.s(sx) + c.up.s(sy)).normalize();
-    let mut tp = [D::c(1.0); 4];
+    let o = c.eye;
+    let d = (c.forward + c.right.s(sx) + c.up.s(sy)).normalize();
+    let mut out = [[0.0; MAXP]; HERO];
+    let rad = walk(
+        scene,
+        tan,
+        theta,
+        &mut rng,
+        &lambda,
+        Start {
+            o,
+            o_trace: pt(o.v()),
+            d,
+            tp: [D::c(1.0); 4],
+            prev_pdf: D::c(0.0),
+            vertex: 0,
+            miss_weight: None,
+        },
+        sec.map(|s| (s, &mut out)),
+    );
+    (rad, out)
+}
+
+/// Where a walk starts: a ray, the throughput it carries, the BSDF pdf it
+/// was drawn with (0: the camera's), and how many vertices are behind it.
+struct Start {
+    o: V3,
+    o_trace: Point3,
+    d: V3,
+    tp: [D; 4],
+    prev_pdf: D,
+    vertex: usize,
+    /// When set, an escape of the first ray is weighted by this instead of
+    /// the MIS weight (an edge sample's continuation scores the BSDF
+    /// strategy's escape weight itself).
+    miss_weight: Option<f64>,
+}
+
+/// The rest of a path from `st`, as duals: what the forward pass's loop
+/// does from vertex `st.vertex + 1` to `scene.depth`.
+#[allow(clippy::too_many_arguments)]
+fn walk(
+    scene: &Scene,
+    tan: &Tangents,
+    theta: &[f64; PARAMS],
+    rng: &mut Rng,
+    lambda: &[f64; HERO],
+    st: Start,
+    mut sec: Option<(&SecCall, &mut SecOut)>,
+) -> [D; 4] {
+    let nw = scene.wavelengths;
+    let env = scene.env;
+    let Start {
+        mut o,
+        mut o_trace,
+        mut d,
+        mut tp,
+        mut prev_pdf,
+        vertex,
+        miss_weight,
+    } = st;
     let mut rad = [D::c(0.0); 4];
-    let mut prev_pdf = D::c(0.0);
-    for _ in 0..scene.depth {
+    for it in vertex..scene.depth {
         let ray = Ray::new(o_trace, d.v());
         let Some(ih) = scene.tlas().trace_closest_range(&ray, 0.0, f64::INFINITY) else {
-            let wm = if scene.nee && prev_pdf.v > 0.0 {
-                mis_d(prev_pdf, env_pdf(scene, &d))
-            } else {
-                D::c(1.0)
+            let wm = match miss_weight {
+                Some(wv) if it == vertex => D::c(wv),
+                _ if scene.nee && prev_pdf.v > 0.0 => mis_d(prev_pdf, env_pdf(scene, &d)),
+                _ => D::c(1.0),
             };
             for k in 0..nw {
                 rad[k] = rad[k] + tp[k] * env_radiance(scene, &d, lambda[k]) * wm;
@@ -622,14 +730,59 @@ fn path(scene: &Scene, tan: &Tangents, theta: &[f64; PARAMS], seed: u64, i: usiz
                     .occluded_range(&Ray::new(origin_v, dir), 0.0, f64::INFINITY);
             (dir, env.pdf(dir), lit)
         });
-        if scene.surface(&ih) == Surface::Diffuse {
-            let albedo = place.albedo
-                * if place.checker {
-                    scene.albedo(ih.hit.point)
-                } else {
-                    scene.floor_albedo
-                };
-            if let Some((dir, pl, true)) = nee {
+        let diffuse = scene.surface(&ih) == Surface::Diffuse;
+        let albedo = place.albedo
+            * if place.checker {
+                scene.albedo(ih.hit.point)
+            } else {
+                scene.floor_albedo
+            };
+        let alpha = scene.frozen_alpha.unwrap_or(theta[0]);
+        let lo = [wo.dot(&tt), wo.dot(&bb), wo.dot(&n)];
+        let warp = match sec.as_ref().map(|(c, _)| c.mode) {
+            Some(SecMode::WarpNee { k: ka, kappa }) => nee
+                .filter(|n| n.2)
+                .map(|(dir, _, _)| warp_nee(scene, tan, sec.as_ref().unwrap().0, &origin, origin_v, dir, ka, kappa, it)),
+            _ => None,
+        };
+        if let Some((call, out)) = sec.as_mut()
+            && !matches!(call.mode, SecMode::WarpNee { .. })
+        {
+            let vx = Vertex {
+                o: origin,
+                o_v: origin_v,
+                n,
+                t0,
+                b0,
+                tt,
+                bb,
+                lo,
+                diffuse,
+                albedo,
+                alpha,
+                tp: std::array::from_fn(|kk| tp[kk].v),
+                vertex: it + 1,
+                moves: [origin.x, origin.y, origin.z, lo[0], lo[1], lo[2]]
+                    .iter()
+                    .any(|c| c.d.iter().any(|x| *x != 0.0)),
+            };
+            for si in 0..call.samples {
+                secondary_edge(scene, tan, theta, lambda, call, &vx, si, out);
+            }
+        }
+        if diffuse {
+            if let (Some((dir, pl, true)), Some((u, div))) = (nee, &warp) {
+                let dw = V3::with(dir, u);
+                let cos = n.dot(&dw);
+                let wl = mis_d(env_pdf(scene, &dw), cos / std::f64::consts::PI);
+                for kk in 0..nw {
+                    let f = tp[kk] * (albedo / std::f64::consts::PI) * cos
+                        * env_radiance(scene, &dw, lambda[kk])
+                        * wl
+                        / pl;
+                    rad[kk] = rad[kk] + f + with_d(f.v, div);
+                }
+            } else if let Some((dir, pl, true)) = nee {
                 let cos = n.dot(&V3::c(dir));
                 let wl = mis_d(D::c(pl), cos / std::f64::consts::PI);
                 for kk in 0..nw {
@@ -654,12 +807,13 @@ fn path(scene: &Scene, tan: &Tangents, theta: &[f64; PARAMS], seed: u64, i: usiz
             o_trace = origin_v;
             continue;
         }
-        let lo = [wo.dot(&tt), wo.dot(&bb), wo.dot(&n)];
-        let alpha = scene.frozen_alpha.unwrap_or(theta[0]);
         if let Some((dir, pl, true)) = nee
             && lo[2].v > 0.0
         {
-            let dv = V3::c(dir);
+            let dv = match &warp {
+                Some((u, _)) => V3::with(dir, u),
+                None => V3::c(dir),
+            };
             let li = [dv.dot(&tt), dv.dot(&bb), dv.dot(&n)];
             let hh = {
                 let s = [li[0] + lo[0], li[1] + lo[1], li[2] + lo[2]];
@@ -670,6 +824,12 @@ fn path(scene: &Scene, tan: &Tangents, theta: &[f64; PARAMS], seed: u64, i: usiz
             for kk in 0..nw {
                 let bw = crate::ggx::band_weights(lambda[kk]);
                 let (f, pb) = ggx_eval(theta, alpha, bw, li[2], lo[2], hh[2], oh);
+                if let Some((_, div)) = &warp {
+                    let s = li[2] * mis_d(env_pdf(scene, &dv), pb) / pl;
+                    let c = tp[kk] * s * env_radiance(scene, &dv, lambda[kk]) * f;
+                    rad[kk] = rad[kk] + c + with_d(c.v, div);
+                    continue;
+                }
                 let s = li[2] * mis_d(D::c(pl), pb) / pl;
                 rad[kk] = rad[kk] + tp[kk] * s * env.radiance(dir, lambda[kk]) * f;
             }
@@ -710,6 +870,445 @@ fn path(scene: &Scene, tan: &Tangents, theta: &[f64; PARAMS], seed: u64, i: usiz
     rad
 }
 
+static DUMP: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("IRYS_SEC_DUMP").is_ok());
+static DUMPED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Debugging (`IRYS_SEC_DUMP`): the largest secondary edge samples drawn
+/// so far (parameter 0, unweighted by the loss), and how many there were.
+pub fn dump_secondary(top: usize) {
+    let mut v = std::mem::take(&mut *DUMPED.lock().unwrap());
+    let key = |s: &String| s.split_whitespace().next().unwrap().parse::<f64>().unwrap().abs();
+    v.sort_by(|a, b| key(b).total_cmp(&key(a)));
+    let tot: f64 = v.iter().map(key).sum();
+    eprintln!("secondary samples: {} nonzero, Σ|c| {tot:.3e}", v.len());
+    for l in v.iter().take(top) {
+        eprintln!("  {l}");
+    }
+}
+
+/// A dual with value 0 and tangent `v · div_j`.
+fn with_d(v: f64, div: &[f64]) -> D {
+    let mut o = D::c(0.0);
+    for (j, dj) in div.iter().enumerate() {
+        o.d[j] = v * dj;
+    }
+    o
+}
+
+/// The warp field at a shadow ray `dir` from `o` (Bangaru et al. 2020's
+/// harmonic interpolation of the auxiliary rays' angular velocities, with
+/// the boundary term), and its divergence on the sphere by central
+/// differences, per parameter. `(U_j, div U_j)`.
+#[allow(clippy::too_many_arguments)]
+fn warp_nee(
+    scene: &Scene,
+    tan: &Tangents,
+    call: &SecCall,
+    o: &V3,
+    o_v: Point3,
+    dir: Vec3,
+    k: usize,
+    kappa: f64,
+    it: usize,
+) -> (Vec<Vec3>, Vec<f64>) {
+    let np = tan.np;
+    let mut rng = Rng::new(call.seed ^ 0x7761_7270, call.key * 64 + it as u64);
+    // Offsets about +z, fixed for this ray (they turn with the direction).
+    let offs: Vec<Vec3> = (0..k)
+        .map(|_| {
+            let (u1, u2) = (rng.uniform(), rng.uniform());
+            let c = (1.0 + (u1 + (1.0 - u1) * (-2.0 * kappa).exp()).ln() / kappa).clamp(-1.0, 1.0);
+            let r = (1.0 - c * c).max(0.0).sqrt();
+            let ph = 2.0 * std::f64::consts::PI * u2;
+            Vec3::new(r * ph.cos(), r * ph.sin(), c)
+        })
+        .collect();
+    let gamma = 2.0;
+    let b_miss = 0.05;
+    let field = |w: Vec3| -> Vec<Vec3> {
+        let (t, b) = basis(w);
+        let (mut num, mut den) = (vec![Vec3::zeros(); np], 0.0);
+        for of in &offs {
+            let wk = (t * of.x + b * of.y + w * of.z).normalize();
+            let dk = of.z.clamp(-1.0, 1.0).acos();
+            let hit = scene
+                .tlas()
+                .trace_closest_range(&Ray::new(o_v, wk), 0.0, f64::INFINITY);
+            let (bk, vk) = match hit {
+                None => (b_miss, vec![Vec3::zeros(); np]),
+                Some(ih) => {
+                    let kk = ih.payload;
+                    let place = &scene.placements()[kk];
+                    let m = scene.blas()[place.blas].geometry().mesh();
+                    let tri = m.triangles()[ih.hit.prim as usize];
+                    let nbr = &call.sec.edges.nbr[place.blas][ih.hit.prim as usize];
+                    let x = ih.hit.point;
+                    let tt = ih.hit.t;
+                    let mut bk = f64::INFINITY;
+                    for e in 0..3 {
+                        if nbr[e] == crate::vis::FLAT {
+                            continue;
+                        }
+                        let a = place.to_world.apply_point(&m.positions()[tri[e] as usize]);
+                        let bp = place.to_world.apply_point(&m.positions()[tri[(e + 1) % 3] as usize]);
+                        let ab = bp - a;
+                        let s = ((x - a).dot(&ab) / ab.norm_squared().max(1e-300)).clamp(0.0, 1.0);
+                        bk = bk.min((x - (a + ab * s)).norm() / tt);
+                    }
+                    let bk = bk.min(b_miss);
+                    let vk = match &call.frame.inv[kk] {
+                        Some(inv) => {
+                            let xp = tan.point(scene, kk, inv.apply_point(&x));
+                            (0..np)
+                                .map(|j| {
+                                    let dv = xp.d(j) - o.d(j);
+                                    (dv - wk * wk.dot(&dv)) / tt
+                                })
+                                .collect()
+                        }
+                        None => vec![Vec3::zeros(); np],
+                    };
+                    (bk, vk)
+                }
+            };
+            let wgt = 1.0 / (dk.powf(gamma) + bk.powf(gamma)).max(1e-300);
+            den += wgt;
+            for j in 0..np {
+                num[j] += vk[j] * wgt;
+            }
+        }
+        num.iter()
+            .map(|v| {
+                let u = *v / den.max(1e-300);
+                u - w * w.dot(&u)
+            })
+            .collect()
+    };
+    let u0 = field(dir);
+    let (t, b) = basis(dir);
+    let h = 1e-3;
+    let mut div = vec![0.0; np];
+    for e in [t, b] {
+        let (up, um) = (
+            field((dir + e * h).normalize()),
+            field((dir - e * h).normalize()),
+        );
+        for j in 0..np {
+            div[j] += (up[j] - um[j]).dot(&e) / (2.0 * h);
+        }
+    }
+    (u0, div)
+}
+
+/// A path vertex, as the secondary edge term needs it.
+struct Vertex {
+    /// The ray origin leaving it (dual) and its value.
+    o: V3,
+    o_v: Point3,
+    /// Shading normal (the side the path is on), and the frame.
+    n: V3,
+    t0: Vec3,
+    b0: Vec3,
+    tt: V3,
+    bb: V3,
+    /// `wo` in the frame.
+    lo: [D; 3],
+    diffuse: bool,
+    albedo: f64,
+    alpha: f64,
+    /// Throughput on arrival, per wavelength.
+    tp: [f64; HERO],
+    /// 1-based: the primary hit is vertex 1.
+    vertex: usize,
+    /// Whether the vertex or its incoming direction moves with `φ`.
+    moves: bool,
+}
+
+/// Half-width of a secondary edge sample, in radians: the two rays leave
+/// `x` this far either side of the edge.
+pub const EPS_DIR: f64 = 1e-7;
+
+/// The inverse of [`crate::ggx::sample`]: the `u` that draws `wi` from `wo`
+/// (local frame), when one does.
+fn ggx_inverse(alpha: f64, wo: [f64; 3], wi: [f64; 3]) -> Option<[f64; 2]> {
+    let h = crate::ggx::normalize([wi[0] + wo[0], wi[1] + wo[1], wi[2] + wo[2]]);
+    let nh = crate::ggx::normalize([h[0] / alpha, h[1] / alpha, h[2]]);
+    let vh = crate::ggx::normalize([alpha * wo[0], alpha * wo[1], wo[2]]);
+    let len2 = vh[0] * vh[0] + vh[1] * vh[1];
+    let t1 = if len2 > 0.0 {
+        let s = 1.0 / len2.sqrt();
+        [-vh[1] * s, vh[0] * s, 0.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let t2 = [
+        vh[1] * t1[2] - vh[2] * t1[1],
+        vh[2] * t1[0] - vh[0] * t1[2],
+        vh[0] * t1[1] - vh[1] * t1[0],
+    ];
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    if dot(nh, vh) < 0.0 {
+        return None;
+    }
+    let (p1, p2) = (dot(nh, t1), dot(nh, t2));
+    let s = 0.5 * (1.0 + vh[2]);
+    let rs = (p2 - (1.0 - s) * (1.0 - p1 * p1).max(0.0).sqrt()) / s;
+    let r2 = p1 * p1 + rs * rs;
+    if r2 > 1.0 {
+        return None;
+    }
+    let ph = rs.atan2(p1) / (2.0 * std::f64::consts::PI);
+    Some([r2, ph - ph.floor()])
+}
+
+/// Phase 2f: one secondary edge sample at vertex `vx`, added to `out` per
+/// wavelength and parameter ([`crate::secondary`] for the integral).
+///
+/// The vertex's direction integral is estimated twice by the forward pass —
+/// a light sample (`ω_L`, fixed in the world for fixed random numbers) and
+/// a BSDF sample (`ω_B`, drawn in the vertex's attached frame from `wo`) —
+/// with integrands `F_L = g · Le · V · w_L` and `F_B = g · C · [w_B on
+/// escape]`, `g` the BSDF times the cosine and `C` what the path collects
+/// from the next vertex on. Both jump across every edge `x` sees. The
+/// boundary term of each is the jump times the edge's angular speed
+/// *relative to its sampler's map*: `n · V` for the light sample, `n · (V −
+/// ω̇_B)` for the BSDF sample, `ω̇_B` the velocity of the direction the
+/// BSDF sampler draws at fixed `u` (the `u` that draws the edge point,
+/// found by inverting the sampler, re-drawn in duals).
+#[allow(clippy::too_many_arguments)]
+fn secondary_edge(
+    scene: &Scene,
+    tan: &Tangents,
+    theta: &[f64; PARAMS],
+    lambda: &[f64; HERO],
+    call: &SecCall,
+    vx: &Vertex,
+    si: usize,
+    out: &mut SecOut,
+) {
+    let nw = scene.wavelengths;
+    let env = scene.env;
+    let salt = (si as u64).wrapping_mul(0x2545_f491_4f6c_dd1d);
+    let mut rng = Rng::new(call.seed ^ 0x7365_6364 ^ salt, call.key * 64 + vx.vertex as u64);
+    let cands = if vx.moves { call.all } else { call.moving };
+    if cands.is_empty() {
+        return;
+    }
+    let nv = vx.n.v();
+    let lobes = Lobes {
+        sun: env.sun,
+        kappa: env.kappa,
+        mirror: (!vx.diffuse).then(|| {
+            let wo = vx.tt.v() * vx.lo[0].v + vx.bb.v() * vx.lo[1].v + nv * vx.lo[2].v;
+            (nv * (2.0 * wo.dot(&nv)) - wo, vx.alpha)
+        }),
+    };
+    let Some(pk) = call
+        .sec
+        .pick(scene, call.frame, cands, vx.o_v, nv, &lobes, &mut rng)
+    else {
+        return;
+    };
+    let p = pk.a + (pk.b - pk.a) * pk.t;
+    let rv = p - vx.o_v;
+    let r = rv.norm();
+    if r <= 0.0 {
+        return;
+    }
+    let w0 = rv / r;
+    let cos = w0.dot(&nv);
+    if cos <= 0.0 {
+        return;
+    }
+    let te = (pk.b - pk.a).normalize();
+    let tproj = te - w0 * w0.dot(&te);
+    let m = tproj.norm() / r;
+    if m <= 0.0 {
+        return;
+    }
+    let mut nrm = w0.cross(&tproj).normalize();
+    if nrm.dot(&(pk.c - p)) > 0.0 {
+        nrm = -nrm;
+    }
+    let side = |s: f64| (w0 + nrm * (s * EPS_DIR)).normalize();
+    let (wi, wout) = (side(-1.0), side(1.0));
+    // Ownership: the inner ray lands on the owner, or on a triangle
+    // coplanar with it on the same face (a CAD sliver thinner than ε).
+    let place = &scene.placements()[pk.k];
+    let normal = &call.sec.edges.normal[place.blas];
+    let hin = scene
+        .tlas()
+        .trace_closest_range(&Ray::new(vx.o_v, wi), 0.0, f64::INFINITY);
+    let own = hin.as_ref().is_some_and(|ih| {
+        if ih.payload != pk.k {
+            return false;
+        }
+        let q = ih.hit.prim as usize;
+        if q == pk.tri {
+            return true;
+        }
+        let (nt, Some(nh)) = (normal[pk.tri], normal.get(q)) else {
+            return false;
+        };
+        let (ln, lh) = (nt.norm(), nh.norm());
+        let local = place
+            .to_world
+            .inverse()
+            .map(|t| t.apply_point(&ih.hit.point));
+        ln > 0.0
+            && lh > 0.0
+            && nt.dot(nh) / (ln * lh) > 1.0 - 1e-6
+            && local.is_some_and(|q| {
+                (nt / ln).dot(&(q - pk.la)).abs() < 1e-4 * (pk.lb - pk.la).norm().max(1e-9)
+            })
+    });
+    if !own {
+        return;
+    }
+    let hout = scene
+        .tlas()
+        .trace_closest_range(&Ray::new(vx.o_v, wout), 0.0, f64::INFINITY);
+    // The edge point's angular velocity seen from the (moving) origin.
+    let xl = pk.la + (pk.lb - pk.la) * pk.t;
+    let xp = tan.point(scene, pk.k, xl);
+    let np = tan.np;
+    let vel: Vec<f64> = (0..np)
+        .map(|j| {
+            let dv = xp.d(j) - vx.o.d(j);
+            let dv = dv - w0 * w0.dot(&dv);
+            nrm.dot(&dv) / r
+        })
+        .collect();
+    // The BSDF sampler's direction velocity at the `u` that draws `w0`.
+    let lo_v = [vx.lo[0].v, vx.lo[1].v, vx.lo[2].v];
+    let li_v = [w0.dot(&vx.t0), w0.dot(&vx.b0), cos];
+    let bsdf_dir: Option<V3> = if vx.diffuse {
+        Some(vx.tt.s(D::c(li_v[0])) + vx.bb.s(D::c(li_v[1])) + vx.n.s(D::c(li_v[2])))
+    } else if lo_v[2] > 0.0 {
+        ggx_inverse(vx.alpha, lo_v, li_v).map(|u| {
+            let (li, _) = ggx_sample(vx.alpha, vx.lo, u);
+            (vx.tt.s(li[0]) + vx.bb.s(li[1]) + vx.n.s(li[2])).normalize()
+        })
+    } else {
+        None
+    };
+    let vel_b: Vec<f64> = match &bsdf_dir {
+        Some(dd) => (0..np).map(|j| vel[j] - nrm.dot(&dd.d(j))).collect(),
+        None => vel.clone(),
+    };
+    // g, and the two strategies' pdfs, at `w0`.
+    let pl = env.pdf(w0);
+    let (g, pb): ([f64; HERO], f64) = if vx.diffuse {
+        (
+            std::array::from_fn(|_| vx.albedo / std::f64::consts::PI * cos),
+            cos / std::f64::consts::PI,
+        )
+    } else if lo_v[2] > 0.0 {
+        let hh = crate::ggx::normalize([li_v[0] + lo_v[0], li_v[1] + lo_v[1], li_v[2] + lo_v[2]]);
+        let oh = lo_v[0] * hh[0] + lo_v[1] * hh[1] + lo_v[2] * hh[2];
+        let mut pb = 0.0;
+        let g = std::array::from_fn(|kk| {
+            if kk >= nw {
+                return 0.0;
+            }
+            let bw = crate::ggx::band_weights(lambda[kk]);
+            let (f, p) = ggx_eval(
+                theta,
+                vx.alpha,
+                bw,
+                D::c(li_v[2]),
+                D::c(lo_v[2]),
+                D::c(hh[2]),
+                D::c(oh),
+            );
+            pb = p.v;
+            f.v * li_v[2]
+        });
+        (g, pb)
+    } else {
+        return;
+    };
+    let (wl, wb) = if scene.nee {
+        (crate::prb::mis(pl, pb), crate::prb::mis(pb, pl))
+    } else {
+        (0.0, 1.0)
+    };
+    let last = vx.vertex >= scene.depth;
+    let crng = Rng::new(call.seed ^ 0x636f_6e74 ^ salt, call.key * 64 + vx.vertex as u64);
+    // F_L and F_B on one side, per wavelength.
+    let f_side = |dir: Vec3, hit: &Option<irys_core::InstanceHit>| -> ([f64; HERO], [f64; HERO]) {
+        let mut fl = [0.0; HERO];
+        let mut fb = [0.0; HERO];
+        let miss = hit.is_none();
+        if scene.nee && miss {
+            for kk in 0..nw {
+                fl[kk] = g[kk] * env.radiance(dir, lambda[kk]) * wl;
+            }
+        }
+        if !last && pb > 0.0 {
+            let mut rr = crng;
+            let c = walk(
+                scene,
+                call.none,
+                theta,
+                &mut rr,
+                lambda,
+                Start {
+                    o: V3::c(vx.o_v.coords()),
+                    o_trace: vx.o_v,
+                    d: V3::c(dir),
+                    tp: [D::c(1.0); 4],
+                    prev_pdf: D::c(pb),
+                    vertex: vx.vertex,
+                    miss_weight: Some(wb),
+                },
+                None,
+            );
+            for kk in 0..nw {
+                fb[kk] = g[kk] * c[kk].v;
+            }
+        }
+        (fl, fb)
+    };
+    let (fli, fbi) = f_side(wi, &hin);
+    let (flo, fbo) = f_side(wout, &hout);
+    let scale = m / pk.pdf / call.samples as f64;
+    if *DUMP {
+        let c: f64 = (0..nw)
+            .map(|kk| vx.tp[kk] * ((fli[kk] - flo[kk]) * vel[0] + (fbi[kk] - fbo[kk]) * vel_b[0]) * scale)
+            .sum();
+        if c != 0.0 {
+            DUMPED.lock().unwrap().push(format!(
+                "{c:+.3e} v{} diff {} k{} r {r:.3e} m {m:.3e} pdf {:.3e} vel {:+.3e} velb {:+.3e} dFL {:+.3e} dFB {:+.3e} tp {:.3e} hin {:?} hout {:?}",
+                vx.vertex,
+                vx.diffuse,
+                pk.k,
+                pk.pdf,
+                vel[0],
+                vel_b[0],
+                fli[0] - flo[0],
+                fbi[0] - fbo[0],
+                vx.tp[0],
+                hin.as_ref().map(|h| h.payload),
+                hout.as_ref().map(|h| h.payload),
+            ));
+        }
+    }
+    for kk in 0..nw {
+        let (dl, mut db) = (fli[kk] - flo[kk], fbi[kk] - fbo[kk]);
+        if call.mode == SecMode::EdgesNee {
+            db = 0.0;
+        }
+        if dl == 0.0 && db == 0.0 {
+            continue;
+        }
+        for j in 0..np {
+            out[kk][j] += vx.tp[kk] * (dl * vel[j] + db * vel_b[j]) * scale;
+        }
+    }
+}
+
 /// The interior term of `∂ℒ/∂φ` for the image frame drawn with `seed`,
 /// given the loss adjoint per pixel channel: `Σ_lanes δL · ∂L/∂φ` at fixed
 /// random numbers. CPU, f64, threads over fixed chunks (so the sum order,
@@ -721,41 +1320,93 @@ pub fn interior(
     seed: u64,
     d_img: &[f64],
 ) -> Vec<f64> {
+    interior_with(scene, tan, theta, seed, d_img, None).0
+}
+
+/// [`interior`] and, with `sec`, phase 2f's secondary edge term from the
+/// same paths: one edge sample per path vertex ([`crate::secondary`]),
+/// returned separately. `(interior, secondary)`.
+pub fn interior_with(
+    scene: &Scene,
+    tan: &Tangents,
+    theta: &[f64; PARAMS],
+    seed: u64,
+    d_img: &[f64],
+    sec: Option<&Secondary>,
+) -> (Vec<f64>, Vec<f64>) {
+    interior_mode(scene, tan, theta, seed, d_img, sec, SecMode::Edges)
+}
+
+/// [`interior_with`] with the secondary estimator chosen (phase 2f's
+/// comparison).
+pub fn interior_mode(
+    scene: &Scene,
+    tan: &Tangents,
+    theta: &[f64; PARAMS],
+    seed: u64,
+    d_img: &[f64],
+    sec: Option<&Secondary>,
+    mode: SecMode,
+) -> (Vec<f64>, Vec<f64>) {
     assert!(scene.points().is_none(), "interior term: image mode only");
     assert!(scene.splats().is_none(), "interior term: no splats");
     let nw = scene.wavelengths;
     let dl = lane_adjoint(scene, seed, d_img);
     let n = scene.paths();
+    let frame = sec.map(|s| s.frame(scene));
+    let none = Tangents::none(scene, tan.np);
+    let moving: Vec<usize> = (0..scene.placements().len())
+        .filter(|&k| tan.shifted[k].is_some())
+        .collect();
+    let all: Vec<usize> = (0..scene.placements().len()).collect();
+    let samples: usize = std::env::var("IRYS_SEC_N").map_or(1, |v| v.parse().unwrap());
     const CHUNKS: usize = 64;
     let per = n.div_ceil(CHUNKS).max(1);
-    let parts: Vec<[f64; MAXP]> = std::thread::scope(|s| {
+    let parts: Vec<([f64; MAXP], [f64; MAXP])> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..n.div_ceil(per))
             .map(|c| {
-                let dl = &dl;
+                let (dl, frame, none, moving, all) = (&dl, &frame, &none, &moving, &all);
                 s.spawn(move || {
                     let mut g = [0.0; MAXP];
+                    let mut gs = [0.0; MAXP];
                     for i in c * per..((c + 1) * per).min(n) {
-                        let l = path(scene, tan, theta, seed, i);
+                        let call = sec.zip(frame.as_ref()).map(|(sec, frame)| SecCall {
+                            sec,
+                            frame,
+                            none,
+                            seed,
+                            key: i as u64,
+                            moving,
+                            all,
+                            mode,
+                            samples,
+                        });
+                        let (l, so) = path_sec(scene, tan, theta, seed, i, call.as_ref());
                         for k in 0..nw {
                             let a = dl[i * nw + k];
                             for (gj, dj) in g.iter_mut().zip(l[k].d) {
                                 *gj += a * dj;
                             }
+                            for (gj, dj) in gs.iter_mut().zip(so[k]) {
+                                *gj += a * dj;
+                            }
                         }
                     }
-                    g
+                    (g, gs)
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let mut g = vec![0.0; tan.np];
-    for p in parts {
-        for (gj, pj) in g.iter_mut().zip(p) {
-            *gj += pj;
+    let mut gs = vec![0.0; tan.np];
+    for (p, q) in parts {
+        for j in 0..tan.np {
+            g[j] += p[j];
+            gs[j] += q[j];
         }
     }
-    g
+    (g, gs)
 }
 
 /// `L` per lane from the dual trace's values — equal to
@@ -786,4 +1437,33 @@ pub fn lane_tangents(
             (0..nw).map(move |k| l[k].d[j])
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The GGX sampler's inverse draws the direction back.
+    #[test]
+    fn ggx_inverse_round_trips() {
+        let mut rng = Rng::new(5, 9);
+        let mut worst: f64 = 0.0;
+        for _ in 0..2000 {
+            let alpha = 0.05 + 0.9 * rng.uniform();
+            let (ct, ph) = (rng.uniform(), 6.283 * rng.uniform());
+            let st = (1.0 - ct * ct).sqrt();
+            let wo = [st * ph.cos(), st * ph.sin(), ct];
+            let u = [rng.uniform(), rng.uniform()];
+            let (wi, _) = crate::ggx::sample(alpha, wo, u);
+            if wi[2] <= 1e-3 {
+                continue;
+            }
+            let back = ggx_inverse(alpha, wo, wi).expect("drawable");
+            let (wi2, _) = crate::ggx::sample(alpha, wo, back);
+            for k in 0..3 {
+                worst = worst.max((wi[k] - wi2[k]).abs());
+            }
+        }
+        assert!(worst < 1e-7, "{worst}");
+    }
 }

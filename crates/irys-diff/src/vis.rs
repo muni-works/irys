@@ -178,22 +178,22 @@ impl CameraRig {
 
 /// No neighbour across an edge (a boundary, or more than two triangles
 /// share it after welding).
-const NONE: u32 = u32::MAX;
+pub(crate) const NONE: u32 = u32::MAX;
 /// Neighbour marker for an edge whose neighbour is coplanar: never a
 /// candidate, `f` is continuous across it.
-const FLAT: u32 = u32::MAX - 1;
+pub(crate) const FLAT: u32 = u32::MAX - 1;
 
 /// Importance of a crease between two front faces whose normals meet at
 /// `cos`: ∝ how much the shading can jump, from 0.02 (a fine tessellation
 /// of a cylinder) to 1 (a right angle) — silhouettes and boundaries are 1.
-fn crease_weight(cos: f64) -> f64 {
+pub(crate) fn crease_weight(cos: f64) -> f64 {
     (4.0 * (1.0 - cos)).clamp(0.02, 1.0)
 }
 
 /// What faces the camera is a hint, not a promise (two-sided shading, a
 /// mesh wound inconsistently): back-only edges keep this much weight, so
 /// the estimator stays unbiased whatever the winding.
-const BACK_WEIGHT: f64 = 0.02;
+pub(crate) const BACK_WEIGHT: f64 = 0.02;
 
 /// Per bottom-level tree, every triangle edge's neighbour across it (by
 /// welded position) and their dihedral cosine: which edges can never be a
@@ -203,7 +203,7 @@ pub struct Edges {
     pub(crate) nbr: Vec<Vec<[u32; 3]>>,
     pub(crate) cos: Vec<Vec<[f32; 3]>>,
     /// Object-space face normals (unnormalised: the winding's).
-    normal: Vec<Vec<Vec3>>,
+    pub(crate) normal: Vec<Vec<Vec3>>,
 }
 
 impl Edges {
@@ -328,6 +328,11 @@ impl Visibility {
             }
         }
         Self::from_parts(scene.size, id, depth)
+    }
+
+    /// The instance (or [`SKY`]) at every pixel centre, row-major.
+    pub fn ids(&self) -> &[u32] {
+        &self.id
     }
 
     /// A buffer from its columns (the device's, say).
