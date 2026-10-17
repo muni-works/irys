@@ -1,0 +1,623 @@
+//! The WGSL BSDF is a port of the Rust one. This checks it, number by number.
+//!
+//! `pathtrace.rs` is the reference and `gpu/shaders/bsdf.wgsl` is the port, and
+//! nothing about a rendered image makes a divergence between them obvious — a
+//! dropped compensation factor or a sheen table read off by a row just shifts
+//! energy a little and still looks like a plausible picture. So the shader is
+//! compiled standalone against a harness entry point, driven on real hardware,
+//! and compared against the Rust for the same inputs.
+//!
+//! Three properties:
+//!
+//! 1. `gpu_bsdf_eval_matches_the_cpu_reference` — `(f·cos, pdf)` agrees across
+//!    a sweep of every parameter, the new ones included.
+//! 2. `gpu_bsdf_sample_pdf_matches_eval_pdf` — the PDF `bsdf_sample` returns is
+//!    the PDF `bsdf_eval` reports for the direction it drew. This is the MIS
+//!    invariant; when it breaks the image is energy-wrong and still plausible.
+//! 3. `gpu_furnace_closes_on_a_rough_metal` — the device's own estimate of a
+//!    white metal's directional albedo, which is what actually exercises the
+//!    baked `GGX_E` table through the shader's interpolation rather than the
+//!    CPU's.
+//!
+//! `#[ignore]`d like the other GPU tests; run with
+//! `cargo test -p kosm-render --features gpu --test gpu_bsdf -- --ignored`.
+
+#![cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+
+use bytemuck::{Pod, Zeroable};
+use kosm_render::gpu::{GpuContext, GpuMaterial, shaders};
+use kosm_render::math::Vec3;
+use kosm_render::pathtrace::{Pbr, reference_bsdf_eval_at, reference_lobe_weights};
+
+/// Mirrors `ParityIn` in [`HARNESS`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct ParityIn {
+    material: GpuMaterial,
+    wo: [f32; 4],
+    wi: [f32; 4],
+    rnd: [f32; 4],
+    /// `.x` is the hero wavelength the BSDF is evaluated at — 0 for an RGB
+    /// path. Deliberately *not* the wavelength in `wi.w`, which drives the
+    /// dispersion check: the two answer different questions, and sharing a
+    /// slot would hide a shader that read the wrong one.
+    hero: [f32; 4],
+}
+
+/// Mirrors `ParityOut` in [`HARNESS`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct ParityOut {
+    /// `(f·cos, pdf)` from `bsdf_eval` at the given `wi`.
+    eval: [f32; 4],
+    /// `(wi, pdf)` from `bsdf_sample`.
+    sampled: [f32; 4],
+    /// `(f·cos, pdf)` from re-evaluating at the sampled direction.
+    resampled: [f32; 4],
+    /// `(n(λ), hero_weight(λ))` at the wavelength riding in `wi.w`.
+    spectral: [f32; 4],
+    /// `(diffuse, specular, sheen, coat)` lobe-selection probabilities.
+    lobes_a: [f32; 4],
+    /// `(dielectric, subsurface, 0, 0)`.
+    lobes_b: [f32; 4],
+}
+
+/// The compute half: one invocation per input, every entry point the tests use.
+const HARNESS: &str = r#"
+struct ParityIn {
+    material: GpuMaterial,
+    wo: vec4<f32>,
+    wi: vec4<f32>,
+    rnd: vec4<f32>,
+    hero: vec4<f32>,
+}
+
+struct ParityOut {
+    eval: vec4<f32>,
+    sampled: vec4<f32>,
+    resampled: vec4<f32>,
+    spectral: vec4<f32>,
+    lobes_a: vec4<f32>,
+    lobes_b: vec4<f32>,
+}
+
+@group(0) @binding(0) var<storage, read> parity_in: array<ParityIn>;
+@group(0) @binding(1) var<storage, read_write> parity_out: array<ParityOut>;
+
+@compute @workgroup_size(64)
+fn parity(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= arrayLength(&parity_in) {
+        return;
+    }
+    let p = parity_in[i];
+    var o: ParityOut;
+
+    // `wo.w` carries eta (n_transmitted / n_incident) and `rnd.w` the
+    // dielectric lobe's reflect-or-refract draw.
+    let eta = p.wo.w;
+    let hero = p.hero.x;
+    let e = bsdf_eval(p.material, p.wo.xyz, p.wi.xyz, eta, hero);
+    o.eval = vec4<f32>(e.value, e.pdf);
+
+    let lw = lobe_weights(p.material);
+    o.lobes_a = lw.w;
+    o.lobes_b = vec4<f32>(lw.diel, lw.sss, 0.0, 0.0);
+
+    let s = bsdf_sample(p.material, p.wo.xyz, eta, hero, p.rnd.x, p.rnd.y, p.rnd.z, p.rnd.w);
+    // A subsurface draw has no direction and no density — the integrator
+    // walks it out of the object — so there is nothing here to compare.
+    if s.ok && !s.sss {
+        o.sampled = vec4<f32>(s.wi, s.pdf);
+        let r = bsdf_eval(p.material, p.wo.xyz, s.wi, eta, hero);
+        o.resampled = vec4<f32>(r.value, r.pdf);
+    } else {
+        o.sampled = vec4<f32>(0.0);
+        o.resampled = vec4<f32>(0.0);
+    }
+    o.spectral = vec4<f32>(mat_index_at(p.material, p.wi.w), hero_weight(p.wi.w));
+    parity_out[i] = o;
+}
+"#;
+
+fn ctx_or_skip(name: &str) -> Option<&'static GpuContext> {
+    match pollster::block_on(GpuContext::init()) {
+        Ok(ctx) => Some(ctx),
+        Err(e) => {
+            eprintln!("[{name}] skipped: {e}");
+            None
+        }
+    }
+}
+
+/// Run the harness over `inputs` and read the results back.
+fn run(ctx: &GpuContext, inputs: &[ParityIn]) -> Vec<ParityOut> {
+    use wgpu::util::DeviceExt;
+
+    let device = &ctx.device;
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("bsdf parity"),
+        // The BSDF alone, not `shaders::compose`: the environment module in
+        // the full composition wants texture bindings this harness has no use
+        // for, and the point here is to isolate the shading model.
+        source: wgpu::ShaderSource::Wgsl(format!("{}\n{HARNESS}", shaders::BSDF_SHADER).into()),
+    });
+
+    let out_size = (inputs.len() * std::mem::size_of::<ParityOut>()) as u64;
+    let in_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("parity in"),
+        contents: bytemuck::cast_slice(inputs),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("parity out"),
+        size: out_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("parity read"),
+        size: out_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("parity layout"),
+        entries: &[entry(0, true), entry(1, false)],
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("parity bind"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: in_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: out_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("parity pipeline layout"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("parity pipeline"),
+        layout: Some(&pipeline_layout),
+        module: &module,
+        entry_point: Some("parity"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(inputs.len().div_ceil(64) as u32, 1, 1);
+    }
+    enc.copy_buffer_to_buffer(&out_buf, 0, &read_buf, 0, out_size);
+    ctx.queue.submit(Some(enc.finish()));
+
+    let slice = read_buf.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let data = slice
+        .get_mapped_range()
+        .expect("readback buffer did not map");
+    let out: Vec<ParityOut> = bytemuck::cast_slice(&data).to_vec();
+    drop(data);
+    read_buf.unmap();
+    out
+}
+
+/// A sweep over every parameter the model has, one axis at a time plus a
+/// couple of everything-at-once materials.
+fn materials() -> Vec<Pbr> {
+    let base = Pbr {
+        base_color: [0.72, 0.55, 0.38],
+        roughness: 0.35,
+        ..Default::default()
+    };
+    let mut out = vec![base, Pbr::default()];
+    for r in [0.05f32, 0.3, 0.7, 1.0] {
+        out.push(Pbr {
+            roughness: r,
+            ..base
+        });
+    }
+    for v in [0.0f32, 0.3, 0.7, 1.0] {
+        out.push(Pbr {
+            metallic: v,
+            ..base
+        });
+        out.push(Pbr {
+            diffuse_roughness: v,
+            ..base
+        });
+        out.push(Pbr {
+            subsurface: v,
+            diffuse_roughness: 0.5,
+            ..base
+        });
+        out.push(Pbr {
+            specular_tint: v,
+            specular: 0.9,
+            ..base
+        });
+        out.push(Pbr {
+            sheen: v,
+            sheen_roughness: 0.4,
+            ..base
+        });
+        out.push(Pbr {
+            sheen: 0.8,
+            sheen_roughness: v.max(0.05),
+            ..base
+        });
+        out.push(Pbr {
+            clearcoat: v,
+            clearcoat_roughness: 0.12,
+            ..base
+        });
+        out.push(Pbr {
+            anisotropy: v * 2.0 - 1.0,
+            ..base
+        });
+    }
+    for s in [0.0f32, 0.25, 0.5, 1.0] {
+        out.push(Pbr {
+            specular: s,
+            ..base
+        });
+    }
+    for ior in [1.0f32, 1.33, 1.52, 2.4] {
+        out.push(Pbr { ior, ..base });
+    }
+    // Everything at once, twice, so cross-terms between the layers are hit.
+    out.push(Pbr {
+        metallic: 0.4,
+        roughness: 0.28,
+        diffuse_roughness: 0.7,
+        subsurface: 0.35,
+        specular: 0.85,
+        specular_tint: 0.6,
+        sheen: 0.7,
+        sheen_color: [0.9, 0.95, 1.0],
+        sheen_roughness: 0.45,
+        anisotropy: 0.6,
+        clearcoat: 0.8,
+        clearcoat_roughness: 0.1,
+        ..base
+    });
+    out.push(Pbr {
+        metallic: 0.9,
+        roughness: 0.8,
+        diffuse_roughness: 1.0,
+        subsurface: 1.0,
+        specular: 0.2,
+        specular_tint: 1.0,
+        sheen: 1.0,
+        sheen_color: [1.0, 0.7, 0.5],
+        sheen_roughness: 0.9,
+        anisotropy: -0.8,
+        clearcoat: 0.4,
+        clearcoat_roughness: 0.3,
+        ior: 1.7,
+        ..base
+    });
+    // Subsurface: the weight has to take its share out of the diffuse lobe
+    // and appear in the sampling weights, on both tiers, even though the walk
+    // itself lives in the integrator and not in the BSDF.
+    for v in [0.0f32, 0.35, 1.0] {
+        out.push(Pbr {
+            subsurface: v,
+            subsurface_color: [0.85, 0.45, 0.3],
+            subsurface_radius: [0.004, 0.002, 0.0012],
+            diffuse_roughness: 0.4,
+            ..base
+        });
+    }
+    out.push(Pbr {
+        subsurface: 0.6,
+        subsurface_color: [0.6; 3],
+        subsurface_radius: [0.002; 3],
+        sheen: 0.3,
+        clearcoat: 0.4,
+        thin_film_thickness: 240.0,
+        ..base
+    });
+    // Thin films across the whole visible range of thicknesses, over a
+    // dielectric and over metals — the two Fresnel paths the film modulates.
+    for d in [40.0f32, 180.0, 320.0, 550.0, 900.0] {
+        out.push(Pbr {
+            thin_film_thickness: d,
+            ..base
+        });
+        out.push(Pbr {
+            thin_film_thickness: d,
+            thin_film_ior: 2.0,
+            metallic: 1.0,
+            roughness: 0.18,
+            ..base
+        });
+    }
+    out.push(Pbr {
+        thin_film_thickness: 280.0,
+        thin_film_ior: 1.33,
+        metallic: 0.5,
+        roughness: 0.5,
+        clearcoat: 0.4,
+        sheen: 0.3,
+        ..base
+    });
+    // Transmissive dielectrics: clear glass at two roughnesses, a dispersive
+    // N-BK7 marble, an absorbing green slab, and a thin-walled pane.
+    out.push(Pbr::glass(1.52, 0.05));
+    out.push(Pbr::glass(1.33, 0.3));
+    out.push(Pbr::glass(1.5168, 0.02).with_sellmeier(kosm_render::spectrum::BK7_SELLMEIER));
+    out.push(Pbr::glass(1.52, 0.15).with_attenuation([0.82, 0.94, 0.86], 0.05));
+    out.push(Pbr {
+        thin_walled: true,
+        abbe: 64.0,
+        ..Pbr::glass(1.52, 0.1)
+    });
+    // Half-transmissive, so both the opaque lobes and the dielectric one are
+    // live at once and their weights have to add up.
+    out.push(Pbr {
+        transmission: 0.5,
+        roughness: 0.25,
+        clearcoat: 0.3,
+        sheen: 0.2,
+        ..base
+    });
+    out
+}
+
+/// `eta` for a material's own interface, entering from air.
+fn eta_of(m: &Pbr) -> f32 {
+    if m.transmission > 0.0 {
+        m.index_at(None).max(1e-3)
+    } else {
+        1.0
+    }
+}
+
+fn directions() -> Vec<Vec3> {
+    [
+        (0.0, 0.0, 1.0),
+        (0.3, 0.15, 0.94),
+        (0.6, -0.2, 0.77),
+        (0.85, 0.1, 0.52),
+        (-0.5, 0.6, 0.62),
+        (0.94, 0.2, 0.27),
+    ]
+    .iter()
+    .map(|&(x, y, z)| Vec3::new(x, y, z).normalize())
+    .collect()
+}
+
+fn v4(v: Vec3) -> [f32; 4] {
+    [v.x as f32, v.y as f32, v.z as f32, 0.0]
+}
+
+fn v4w(v: Vec3, w: f32) -> [f32; 4] {
+    [v.x as f32, v.y as f32, v.z as f32, w]
+}
+
+/// Build the full cross product of materials, view and light directions, with
+/// a cheap deterministic sample seed riding along in `rnd`.
+fn sweep() -> (Vec<ParityIn>, Vec<(Pbr, Vec3, Vec3, f32)>) {
+    let mut ins = Vec::new();
+    let mut meta = Vec::new();
+    let dirs = directions();
+    let mut k = 0u32;
+    // `wi` also sweeps the lower hemisphere, which is where the dielectric
+    // lobe's transmitted half lives and where nothing was ever checked before.
+    let below: Vec<Vec3> = dirs.iter().map(|d| Vec3::new(d.x, d.y, -d.z)).collect();
+    for m in materials() {
+        let eta = eta_of(&m);
+        for &wo in &dirs {
+            for &wi in dirs.iter().chain(below.iter()) {
+                k = k.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                // Every case is drawn as an RGB path or a hero-wavelength
+                // one; the film takes a different branch for each.
+                let hero = if k & 0x40 != 0 {
+                    0.0
+                } else {
+                    380.0 + 400.0 * ((k >> 20) & 0xFF) as f32 / 256.0
+                };
+                let r = |s: u32| ((k >> s) & 0xFFFF) as f32 / 65536.0;
+                ins.push(ParityIn {
+                    material: GpuMaterial::from_pbr(m),
+                    wo: v4w(wo, eta),
+                    // A wavelength rides in `wi.w` for the dispersion check;
+                    // it plays no part in the BSDF evaluation.
+                    wi: v4w(wi, 380.0 + 400.0 * r(12)),
+                    rnd: [r(0), r(8), r(16), r(4)],
+                    hero: [hero, 0.0, 0.0, 0.0],
+                });
+                meta.push((m, wo, wi, hero));
+            }
+        }
+    }
+    (ins, meta)
+}
+
+#[test]
+#[ignore = "requires GPU"]
+fn gpu_bsdf_eval_matches_the_cpu_reference() {
+    let Some(ctx) = ctx_or_skip("gpu_bsdf_eval_matches_the_cpu_reference") else {
+        return;
+    };
+    let (ins, meta) = sweep();
+    let outs = run(ctx, &ins);
+
+    let mut worst = 0.0f32;
+    for (o, (m, wo, wi, hero)) in outs.iter().zip(&meta) {
+        let (cf, cpdf) = reference_bsdf_eval_at(m, *wo, *wi, eta_of(m), *hero);
+        for c in 0..3 {
+            // The CPU runs f64 and the device f32, and the tables are
+            // interpolated on both sides, so this is an f32 tolerance, not
+            // bit-equality.
+            let scale = cf[c].abs().max(o.eval[c].abs()).max(1e-3);
+            let rel = (cf[c] - o.eval[c]).abs() / scale;
+            worst = worst.max(rel);
+            assert!(
+                rel <= 2e-3,
+                "value channel {c} differs by {rel}: cpu {cf:?} gpu {:?}\n  {m:?}\n  \
+                 wo {wo:?} wi {wi:?}",
+                &o.eval[..3]
+            );
+        }
+        // The lobe probabilities are not visible in any single evaluation and
+        // a divergence in them shows up only as noise, so they are checked
+        // outright.
+        let cw = reference_lobe_weights(m);
+        let gw = [
+            o.lobes_a[0],
+            o.lobes_a[1],
+            o.lobes_a[2],
+            o.lobes_a[3],
+            o.lobes_b[0],
+            o.lobes_b[1],
+        ];
+        for i in 0..6 {
+            assert!(
+                (cw[i] - gw[i]).abs() <= 1e-5,
+                "lobe weight {i}: cpu {cw:?} gpu {gw:?}\n  {m:?}"
+            );
+        }
+        let scale = cpdf.abs().max(o.eval[3].abs()).max(1e-3);
+        let rel = (cpdf - o.eval[3]).abs() / scale;
+        worst = worst.max(rel);
+        assert!(
+            rel <= 2e-3,
+            "pdf differs by {rel}: cpu {cpdf} gpu {}\n  {m:?}\n  wo {wo:?} wi {wi:?}",
+            o.eval[3]
+        );
+    }
+    eprintln!(
+        "worst relative disagreement over {} cases: {worst:e}",
+        meta.len()
+    );
+}
+
+/// The dispersion half: the device's Sellmeier/Cauchy index and its CIE fit
+/// have to be the CPU's, or a prism bends the two tiers by different angles
+/// and the colours land in different places.
+#[test]
+#[ignore = "requires GPU"]
+fn gpu_dispersion_matches_the_cpu_reference() {
+    let Some(ctx) = ctx_or_skip("gpu_dispersion_matches_the_cpu_reference") else {
+        return;
+    };
+    let (ins, meta) = sweep();
+    let outs = run(ctx, &ins);
+    for (o, (i, (m, _, _, _))) in outs.iter().zip(meta.iter().enumerate()) {
+        let lambda = ins[i].wi[3] as f64;
+        let want = m.index_at(Some(lambda));
+        assert!(
+            (want - o.spectral[0]).abs() <= 2e-5 * want.max(1.0),
+            "n({lambda}nm): cpu {want} gpu {}\n  {m:?}",
+            o.spectral[0]
+        );
+        let hw = kosm_render::spectrum::hero_weight(lambda);
+        for c in 0..3 {
+            assert!(
+                (hw[c] - o.spectral[1 + c]).abs() <= 2e-4,
+                "hero_weight({lambda}nm) channel {c}: cpu {} gpu {}",
+                hw[c],
+                o.spectral[1 + c]
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires GPU"]
+fn gpu_bsdf_sample_pdf_matches_eval_pdf() {
+    let Some(ctx) = ctx_or_skip("gpu_bsdf_sample_pdf_matches_eval_pdf") else {
+        return;
+    };
+    let (ins, meta) = sweep();
+    let outs = run(ctx, &ins);
+    for (o, (m, wo, _, _)) in outs.iter().zip(&meta) {
+        let sampled = o.sampled[3];
+        if sampled <= 0.0 {
+            continue; // the sampler rejected this draw
+        }
+        let evaluated = o.resampled[3];
+        assert!(
+            (sampled - evaluated).abs() <= 1e-4 * sampled.max(1.0),
+            "device PDF mismatch: sampled {sampled}, evaluated {evaluated}\n  {m:?}\n  wo {wo:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires GPU"]
+fn gpu_furnace_closes_on_a_rough_metal() {
+    let Some(ctx) = ctx_or_skip("gpu_furnace_closes_on_a_rough_metal") else {
+        return;
+    };
+    // A white metal under Turquin's compensation should return every photon
+    // regardless of how rough it is. Estimated on the device, so the shader's
+    // own GGX_E interpolation is what is on trial.
+    for alpha in [0.2f32, 0.5, 1.0] {
+        let m = Pbr {
+            base_color: [1.0; 3],
+            metallic: 1.0,
+            roughness: alpha.sqrt(),
+            ..Default::default()
+        };
+        for mu in [1.0f64, 0.7, 0.3] {
+            let s = (1.0 - mu * mu).max(0.0).sqrt();
+            let wo = Vec3::new(s, 0.0, mu);
+            let n = 65_536usize;
+            let ins: Vec<ParityIn> = (0..n)
+                .map(|i| {
+                    // Stratified in the lobe-choice and the two lobe
+                    // variates, so the estimate is stable enough for a 1%
+                    // bound without a million invocations.
+                    let a = (i % 256) as f32 / 256.0 + 1.0 / 512.0;
+                    let b = (i / 256) as f32 / 256.0 + 1.0 / 512.0;
+                    ParityIn {
+                        material: GpuMaterial::from_pbr(m),
+                        wo: v4(wo),
+                        wi: v4(wo),
+                        rnd: [0.9, a, b, 0.0],
+                        hero: [0.0; 4],
+                    }
+                })
+                .collect();
+            let outs = run(ctx, &ins);
+            let mut sum = 0.0f64;
+            for o in &outs {
+                if o.sampled[3] > 0.0 {
+                    sum += (o.resampled[0] / o.sampled[3]) as f64;
+                }
+            }
+            let albedo = sum / n as f64;
+            assert!(
+                (0.99..=1.01).contains(&albedo),
+                "device albedo {albedo} at alpha {alpha}, mu {mu}"
+            );
+        }
+    }
+}
