@@ -210,6 +210,8 @@ pub struct Placement {
     pub to_world: Transform,
     /// Multiplies the diffuse albedo of this instance's diffuse prims.
     pub albedo: f64,
+    /// Whether [`Scene::floor_checker`] patterns this instance.
+    pub checker: bool,
 }
 
 impl Placement {
@@ -219,12 +221,15 @@ impl Placement {
             blas,
             to_world,
             albedo: 1.0,
+            checker: true,
         }
     }
 
-    /// The same placement with diffuse albedo scaled by `albedo`.
+    /// The same placement with diffuse albedo scaled by `albedo`, and no
+    /// checker.
     pub fn tinted(mut self, albedo: f64) -> Self {
         self.albedo = albedo;
+        self.checker = false;
         self
     }
 }
@@ -962,7 +967,13 @@ fn trace(
             });
             if scene.surface(&ih) == Surface::Diffuse {
                 // Lambertian: cosine sampling, weight = albedo. θ-free.
-                let albedo = scene.albedo(ih.hit.point) * scene.placements[ih.payload].albedo;
+                let place = &scene.placements[ih.payload];
+                let albedo = place.albedo
+                    * if place.checker {
+                        scene.albedo(ih.hit.point)
+                    } else {
+                        scene.floor_albedo
+                    };
                 if let Some((dir, cos, pl, true)) = nee {
                     let w = mis(pl, cos / std::f64::consts::PI);
                     for k in 0..nw {

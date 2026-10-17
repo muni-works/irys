@@ -89,7 +89,8 @@ struct Path {
 @group(0) @binding(22) var<storage, read_write> dl_out: array<f32>;
 // The scene: nodes (min.xyz, a) (max.xyz, b | LEAF), leaf prim indices, and
 // records: opaque prims (three vec4 each, from 0), instances (four from
-// `inst_base`: world → local rows, then (blas root, prim base, albedo, _)),
+// `inst_base`: world → local rows, then (blas root, prim base, albedo,
+// checker on)),
 // splats (four from `splat_base`). Node 0 is the top-level tree's root.
 @group(0) @binding(23) var<storage, read> nodes: array<vec4<f32>>;
 @group(0) @binding(24) var<storage, read> prim_ids: array<u32>;
@@ -411,10 +412,6 @@ fn hit_normal(h: Hit, o: vec3<f32>, d: vec3<f32>) -> vec3<f32> {
     return normalize(geo[r].xyz * nl.x + geo[r + 1u].xyz * nl.y + geo[r + 2u].xyz * nl.z);
 }
 
-fn inst_albedo(k: u32) -> f32 {
-    return geo[params.inst_base + 4u * k + 3u].z;
-}
-
 fn prim_normal(i: u32, x: vec3<f32>) -> vec3<f32> {
     let r0 = geo[3u * i];
     let r1 = geo[3u * i + 1u];
@@ -432,8 +429,8 @@ fn prim_conductor(i: u32) -> bool {
     return geo[3u * i + 1u].w == 0.0;
 }
 
-fn albedo_at(x: vec3<f32>) -> f32 {
-    if (params.checker > 0.0) {
+fn albedo_at(x: vec3<f32>, checker: bool) -> f32 {
+    if (checker && params.checker > 0.0) {
         let c = floor(x.x / params.checker) + floor(x.y / params.checker);
         if (c - 2.0 * floor(c * 0.5) == 1.0) {
             return params.albedo * 0.55;
@@ -783,7 +780,8 @@ fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
         lit = lcos > 0.0 && !occluded(origin, ld);
     }
     if (!conductor) {
-        let albedo = albedo_at(x) * inst_albedo(hit.inst);
+        let info = geo[params.inst_base + 4u * hit.inst + 3u];
+        let albedo = albedo_at(x, info.w != 0.0) * info.z;
         if (lit) {
             let w = mis(lpdf, lcos / PI);
             for (var k = 0u; k < params.nw; k = k + 1u) {

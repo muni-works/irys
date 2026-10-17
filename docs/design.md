@@ -337,7 +337,7 @@ Remaining risks and follow-ups:
    pipeline on the same GPU. Replaying on another adapter is not promised,
    and nothing needs it.
 6. f32 everywhere on the device; long paths and big scenes will want the
-   offset scaled to the hit distance.
+   offset scaled to the hit distance. *Done in phase 2c, piece 2.*
 
 ## Phase 2b: the real scene on the GPU wavefront (2026-10-17)
 
@@ -416,7 +416,8 @@ Deviations:
 2. **One BVH per kind, not a TLAS.** Two trees in one node buffer; no
    instance transforms. `Tlas` is generic over one geometry type, and mixing
    kinds needs either an enum geometry (what `Opaque` is) or per-instance
-   kinds in the WGSL. The traversal is the same code either way.
+   kinds in the WGSL. The traversal is the same code either way. *A TLAS over
+   instances in phase 2c, piece 1 (one `Opaque` kind per tree).*
 3. **GPU analytic prims are spheres and discs**, and splat colour is
    degree 0; `pack` panics on anything else rather than dropping it.
 4. **Splats are not differentiated**, and they cast no shadows (there are
@@ -437,13 +438,154 @@ Risks and next:
    four-parameter reduction is unchanged work.
 3. **The IR's grid limit.** `to_wgsl` dispatches one-dimensional grids, so a
    frame is capped at 65535 × 64 lanes (the beauty frame renders 4 spp at a
-   time). A 2D grid split, or chunking lanes, lifts it.
+   time). A 2D grid split, or chunking lanes, lifts it. *Done in phase 2c,
+   piece 2 (chunks).*
 4. **f32 offsets** (phase 2a risk 6) bite sooner in a mesh: the fixed
    1e-4 offset is fine at unit scale; a CAD-scale scene needs it scaled to
-   the hit distance.
+   the hit distance. *Done in phase 2c, piece 2.*
 5. **Splat gradients** need the backward walk per segment and per-splat
    parameter accumulation, which brings back the reduction problem at
    10⁵ parameters: per-splat accumulators can't be one workgroup each.
+
+## Phase 2c: instances, NEE, robustness, the rover (2026-10-17)
+
+Three pieces, all in `irys-diff`; splats are untouched (they work as in 2b,
+and refuse NEE).
+
+**Piece 1 — TLAS + instances, NEE and MIS.** `prb::Scene` is now
+bottom-level trees (`Bvh<Opaque>`, shared by `Arc`) placed by
+`irys_core::Tlas` (`Placement`: tree, object → world, diffuse tint); the
+CPU reference traces the `Tlas` itself. The wavefront flattens the top
+level into the node array (root 0), every bottom-level tree after it, and
+one four-`vec4` record per instance (world → local rows, root, first prim,
+tint). The walk is the 2b walk twice: top-level leaves in leaf order, each
+instance through its own tree with the ray mapped into local space and
+*not* renormalised, so a local `t` is the world ray's and hits compare
+across instances with no rescale; the normal comes back by the transpose
+of world → local (the inverse transpose of the placement). Shading is
+two-sided on both tiers.
+
+NEE: at every surface vertex, three uniforms (always drawn, before the
+BSDF's two) pick a light direction from `Env::sample` — `SUN_PICK = ½` the
+sun lobe, which is a von Mises–Fisher density up to scale and so sampled
+exactly, the rest uniform over the sphere for the gradient — and a shadow
+ray (any-hit through the same walk) decides visibility. The power heuristic
+weighs it against BSDF sampling; an escape after a BSDF bounce carries
+`w_B = p_B² / (p_B² + p_L²)` with `p_B` kept in the path state, and the
+camera ray's escape has no rival (`w = 1`). `Env::default()` is 2b's sky to
+the bit, so with `Scene::nee = false` every earlier estimator and test is
+unchanged.
+
+The replay (derived in full on `prb::trace`). Every term of `L` is a
+product of BSDF values: the BSDF-sampled `f_i` of each earlier vertex and,
+for a light term `C_j = T_j f_j(ω_L) cos Le V w_L / p_L`, the light-sampled
+`f_j(ω_L)` once. Regrouping `∂θ log` by `f`,
+
+```text
+∂L/∂θ = Σ_j [ ∂θ log f_j(ω_B,j) · (L − L_j⁺)  +  ∂θ log f_j(ω_L,j) · C_j ]
+```
+
+with `L_j⁺` the radiance collected *including* `C_j`. So at a conductor
+vertex the replay adds `C_j` to its running `L_j` first, then seeds two
+lanes: `δf_L = δL · T_j · s · Le` (`s = cos w_L / p_L`; no division, `f_L`
+may be 0) and `δf_B = δL (L − L_j⁺) / f_B`. The light lanes are a second
+half of the same graph batch (`Scene::graph_width` = 2 × lanes), so one
+eval and one adjoint reduction take both; MIS weights are functions of the
+detached pdfs and are constants to `∂θ` like `p` (they sum to one for every
+`ω`, so this stays unbiased with a live sampler too). Diffuse vertices are
+θ-free: their `C_j` lands in `L_j` and nothing else.
+
+**Piece 2 — robustness.** Origins leave a surface along the normal by
+`ε = max(2⁻¹⁵ |x|∞, 2⁻¹⁷ (|o|∞ + t))` on both tiers (`prb::offset`,
+`offset_ray`), and hits need only `t > 0`. The first term is Wächter &
+Binder's 256 ulps of the position; their per-coordinate integer form
+assumes a hit point interpolated from vertices, and ours is `o + t d`,
+whose rounding grows with `|o| + t` — a floor at `z = 0` seen from 5 m has a
+`z` error of `ulp(5 m)`, not `ulp(0)`; the integer form alone still left
+the ×1000 floor speckled — hence the second term. The CPU uses the same
+constants in f64, so both tiers offset by the same relative amount.
+
+Frames of any size are one call: `GpuPrb` traces a frame in chunks of as
+many paths as one 1-D dispatch of the IR's kernels holds (65535 × 64 graph
+lanes; with NEE, 524 280 paths at 4 λ), one submit per chunk after that
+chunk's uniforms, and scores the whole frame after with 2-D grids (`flat`).
+`L`, `δL` and the image are frame-wide; path state, columns and `δf` are
+the chunk's, and a short last chunk's tail is dead paths with harmless
+lanes. Scoring rebuilds each path's wavelengths from its generator rather
+than reading the (chunk-local) path state. The gradient adds chunk by chunk
+in order, so it is still deterministic.
+
+**Piece 3 — the rover.** `examples/rover.rs`: muni's BVR1 (`bvr/cad`) —
+the 2020-extrusion frame of `BVR1Frame::generate` (T-slots and bore cut by
+vcad's booleans), four `UUMotor::kn6104` hub motors, dropout plates, base
+tray and a lid — authored on vcad 0.10's `Part` and tessellated by vcad's
+kernel, in millimetres. Each repeated part is one tree: a 500 mm rail
+placed 8 times, a 20 mm corner block 8, a 200 mm post 4, the wheel 4, the
+plate 4 (31 instances, 18 966 triangles stored, 84 808 placed). The frame
+and lid are the anodised-gold GGX conductor (θ), wheels and plates tinted
+diffuse, the ground a checkered mesh, sun (κ = 900, ≈ 2° across) and sky
+with NEE. The fit starts at θ = (0.6, 0.6, 0.6, 0.6) and recovers the
+body's roughness and F0 from a 256-spp target render with 8-spp gradients.
+
+| Gate (debug, M-series, Metal; scene `Scene::pair` unless named) | Result |
+|---|---|
+| instances | one mesh ball (16 × 32 UV sphere) placed twice — uniform scale, and squashed + turned — on a mesh floor of a second tree |
+| replay vs forward, NEE, 64×64×4 × 4 λ | 65536/65536 lanes bit-identical at depth 2 and 6; `δθ` identical twice |
+| determinism | two wavefronts × two runs: `L`, image, loss, `δθ` bitwise identical |
+| CPU f64 PRB vs CPU central differences (h = 1e-5, CRN, frozen sampler, 16×16×2) | rel 3.1e-9, 7.0e-11, 1.8e-10, 6.0e-12 — the NEE replay formula, light lanes and `L_j⁺` included |
+| GPU f32 vs CPU f64, frozen, 32×32×4 | `L` median rel 1.1e-7, p99 4.1e-6, 0/16384 lanes > 1e-3; loss rel 1.8e-7; `δθ` rel 3.6e-6, 7.4e-7, 2.7e-7, 4.3e-7 |
+| GPU PRB vs GPU central differences (h = 4e-3, device loss) | rel 9.3e-4, 4.0e-6, 1.2e-5, 1.8e-5 |
+| **NEE + MIS vs BSDF only, equal spp** (64×64×4, 48 frames) | per-pixel variance **4.5× lower**; image means agree to 2.4e-3, worst 8×8 block 2.7 σ |
+| throughput 96×96×8, NEE off / on | debug: forward 1.75 / 2.08 ms, gradient 11.7 / 18.4 ms; release: 0.87 / 1.21 ms, 7.5 / 14.9 ms |
+| ×1000 and ×1e5 scene vs unit (images normalised by their mean) | mean \|Δ\| / mean 2.1e-7 and 1.8e-7, 0/9216 pixels > 20 % darker; the fixed 1e-4 offset at ×1000: 0.21 and 1825/9216 (20 %) |
+| chunked (10 chunks, last short) vs one dispatch | `L`, image, loss bitwise identical; `δθ` rel ≤ 1.2e-7; chunked replay bit-exact |
+| 1024×1024 × 4 spp, NEE, one call | 9 chunks; image 106 ms (release 85 ms), replay 1.0 s, 16 777 216/16 777 216 lanes bit-identical; mean within 5e-4 of 128² × 64 spp |
+| rover: vcad tessellation | 7 parts in 109 s debug, 8 s release |
+| **rover fit**, 192×128×8, NEE, depth 5, 80 its, same Adam as 2b | **θ = [0.182, 0.417, 0.768, 0.987]** (mean of the last 20 iterates) vs truth [0.18, 0.42, 0.78, 0.98]; image MSE 2.70e-3, the same as the truth re-rendered (the noise floor); ≈ 62 ms per gradient, debug and release alike (GPU-bound) |
+| rover beauty, 768×512, 256 spp (16 calls × 16 spp, 13 chunks each), depth 6 | 2.7 s debug, 2.6 s release |
+
+![phase 2c rover](phase2c-rover.png)
+
+![phase 2c fit](phase2c-fit.png) (`phase2c-loss.csv` is every iteration's
+8-spp loss and θ.)
+
+Deviations:
+
+1. **The rover CAD is ported, not imported.** `bvr/cad` is a crate on a
+   path dependency of a private checkout, so it cannot be a dependency here;
+   `examples/rover.rs` repeats its calls (same dimensions, same booleans) on
+   crates.io vcad 0.10, a dev-dependency only (no irys crate depends on
+   vcad). The vcad graph is wgpu-free (vcad-kernel-raytrace's `gpu` feature
+   is off) but brings crates.io kosm-render 0.2.0 as a second copy beside
+   the workspace shim, dev-only. Simplified against the full assembly: plates
+   for the dropout mounts, a box lid for the shell, no electronics.
+2. **The sun is the environment's lobe**, sampled exactly, not a separate
+   area emitter; there are no mesh emitters yet.
+3. **The phase-2 gate is half met**: the rover is in a scene and its
+   material is fitted from a *render*. A photo needs a camera pose and the
+   lighting, and pose needs visibility gradients (below).
+4. Wächter & Binder's per-coordinate integer offset is replaced by a scalar
+   ε with a distance term (piece 2 above, and why).
+5. Chunking is the wavefront's; the IR's grid is still one-dimensional
+   (tang unchanged).
+6. NEE with splats is refused: shadow rays would have to composite them.
+
+Risks and next:
+
+1. **Visibility gradients.** θ moves no geometry, so the estimator has no
+   boundary term. Fitting pose or shape from a photo (the actual gate)
+   needs the reparameterisation kernel (warped area, Bangaru+ 2020), and
+   then edges of 85 k triangles are the expensive part.
+2. **NEE doubles the graph batch**: release gradient 7.5 → 14.9 ms. The
+   fused four-parameter reduction (2a risk 2) matters twice as much now.
+3. **One submit per chunk**, uniforms by queue writes; at hundreds of chunks
+   a dynamic-offset uniform array would put a frame in one submit.
+4. **Fixed traversal stacks** (32 top, 64 bottom): `pack` refuses deeper
+   trees rather than overflowing; a TLAS of 10⁵ instances will want more.
+5. Light sampling knows only the environment; emissive meshes (and the
+   rover's LEDs) need a light tree.
+6. f32 holds at ×1e5 about the origin; a kilometre scene with millimetre
+   parts wants camera-relative positions.
 
 ## Open questions
 

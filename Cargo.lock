@@ -18,6 +18,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
+name = "approx"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab112f0a86d568ea0e627cc1d6be74a1e9cd55214684db5561995f6dad897c6"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -95,6 +110,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
+name = "cc"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6651c9ed80effdc7db0ff72512157f901af5e3549e341e24b1dd4887d836d838"
+dependencies = [
+ "find-msvc-tools",
+ "shlex",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -105,6 +136,15 @@ name = "cfg_aliases"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
+
+[[package]]
+name = "clipper-sys"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc6bccb550d47c390af7a601bee66a74fd3a01163feb85442021096f5533d2e5"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "codespan-reporting"
@@ -177,6 +217,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "earcutr"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79127ed59a85d7687c409e9978547cffb7dc79675355ed22da6b66fd5f6ead01"
+dependencies = [
+ "itertools",
+ "num-traits",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -187,6 +237,18 @@ name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
+
+[[package]]
+name = "find-msvc-tools"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
+
+[[package]]
+name = "float_next_after"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bf7cc16383c4b8d58b9905a8509f02926ce3058053c056376248d958c9df1e8"
 
 [[package]]
 name = "foldhash"
@@ -216,6 +278,55 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "geo"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f811f663912a69249fa620dcd2a005db7254529da2d8a0b23942e81f47084501"
+dependencies = [
+ "earcutr",
+ "float_next_after",
+ "geo-types",
+ "geographiclib-rs",
+ "log",
+ "num-traits",
+ "robust",
+ "rstar",
+ "spade",
+]
+
+[[package]]
+name = "geo-clipper"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c080ca0fbf8beeaad1c3bb420d00db56fa109f92cb8e985a0ff53fb5c2820bab"
+dependencies = [
+ "clipper-sys",
+ "geo-types",
+]
+
+[[package]]
+name = "geo-types"
+version = "0.7.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "777d18aa0f12f8b285331cd867133ee14422b3f023f6d388034c47d43e28786a"
+dependencies = [
+ "approx",
+ "num-traits",
+ "rstar",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "geographiclib-rs"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5a7f08910fd98737a6eda7568e7c5e645093e073328eeef49758cfe8b0489c7"
+dependencies = [
+ "libm",
 ]
 
 [[package]]
@@ -277,6 +388,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hash32"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -294,6 +414,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
  "foldhash",
+]
+
+[[package]]
+name = "heapless"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
+dependencies = [
+ "hash32",
+ "stable_deref_trait",
 ]
 
 [[package]]
@@ -339,6 +469,7 @@ dependencies = [
  "tang",
  "tang-compile",
  "tang-expr",
+ "vcad",
 ]
 
 [[package]]
@@ -372,6 +503,21 @@ dependencies = [
  "irys-core",
  "tang",
 ]
+
+[[package]]
+name = "itertools"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1c173a5686ce8bfa551b3563d0c2170bf24ca44da99c7ca4bfdab5418c3fe57"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itoa"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jni-sys"
@@ -431,6 +577,16 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "kosm-render"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f34e90e3f7552416125f7652e504526e79269fb7b9c1abe4db1b68396ffae87"
+dependencies = [
+ "rayon",
+ "tang",
+]
+
+[[package]]
+name = "kosm-render"
 version = "0.2.1"
 dependencies = [
  "irys",
@@ -478,6 +634,12 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "memchr"
+version = "2.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "naga"
@@ -789,6 +951,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
+name = "robust"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e27ee8bb91ca0adcf0ecb116293afa12d393f9c2b9b9cd54d33e8078fe19839"
+
+[[package]]
+name = "rstar"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "421400d13ccfd26dfa5858199c30a5d76f9c54e0dba7575273025b43c5175dbb"
+dependencies = [
+ "heapless",
+ "num-traits",
+ "smallvec",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -799,6 +978,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "scopeguard"
@@ -837,6 +1022,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json"
+version = "1.0.154"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
+]
+
+[[package]]
+name = "serde_spanned"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -858,6 +1071,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
 
 [[package]]
+name = "spade"
+version = "2.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9699399fd9349b00b184f5635b074f9ec93afffef30c853f8c875b32c0f8c7fa"
+dependencies = [
+ "hashbrown 0.16.1",
+ "num-traits",
+ "robust",
+ "smallvec",
+]
+
+[[package]]
 name = "spirv"
 version = "0.4.0+sdk-1.4.341.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -867,10 +1092,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "stable_deref_trait"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "stepperoni"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fad37b3273eb59fa35e3cf6868d85316378522f6ec6aa91ee7a5007d5e8288bb"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "syn"
@@ -900,6 +1140,7 @@ version = "0.2.1"
 source = "git+https://github.com/ecto/tang?rev=bfc8003#bfc8003b08d29a2bb1f62b00c771d59a2d9fc3bd"
 dependencies = [
  "paste",
+ "robust",
 ]
 
 [[package]]
@@ -915,6 +1156,15 @@ dependencies = [
 name = "tang-expr"
 version = "0.1.1"
 source = "git+https://github.com/ecto/tang?rev=bfc8003#bfc8003b08d29a2bb1f62b00c771d59a2d9fc3bd"
+dependencies = [
+ "tang",
+]
+
+[[package]]
+name = "tang-la"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a1cf961cd2968a09fb079624db1eae07390acbe238fe61f075555b5302009d"
 dependencies = [
  "tang",
 ]
@@ -958,6 +1208,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
+dependencies = [
+ "serde",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_edit",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "0.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.22.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_write",
+ "winnow",
+]
+
+[[package]]
+name = "toml_write"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "ttf-parser"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -968,6 +1265,555 @@ name = "unicode-width"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+
+[[package]]
+name = "vcad"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb87421f63dcd0acdb4ed8ed9f8ffe2b21505cacbf9a798b874156db89f1936b"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tang",
+ "thiserror",
+ "toml",
+ "vcad-ir",
+ "vcad-kernel",
+ "vcad-kernel-export",
+]
+
+[[package]]
+name = "vcad-gdsii"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "554e6a7f7645aa91e4f28c3dae8963a54d84ddac16b1c404be91c618200c54f0"
+dependencies = [
+ "geo",
+ "thiserror",
+ "vcad-ir",
+]
+
+[[package]]
+name = "vcad-ir"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5084f04cb0ebbebe3ebafbacec4f9fc119b4cc449b6dfc6401301523a9c48cc1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "vcad-tool-derive",
+]
+
+[[package]]
+name = "vcad-kernel"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07f2dcbceff8bfad67516264addfd399e2124c54577b3dcf6104f288dd51e69d"
+dependencies = [
+ "serde",
+ "vcad-kernel-acoustics",
+ "vcad-kernel-antenna",
+ "vcad-kernel-booleans",
+ "vcad-kernel-calibration",
+ "vcad-kernel-cam",
+ "vcad-kernel-constraints",
+ "vcad-kernel-cost",
+ "vcad-kernel-dfm",
+ "vcad-kernel-em",
+ "vcad-kernel-enclosure",
+ "vcad-kernel-fea",
+ "vcad-kernel-fillet",
+ "vcad-kernel-flow",
+ "vcad-kernel-geom",
+ "vcad-kernel-math",
+ "vcad-kernel-naming",
+ "vcad-kernel-neutronics",
+ "vcad-kernel-particle",
+ "vcad-kernel-photonics",
+ "vcad-kernel-primitives",
+ "vcad-kernel-qcd",
+ "vcad-kernel-sheet",
+ "vcad-kernel-shell",
+ "vcad-kernel-sketch",
+ "vcad-kernel-step",
+ "vcad-kernel-stocksim",
+ "vcad-kernel-sweep",
+ "vcad-kernel-tessellate",
+ "vcad-kernel-text",
+ "vcad-kernel-thermal",
+ "vcad-kernel-tolerance",
+ "vcad-kernel-topo",
+ "vcad-kernel-topopt",
+]
+
+[[package]]
+name = "vcad-kernel-acoustics"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c5c1f5813e3d19b69b05d30fce46a4fd2be70376978ce27c36070b70d9d255e"
+dependencies = [
+ "serde",
+ "vcad-receipt",
+]
+
+[[package]]
+name = "vcad-kernel-adjoint"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e74699ad56880e95e3ed6def9ed68f221e9dd6977be4d1a78d3b7b861e2727d"
+dependencies = [
+ "serde",
+ "vcad-receipt",
+]
+
+[[package]]
+name = "vcad-kernel-antenna"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "830058bb200a56453ec360806f6587326d686e6c62f03d6037433540deb8e170"
+dependencies = [
+ "serde",
+ "vcad-receipt",
+]
+
+[[package]]
+name = "vcad-kernel-booleans"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "243c7e55e64bb705fe1d83803a7c84e49eb9c9992e2fc2b0b11478d1e9c99f17"
+dependencies = [
+ "rayon",
+ "vcad-kernel-geom",
+ "vcad-kernel-math",
+ "vcad-kernel-primitives",
+ "vcad-kernel-tessellate",
+ "vcad-kernel-topo",
+]
+
+[[package]]
+name = "vcad-kernel-calibration"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a75f9d52d0df43d51e7cec4e9c628c2684c63afb4c8965619a79beddf4ad8d38"
+dependencies = [
+ "ryu",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "vcad-kernel-cam"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a901ef35b7d7db5c879c71ac4e371aa41df01a2ae364f9db8584ef576e7236b"
+dependencies = [
+ "geo",
+ "geo-clipper",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "vcad-kernel-math",
+]
+
+[[package]]
+name = "vcad-kernel-constraints"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22707aca1db91e2f30f4016f5909b7fcc6ed97653154cc716528e1edee1eec80"
+dependencies = [
+ "slotmap",
+ "tang",
+ "tang-expr",
+ "tang-la",
+ "thiserror",
+ "vcad-kernel-math",
+ "vcad-kernel-sketch",
+]
+
+[[package]]
+name = "vcad-kernel-cost"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efa25e3d46cd425d9322d6c715d00bc399a9398d6ac5e3bae01854f8969358c9"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "vcad-kernel-dfm"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29e383d6358fe4cee4da276e5495fb760311210ee11c00191d005ab1538497fe"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+ "vcad-ir",
+ "vcad-kernel-cost",
+ "vcad-kernel-geom",
+ "vcad-kernel-math",
+ "vcad-kernel-primitives",
+ "vcad-kernel-raytrace",
+ "vcad-kernel-tessellate",
+ "vcad-kernel-topo",
+]
+
+[[package]]
+name = "vcad-kernel-em"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84f3553b3546af516fd21425adfdb8f334c042320293b6f332e0e7fba8809ff8"
+dependencies = [
+ "serde",
+ "vcad-receipt",
+]
+
+[[package]]
+name = "vcad-kernel-enclosure"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2b15f769e52e3c9ba79a68875b16d22a0fe30e37383264c633e96aad84210e4"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "vcad-kernel-export"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31c45b8a7a771633117ebbb9a8c3dc532806f645d0234a5847b45770c0e7b1fc"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "vcad-kernel-fea"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba75bd2d427601c29d81bc918da44e784e446851efa4292b6d33f4f9393eb7da"
+dependencies = [
+ "serde",
+ "vcad-kernel-tessellate",
+ "vcad-receipt",
+]
+
+[[package]]
+name = "vcad-kernel-fillet"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b41b0e4ce860dcd9f5db429f44801efe0a5744d77ccd27eaebba160f62742bf0"
+dependencies = [
+ "vcad-kernel-geom",
+ "vcad-kernel-math",
+ "vcad-kernel-nurbs",
+ "vcad-kernel-primitives",
+ "vcad-kernel-topo",
+]
+
+[[package]]
+name = "vcad-kernel-flow"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4461acd941a02baa034be0cf395306bbd6ea0a25556bdb2868b545a7a916fdb"
+dependencies = [
+ "serde",
+ "vcad-kernel-adjoint",
+ "vcad-kernel-thermal",
+ "vcad-receipt",
+]
+
+[[package]]
+name = "vcad-kernel-geom"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e644f69de0cdc1a5206e962d0f5228557eb22ab533f0015c41a0b444f522982b"
+dependencies = [
+ "tang",
+ "vcad-kernel-math",
+]
+
+[[package]]
+name = "vcad-kernel-math"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccd3c99901cdeb3e3660431717478a377f90d2501b4c747daf8d981018443481"
+dependencies = [
+ "tang",
+]
+
+[[package]]
+name = "vcad-kernel-naming"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4d8cc94b1ddac39b9299d33e05092e877f33058ced05e460488a5ebf57a57f0"
+dependencies = [
+ "vcad-kernel-geom",
+ "vcad-kernel-math",
+ "vcad-kernel-primitives",
+ "vcad-kernel-topo",
+]
+
+[[package]]
+name = "vcad-kernel-neutronics"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42d113ee27bb8b41063c3da5b743ce12df45f5cbaf48334c5c10d53238497c28"
+dependencies = [
+ "serde",
+ "vcad-receipt",
+]
+
+[[package]]
+name = "vcad-kernel-nurbs"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ade3700c0c18267e9743bcfceca55e32d1137ea61f833723d688960288b0d360"
+dependencies = [
+ "tang",
+ "vcad-kernel-geom",
+ "vcad-kernel-math",
+]
+
+[[package]]
+name = "vcad-kernel-particle"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12f9e726437990f3df1076dbce8ccafe788b102e0da69cf7810103127a5cb2af"
+dependencies = [
+ "serde",
+ "vcad-receipt",
+]
+
+[[package]]
+name = "vcad-kernel-photonics"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "534b02f442e56e6ba0f7e638e7ff979d909eada1bfd3be8a053719e4be693e5e"
+dependencies = [
+ "serde",
+ "vcad-gdsii",
+ "vcad-receipt",
+]
+
+[[package]]
+name = "vcad-kernel-primitives"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46f7a1259f7433df55e7460277e92f1cbc7088b9721cb2a9835432ed7e226482"
+dependencies = [
+ "vcad-kernel-geom",
+ "vcad-kernel-math",
+ "vcad-kernel-topo",
+]
+
+[[package]]
+name = "vcad-kernel-qcd"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "643e42a4e44fd4a4819537046d261b955b6269bf699b31e4492a4167271d05fb"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "vcad-kernel-raytrace"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b11287224c7ca6b7f650a3a0a2700caf8e3c4e8affe3d0a87bb5ce6133036141"
+dependencies = [
+ "bytemuck",
+ "js-sys",
+ "kosm-render 0.2.0",
+ "rayon",
+ "smallvec",
+ "tang",
+ "thiserror",
+ "vcad-ir",
+ "vcad-kernel-booleans",
+ "vcad-kernel-geom",
+ "vcad-kernel-math",
+ "vcad-kernel-primitives",
+ "vcad-kernel-tessellate",
+ "vcad-kernel-topo",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "vcad-kernel-sheet"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "336ef04236dd4e1e721e7602564cbd1842e3ef0eb166033073e2b545eaac230b"
+dependencies = [
+ "serde",
+ "serde_json",
+ "vcad-kernel-math",
+ "vcad-receipt",
+]
+
+[[package]]
+name = "vcad-kernel-shell"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e83be33852e494ed714fa938cd6e191e6fc3761b7cc41ab36f8390af6f86323e"
+dependencies = [
+ "vcad-kernel-geom",
+ "vcad-kernel-math",
+ "vcad-kernel-primitives",
+ "vcad-kernel-tessellate",
+ "vcad-kernel-topo",
+]
+
+[[package]]
+name = "vcad-kernel-sketch"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "303d403dc48b60c15fa78e229d8c367d715c5e580485958bd56dd5d9a6026c75"
+dependencies = [
+ "thiserror",
+ "vcad-kernel-geom",
+ "vcad-kernel-math",
+ "vcad-kernel-primitives",
+ "vcad-kernel-topo",
+]
+
+[[package]]
+name = "vcad-kernel-step"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e897e80f2bde8c5e3433d9213b41c4664da0b3a35e45657872fb72dfe4b7977"
+dependencies = [
+ "stepperoni",
+ "thiserror",
+ "vcad-kernel-geom",
+ "vcad-kernel-math",
+ "vcad-kernel-nurbs",
+ "vcad-kernel-primitives",
+ "vcad-kernel-topo",
+]
+
+[[package]]
+name = "vcad-kernel-stocksim"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9682fd588ec9d7d284159edbf92e89e910df5f6dd89170aa73389f1dec50a34"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "vcad-kernel-cam",
+ "vcad-kernel-math",
+]
+
+[[package]]
+name = "vcad-kernel-sweep"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1933fbb53b4fc87c60efa662b75549ad0250e475d2d59d3197ed5176ff149b09"
+dependencies = [
+ "rustc-hash",
+ "thiserror",
+ "vcad-kernel-geom",
+ "vcad-kernel-math",
+ "vcad-kernel-primitives",
+ "vcad-kernel-sketch",
+ "vcad-kernel-topo",
+]
+
+[[package]]
+name = "vcad-kernel-tessellate"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da5e1f864c8f3cbb3258174cadf5ba86ab6c5d8de21ef68e9df21c7f3d760e85"
+dependencies = [
+ "earcutr",
+ "serde",
+ "serde_json",
+ "tang",
+ "vcad-kernel-geom",
+ "vcad-kernel-math",
+ "vcad-kernel-primitives",
+ "vcad-kernel-topo",
+]
+
+[[package]]
+name = "vcad-kernel-text"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4a6b9be856f57403b0f82a65b15d1eef861e09df8f80127eb48127e2de377f3"
+dependencies = [
+ "thiserror",
+ "ttf-parser",
+ "vcad-kernel-math",
+ "vcad-kernel-sketch",
+]
+
+[[package]]
+name = "vcad-kernel-thermal"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b672ee5fe0406e5ba9dabc209e99dad22b9f5e43f2393a62eda0653c3574d18"
+dependencies = [
+ "serde",
+ "vcad-receipt",
+]
+
+[[package]]
+name = "vcad-kernel-tolerance"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ec19a855222b7ea2546d1fed3c458e57bbd1aec383a2d8997bac4498977f99e"
+dependencies = [
+ "serde",
+ "vcad-kernel-adjoint",
+ "vcad-receipt",
+]
+
+[[package]]
+name = "vcad-kernel-topo"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ccb839ee0efb80e7343449442d0806ae057beb076da0a88da55b03ae6f879eb"
+dependencies = [
+ "slotmap",
+ "vcad-kernel-math",
+]
+
+[[package]]
+name = "vcad-kernel-topopt"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16e9abab273ae85a4683e7a62aab3ecb7b65f7e56f0da1b1647bfc686150cc77"
+dependencies = [
+ "serde",
+ "vcad-kernel-tessellate",
+]
+
+[[package]]
+name = "vcad-receipt"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa2bd645cd2f7a1e4d75f4d03eeb2c5a1cc0be12a31703368dc30b4f310f9dcf"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "vcad-tool-derive"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c0486d0c026fc694ca273466f775d3d76fa035df59bfbd298fd536d51870b44"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "version_check"
@@ -1355,6 +2201,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "winnow"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "xml-rs"
 version = "0.8.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1379,3 +2234,9 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"

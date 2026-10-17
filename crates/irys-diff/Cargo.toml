@@ -34,3 +34,12 @@ required-features = ["gpu"]
 [[example]]
 name = "fit_scene"
 required-features = ["gpu"]
+
+[dev-dependencies]
+# examples/rover: muni's BVR1 rover built from vcad parts and tessellated
+# by vcad's own kernel. A dev-dependency only: no irys crate depends on vcad.
+vcad = { version = "0.10", default-features = false }
+
+[[example]]
+name = "rover"
+required-features = ["gpu"]

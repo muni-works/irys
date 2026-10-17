@@ -368,7 +368,7 @@ fn pack(scene: &Scene) -> (Vec<[f32; 4]>, Vec<u32>, Vec<[f32; 4]>, Layout) {
                 f32::from_bits(root),
                 f32::from_bits(prim_base),
                 place.albedo as f32,
-                0.0,
+                if place.checker { 1.0 } else { 0.0 },
             ],
         ]);
     }
