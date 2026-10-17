@@ -470,6 +470,7 @@ dependencies = [
  "tang-compile",
  "tang-expr",
  "vcad",
+ "vcad-kernel",
 ]
 
 [[package]]

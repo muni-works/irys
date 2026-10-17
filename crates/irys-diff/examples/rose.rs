@@ -1,6 +1,7 @@
-//! Phase 2d: rose full's left arm — read from the rose repo's `.loon` link
-//! files, tessellated by vcad 0.10 ([`arm`]) — as irys's hero frame, and the
-//! check that the pose gradient holds on it.
+//! Phase 2d: rose full — the whole robot, read from the rose repo's
+//! assembly `full/cad/rose-full.loon` and tessellated by vcad 0.10's kernel
+//! ([`arm`]), its left arm posed — as irys's hero frame, and the check that
+//! the pose gradient holds on it.
 //!
 //! `cargo run --release -p irys-diff --features gpu --example rose -- out/rose`
 //! writes `beauty.ppm` (768 × 768, 256 spp, depth 6, sun and sky with NEE)
@@ -78,16 +79,16 @@ fn check(arm: &arm::Arm, depth: usize, label: &str) {
     let ctx = gpu::context().expect("check needs a GPU adapter");
     let (w, h) = (96, 96);
     let phi = arm::TRUE_PHI;
-    let rig: Rig = arm::rig();
+    let rig: Rig = arm.rig();
     let g = weights(w, h);
     let mut s = arm::scene(arm, (w, h), 1, &phi);
     s.depth = depth;
     if depth == 1 {
         // The mask: no NEE, and the ground shrunk to nothing far below, so
-        // every pixel is the sky or the arm (or the static post).
+        // every pixel is the sky or the robot (the body is static).
         s.nee = false;
         s.place(&[(
-            9,
+            arm.meshes.len(),
             irys_core::Transform::translation(-5e6, -5e6, -1e6)
                 .then(&irys_core::Transform::scale(1e-3, 1e-3, 1e-3)),
         )]);
@@ -294,7 +295,7 @@ fn main() {
     let out = Path::new(&out);
     std::fs::create_dir_all(out).unwrap();
     let arm = arm::load_arm(&arm::rose_dir());
-    for (name, m) in arm::TREES.iter().zip(&arm.meshes) {
+    for (name, m) in arm.names.iter().zip(&arm.meshes) {
         eprintln!("  {name:14} {:6} triangles", m.triangles().len());
     }
     let mode = args.next();
@@ -311,7 +312,7 @@ fn main() {
         return;
     }
     if mode.as_deref() == Some("mini") {
-        for (name, m) in arm::TREES.iter().zip(&arm.meshes).take(4) {
+        for (name, m) in arm.names.iter().zip(&arm.meshes).take(4) {
             mini_check(m, name);
         }
         return;

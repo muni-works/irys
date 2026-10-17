@@ -1,4 +1,5 @@
-//! Phase 2d: recover rose's arm pose (shoulder pitch, shoulder roll, elbow)
+//! Phase 2d: recover rose full's left arm pose — the arm alone, placed as
+//! in rose-full.loon — (shoulder pitch, shoulder roll, elbow)
 //! *and* its finish (GGX `α`, F0 at three bands) from a target render, by
 //! path replay backprop for `θ` and edge-sampled visibility gradients for
 //! `φ` ([`irys_diff::vis`]), both on the GPU wavefront.
@@ -78,7 +79,7 @@ fn main() {
     fs::create_dir_all(out).unwrap();
     let ctx = gpu::context().expect("rose_fit needs a GPU adapter");
     let arm = arm::load_arm(&arm::rose_dir());
-    let rig = arm::rig();
+    let rig = arm.rig();
 
     let truth_phi = arm::TRUE_PHI;
     let truth_theta = arm::TRUE_THETA;
@@ -90,7 +91,7 @@ fn main() {
     let mut theta = [0.6, 0.55, 0.62, 0.70];
     let (phi0, theta0) = (phi, theta);
 
-    let mut reference = arm::scene_from(&arm, SIZE, 32, &truth_phi, arm::FIT_CAM);
+    let mut reference = arm::arm_scene_from(&arm, SIZE, 32, &truth_phi, arm::FIT_CAM);
     let mut gr = GpuPrb::new(ctx, &reference);
     let target = match &photo {
         Some(p) => {
@@ -103,7 +104,7 @@ fn main() {
     arm::ppm(&out.join("target.ppm"), SIZE, &target, EXPOSURE);
     let target64: Vec<f64> = target.iter().map(|&x| x as f64).collect();
 
-    let mut scene = arm::scene_from(&arm, SIZE, 8, &phi, arm::FIT_CAM);
+    let mut scene = arm::arm_scene_from(&arm, SIZE, 8, &phi, arm::FIT_CAM);
     let mut g = GpuPrb::new(ctx, &scene);
     g.set_target(&target64);
     let edges = Edges::new(&scene);

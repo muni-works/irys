@@ -39,6 +39,9 @@ required-features = ["gpu"]
 # examples/rover: muni's BVR1 rover built from vcad parts and tessellated
 # by vcad's own kernel. A dev-dependency only: no irys crate depends on vcad.
 vcad = { version = "0.10", default-features = false }
+# examples/rose: rose-full.loon's chest panels are sketch extrusions, which
+# only the kernel's `Solid` exposes. The same 0.10 vcad already pulls in.
+vcad-kernel = "0.10"
 
 [[example]]
 name = "rover"
@@ -46,6 +49,10 @@ required-features = ["gpu"]
 
 [[example]]
 name = "rose"
+required-features = ["gpu"]
+
+[[example]]
+name = "rose_check"
 required-features = ["gpu"]
 
 [[example]]
