@@ -587,6 +587,164 @@ Risks and next:
 6. f32 holds at ×1e5 about the origin; a kilometre scene with millimetre
    parts wants camera-relative positions.
 
+## Phase 2d: visibility gradients, rose's arm (2026-10-17)
+
+The hero subject is now rose full's left arm (the rover stays as an
+example). Three pieces: pose gradients through primary visibility, the arm
+from rose's own CAD, and a fit that recovers three joint angles and the
+finish together. Splats are untouched.
+
+**The choice: edge sampling, not a reparameterisation.** The brief named
+warped-area sampling (Bangaru, Li & Durand 2020) or Loubet et al. 2019's
+reparameterisation. Both were weighed against what the wavefront is:
+
+- *Warped area* needs a warp field `V` that is continuous across every
+  discontinuity and equals its velocity there. With a box pixel filter the
+  pixel borders are discontinuities of the integrand too (velocity 0), so
+  `V` must also vanish on them — which contradicts matching a silhouette
+  crossing a pixel border; the paper gets out of this with a smooth
+  reconstruction filter spanning pixels. So: a new image formation (tent or
+  Gaussian splatting) on both tiers, auxiliary rays per primary ray, and the
+  harmonic boundary-test weights — and its estimate of `V` is a ratio of
+  sums, consistent rather than unbiased at finite auxiliary counts.
+- *Loubet* is cheaper (one rotation per ray, picked from auxiliary rays)
+  but biased by construction wherever more than one discontinuity is in the
+  kernel — on an arm of 550 k triangles, everywhere near the silhouette.
+
+The parameters here are rigid instance placements and the camera is fixed,
+so the discontinuity set is known exactly: the projected edges of the moving
+triangles. Reynolds' transport over that set — the boundary integral both
+methods above are ways of *not* evaluating — is directly samplable: Li et
+al. 2018's edge sampling restricted to primary rays. It is exact, needs no
+change to image formation or to the path kernel (the two sides of an edge
+are two ordinary camera paths), and is tested against central differences
+to the noise. `vis.rs` derives it in full:
+
+```text
+∂I_p/∂φ ⊇ ∫_{E ∩ p} (f(s − εn) − f(s + εn)) · v_n(s) dℓ(s),   v_n = n · ∂π(X(s))/∂φ
+```
+
+- **Candidates.** Every triangle edge of every moving instance, projected
+  and clipped to the frame. `Edges` welds each tree once (positions to
+  1e-7 of the diagonal) to find each edge's neighbour: shared with a
+  coplanar triangle → never a candidate; otherwise an importance —
+  silhouette (one face front, one back) and boundary 1, a crease between
+  front faces `clamp(4 (1 − cos), 0.02, 1)` (a cylinder facet ≈ 0.08, a
+  right angle 1), back-only 0.02 (winding is a hint: nothing gets weight 0,
+  so it stays unbiased). `n` samples per call, stratified over
+  `Σ ℓ w`, each weighted `Σℓw / (w_e n)`.
+- **The two sides** are two full paths through `s ∓ εn`, `ε = 10⁻³ px`,
+  traced by the existing wavefront in a new *point mode*
+  (`Scene::set_points`, WGSL binding 26): path `i` leaves through a given
+  camera-plane point and is keyed `i / 2`, so a pair shares wavelengths and
+  every uniform after the camera — the difference is common random numbers.
+- **Ownership.** Each triangle owns its edges: the inner ray must hit that
+  triangle, *or a coplanar one of the same face* — CAD tessellations are
+  full of slivers thinner than ε, and without this the vcad plate's
+  edge term came out 60 % high; a test now holds it. Where the outer ray
+  lands on the same instance within 10⁻⁴ of the distance (a crease, which
+  the neighbour samples from its side), each side takes half. A silhouette's
+  back face sees its inner ray hit the front face (not coplanar) and is 0.
+- **Velocity.** `X(s)` is the edge line's closest approach to the camera ray
+  through `s`, carried back to object space; `v = J_π · ∂X/∂φ`, with
+  `∂X/∂φ` from central differences (h = 1e-6) of the rig's closed-form
+  placement — a derivative of the rig, exact to ~1e-10, not of the image.
+- **What is left out.** The interior derivative of `f` at fixed `x` (shading
+  at the hit turning with the link) and every secondary discontinuity
+  (shadows, reflections). Against the sky at depth 1 the edge term is the
+  whole derivative; shaded, it is not (below), and the fit converges anyway
+  because the target is a fixed point of any gradient linear in `δI`.
+
+GPU: the edge term is host bookkeeping (sampling, ownership tests on the CPU
+TLAS, weights) around one point-mode forward pass on the device;
+`GpuPrb::update_geometry` re-uploads the top-level tree and instance records
+after `Scene::place` (buffers carry room for the tree to change shape) and
+is tested bitwise against a rebuild.
+
+**The arm.** `examples/rose/arm.rs` reads `full/cad/links/{shoA,shoB,elbA,hand}.loon`
+and the four arm envelopes of `full/cad/actuators.loon` from the rose
+checkout as they are — generated `[let NAME EXPR]` forms over `plate-*`,
+`bore-*`, `act-*`, `union`, `difference` — with a 150-line reader, and
+evaluates them onto vcad 0.10's `Part`; the vocabulary (vcad's
+`hardware/rose-full/plates.loon`) is ported call for call, because
+vcad-loon is not on crates.io. Each link's plates are one tree (shoA 223 304
+triangles, shoB 145 818, elbA 175 934, hand 5 104), each actuator its own
+(dark diffuse, carried by the link its stator plate bolts to), plus a post
+for the shoulder to hang from and the ground: 10 instances, 550 k
+triangles. The chain is `rose_full_layout.py`'s `arm('L')`: shoulder pitch
+about `y` through (0, 255, 462) → shoA; roll about `x` through (·, 255, 362)
+→ shoB; elbow about `y` through (0, 255, 235.2) → elbA and the hand (wrist
+held). The *full* variant is the one used — it is the one whose links exist
+as modules, and its arm is light enough: 22 tessellations take 303 s
+release on a cold cache (vcad's booleans on bored plates, 10–30 s each),
+then 8 ms from the cache. Links are clear-anodised aluminium (GGX
+`θ = (0.30, 0.86, 0.88, 0.90)`), actuators at `actuators.loon`'s 0.10 grey.
+
+| Gate (M-series, Metal) | Result |
+|---|---|
+| box vs sky, depth 1, 40×30, edge 24 × 8192 samples vs CD over 48² fixed points per pixel (h 0.05) | rel 6.7e-2, 1.1e-1, 4.1e-3 — within 3.3, 0.8, 1.3 σ of the edge estimate (the CD reference is good to ~1 %) |
+| vcad rounded plate (5 110 triangles) vs sky, same | rel 6.7e-2, 9.2e-4, 2.4e-3 (z 0.7, 0.05, 0.9) |
+| edge term on the device (f32) vs CPU f64, same samples, depth 3 | rel 1.8e-6, 7.3e-7, 2.6e-7 |
+| point-mode replay | 65536/65536 lanes bit-identical; every 2a–2c replay/determinism test unchanged |
+| `update_geometry` vs rebuilding the wavefront | image bitwise identical |
+| **arm mask** (depth 1, 96², 64 × 16384 samples vs CD over 48² points, h 0.02) | edge (−30.6 ± 9.1, +37.2 ± 3.6, +0.8 ± 5.7) vs CD (−40.2, +32.2, −7.1): within 1.05, 1.4, 1.4 σ; per-run rel σ 2.4, 0.8, 59 (the mask derivative of a smooth `g` mostly cancels around a closed outline) |
+| arm shaded (depth 5, NEE) | edge (+650, +479, +167) vs CD (−951, +282, +405): the interior and shadow terms dominate — measured, not hidden |
+| arm GPU vs CPU edge term, mask | \|Δ\|/\|g\| 7.0e-8 |
+| rose beauty 768² × 256 spp, depth 6 | 3.0 s release (19 chunks per call) |
+| **rose fit**, 192², 8 spp, depth 5, 16 384 edge pairs, 300 its (pose alone for 100) | φ = (−25.79, −16.00, −60.10)° vs truth (−25.78, −16.04, −60.16)° from (−8.6, −28.7, −37.2)°: error ≤ 0.06°; θ = (0.302, 0.856, 0.876, 0.896) vs (0.30, 0.86, 0.88, 0.90); image MSE 3.50e-3 = truth re-rendered (3.50e-3); 93 ms θ gradient + 87 ms edge term per iteration, 60 s total |
+
+![phase 2d rose](phase2d-rose.png)
+
+![phase 2d fit](phase2d-fit.png) (`phase2d-loss.csv`: every iteration's
+8-spp loss, the three angles, θ.)
+
+Deviations:
+
+1. **Edge sampling instead of warped area or Loubet**, for the reasons
+   above. Primary visibility only, rigid instance parameters only.
+2. **The interior pose derivative is not computed.** Shading at a hit
+   point turning with its link, and shadows/reflections moving, are absent
+   from `∂/∂φ`; the shaded arm's gradient is wrong by O(1) in magnitude and
+   sign on two of three angles. The fit still lands on the truth — the
+   silhouette term is zero there and points the right way near it — but a
+   fit that needs shading cues for pose (a low-contrast silhouette) would
+   not.
+3. **The loon is read, the plates vocabulary ported** (vcad-loon is not
+   published). The fit stages pose before finish (100 pose-only
+   iterations). On the beauty camera, with both live from the first step,
+   `F0` saturated at 1 to brighten a misplaced arm; whether the staging is
+   still needed on the fit's camera was not separately tested.
+4. **The fit's camera is tighter than the beauty's** (11° half-angle on the
+   arm); from the beauty camera at 192² the forearm plates are 2 px wide
+   and the elbow stalled 24° short, staged or not.
+5. **"From a photo" not done.** The obvious non-irys target is
+   `vcad-render`'s output from `rose/render.sh`, but it is an auto-framed
+   (`--fill --auto-aspect`) orthographic flat/line render with its own
+   lights: matching it needs an orthographic camera in irys, a camera-pose
+   parameter, and a lighting model — none of which this phase has. Not
+   attempted rather than shown badly.
+
+Risks and next:
+
+1. **Variance.** 76 % of the arm's edge samples are hidden (inner ray
+   blocked); per-run rel σ is 0.8–2.4 on the mask. A visibility-aware
+   importance (a cheap ID-buffer pass to keep only edges that border a
+   different instance or the sky) is the obvious next 10×.
+2. **The interior term.** Differentiating the hit's shading frame with the
+   link's motion (the GGX graph takes the cosines as columns: `∂cos/∂φ`
+   feeds the adjoint as extra lanes) — then shadows need edge sampling of
+   *secondary* rays, which is where warped-area's per-ray machinery starts
+   to pay.
+3. **Host-side cost.** The 87 ms edge term is mostly host work —
+   projecting 227 k candidate edges and two CPU ownership rays per sample,
+   around one small device pass (the split is not measured). It belongs on
+   the device, where a TLAS walk already exists.
+4. **Camera pose** is the next parameter (the camera is a moving "instance"
+   for every edge), and then a real photo with a measured camera.
+5. vcad tessellation density (550 k triangles for three sheet-metal links)
+   costs traversal and edge count; a coarser tolerance for rendering would
+   cut both.
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.

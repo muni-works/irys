@@ -43,3 +43,11 @@ vcad = { version = "0.10", default-features = false }
 [[example]]
 name = "rover"
 required-features = ["gpu"]
+
+[[example]]
+name = "rose"
+required-features = ["gpu"]
+
+[[example]]
+name = "rose_fit"
+required-features = ["gpu"]

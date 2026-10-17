@@ -24,13 +24,16 @@
 //! # The estimator (Li et al. 2018's edge sampling, primary rays)
 //!
 //! Every triangle edge of every moving instance is projected and clipped to
-//! the frame; an edge sample picks a point uniformly in total screen length
-//! (stratified, `n` per call), and weighs
-//! `(Σℓ / n) · v_n · ½?` the difference of two full paths traced through
+//! the frame; an edge sample picks a point with density ∝ screen length ×
+//! importance (stratified, `n` per call) — importance 1 on silhouettes and
+//! boundaries, a crease between front faces by its dihedral angle
+//! ([`crease_weight`]), [`BACK_WEIGHT`] behind — and weighs
+//! `(Σ ℓ w / (w_e n)) · v_n · ½?` the difference of two full paths traced through
 //! `s ∓ εn` ([`Scene::set_points`]; the pair shares its generator, so
 //! the difference is common random numbers). Each triangle owns its edges:
-//! the inner ray must hit *that* triangle (otherwise the edge is hidden at
-//! `s` and the sample is 0), and where the outer ray lands on the same
+//! the inner ray must hit *that* triangle or one coplanar with it on the
+//! same face — CAD tessellations are full of slivers thinner than `ε` —
+//! (otherwise the edge is hidden at `s` and the sample is 0), and where the outer ray lands on the same
 //! instance right next to `X` — a crease, which the neighbour also samples
 //! from its side — each side takes half. Edges shared by two coplanar
 //! triangles are never candidates: `f` is continuous across them. No mesh
@@ -80,72 +83,110 @@ impl Rig<'_> {
     }
 }
 
-/// Per bottom-level tree, which triangle edges can never be a
-/// discontinuity: shared (by welded position) with exactly one coplanar
-/// triangle.
+/// No neighbour across an edge (a boundary, or more than two triangles
+/// share it after welding).
+const NONE: u32 = u32::MAX;
+/// Neighbour marker for an edge whose neighbour is coplanar: never a
+/// candidate, `f` is continuous across it.
+const FLAT: u32 = u32::MAX - 1;
+
+/// Importance of a crease between two front faces whose normals meet at
+/// `cos`: ∝ how much the shading can jump, from 0.02 (a fine tessellation
+/// of a cylinder) to 1 (a right angle) — silhouettes and boundaries are 1.
+fn crease_weight(cos: f64) -> f64 {
+    (4.0 * (1.0 - cos)).clamp(0.02, 1.0)
+}
+
+/// What faces the camera is a hint, not a promise (two-sided shading, a
+/// mesh wound inconsistently): back-only edges keep this much weight, so
+/// the estimator stays unbiased whatever the winding.
+const BACK_WEIGHT: f64 = 0.02;
+
+/// Per bottom-level tree, every triangle edge's neighbour across it (by
+/// welded position) and their dihedral cosine: which edges can never be a
+/// discontinuity (shared with one coplanar triangle), and how to weigh the
+/// rest when sampling.
 pub struct Edges {
-    skip: Vec<Vec<[bool; 3]>>,
+    nbr: Vec<Vec<[u32; 3]>>,
+    cos: Vec<Vec<[f32; 3]>>,
+    /// Object-space face normals (unnormalised: the winding's).
+    normal: Vec<Vec<Vec3>>,
 }
 
 impl Edges {
-    /// Weld every tree of `scene` and mark its flat interior edges.
+    /// Weld every tree of `scene` and find each edge's neighbour.
     pub fn new(scene: &Scene) -> Self {
-        let skip = scene
-            .blas()
-            .iter()
-            .map(|b| {
-                let m = b.geometry().mesh();
-                let (pos, tris) = (m.positions(), m.triangles());
-                let mut bb = irys_core::Aabb::empty();
-                for p in pos {
-                    bb.include_point(p);
-                }
-                let tol = if pos.is_empty() {
-                    1.0
-                } else {
-                    ((bb.max - bb.min).norm() * 1e-7).max(1e-12)
-                };
-                let key = |i: u32| {
-                    let p = pos[i as usize];
-                    [p.x, p.y, p.z].map(|c| (c / tol).round() as i64)
-                };
-                let normal = |t: &[u32; 3]| {
+        let (mut nbrs, mut coss, mut normals) = (Vec::new(), Vec::new(), Vec::new());
+        for b in scene.blas() {
+            let m = b.geometry().mesh();
+            let (pos, tris) = (m.positions(), m.triangles());
+            let mut bb = irys_core::Aabb::empty();
+            for p in pos {
+                bb.include_point(p);
+            }
+            let tol = if pos.is_empty() {
+                1.0
+            } else {
+                ((bb.max - bb.min).norm() * 1e-7).max(1e-12)
+            };
+            let key = |i: u32| {
+                let p = pos[i as usize];
+                [p.x, p.y, p.z].map(|c| (c / tol).round() as i64)
+            };
+            let normal: Vec<Vec3> = tris
+                .iter()
+                .map(|t| {
                     let [a, b, c] = t.map(|i| pos[i as usize]);
                     (b - a).cross(&(c - a))
-                };
-                let mut map: std::collections::HashMap<_, Vec<(usize, usize)>> =
-                    std::collections::HashMap::new();
-                for (ti, t) in tris.iter().enumerate() {
-                    for e in 0..3 {
-                        let (a, b) = (key(t[e]), key(t[(e + 1) % 3]));
-                        map.entry(if a < b { (a, b) } else { (b, a) })
-                            .or_default()
-                            .push((ti, e));
+                })
+                .collect();
+            let mut map: std::collections::HashMap<_, Vec<(usize, usize)>> =
+                std::collections::HashMap::new();
+            for (ti, t) in tris.iter().enumerate() {
+                for e in 0..3 {
+                    let (a, b) = (key(t[e]), key(t[(e + 1) % 3]));
+                    map.entry(if a < b { (a, b) } else { (b, a) })
+                        .or_default()
+                        .push((ti, e));
+                }
+            }
+            let mut nbr = vec![[NONE; 3]; tris.len()];
+            let mut cos = vec![[0.0f32; 3]; tris.len()];
+            for v in map.values() {
+                if let [(t0, e0), (t1, e1)] = v[..] {
+                    let (n0, n1) = (normal[t0], normal[t1]);
+                    let (l0, l1) = (n0.norm(), n1.norm());
+                    if l0 > 0.0 && l1 > 0.0 {
+                        let c = n0.dot(&n1) / (l0 * l1);
+                        let (a, b) = if c > 1.0 - 1e-10 {
+                            (FLAT, FLAT)
+                        } else {
+                            (t1 as u32, t0 as u32)
+                        };
+                        nbr[t0][e0] = a;
+                        nbr[t1][e1] = b;
+                        cos[t0][e0] = c as f32;
+                        cos[t1][e1] = c as f32;
                     }
                 }
-                let mut skip = vec![[false; 3]; tris.len()];
-                for v in map.values() {
-                    if let [(t0, e0), (t1, e1)] = v[..] {
-                        let (n0, n1) = (normal(&tris[t0]), normal(&tris[t1]));
-                        let (l0, l1) = (n0.norm(), n1.norm());
-                        if l0 > 0.0 && l1 > 0.0 && n0.dot(&n1) / (l0 * l1) > 1.0 - 1e-10 {
-                            skip[t0][e0] = true;
-                            skip[t1][e1] = true;
-                        }
-                    }
-                }
-                skip
-            })
-            .collect();
-        Self { skip }
+            }
+            nbrs.push(nbr);
+            coss.push(cos);
+            normals.push(normal);
+        }
+        Self {
+            nbr: nbrs,
+            cos: coss,
+            normal: normals,
+        }
     }
 
     /// Edges that are candidates, over every tree.
     pub fn candidates(&self) -> usize {
-        self.skip
+        self.nbr
             .iter()
             .flatten()
-            .map(|s| s.iter().filter(|x| !**x).count())
+            .map(|s| s.iter().filter(|x| **x != FLAT).count())
             .sum()
     }
 }
@@ -159,6 +200,8 @@ pub struct EdgeSamples {
     weight: Vec<Vec<f64>>,
     /// Screen length of every candidate edge in the frame, pixels.
     pub total_len: f64,
+    /// Of it, the length of silhouettes and boundaries (importance 1).
+    pub silhouette_len: f64,
     /// Candidate edge pieces inside the frame.
     pub segments: usize,
     /// Samples whose edge was visible at the sample (inner ray hit its own
@@ -178,6 +221,8 @@ struct Seg {
     pc: [f64; 2],
     t0: f64,
     t1: f64,
+    /// Sampling importance.
+    w: f64,
 }
 
 /// The part of the segment `a → b` inside `[0, w] × [0, h]`, as parameters.
@@ -224,13 +269,20 @@ impl EdgeSamples {
         let (w, h) = (scene.size.0 as f64, scene.size.1 as f64);
         let mut segs = Vec::new();
         let mut cum = Vec::new();
-        let mut total = 0.0;
+        let (mut total, mut wtotal, mut sil) = (0.0, 0.0, 0.0);
+        let (eye, fwd, right, up, _) = scene.camera();
         for (mi, &k) in rig.moving.iter().enumerate() {
             let place = &scene.placements()[k];
             let m = scene.blas()[place.blas].geometry().mesh();
             let pos = m.positions();
-            let skip = &edges.skip[place.blas];
-            for (tri, t) in m.triangles().iter().enumerate() {
+            let (nbr, cos) = (&edges.nbr[place.blas], &edges.cos[place.blas]);
+            let normal = &edges.normal[place.blas];
+            let tris = m.triangles();
+            let front = |tri: usize| {
+                let x = place.to_world.apply_point(&pos[tris[tri][0] as usize]);
+                place.to_world.apply_normal(&normal[tri]).dot(&(eye - x)) > 0.0
+            };
+            for (tri, t) in tris.iter().enumerate() {
                 let Some(px) = t
                     .iter()
                     .map(|&i| {
@@ -242,10 +294,18 @@ impl EdgeSamples {
                 else {
                     continue;
                 };
+                let f = front(tri);
                 for e in 0..3 {
-                    if skip[tri][e] {
-                        continue;
-                    }
+                    let imp = match nbr[tri][e] {
+                        FLAT => continue,
+                        NONE if f => 1.0,
+                        NONE => BACK_WEIGHT,
+                        n => match (f, front(n as usize)) {
+                            (true, true) => crease_weight(cos[tri][e] as f64),
+                            (false, false) => BACK_WEIGHT,
+                            _ => 1.0,
+                        },
+                    };
                     let (pa, pb, pc) = (px[e], px[(e + 1) % 3], px[(e + 2) % 3]);
                     let Some((t0, t1)) = clip(pa, pb, w, h) else {
                         continue;
@@ -255,7 +315,11 @@ impl EdgeSamples {
                         continue;
                     }
                     total += len;
-                    cum.push(total);
+                    if imp == 1.0 {
+                        sil += len;
+                    }
+                    wtotal += len * imp;
+                    cum.push(wtotal);
                     segs.push(Seg {
                         mi,
                         k,
@@ -266,6 +330,7 @@ impl EdgeSamples {
                         pc,
                         t0,
                         t1,
+                        w: imp,
                     });
                 }
             }
@@ -275,11 +340,11 @@ impl EdgeSamples {
             pixel: Vec::with_capacity(n),
             weight: Vec::with_capacity(n),
             total_len: total,
+            silhouette_len: sil,
             segments: segs.len(),
             visible: 0,
             halved: 0,
         };
-        let (eye, fwd, right, up, _) = scene.camera();
         let mut rng = Rng::new(seed ^ 0x6564_6765, u64::MAX);
         for i in 0..n {
             let put = |o: &mut Self, s: [f64; 2], nrm: [f64; 2], wt: Vec<f64>| {
@@ -291,7 +356,7 @@ impl EdgeSamples {
                 o.pixel.push(y * scene.size.0 + x);
                 o.weight.push(wt);
             };
-            let u = (i as f64 + rng.uniform()) / n as f64 * total;
+            let u = (i as f64 + rng.uniform()) / n as f64 * wtotal;
             if segs.is_empty() {
                 put(&mut out, [0.0, 0.0], [1.0, 0.0], vec![0.0; np]);
                 continue;
@@ -344,8 +409,34 @@ impl EdgeSamples {
             };
             let inner = scene.screen(s[0] - EPS_PX * nrm[0], s[1] - EPS_PX * nrm[1]);
             let outer = scene.screen(s[0] + EPS_PX * nrm[0], s[1] + EPS_PX * nrm[1]);
-            let own =
-                hit(inner).is_some_and(|ih| ih.payload == seg.k && ih.hit.prim as usize == seg.tri);
+            // A sliver thinner than ε puts the inner point past its own
+            // triangle onto a coplanar neighbour of the same face: that is
+            // still this side of the edge. A triangle folded behind (the
+            // back half of a silhouette) is not coplanar, and is refused.
+            let nt = edges.normal[place.blas][seg.tri];
+            let own = hit(inner).is_some_and(|ih| {
+                if ih.payload != seg.k {
+                    return false;
+                }
+                let p = ih.hit.prim as usize;
+                if p == seg.tri {
+                    return true;
+                }
+                let Some(nh) = edges.normal[place.blas].get(p) else {
+                    return false;
+                };
+                let (ln, lh) = (nt.norm(), nh.norm());
+                let local = place
+                    .to_world
+                    .inverse()
+                    .map(|t| t.apply_point(&ih.hit.point));
+                ln > 0.0
+                    && lh > 0.0
+                    && nt.dot(nh) / (ln * lh) > 1.0 - 1e-6
+                    && local.is_some_and(|q| {
+                        (nt / ln).dot(&(q - la)).abs() < 1e-4 * (lb - la).norm().max(1e-9)
+                    })
+            });
             let (Some(jac), true) = (jac, own) else {
                 put(&mut out, s, nrm, vec![0.0; np]);
                 continue;
@@ -366,7 +457,7 @@ impl EdgeSamples {
                     let dx =
                         (p[seg.mi].apply_point(&xl) - q[seg.mi].apply_point(&xl)) / (2.0 * RIG_H);
                     let vn = jac[0].dot(&dx) * nrm[0] + jac[1].dot(&dx) * nrm[1];
-                    half * vn * total / n as f64
+                    half * vn * wtotal / (seg.w * n as f64)
                 })
                 .collect();
             put(&mut out, s, nrm, wt);

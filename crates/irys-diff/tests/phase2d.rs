@@ -297,6 +297,70 @@ fn box_silhouette_gradient_matches_central_differences() {
     }
 }
 
+/// vcad's tessellation of a rounded 60 × 60 × 3 mm plate (two boxes and
+/// four corner cylinders, unioned — rose's `plate-z`): thousands of
+/// triangles, slivers thinner than the edge sample's ε along the arcs. The
+/// inner ray then lands on a coplanar neighbour, which must still count as
+/// the edge's own side (it did not, and the edge term came out 60 % high).
+#[test]
+fn vcad_plate_silhouette_matches_central_differences() {
+    use vcad::Part;
+    let (r, t) = (20.0, 3.0);
+    let corner = |x: f64, y: f64| Part::cylinder("c", r, t, 24).translate(x, y, 0.0);
+    let plate = Part::cube("core", 60.0 - 2.0 * r, 60.0, t)
+        .translate(r, 0.0, 0.0)
+        .union(&Part::cube("cross", 60.0, 60.0 - 2.0 * r, t).translate(0.0, r, 0.0))
+        .union(&corner(r, r))
+        .union(&corner(r, 60.0 - r))
+        .union(&corner(60.0 - r, r))
+        .union(&corner(60.0 - r, 60.0 - r));
+    let m = plate.to_mesh();
+    let v = m.vertices();
+    let pos = v
+        .chunks_exact(3)
+        .map(|p| {
+            Point3::new(
+                p[0] as f64 / 40.0 - 0.75,
+                p[1] as f64 / 40.0 - 0.75,
+                p[2] as f64 / 40.0,
+            )
+        })
+        .collect();
+    let mesh = irys_core::TriMesh::new(pos, Vec::new(), &m.indices());
+    eprintln!("vcad plate: {} triangles", mesh.triangles().len());
+    let (w, h) = (40, 30);
+    let mut s = Scene::instanced(
+        vec![opaque(mesh)],
+        vec![Placement::new(0, Transform::identity())],
+        None,
+        (w, h),
+        1,
+        (Point3::new(0.0, -4.5, 2.2), Point3::new(0.0, 0.0, 0.8)),
+        20.0,
+    );
+    s.depth = 1;
+    let rig = box_rig();
+    let phi = [0.15, 0.5, 0.2];
+    rig.pose(&mut s, &phi);
+    let g = Weighted::new(w, h);
+    let est = edge_estimate(&mut s, &rig, &phi, &g, 8192, 16);
+    let cd = grid_central(&mut s, &rig, &phi, &g, 32, 0.05);
+    for j in 0..3 {
+        let z = (est.mean[j] - cd[j]) / est.stderr[j];
+        eprintln!(
+            "φ{j}: edge {:+.4} ± {:.4}, central {:+.4}, rel {:.2e}, z {z:+.2}",
+            est.mean[j],
+            est.stderr[j],
+            cd[j],
+            rel(est.mean[j], cd[j]),
+        );
+        assert!(
+            (est.mean[j] - cd[j]).abs() < 4.0 * est.stderr[j] + 0.03 * cd[j].abs(),
+            "φ{j}: z {z}"
+        );
+    }
+}
+
 #[cfg(feature = "gpu")]
 mod gpu_tier {
     use super::*;
