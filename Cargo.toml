@@ -6,6 +6,7 @@ members = [
     "crates/irys-prims",
     "crates/irys-gpu",
     "crates/irys",
+    "crates/irys-diff",
     "crates/kosm-render",
 ]
 
@@ -23,8 +24,20 @@ rust-version = "1.95"
 # `.cargo/config.toml.example` points it at a local checkout instead.
 tang = "0.2"
 rayon = "1"
+# The tensor IR (`tang_compile::tensor::TensorGraph`) for irys-diff's kernels.
+# tang-compile is not on crates.io yet, so it is pinned by rev — the same rev
+# kosm pins — and `[patch.crates-io]` below sends crates.io `tang` and
+# `tang-expr` to that rev, so the graph still holds one `tang`. irys-diff is
+# the only crate that names it; the published crates still resolve `tang = "0.2"`.
+tang-compile = { git = "https://github.com/ecto/tang", rev = "bfc8003" }
+tang-expr = "0.1"
 irys-core  = { path = "crates/irys-core", version = "0.1" }
 irys-light = { path = "crates/irys-light", version = "0.1" }
 irys-prims = { path = "crates/irys-prims", version = "0.1" }
 irys-gpu   = { path = "crates/irys-gpu", version = "0.1" }
 irys       = { path = "crates/irys", version = "0.1" }
+
+# One tang: the rev tang-compile is pinned to. Drop with tang-compile's publish.
+[patch.crates-io]
+tang      = { git = "https://github.com/ecto/tang", rev = "bfc8003" }
+tang-expr = { git = "https://github.com/ecto/tang", rev = "bfc8003" }

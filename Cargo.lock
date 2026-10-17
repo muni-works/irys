@@ -326,6 +326,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "irys-diff"
+version = "0.1.0"
+dependencies = [
+ "irys-core",
+ "irys-light",
+ "irys-prims",
+ "libloading",
+ "tang",
+ "tang-compile",
+ "tang-expr",
+]
+
+[[package]]
 name = "irys-gpu"
 version = "0.1.0"
 dependencies = [
@@ -881,10 +894,26 @@ dependencies = [
 [[package]]
 name = "tang"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01222e2be85bd48a1b129975a3b4045f425adaceb6ecda6e7a97cdb8dd96a75a"
+source = "git+https://github.com/ecto/tang?rev=bfc8003#bfc8003b08d29a2bb1f62b00c771d59a2d9fc3bd"
 dependencies = [
  "paste",
+]
+
+[[package]]
+name = "tang-compile"
+version = "0.1.0"
+source = "git+https://github.com/ecto/tang?rev=bfc8003#bfc8003b08d29a2bb1f62b00c771d59a2d9fc3bd"
+dependencies = [
+ "tang",
+ "tang-expr",
+]
+
+[[package]]
+name = "tang-expr"
+version = "0.1.1"
+source = "git+https://github.com/ecto/tang?rev=bfc8003#bfc8003b08d29a2bb1f62b00c771d59a2d9fc3bd"
+dependencies = [
+ "tang",
 ]
 
 [[package]]

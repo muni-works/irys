@@ -1,0 +1,21 @@
+[package]
+name = "irys-diff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "irys: the kernel contract on CPU — BSDFs as tang IR graphs, path replay backprop"
+publish = false   # tang-compile is a git dependency until it publishes
+
+[dependencies]
+irys-core.workspace = true
+irys-light.workspace = true
+irys-prims.workspace = true
+tang.workspace = true
+tang-compile.workspace = true
+tang-expr.workspace = true
+# dlopen for the compiled C kernels. tang-gpu's `CpuProgram` does the same,
+# but tang-gpu links wgpu 25 and irys is on 30 (principle 4).
+libloading = "0.8"

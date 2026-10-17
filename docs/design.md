@@ -193,6 +193,64 @@ Each moved module keeps its `crate::x` paths through a private
 `use irys_core::{..}` at its new crate root. The integration tests live in
 the facade (`crates/irys/tests`) since they span tiers.
 
+## Phase 1 spike: the contract on CPU (2026-10-17)
+
+`crates/irys-diff`, its own crate because tang-compile is a git dependency
+(`bfc8003`, kosm's rev) and irys-light has to stay publishable. The
+workspace `[patch.crates-io]` sends `tang`/`tang-expr` to that rev so the
+graph holds one tang; it folds into irys-light when the IR publishes.
+
+- `ggx.rs` — a rough conductor (GGX, height-correlated Smith, Schlick with a
+  three-hat spectral F0), `θ = (α, F0₀, F0₁, F0₂)`, written once as one
+  `TensorGraph` batched over a wavefront: inputs are `[n]` columns of vertex
+  cosines and hero-wavelength hat weights. Lowered to eval (`f`, `pdf`) and
+  adjoint (`backward` of `Σ δf·f`, so the batch sum is the reduction).
+  Sampling (VNDF) is f64 CPU code and detached.
+- `prb.rs` — forward pass keeps `L` per path; replay reseeds, re-walks, and
+  adds `δL (L − L_j) ∂f_j/f_j`. The derivation is the module doc.
+- `ir.rs` — compiled C (f32) or interpreter (f64), `IRYS_IR=interp` forces
+  the latter.
+
+Scene: GGX ball on a grey Lambertian disc under a smooth sky + soft sun,
+`irys_core::Bvh` over `irys_prims::Analytic`, one hero wavelength per path
+through `irys_light::spectrum`. Results (debug build, M-series):
+
+| Gate | Result |
+|---|---|
+| gradient vs CRN central differences, sampler frozen, L2, f64 | rel error 1.6e-10 … 1.9e-9 on all four θ |
+| same, sampler at current α (paths move), mean pixel, 64 seeds | α: −5.84e-2 ± 0.40e-2 vs −5.79e-2 ± 1.2e-2 (0.0σ); F0 bands rel ≤ 1e-6 |
+| compiled C f32 vs interpreter f64 | f 1.6e-6, pdf 1.7e-6, δθ 9.4e-7 worst rel; interpreter = hand f64 to 1e-12 |
+| replay vs forward | bit-identical L on 512/512 paths, both backends |
+| memory | 30.1 f64 words per path at depth 2 and 8, nothing per vertex |
+| inverse: α 0.6 → 0.25, 32×32×4, Adam | within 0.02 at iteration ~20; last-10 mean 0.265 |
+| timing | gradient (render + forward + replay) 4096 paths ≈ 35 ms native, ≈ 1.3 s interpreted; 512 paths interpreted 0.17 s |
+
+What the spike says the design got wrong or left out:
+
+1. **The replay weight has a `1/f`.** It is `δL (L − L_j) ∂θ log f_j`; the
+   contract's "`(L − L_so_far) · ∂f/∂θ`" is off by `f_j`.
+2. **A nonlinear loss needs two seeds.** With one, the L2 gradient
+   `2 (I − T) ∂I` correlates the noise in both factors and descent also
+   minimises variance: the first inverse run walked α from 0.6 to 1.0.
+   `prb::gradient` takes `(primal, adjoint)` seeds; same seed only for the
+   CRN check.
+3. **Memory is paths × 1, not pixels × 1**, once forward and replay are
+   separate wavefront passes (`L` per path between them). Pixels × 1 needs
+   the replay fused into the forward kernel per path, or a third pass.
+4. **The pdf the integrator divides by is the sampler's**, not the eval
+   graph's: the two agree (tested to 1e-9), but the one that drew the
+   direction is the one that counts (frozen sampling makes that explicit).
+   The graph's pdf is for MIS.
+5. **Replay bit-exactness needs one program for `f`.** The eval and adjoint
+   lowerings fuse differently and may round differently in f32, so replay
+   re-evaluates `f` with the eval program and runs the adjoint only for `δθ`.
+   The C is built with `-ffp-contract=off` for the same reason.
+6. **tang-gpu is out.** Its `CpuProgram` links wgpu 25 (principle 4); `ir.rs`
+   carries the forty-line loader instead.
+7. Not done: PRB inside `irys-light`'s integrator (the spike has its own
+   200-line wavefront), the floor's BSDF as a graph, four rotated hero
+   wavelengths, NEE/MIS, Russian roulette, visibility (reparam) gradients.
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.
