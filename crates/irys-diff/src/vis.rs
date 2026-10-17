@@ -110,8 +110,8 @@ const BACK_WEIGHT: f64 = 0.02;
 /// discontinuity (shared with one coplanar triangle), and how to weigh the
 /// rest when sampling.
 pub struct Edges {
-    nbr: Vec<Vec<[u32; 3]>>,
-    cos: Vec<Vec<[f32; 3]>>,
+    pub(crate) nbr: Vec<Vec<[u32; 3]>>,
+    pub(crate) cos: Vec<Vec<[f32; 3]>>,
     /// Object-space face normals (unnormalised: the winding's).
     normal: Vec<Vec<Vec3>>,
 }
@@ -338,7 +338,7 @@ impl Visibility {
 pub struct EdgeSamples {
     points: Vec<[f64; 2]>,
     pixel: Vec<usize>,
-    /// Per sample, per parameter: `½? · v_n · Σℓ / n`.
+    /// Per sample, per parameter: `v_n · Σℓw / (w_e n)`.
     weight: Vec<Vec<f64>>,
     /// Screen length of every candidate edge in the frame, pixels.
     pub total_len: f64,
@@ -395,6 +395,21 @@ fn clip(a: [f64; 2], b: [f64; 2], w: f64, h: f64) -> Option<(f64, f64)> {
 }
 
 impl EdgeSamples {
+    /// Samples drawn elsewhere (the device): pixel and weights per sample,
+    /// the points left where the device wrote them.
+    pub(crate) fn from_parts(pixel: Vec<usize>, weight: Vec<Vec<f64>>, visible: usize) -> Self {
+        Self {
+            points: Vec::new(),
+            pixel,
+            weight,
+            total_len: 0.0,
+            silhouette_len: 0.0,
+            segments: 0,
+            visible,
+            halved: 0,
+        }
+    }
+
     /// Draw `n` edge samples of `scene` as posed at `phi` (the caller has
     /// [`Rig::pose`]d it) with generator `seed`.
     pub fn new(scene: &Scene, edges: &Edges, rig: &Rig, phi: &[f64], n: usize, seed: u64) -> Self {
@@ -414,6 +429,34 @@ impl EdgeSamples {
         phi: &[f64],
         n: usize,
         seed: u64,
+        vis: Option<&Visibility>,
+    ) -> Self {
+        Self::build(scene, edges, rig, phi, n, seed, vis.is_some(), vis)
+    }
+
+    /// 2e's front-only silhouettes without an ID buffer (what the device
+    /// draws, [`crate::gpu::GpuEdges`]), or 2d's importance.
+    pub fn with_policy(
+        scene: &Scene,
+        edges: &Edges,
+        rig: &Rig,
+        phi: &[f64],
+        n: usize,
+        seed: u64,
+        front_only: bool,
+    ) -> Self {
+        Self::build(scene, edges, rig, phi, n, seed, front_only, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        scene: &Scene,
+        edges: &Edges,
+        rig: &Rig,
+        phi: &[f64],
+        n: usize,
+        seed: u64,
+        front_only: bool,
         vis: Option<&Visibility>,
     ) -> Self {
         let np = phi.len();
@@ -482,7 +525,7 @@ impl EdgeSamples {
                             // scores 0 (2d gives it weight 1 — half of
                             // every silhouette sample wasted).
                             (true, false) => 1.0,
-                            (false, true) if vis.is_some() => BACK_WEIGHT,
+                            (false, true) if front_only => BACK_WEIGHT,
                             (false, true) => 1.0,
                         },
                     };
@@ -551,7 +594,6 @@ impl EdgeSamples {
             visible: 0,
             halved: 0,
         };
-        let mut rng = Rng::new(seed ^ 0x6564_6765, u64::MAX);
         for i in 0..n {
             let put = |o: &mut Self, s: [f64; 2], nrm: [f64; 2], wt: Vec<f64>| {
                 let at = |d: f64| scene.screen(s[0] + d * nrm[0], s[1] + d * nrm[1]);
@@ -562,7 +604,10 @@ impl EdgeSamples {
                 o.pixel.push(y * scene.size.0 + x);
                 o.weight.push(wt);
             };
-            let u = (i as f64 + rng.uniform()) / n as f64 * wtotal;
+            // One generator per sample (phase 2e: the device draws the
+            // same `u` in parallel).
+            let u =
+                (i as f64 + Rng::new(seed ^ 0x6564_6765, i as u64).uniform()) / n as f64 * wtotal;
             if segs.is_empty() {
                 put(&mut out, [0.0, 0.0], [1.0, 0.0], vec![0.0; np]);
                 continue;
@@ -666,6 +711,11 @@ impl EdgeSamples {
             put(&mut out, s, nrm, wt);
         }
         out
+    }
+
+    /// Per sample, per parameter, what its pair's difference is worth.
+    pub fn weights(&self) -> &[Vec<f64>] {
+        &self.weight
     }
 
     /// The ray pairs, inner then outer, as camera-plane points.

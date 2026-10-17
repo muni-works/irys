@@ -829,6 +829,35 @@ itself noisy. A velocity-aware importance (`∝ |v_n|`, per parameter) is the
 next lever. The rose arm itself was not re-measured (its files are off
 limits here).
 
+### 3. The edge term's host work on the device (`gpu/edges.wgsl`, `GpuEdges`)
+
+`edges.wgsl` is appended to the wavefront's source and walks its tree.
+`edge_cand` (a thread per moving triangle edge: project, facing, crease
+owner, importance, clip, `len × w`), a fixed-order prefix sum (`scan_block`
+sums 1024 slots sequentially per thread, `scan_tops` the block totals in
+one thread, `scan_fill` writes the inclusive sums — no atomics, so the same
+weights give the same bits), and `edge_sample` (a thread per sample:
+stratified `u`, binary search, edge point, closest-approach material point,
+the ownership ray through the device's TLAS with the coplanar-sliver rule,
+the pinhole Jacobian, `v_n` per parameter from the rig's derivative
+matrices). The samples land straight in the wavefront's point buffer; the
+host keeps the rig (placements at `φ ± RIG_H`, a few matrices) and the
+final `O(n)` weighted sum. The host now draws each sample's `u` from its
+own generator (`Rng(seed ^ "edge", i)`), as the device does, so the two
+draw the same samples.
+
+| Gate (M-series, Metal) | Result |
+|---|---|
+| device vs host samples, plate arm, 16 384, both importances | 99.3–99.7 % of points within 1e-5 (the rest: f32 cumulative sums moving a `u` across a segment end); weights 16384/16384 within 2e-3; visible counts equal |
+| edge term from device samples vs host samples, both traced on the device | rel ≤ 2.1e-3 |
+| two device draws | bit-identical points and weights |
+| **split, 522 k triangles, 16 384 pairs, 192², depth 5 (release)** | before: host sampling **102.5 ms**, device pairs 2.7 ms, host sum 0.45 ms. After: host 0.04 ms, device sampling **3.0 ms**, device pairs 3.9 ms, host sum 0.43 ms — 105 → 7.4 ms |
+
+Deviations: the ID-buffer demotion (piece 2) is host-only; the device does
+2d's importance or 2e's front-only silhouettes. Velocities still come from
+central differences of the rig's closed form on the host (exact to 1e-10;
+f32 on the device).
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.

@@ -500,3 +500,201 @@ fn cut(depth: usize) -> f64 {
     eprintln!("depth {depth}: geometric-mean variance ratio {gm:.2}");
     gm
 }
+
+#[cfg(feature = "gpu")]
+mod gpu_tier {
+    use super::*;
+    use irys_diff::gpu::{self, GpuEdges, GpuPrb};
+
+    macro_rules! device {
+        () => {
+            match gpu::context() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("no GPU ({e}): skipping");
+                    return;
+                }
+            }
+        };
+    }
+
+    /// Piece 3: the device draws the same edge samples as the host (same
+    /// `u` per sample; f32 against f64 moves a few across segment ends),
+    /// with the same weights, and draws them bit-identically twice.
+    #[test]
+    fn device_edge_samples_match_the_host() {
+        let ctx = device!();
+        let (w, h) = (48, 36);
+        let rig = arm_rig();
+        let g = Weighted::new(w, h);
+        let mut s = plate_arm(w, h, 3);
+        rig.pose(&mut s, &PHI);
+        let edges = Edges::new(&s);
+        let n = 16384;
+        for front_only in [false, true] {
+            let vb = vis::Visibility::new(&s);
+            let cpu = vis::EdgeSamples::with_visibility(
+                &s,
+                &edges,
+                &rig,
+                &PHI,
+                n,
+                41,
+                front_only.then_some(&vb),
+            );
+            // The device has no ID buffer: compare 2e's front-only rule
+            // with the host's ID buffer turned off (HIDDEN demotion aside).
+            let cpu = if front_only {
+                vis::EdgeSamples::with_policy(&s, &edges, &rig, &PHI, n, 41, true)
+            } else {
+                cpu
+            };
+            s.set_points(Some(cpu.points().to_vec()));
+            let mut gp = GpuPrb::new(ctx, &s);
+            let mut ge = GpuEdges::new(&gp, &s, &edges, &rig.moving, n, 3, front_only);
+            let dev = ge.sample(&gp, &s, &rig, &PHI, 41);
+            let pts = ge.points(&gp);
+            let again = ge.sample(&gp, &s, &rig, &PHI, 41);
+            assert_eq!(
+                dev.weights(),
+                again.weights(),
+                "device draws are deterministic"
+            );
+            assert_eq!(pts, ge.points(&gp));
+            let close = cpu
+                .points()
+                .iter()
+                .zip(&pts)
+                .filter(|(a, b)| (a[0] - b[0]).abs() + (a[1] - b[1]).abs() < 1e-5)
+                .count();
+            let same_w = cpu
+                .weights()
+                .iter()
+                .zip(dev.weights())
+                .filter(|(a, b)| {
+                    a.iter()
+                        .zip(b.iter())
+                        .all(|(x, y)| (x - y).abs() <= 2e-3 * (1.0 + x.abs()))
+                })
+                .count();
+            eprintln!(
+                "front-only {front_only}: {close}/{} points within 1e-5, {same_w} weights agree; visible host {} device {}",
+                2 * n,
+                cpu.visible,
+                dev.visible
+            );
+            assert!(close as f64 >= 0.99 * 2.0 * n as f64);
+            assert!(same_w as f64 >= 0.99 * n as f64);
+            // Both traced by the device: the edge term from the device's
+            // samples against the host's.
+            let lc = gpu::widen(&gp.forward(&s, &THETA, 41));
+            let _ = ge.sample(&gp, &s, &rig, &PHI, 41);
+            let ld = gpu::widen(&gp.forward(&s, &THETA, 41));
+            s.set_points(None);
+            let (gc, gd) = (
+                cpu.gradient(&s, 41, &lc, &g.0),
+                dev.gradient(&s, 41, &ld, &g.0),
+            );
+            for j in 0..3 {
+                let r = (gc[j] - gd[j]).abs() / gc[j].abs().max(gd[j].abs()).max(1e-9);
+                eprintln!(
+                    "  φ{j}: host samples {:+.5}, device samples {:+.5}, rel {r:.1e}",
+                    gc[j], gd[j]
+                );
+                assert!(r < 2e-2, "φ{j}");
+            }
+        }
+    }
+
+    /// Piece 3's split, host vs device, before and after: run with
+    /// `--release --ignored`. Links are 256 × 512 UV ellipsoids (~520 k
+    /// triangles, rose-arm sized), 192², 16 384 pairs, depth 5.
+    #[test]
+    #[ignore]
+    fn edge_term_timing() {
+        let ctx = device!();
+        let (w, h) = (192, 192);
+        let rig = arm_rig();
+        let g = Weighted::new(w, h);
+        let ell = |a: f64, b: f64| {
+            let m = prb::uv_sphere(256, 512);
+            let pos = m
+                .positions()
+                .iter()
+                .map(|p| Point3::new(p.x * a, p.y * b, p.z * b))
+                .collect();
+            irys_core::TriMesh::new(pos, Vec::new(), &m.triangles().concat())
+        };
+        let mut s = Scene::instanced(
+            vec![
+                opaque(prb::cuboid(0.01, 0.01, 0.01), Surface::Diffuse),
+                opaque(prb::cuboid(0.12, 0.12, 0.62), Surface::Diffuse),
+                opaque(ell(UPPER, 0.11), Surface::Conductor),
+                opaque(ell(FORE, 0.095), Surface::Diffuse),
+            ],
+            arm_scene(4, 4, 1, 1).placements().to_vec(),
+            None,
+            (w, h),
+            8,
+            (Point3::new(0.0, -4.5, 2.2), Point3::new(0.0, 0.0, 0.8)),
+            20.0,
+        );
+        s.nee = true;
+        s.depth = 5;
+        rig.pose(&mut s, &PHI);
+        let edges = Edges::new(&s);
+        let n = 16384;
+        let tris: usize = s
+            .blas()
+            .iter()
+            .map(|b| b.geometry().mesh().triangles().len())
+            .sum();
+        let es = vis::EdgeSamples::new(&s, &edges, &rig, &PHI, n, 1);
+        s.set_points(Some(es.points().to_vec()));
+        let mut gp = GpuPrb::new(ctx, &s);
+        let mut ge = GpuEdges::new(&gp, &s, &edges, &rig.moving, n, 3, false);
+        let _ = gp.forward(&s, &THETA, 1);
+        let _ = ge.sample(&gp, &s, &rig, &PHI, 1);
+        let reps = 5;
+        let (mut host, mut fwd, mut sum) = (0.0, 0.0, 0.0);
+        for r in 0..reps {
+            let t = std::time::Instant::now();
+            let es = vis::EdgeSamples::new(&s, &edges, &rig, &PHI, n, 10 + r);
+            host += t.elapsed().as_secs_f64();
+            s.set_points(Some(es.points().to_vec()));
+            let t = std::time::Instant::now();
+            let l = gpu::widen(&gp.forward(&s, &THETA, 10 + r));
+            fwd += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let _ = es.gradient(&s, 10 + r, &l, &g.0);
+            sum += t.elapsed().as_secs_f64();
+        }
+        let (mut dh, mut dd, mut fwd2, mut sum2) = (0.0, 0.0, 0.0, 0.0);
+        for r in 0..reps {
+            let es = ge.sample(&gp, &s, &rig, &PHI, 10 + r);
+            dh += ge.timing.host.as_secs_f64();
+            dd += ge.timing.device.as_secs_f64();
+            let t = std::time::Instant::now();
+            let l = gpu::widen(&gp.forward(&s, &THETA, 10 + r));
+            fwd2 += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let _ = es.gradient(&s, 10 + r, &l, &g.0);
+            sum2 += t.elapsed().as_secs_f64();
+        }
+        let ms = |x: f64| 1e3 * x / reps as f64;
+        eprintln!("{tris} triangles, {n} pairs, {w}², depth {}", s.depth);
+        eprintln!(
+            "before: host sampling {:.1} ms, device pairs {:.1} ms, host sum {:.2} ms",
+            ms(host),
+            ms(fwd),
+            ms(sum)
+        );
+        eprintln!(
+            "after:  host rig {:.2} ms, device sampling {:.1} ms, device pairs {:.1} ms, host sum {:.2} ms",
+            ms(dh),
+            ms(dd),
+            ms(fwd2),
+            ms(sum2)
+        );
+    }
+}
