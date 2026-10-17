@@ -182,8 +182,15 @@ fn edge_cand(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
     }
     let pa = project(world(mi, obj(prim, e)));
     let pb = project(world(mi, obj(prim, (e + 1u) % 3u)));
-    let pc = project(world(mi, obj(prim, (e + 2u) % 3u)));
-    if (pa.z <= 0.0 || pb.z <= 0.0 || pc.z <= 0.0) { return; }
+    var pc = project(world(mi, obj(prim, (e + 2u) % 3u)));
+    if (pa.z <= 0.0 || pb.z <= 0.0) { return; }
+    if (pc.z <= 0.0) {
+        // The third corner behind the eye: a point just inside the
+        // triangle next to the edge says which side is its, as on the host.
+        let m = 0.5 * (world(mi, obj(prim, e)) + world(mi, obj(prim, (e + 1u) % 3u)));
+        pc = project(m + (world(mi, obj(prim, (e + 2u) % 3u)) - m) * 1e-3);
+        if (pc.z <= 0.0) { return; }
+    }
     let t = clip(pa.xy, pb.xy);
     if (t.x >= t.y) { return; }
     let len = length(pb.xy - pa.xy) * (t.y - t.x);
@@ -279,7 +286,12 @@ fn edge_sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     let b = world(mi, lb);
     let pa = project(a).xy;
     let pb = project(b).xy;
-    let pc = project(world(mi, obj(prim, (e + 2u) % 3u))).xy;
+    var pc3 = project(world(mi, obj(prim, (e + 2u) % 3u)));
+    if (pc3.z <= 0.0) {
+        let m = 0.5 * (a + b);
+        pc3 = project(m + (world(mi, obj(prim, (e + 2u) % 3u)) - m) * 1e-3);
+    }
+    let pc = pc3.xy;
     let t = r.x + frac * (r.y - r.x);
     let d = pb - pa;
     let sp = pa + t * d;

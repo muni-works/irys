@@ -848,7 +848,7 @@ draw the same samples.
 
 | Gate (M-series, Metal) | Result |
 |---|---|
-| device vs host samples, plate arm, 16 384, both importances | 99.3–99.7 % of points within 1e-5 (the rest: f32 cumulative sums moving a `u` across a segment end); weights 16384/16384 within 2e-3; visible counts equal |
+| device vs host samples, plate arm, 16 384, both importances | 98.9–99.6 % of points within 1e-5 (the rest: f32 cumulative sums moving a `u` across a segment end); weights 16384/16384 within 2e-3; visible counts equal |
 | edge term from device samples vs host samples, both traced on the device | rel ≤ 2.1e-3 |
 | two device draws | bit-identical points and weights |
 | **split, 522 k triangles, 16 384 pairs, 192², depth 5 (release)** | before: host sampling **102.5 ms**, device pairs 2.7 ms, host sum 0.45 ms. After: host 0.04 ms, device sampling **3.0 ms**, device pairs 3.9 ms, host sum 0.43 ms — 105 → 7.4 ms |
@@ -857,6 +857,28 @@ Deviations: the ID-buffer demotion (piece 2) is host-only; the device does
 2d's importance or 2e's front-only silhouettes. Velocities still come from
 central differences of the rig's closed form on the host (exact to 1e-10;
 f32 on the device).
+
+### 4. The camera as a parameter (`vis::CameraRig`, `Tangents::camera`)
+
+`c = (t, ω, δ)`: eye translated by `t` (world), the frame turned about the
+eye by `R_z R_y R_x(ω)` (world axes), the half field of view widened by `δ`
+— seven parameters about a base pinhole (`Scene::set_camera` is new). Edge
+term: every instance's edges are candidates (front-only silhouettes), and a
+fixed world point's screen velocity is the pinhole's derivative (central
+differences of the closed form). Interior: the eye, axes and `tan` of the
+half-angle are duals; the primary ray and everything downstream follow.
+Edges with a corner behind the eye are now kept on both tiers (the
+triangle's side is read from a point just inside it next to the edge); 2d
+dropped every triangle with a corner behind the eye, which a camera near a
+floor makes common. Edge ends behind the eye are still dropped (no near
+clip).
+
+| Gate | Result |
+|---|---|
+| per-lane, all 7 parameters, arm on floor, depth 4, NEE, one seed | rotations and fov: 376/376, 376/376, 44/44, 376/376 moving lanes agree to 1e-4; translations move no lane (flat faces, directional light, no second object on the path) |
+| **two boxes, conductor + diffuse, apart, depth 3 + NEE**, 48×36, 24 × (8192 pairs + 4 spp) vs CD (16² points, h 0.05 / 0.004 rad / 0.01 rad, 4 seeds) | z −0.54, +1.01, −2.34, −0.40, −0.59, +0.96, −1.57; e.g. fov: edge 55.5 + interior 89.9 = 145.4 ± 1.3 vs 150.1 ± 2.7 |
+| arm mask, depth 1 | z −0.52, +1.69, +1.72, +1.25, −2.74, −0.28, +0.80. The reference itself moves by a few per cent with the rotation step (c4: 6.5, 5.3, 4.3 at h = 0.01, 0.004, 0.025 rad) |
+| shaded arm, depth 4 + NEE (ignored test, measured) | translations and the roll disagree by 5–14σ (c0: 5.16 ± 0.25 vs 0.57 ± 0.21) — the arm's shadows on itself and the post are image discontinuities that are no triangle's edge, and every one of them moves when the camera does |
 
 ## Open questions
 

@@ -86,6 +86,96 @@ impl Rig<'_> {
     }
 }
 
+/// A pinhole: eye, forward, right, up, `tan` of the half field of view.
+#[derive(Debug, Clone, Copy)]
+pub struct Pinhole {
+    /// Eye.
+    pub eye: Point3,
+    /// Unit forward.
+    pub forward: Vec3,
+    /// Unit right.
+    pub right: Vec3,
+    /// Unit up.
+    pub up: Vec3,
+    /// `tan` of the half field of view.
+    pub tan_half: f64,
+}
+
+impl Pinhole {
+    /// The scene's.
+    pub fn of(scene: &Scene) -> Self {
+        let (eye, forward, right, up, tan_half) = scene.camera();
+        Self {
+            eye,
+            forward,
+            right,
+            up,
+            tan_half,
+        }
+    }
+
+    /// [`Scene::project`] through this pinhole, without the Jacobian.
+    pub fn project(&self, size: (usize, usize), p: Point3) -> Option<[f64; 2]> {
+        let d = p - self.eye;
+        let z = d.dot(&self.forward);
+        if z <= 0.0 {
+            return None;
+        }
+        let (w, h) = (size.0 as f64, size.1 as f64);
+        let kx = w / (2.0 * self.tan_half * w / h);
+        let ky = h / (2.0 * self.tan_half);
+        Some([
+            d.dot(&self.right) / z * kx + w / 2.0,
+            h / 2.0 - d.dot(&self.up) / z * ky,
+        ])
+    }
+}
+
+/// The camera as a parameter (phase 2e): `c = (t, ω, δ)` — the eye moved
+/// by `t` (world), the frame turned about the eye by `R_z(ω_z) R_y(ω_y)
+/// R_x(ω_x)` (world axes), the half field of view widened by `δ` radians —
+/// all about a base pinhole, so `c = 0` is the base.
+#[derive(Debug, Clone, Copy)]
+pub struct CameraRig {
+    /// The pinhole at `c = 0`.
+    pub base: Pinhole,
+}
+
+/// Camera parameters: three of translation, three of rotation, one of fov.
+pub const CAMERA_PARAMS: usize = 7;
+
+impl CameraRig {
+    /// Rigged about `scene`'s current camera.
+    pub fn new(scene: &Scene) -> Self {
+        Self {
+            base: Pinhole::of(scene),
+        }
+    }
+
+    /// The pinhole at `c`.
+    pub fn pinhole(&self, c: &[f64]) -> Pinhole {
+        assert_eq!(c.len(), CAMERA_PARAMS);
+        let o = Point3::origin();
+        let r = about(o, Vec3::new(0.0, 0.0, 1.0), c[5])
+            .then(&about(o, Vec3::new(0.0, 1.0, 0.0), c[4]))
+            .then(&about(o, Vec3::new(1.0, 0.0, 0.0), c[3]));
+        let b = &self.base;
+        Pinhole {
+            eye: b.eye + Vec3::new(c[0], c[1], c[2]),
+            forward: r.apply_vec(&b.forward),
+            right: r.apply_vec(&b.right),
+            up: r.apply_vec(&b.up),
+            tan_half: (b.tan_half.atan() + c[6]).tan(),
+        }
+    }
+
+    /// Put `scene`'s camera at `c`.
+    pub fn pose(&self, scene: &mut Scene, c: &[f64]) {
+        let p = self.pinhole(c);
+        scene.set_camera(p.eye, p.forward, p.right, p.up, p.tan_half);
+    }
+}
+
 /// No neighbour across an edge (a boundary, or more than two triangles
 /// share it after welding).
 const NONE: u32 = u32::MAX;
@@ -431,7 +521,7 @@ impl EdgeSamples {
         seed: u64,
         vis: Option<&Visibility>,
     ) -> Self {
-        Self::build(scene, edges, rig, phi, n, seed, vis.is_some(), vis)
+        Self::for_rig(scene, edges, rig, phi, n, seed, vis.is_some(), vis)
     }
 
     /// 2e's front-only silhouettes without an ID buffer (what the device
@@ -445,11 +535,11 @@ impl EdgeSamples {
         seed: u64,
         front_only: bool,
     ) -> Self {
-        Self::build(scene, edges, rig, phi, n, seed, front_only, None)
+        Self::for_rig(scene, edges, rig, phi, n, seed, front_only, None)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build(
+    fn for_rig(
         scene: &Scene,
         edges: &Edges,
         rig: &Rig,
@@ -470,12 +560,83 @@ impl EdgeSamples {
                 [plus, (rig.place)(&p)]
             })
             .collect();
+        // A material point carried by its instance: `J_π · ∂X/∂φ`.
+        let vel = |mi: usize, xl: Point3, _x: Point3, jac: [Vec3; 2]| {
+            shifted
+                .iter()
+                .map(|[p, q]| {
+                    let dx = (p[mi].apply_point(&xl) - q[mi].apply_point(&xl)) / (2.0 * RIG_H);
+                    [jac[0].dot(&dx), jac[1].dot(&dx)]
+                })
+                .collect::<Vec<_>>()
+        };
+        Self::build(
+            scene,
+            edges,
+            &rig.moving,
+            &vel,
+            np,
+            n,
+            seed,
+            front_only,
+            vis,
+        )
+    }
+
+    /// Edge samples for the camera's parameters ([`CameraRig`] at `c`; the
+    /// scene is set there): every instance's edges are candidates, and a
+    /// world point's screen velocity is the pinhole's derivative.
+    pub fn for_camera(
+        scene: &Scene,
+        edges: &Edges,
+        cam: &CameraRig,
+        c: &[f64],
+        n: usize,
+        seed: u64,
+    ) -> Self {
+        let shifted: Vec<[Pinhole; 2]> = (0..c.len())
+            .map(|j| {
+                let mut p = c.to_vec();
+                p[j] += RIG_H;
+                let a = cam.pinhole(&p);
+                p[j] -= 2.0 * RIG_H;
+                [a, cam.pinhole(&p)]
+            })
+            .collect();
+        let size = scene.size;
+        let vel = |_mi: usize, _xl: Point3, x: Point3, _jac: [Vec3; 2]| {
+            shifted
+                .iter()
+                .map(|[a, b]| match (a.project(size, x), b.project(size, x)) {
+                    (Some(p), Some(q)) => {
+                        [(p[0] - q[0]) / (2.0 * RIG_H), (p[1] - q[1]) / (2.0 * RIG_H)]
+                    }
+                    _ => [0.0, 0.0],
+                })
+                .collect::<Vec<_>>()
+        };
+        let all: Vec<usize> = (0..scene.placements().len()).collect();
+        Self::build(scene, edges, &all, &vel, c.len(), n, seed, true, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        scene: &Scene,
+        edges: &Edges,
+        moving: &[usize],
+        vel: &dyn Fn(usize, Point3, Point3, [Vec3; 2]) -> Vec<[f64; 2]>,
+        np: usize,
+        n: usize,
+        seed: u64,
+        front_only: bool,
+        vis: Option<&Visibility>,
+    ) -> Self {
         let (w, h) = (scene.size.0 as f64, scene.size.1 as f64);
         let mut segs = Vec::new();
         let mut cum = Vec::new();
         let (mut total, mut wtotal, mut sil) = (0.0, 0.0, 0.0);
         let (eye, fwd, right, up, _) = scene.camera();
-        for (mi, &k) in rig.moving.iter().enumerate() {
+        for (mi, &k) in moving.iter().enumerate() {
             let place = &scene.placements()[k];
             let m = scene.blas()[place.blas].geometry().mesh();
             let pos = m.positions();
@@ -490,17 +651,17 @@ impl EdgeSamples {
             };
             let front = |tri: usize| facing(tri) > 0.0;
             for (tri, t) in tris.iter().enumerate() {
-                let Some(pz) = t
+                let wp: Vec<Point3> = t
                     .iter()
-                    .map(|&i| {
-                        let x = place.to_world.apply_point(&pos[i as usize]);
-                        scene.project(x).map(|p| (p.0, (x - eye).dot(&fwd)))
-                    })
-                    .collect::<Option<Vec<_>>>()
-                else {
+                    .map(|&i| place.to_world.apply_point(&pos[i as usize]))
+                    .collect();
+                let pz: Vec<Option<([f64; 2], f64)>> = wp
+                    .iter()
+                    .map(|&x| scene.project(x).map(|p| (p.0, (x - eye).dot(&fwd))))
+                    .collect();
+                if pz.iter().all(Option::is_none) {
                     continue;
-                };
-                let px: Vec<[f64; 2]> = pz.iter().map(|p| p.0).collect();
+                }
                 let f = front(tri);
                 for e in 0..3 {
                     let imp = match nbr[tri][e] {
@@ -529,7 +690,24 @@ impl EdgeSamples {
                             (false, true) => 1.0,
                         },
                     };
-                    let (pa, pb, pc) = (px[e], px[(e + 1) % 3], px[(e + 2) % 3]);
+                    // The edge's ends must be in front of the eye; the
+                    // third corner only says which side is the triangle's,
+                    // so behind the eye a point just inside the triangle
+                    // next to the edge says it instead (2d dropped every
+                    // triangle with a corner behind the eye).
+                    let (Some((pa, za)), Some((pb, zb))) = (pz[e], pz[(e + 1) % 3]) else {
+                        continue;
+                    };
+                    let pc = match pz[(e + 2) % 3] {
+                        Some((p, _)) => p,
+                        None => {
+                            let m = wp[e] + (wp[(e + 1) % 3] - wp[e]) * 0.5;
+                            match scene.project(m + (wp[(e + 2) % 3] - m) * 1e-3) {
+                                Some((p, _)) => p,
+                                None => continue,
+                            }
+                        }
+                    };
                     let Some((t0, t1)) = clip(pa, pb, w, h) else {
                         continue;
                     };
@@ -540,7 +718,6 @@ impl EdgeSamples {
                     let runs = match vis {
                         None => vec![(t0, t1, imp)],
                         Some(v) => {
-                            let (za, zb) = (pz[e].1, pz[(e + 1) % 3].1);
                             v.runs(k, pa, pb, za, zb, t0, t1)
                                 .into_iter()
                                 .map(|(a, b, seen)| {
@@ -699,14 +876,9 @@ impl EdgeSamples {
             if crease {
                 out.halved += 1;
             }
-            let wt = (0..np)
-                .map(|j| {
-                    let [p, q] = &shifted[j];
-                    let dx =
-                        (p[seg.mi].apply_point(&xl) - q[seg.mi].apply_point(&xl)) / (2.0 * RIG_H);
-                    let vn = jac[0].dot(&dx) * nrm[0] + jac[1].dot(&dx) * nrm[1];
-                    vn * wtotal / (seg.w * n as f64)
-                })
+            let wt = vel(seg.mi, xl, x, jac)
+                .into_iter()
+                .map(|v| (v[0] * nrm[0] + v[1] * nrm[1]) * wtotal / (seg.w * n as f64))
                 .collect();
             put(&mut out, s, nrm, wt);
         }

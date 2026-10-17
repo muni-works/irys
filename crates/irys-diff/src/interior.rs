@@ -375,6 +375,41 @@ impl Tangents {
         t
     }
 
+    /// The camera rig at `c` (the scene's camera is there; nothing else
+    /// moves).
+    pub fn camera(scene: &Scene, cam: &crate::vis::CameraRig, c: &[f64]) -> Self {
+        let mut t = Self::none(scene, c.len());
+        let at: Vec<[crate::vis::Pinhole; 2]> = (0..c.len())
+            .map(|j| {
+                let mut p = c.to_vec();
+                p[j] += RIG_H;
+                let a = cam.pinhole(&p);
+                p[j] -= 2.0 * RIG_H;
+                [a, cam.pinhole(&p)]
+            })
+            .collect();
+        let p0 = cam.pinhole(c);
+        let dv = |f: &dyn Fn(&crate::vis::Pinhole) -> Vec3| -> Vec<Vec3> {
+            at.iter()
+                .map(|[a, b]| (f(a) - f(b)) / (2.0 * RIG_H))
+                .collect()
+        };
+        t.cam = Cam {
+            eye: V3::with(p0.eye.coords(), &dv(&|p| p.eye.coords())),
+            forward: V3::with(p0.forward, &dv(&|p| p.forward)),
+            right: V3::with(p0.right, &dv(&|p| p.right)),
+            up: V3::with(p0.up, &dv(&|p| p.up)),
+            tan_half: {
+                let mut d = D::c(p0.tan_half);
+                for (j, [a, b]) in at.iter().enumerate() {
+                    d.d[j] = (a.tan_half - b.tan_half) / (2.0 * RIG_H);
+                }
+                d
+            },
+        };
+        t
+    }
+
     /// A world point carried by placement `k`, from its object-space `p`.
     fn point(&self, scene: &Scene, k: usize, p: Point3) -> V3 {
         let x = scene.placements()[k].to_world.apply_point(&p).coords();
