@@ -237,6 +237,13 @@ impl Splats {
         self.centers[i]
     }
 
+    /// The inverse covariance of splat `i`, `[a00, a01, a02, a11, a12, a22]`:
+    /// what a device-side intersector uploads, so it solves the same
+    /// quadratic as [`Geometry::intersect`] here.
+    pub fn inv_cov(&self, i: usize) -> [f64; 6] {
+        self.inv_cov[i]
+    }
+
     /// The base opacity of splat `i`, before the Gaussian falloff.
     pub fn opacity(&self, i: usize) -> f32 {
         self.opacities[i]

@@ -8,7 +8,13 @@
 // replay differs from the forward pass only in `params.replay`, which gates
 // the `δf` write and nothing that feeds the path.
 //
-// Scene: `prb::Scene`'s ball and floor, as two analytic primitives.
+// Scene (phase 2b): `prb::Scene`'s two trees, flattened from irys-core's
+// `Bvh::flatten` into one node array — the opaque tree (triangles + analytic
+// spheres and discs) rooted at node 0, the splat tree at `splat_root` — and
+// walked with a fixed-order stack, so a ray visits the same nodes in the same
+// order every time it is traced. Splats are 3DGRT-style: their 3σ boxes are
+// the proxies in the tree, and a ray collects them in (t, index) order, K at a
+// time, compositing front to back up to the opaque hit.
 
 struct Params {
     seed: vec2<u32>,      // (lo, hi) of the u64 frame seed
@@ -28,8 +34,16 @@ struct Params {
     resp: vec4<f32>,      // spectrum::RESPONSE_NORM × band / (spp × nw)
     pixels: u32,
     inv_n: f32,           // 1 / (pixels × 3), the L2 mean
-    _pad: vec2<u32>,
+    checker: f32,         // checker square size, 0 for plain
+    splat_root: u32,      // node index of the splat tree, NONE without one
+    splat_base: u32,      // first splat record in `geo`, in vec4s
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
 }
+
+const NONE: u32 = 0xffffffffu;
+const LEAF: u32 = 0x80000000u;
 
 struct Path {
     o: vec4<f32>,
@@ -66,6 +80,11 @@ struct Path {
 @group(0) @binding(20) var<storage, read_write> sq: array<f32>;
 @group(0) @binding(21) var<storage, read_write> loss_out: array<f32>;
 @group(0) @binding(22) var<storage, read_write> dl_out: array<f32>;
+// The scene: nodes (min.xyz, a) (max.xyz, b | LEAF), leaf prim indices, and
+// prim records (opaque: three vec4 each, splats: four from `splat_base`).
+@group(0) @binding(23) var<storage, read> nodes: array<vec4<f32>>;
+@group(0) @binding(24) var<storage, read> prim_ids: array<u32>;
+@group(0) @binding(25) var<storage, read> geo: array<vec4<f32>>;
 
 const PI: f32 = 3.14159265358979;
 
@@ -135,34 +154,271 @@ fn sky(d: vec3<f32>, lambda: f32) -> f32 {
 
 struct Hit {
     t: f32,
-    prim: u32,   // 0 ball, 1 floor, 2 miss
+    prim: u32,   // combined opaque index, NONE on a miss
 }
 
-fn intersect(o: vec3<f32>, d: vec3<f32>) -> Hit {
-    let tmin = params.eps * 0.1;
-    var best = Hit(3.4e38, 2u);
-    let oc = o - vec3<f32>(0.0, 0.0, 1.0);
-    let b = dot(oc, d);
-    let c = dot(oc, oc) - 1.0;
-    let disc = b * b - c;
-    if (disc >= 0.0) {
+// The slab test, as `Ray::intersect_aabb`: (enter, exit), enter > exit on a
+// miss.
+fn slab(o: vec3<f32>, inv: vec3<f32>, n: u32) -> vec2<f32> {
+    let lo = (nodes[2u * n].xyz - o) * inv;
+    let hi = (nodes[2u * n + 1u].xyz - o) * inv;
+    let a = min(lo, hi);
+    let b = max(lo, hi);
+    let enter = max(max(a.x, a.y), max(a.z, 0.0));
+    let exit = min(b.x, min(b.y, b.z));
+    return vec2<f32>(enter, exit);
+}
+
+fn node_a(n: u32) -> u32 {
+    return bitcast<u32>(nodes[2u * n].w);
+}
+
+fn node_b(n: u32) -> u32 {
+    return bitcast<u32>(nodes[2u * n + 1u].w);
+}
+
+// One opaque prim: kind in `r0.w` (0 triangle, 1 sphere, 2 disc).
+fn hit_prim(o: vec3<f32>, d: vec3<f32>, i: u32, tmin: f32) -> f32 {
+    let r0 = geo[3u * i];
+    let r1 = geo[3u * i + 1u];
+    let r2 = geo[3u * i + 2u];
+    let kind = u32(r0.w);
+    if (kind == 0u) {
+        // Möller–Trumbore, double-sided.
+        let e1 = r1.xyz - r0.xyz;
+        let e2 = r2.xyz - r0.xyz;
+        let pv = cross(d, e2);
+        let det = dot(e1, pv);
+        if (abs(det) < 1e-12) { return -1.0; }
+        let inv = 1.0 / det;
+        let tv = o - r0.xyz;
+        let u = dot(tv, pv) * inv;
+        if (u < 0.0 || u > 1.0) { return -1.0; }
+        let qv = cross(tv, e1);
+        let v = dot(d, qv) * inv;
+        if (v < 0.0 || u + v > 1.0) { return -1.0; }
+        return dot(e2, qv) * inv;
+    }
+    if (kind == 1u) {
+        let oc = o - r0.xyz;
+        let b = dot(oc, d);
+        let c = dot(oc, oc) - r2.w * r2.w;
+        let disc = b * b - c;
+        if (disc < 0.0) { return -1.0; }
         let sq = sqrt(disc);
         let t0 = -b - sq;
-        let t1 = -b + sq;
-        if (t0 > tmin) {
-            best = Hit(t0, 0u);
-        } else if (t1 > tmin) {
-            best = Hit(t1, 0u);
-        }
+        if (t0 > tmin) { return t0; }
+        return -b + sq;
     }
-    if (abs(d.z) > 1e-12) {
-        let t = -o.z / d.z;
-        let p = o + d * t;
-        if (t > tmin && t < best.t && p.x * p.x + p.y * p.y <= 900.0) {
-            best = Hit(t, 1u);
+    let n = r1.xyz;
+    let den = dot(d, n);
+    if (den == 0.0) { return -1.0; }
+    let q = o - r0.xyz;
+    let t = -dot(q, n) / den;
+    let p = q + d * t;
+    if (dot(p, p) > r2.w * r2.w) { return -1.0; }
+    return t;
+}
+
+// Closest opaque hit. Near child first (left on a tie), far child pushed
+// under it; the walk is a function of the ray alone, so replay retraces it.
+fn intersect(o: vec3<f32>, d: vec3<f32>) -> Hit {
+    let tmin = params.eps * 0.1;
+    let inv = 1.0 / d;
+    var best = Hit(3.4e38, NONE);
+    var stack: array<u32, 64>;
+    var sp = 1u;
+    stack[0] = 0u;
+    loop {
+        if (sp == 0u) { break; }
+        sp = sp - 1u;
+        let n = stack[sp];
+        let e = slab(o, inv, n);
+        if (e.x > e.y || e.x >= best.t || e.y <= tmin) { continue; }
+        let a = node_a(n);
+        let b = node_b(n);
+        if ((b & LEAF) != 0u) {
+            for (var k = a; k < a + (b & ~LEAF); k = k + 1u) {
+                let i = prim_ids[k];
+                let t = hit_prim(o, d, i, tmin);
+                if (t > tmin && t < best.t) {
+                    best = Hit(t, i);
+                }
+            }
+            continue;
+        }
+        let ea = slab(o, inv, a);
+        let eb = slab(o, inv, b);
+        let ha = ea.x <= ea.y;
+        let hb = eb.x <= eb.y;
+        if (ha && hb) {
+            if (ea.x <= eb.x) {
+                stack[sp] = b;
+                stack[sp + 1u] = a;
+            } else {
+                stack[sp] = a;
+                stack[sp + 1u] = b;
+            }
+            sp = sp + 2u;
+        } else if (ha) {
+            stack[sp] = a;
+            sp = sp + 1u;
+        } else if (hb) {
+            stack[sp] = b;
+            sp = sp + 1u;
         }
     }
     return best;
+}
+
+fn prim_normal(i: u32, x: vec3<f32>) -> vec3<f32> {
+    let r0 = geo[3u * i];
+    let r1 = geo[3u * i + 1u];
+    let kind = u32(r0.w);
+    if (kind == 0u) {
+        return normalize(cross(r1.xyz - r0.xyz, geo[3u * i + 2u].xyz - r0.xyz));
+    }
+    if (kind == 1u) {
+        return normalize(x - r0.xyz);
+    }
+    return r1.xyz;
+}
+
+fn prim_conductor(i: u32) -> bool {
+    return geo[3u * i + 1u].w == 0.0;
+}
+
+fn albedo_at(x: vec3<f32>) -> f32 {
+    if (params.checker > 0.0) {
+        let c = floor(x.x / params.checker) + floor(x.y / params.checker);
+        if (c - 2.0 * floor(c * 0.5) == 1.0) {
+            return params.albedo * 0.55;
+        }
+    }
+    return params.albedo;
+}
+
+// ---- splats: 3DGRT-style ordered hit collection ----
+
+const K: u32 = 16u;
+
+// `Splats::intersect`: the Gaussian's peak along the ray, `(t, α)`; α < 0
+// for a miss or past 3σ.
+fn hit_splat(o: vec3<f32>, d: vec3<f32>, i: u32) -> vec2<f32> {
+    let base = params.splat_base + 4u * i;
+    let c = geo[base];
+    let a0 = geo[base + 1u];
+    let a1 = geo[base + 2u];
+    let delta = o - c.xyz;
+    let ad = vec3<f32>(
+        a0.x * d.x + a0.y * d.y + a0.z * d.z,
+        a0.y * d.x + a0.w * d.y + a1.x * d.z,
+        a0.z * d.x + a1.x * d.y + a1.y * d.z,
+    );
+    let den = dot(d, ad);
+    if (!(den > 0.0)) { return vec2<f32>(0.0, -1.0); }
+    let t = -dot(delta, ad) / den;
+    let q = delta + t * d;
+    let aq = vec3<f32>(
+        a0.x * q.x + a0.y * q.y + a0.z * q.z,
+        a0.y * q.x + a0.w * q.y + a1.x * q.z,
+        a0.z * q.x + a1.x * q.y + a1.y * q.z,
+    );
+    let d2 = max(dot(q, aq), 0.0);
+    if (d2 > 9.0) { return vec2<f32>(t, -1.0); }
+    return vec2<f32>(t, c.w * exp(-0.5 * d2));
+}
+
+// (t, i) strictly after (t0, i0): the order splats are composited in, a
+// total order, so ties never depend on the walk.
+fn after(t: f32, i: u32, t0: f32, i0: u32) -> bool {
+    return t > t0 || (t == t0 && i0 != NONE && i > i0);
+}
+
+struct Segment {
+    rad: vec3<f32>,   // Σ T α c, linear sRGB
+    tr: f32,          // Π (1 − α)
+}
+
+// `splats::composite` over (tmin, tmax): rounds of "the K nearest splats
+// after the last one composited", each a full walk of the splat tree that
+// keeps a sorted K-buffer and culls boxes beyond its last entry once full.
+fn composite(o: vec3<f32>, d: vec3<f32>, tmin: f32, tmax: f32) -> Segment {
+    var seg = Segment(vec3<f32>(0.0), 1.0);
+    if (params.splat_root == NONE) { return seg; }
+    let inv = 1.0 / d;
+    var t0 = tmin;
+    var i0 = NONE;
+    for (var round = 0u; round < 256u; round = round + 1u) {
+        var kt: array<f32, 16>;
+        var ki: array<u32, 16>;
+        var ka: array<f32, 16>;
+        var cnt = 0u;
+        var stack: array<u32, 64>;
+        var sp = 1u;
+        stack[0] = params.splat_root;
+        loop {
+            if (sp == 0u) { break; }
+            sp = sp - 1u;
+            let n = stack[sp];
+            let e = slab(o, inv, n);
+            if (e.x > e.y || e.y < t0 || e.x >= tmax) { continue; }
+            if (cnt == K && e.x > kt[K - 1u]) { continue; }
+            let a = node_a(n);
+            let b = node_b(n);
+            if ((b & LEAF) != 0u) {
+                for (var k = a; k < a + (b & ~LEAF); k = k + 1u) {
+                    let i = prim_ids[k];
+                    let h = hit_splat(o, d, i);
+                    if (h.y <= 0.0 || h.x >= tmax || !after(h.x, i, t0, i0)) { continue; }
+                    if (cnt == K && !(h.x < kt[K - 1u] || (h.x == kt[K - 1u] && i < ki[K - 1u]))) {
+                        continue;
+                    }
+                    // Sorted insert by (t, i).
+                    var j = min(cnt, K - 1u);
+                    loop {
+                        if (j == 0u) { break; }
+                        let pt = kt[j - 1u];
+                        if (pt < h.x || (pt == h.x && ki[j - 1u] < i)) { break; }
+                        kt[j] = kt[j - 1u];
+                        ki[j] = ki[j - 1u];
+                        ka[j] = ka[j - 1u];
+                        j = j - 1u;
+                    }
+                    kt[j] = h.x;
+                    ki[j] = i;
+                    ka[j] = h.y;
+                    cnt = min(cnt + 1u, K);
+                }
+                continue;
+            }
+            // Children in index order: the K-buffer's order is the (t, i)
+            // order whatever the walk, so no near-first sort is needed.
+            stack[sp] = b;
+            stack[sp + 1u] = a;
+            sp = sp + 2u;
+        }
+        for (var k = 0u; k < cnt; k = k + 1u) {
+            let alpha = clamp(ka[k], 0.0, 1.0);
+            let c = geo[params.splat_base + 4u * ki[k] + 3u].xyz;
+            seg.rad = seg.rad + seg.tr * alpha * c;
+            seg.tr = seg.tr * (1.0 - alpha);
+            if (seg.tr <= 1e-4) {
+                seg.tr = 0.0;
+                return seg;
+            }
+        }
+        if (cnt < K) { return seg; }
+        t0 = kt[K - 1u];
+        i0 = ki[K - 1u];
+    }
+    return seg;
+}
+
+// `prb::splat_radiance`: sRGB onto the three hats (450 b, 550 g, 650 r).
+fn splat_lambda(rgb: vec3<f32>, l: f32) -> f32 {
+    let w = band_weights(l);
+    return w.x * rgb.z + w.y * rgb.y + w.z * rgb.x;
 }
 
 // Duff et al. 2017, as `prb::basis`.
@@ -290,7 +546,19 @@ fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
     let o = p.o.xyz;
     let d = p.d.xyz;
     let hit = intersect(o, d);
-    if (hit.prim == 2u) {
+    if (params.splat_root != NONE) {
+        let seg = composite(o, d, params.eps * 0.1, hit.t);
+        for (var k = 0u; k < params.nw; k = k + 1u) {
+            p.rad[k] = p.rad[k] + p.tp[k] * splat_lambda(seg.rad, p.lam[k]);
+            p.tp[k] = p.tp[k] * seg.tr;
+        }
+        if (seg.tr == 0.0) {
+            p.alive = 0u;
+            paths[i] = p;
+            return;
+        }
+    }
+    if (hit.prim == NONE) {
         for (var k = 0u; k < params.nw; k = k + 1u) {
             p.rad[k] = p.rad[k] + p.tp[k] * sky(d, p.lam[k]);
         }
@@ -299,22 +567,21 @@ fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let x = o + d * hit.t;
-    var n = vec3<f32>(0.0, 0.0, 1.0);
-    if (hit.prim == 0u) {
-        n = normalize(x - vec3<f32>(0.0, 0.0, 1.0));
-    }
+    let n = prim_normal(hit.prim, x);
+    let conductor = prim_conductor(hit.prim);
     let t = basis_t(n);
     let b = basis_b(n);
     let origin = x + n * params.eps;
     var s = p.rng;
-    if (hit.prim == 1u) {
+    if (!conductor) {
+        let albedo = albedo_at(x);
         let u1 = rand(&s);
         let u2 = rand(&s);
         let r = sqrt(u1);
         let phi = 2.0 * PI * u2;
         let wi = t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(1.0 - u1, 0.0));
         for (var k = 0u; k < params.nw; k = k + 1u) {
-            p.tp[k] = p.tp[k] * params.albedo;
+            p.tp[k] = p.tp[k] * albedo;
         }
         p.o = vec4<f32>(origin, 0.0);
         p.d = vec4<f32>(normalize(wi), 0.0);

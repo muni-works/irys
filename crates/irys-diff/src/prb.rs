@@ -56,8 +56,9 @@
 //! weight `p_k / Σ p` is `1/4` for each: the image averages the four lanes.
 //! Each lane is a path in the PRB sense, with its own `L`, `L_j`, `δL`.
 
-use irys_core::{Bvh, Point3, Ray, Vec3};
+use irys_core::{Aabb, Bvh, Geometry, Hit, Point3, Ray, TriMesh, Vec3};
 use irys_light::spectrum::{hero_weight, sample_lambda_nm};
+use irys_light::splats::{self, Splats};
 use irys_prims::analytic::{Analytic, Prim};
 
 use crate::ggx::{self, COLUMNS, DF, Graph, PARAMS, THETA, band_weights, normalize};
@@ -103,9 +104,105 @@ impl Rng {
     }
 }
 
-/// The ball, the floor, the camera and the sky.
+/// What an opaque primitive is made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// The rough conductor: `θ`'s GGX graph.
+    Conductor,
+    /// The grey Lambertian floor, θ-free ([`Scene::floor_albedo`]).
+    Diffuse,
+}
+
+/// Every opaque primitive of a scene behind one [`Geometry`], so one tree
+/// holds them: index `i < mesh.len()` is triangle `i`, past that analytic
+/// primitive `i − mesh.len()`. Hits report this combined index.
+pub struct Opaque {
+    mesh: TriMesh,
+    analytic: Analytic,
+    surfaces: Vec<Surface>,
+}
+
+impl Opaque {
+    /// A mesh, all of `mesh_surface`, and analytic prims, one surface each.
+    pub fn new(
+        mesh: TriMesh,
+        mesh_surface: Surface,
+        analytic: Analytic,
+        analytic_surfaces: &[Surface],
+    ) -> Self {
+        assert_eq!(
+            analytic.len(),
+            analytic_surfaces.len(),
+            "one surface per prim"
+        );
+        let mut surfaces = vec![mesh_surface; mesh.len()];
+        surfaces.extend_from_slice(analytic_surfaces);
+        Self {
+            mesh,
+            analytic,
+            surfaces,
+        }
+    }
+
+    /// The triangles.
+    pub fn mesh(&self) -> &TriMesh {
+        &self.mesh
+    }
+
+    /// The analytic primitives.
+    pub fn analytic(&self) -> &Analytic {
+        &self.analytic
+    }
+
+    /// What primitive `i` (combined index) is made of.
+    pub fn surface(&self, i: usize) -> Surface {
+        self.surfaces[i]
+    }
+}
+
+impl Geometry for Opaque {
+    fn len(&self) -> usize {
+        self.mesh.len() + self.analytic.len()
+    }
+
+    fn bounds(&self, i: usize) -> Aabb {
+        let nt = self.mesh.len();
+        if i < nt {
+            self.mesh.bounds(i)
+        } else {
+            self.analytic.bounds(i - nt)
+        }
+    }
+
+    fn intersect(&self, ray: &Ray, i: usize, t_min: f64, t_max: f64) -> Option<Hit> {
+        let nt = self.mesh.len();
+        let hit = if i < nt {
+            self.mesh.intersect(ray, i, t_min, t_max)
+        } else {
+            self.analytic.intersect(ray, i - nt, t_min, t_max)
+        };
+        hit.map(|mut h| {
+            h.prim = i as u32;
+            h
+        })
+    }
+}
+
+/// A splat's baked radiance at `lambda_nm`: its linear-sRGB colour lifted
+/// onto the conductor's three-hat basis (450, 550, 650 nm — blue, green,
+/// red). Linear, so it commutes with the compositor's sums. The GPU does the
+/// same in `wavefront.wgsl`.
+pub fn splat_radiance(rgb: [f32; 3], lambda_nm: f64) -> f64 {
+    let w = band_weights(lambda_nm);
+    w[0] * rgb[2] as f64 + w[1] * rgb[1] as f64 + w[2] * rgb[0] as f64
+}
+
+/// The ball, the floor, the camera and the sky; optionally a splat cloud.
 pub struct Scene {
-    bvh: Bvh<Analytic>,
+    pub(crate) opaque: Bvh<Opaque>,
+    /// Gaussian splats, composited front to back along every segment
+    /// ([`splats::composite`]): emissive and absorbing, θ-free.
+    pub(crate) splats: Option<Bvh<Splats>>,
     /// Image width and height in pixels.
     pub size: (usize, usize),
     /// Paths per pixel.
@@ -116,21 +213,27 @@ pub struct Scene {
     pub wavelengths: usize,
     /// The floor's (grey, θ-free) albedo.
     pub floor_albedo: f64,
+    /// When set, diffuse surfaces are a checker of this square size, the
+    /// odd squares at [`CHECKER_DARK`] of the albedo.
+    pub floor_checker: Option<f64>,
     /// When set, the conductor samples at this roughness instead of the
     /// current one. Paths then do not move with `θ`, so central differences
     /// with common random numbers see exactly the estimator PRB
     /// differentiates — the tight test.
     pub frozen_alpha: Option<f64>,
+    pub(crate) tan_half: f64,
     pub(crate) eye: Point3,
     pub(crate) forward: Vec3,
     pub(crate) right: Vec3,
     pub(crate) up: Vec3,
 }
 
-const BALL: u32 = 0;
+/// The odd checker squares' share of the floor albedo.
+pub const CHECKER_DARK: f64 = 0.55;
 
 impl Scene {
-    /// The marble-like test scene at `w × h`, `spp` paths per pixel.
+    /// The marble-like test scene at `w × h`, `spp` paths per pixel: the
+    /// ball and a disc floor, two analytic prims.
     pub fn new(w: usize, h: usize, spp: usize) -> Self {
         let prims = vec![
             Prim::Sphere {
@@ -143,22 +246,91 @@ impl Scene {
                 radius: 30.0,
             },
         ];
-        let eye = Point3::new(0.0, -4.5, 2.2);
+        let opaque = Opaque::new(
+            TriMesh::default(),
+            Surface::Diffuse,
+            Analytic::from_prims(prims),
+            &[Surface::Conductor, Surface::Diffuse],
+        );
+        Self::with(opaque, None, (w, h), spp, Point3::new(0.0, -4.5, 2.2), 20.0)
+    }
+
+    /// Phase 2b's scene: the ball on a triangle-mesh floor (a 16 × 16 grid,
+    /// 512 triangles, checkered), in front of a bush of [`BUSH_SPLATS`]
+    /// Gaussian splats.
+    pub fn garden(w: usize, h: usize, spp: usize) -> Self {
+        let opaque = Opaque::new(
+            grid_floor(16, 12.0),
+            Surface::Diffuse,
+            Analytic::from_prims(vec![Prim::Sphere {
+                center: Point3::new(0.0, 0.0, 1.0),
+                radius: 1.0,
+            }]),
+            &[Surface::Conductor],
+        );
+        let mut s = Self::with(
+            opaque,
+            Some(Bvh::build(bush(BUSH_SPLATS, 17))),
+            (w, h),
+            spp,
+            Point3::new(0.0, -4.5, 2.2),
+            24.0,
+        );
+        s.floor_checker = Some(1.0);
+        s
+    }
+
+    fn with(
+        opaque: Opaque,
+        splats: Option<Bvh<Splats>>,
+        size: (usize, usize),
+        spp: usize,
+        eye: Point3,
+        half_fov_deg: f64,
+    ) -> Self {
         let forward = (Point3::new(0.0, 0.0, 0.8) - eye).normalize();
         let right = forward.cross(&Vec3::new(0.0, 0.0, 1.0)).normalize();
         let up = right.cross(&forward);
         Self {
-            bvh: Bvh::build(Analytic::from_prims(prims)),
-            size: (w, h),
+            opaque: Bvh::build(opaque),
+            splats,
+            size,
             spp,
             depth: 4,
             wavelengths: HERO,
             floor_albedo: 0.5,
+            floor_checker: None,
             frozen_alpha: None,
+            tan_half: half_fov_deg.to_radians().tan(),
             eye,
             forward,
             right,
             up,
+        }
+    }
+
+    /// The opaque tree.
+    pub fn opaque(&self) -> &Bvh<Opaque> {
+        &self.opaque
+    }
+
+    /// Replace (or with `None`, remove) the splat cloud.
+    pub fn set_splats(&mut self, splats: Option<Splats>) {
+        self.splats = splats.map(Bvh::build);
+    }
+
+    /// The splat tree, if the scene has one.
+    pub fn splats(&self) -> Option<&Bvh<Splats>> {
+        self.splats.as_ref()
+    }
+
+    /// The diffuse albedo at `p`.
+    pub fn albedo(&self, p: Point3) -> f64 {
+        match self.floor_checker {
+            Some(s) if ((p.x / s).floor() + (p.y / s).floor()).rem_euclid(2.0) == 1.0 => {
+                self.floor_albedo * CHECKER_DARK
+            }
+            _ => self.floor_albedo,
         }
     }
 
@@ -181,11 +353,82 @@ impl Scene {
             (px % w) as f64 + rng.uniform(),
             (px / w) as f64 + rng.uniform(),
         );
-        let tan = (20.0f64).to_radians().tan();
+        let tan = self.tan_half;
         let sx = (2.0 * x / w as f64 - 1.0) * tan * w as f64 / h as f64;
         let sy = (1.0 - 2.0 * y / h as f64) * tan;
         Ray::new(self.eye, self.forward + self.right * sx + self.up * sy)
     }
+}
+
+/// A flat `n × n` grid of quads over `[−half, half]²` at `z = 0`, two
+/// triangles each, wound so the face normal is `+z`.
+pub fn grid_floor(n: usize, half: f64) -> TriMesh {
+    let at = |i: usize| -half + 2.0 * half * i as f64 / n as f64;
+    let positions = (0..=n)
+        .flat_map(|j| (0..=n).map(move |i| (i, j)))
+        .map(|(i, j)| Point3::new(at(i), at(j), 0.0))
+        .collect();
+    let v = |i: usize, j: usize| (j * (n + 1) + i) as u32;
+    let indices: Vec<u32> = (0..n)
+        .flat_map(|j| (0..n).map(move |i| (i, j)))
+        .flat_map(|(i, j)| {
+            [
+                v(i, j),
+                v(i + 1, j),
+                v(i + 1, j + 1),
+                v(i, j),
+                v(i + 1, j + 1),
+                v(i, j + 1),
+            ]
+        })
+        .collect();
+    TriMesh::new(positions, Vec::new(), &indices)
+}
+
+/// Splats in [`Scene::garden`]'s bush.
+pub const BUSH_SPLATS: usize = 900;
+
+/// A procedural bush: `n` anisotropic Gaussians filling an ellipsoid that
+/// sits on the floor behind and left of the ball, greens darkening toward
+/// the ground. Degree-0 colour, so the radiance is view-independent.
+pub fn bush(n: usize, seed: u64) -> Splats {
+    const SH_C0: f32 = 0.282_094_8;
+    let centre = [-1.6, 2.5, 0.9];
+    let radii = [1.0, 0.8, 0.9];
+    let mut rng = Rng::new(seed, 0);
+    let mut u = move || rng.uniform() as f32;
+    let (mut pos, mut scale, mut quat, mut opac, mut sh) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    while pos.len() < n {
+        let q = [2.0 * u() - 1.0, 2.0 * u() - 1.0, 2.0 * u() - 1.0];
+        if q[0] * q[0] + q[1] * q[1] + q[2] * q[2] > 1.0 {
+            continue;
+        }
+        let p: [f32; 3] = std::array::from_fn(|k| centre[k] + radii[k] * q[k]);
+        pos.push(p);
+        scale.push([0.035 + 0.07 * u(), 0.035 + 0.07 * u(), 0.025 + 0.045 * u()]);
+        quat.push([
+            2.0 * u() - 1.0,
+            2.0 * u() - 1.0,
+            2.0 * u() - 1.0,
+            2.0 * u() - 1.0,
+        ]);
+        opac.push(0.5 + 0.4 * u());
+        // Lighter and yellower toward the top, a few berries.
+        let h = (p[2] / (2.0 * radii[2])).clamp(0.0, 1.0);
+        let k = 0.6 + 0.6 * u();
+        let c = if u() < 0.02 {
+            [0.45, 0.05, 0.04]
+        } else {
+            [
+                (0.03 + 0.08 * h) * k,
+                (0.10 + 0.18 * h) * k,
+                (0.02 + 0.03 * h) * k,
+            ]
+        };
+        sh.push(c.map(|c| (c - 0.5) / SH_C0));
+    }
+    Splats::from_parts(&pos, &scale, &quat, &opac, &sh)
 }
 
 /// Sky radiance towards `d` at `lambda_nm`: a dim gradient and a soft sun.
@@ -309,7 +552,28 @@ fn trace(
             if !p.alive {
                 continue;
             }
-            let Some(hit) = scene.bvh.trace_closest_range(&p.ray, 1e-6, f64::INFINITY) else {
+            let hit = scene
+                .opaque
+                .trace_closest_range(&p.ray, 1e-6, f64::INFINITY);
+            // Splats in front of the surface (or of the sky): emissive and
+            // absorbing, composited front to back, θ-free.
+            if let Some(cloud) = &scene.splats {
+                let seg = splats::composite(
+                    cloud,
+                    &p.ray,
+                    1e-6,
+                    hit.as_ref().map_or(f64::INFINITY, |h| h.t),
+                );
+                for w in 0..nw {
+                    p.radiance[w] += p.throughput[w] * splat_radiance(seg.radiance, p.lambda[w]);
+                    p.throughput[w] *= seg.transmittance as f64;
+                }
+                if seg.transmittance == 0.0 {
+                    p.alive = false;
+                    continue;
+                }
+            }
+            let Some(hit) = hit else {
                 for w in 0..nw {
                     p.radiance[w] += p.throughput[w] * sky(*p.ray.direction.as_ref(), p.lambda[w]);
                 }
@@ -320,14 +584,15 @@ fn trace(
             let wo = -*p.ray.direction.as_ref();
             let (t, b) = basis(nrm);
             let origin = hit.point + nrm * 1e-6;
-            if hit.prim != BALL {
+            if scene.opaque.geometry().surface(hit.prim as usize) == Surface::Diffuse {
                 // Lambertian floor: cosine sampling, weight = albedo. θ-free.
+                let albedo = scene.albedo(hit.point);
                 let (u1, u2) = (p.rng.uniform(), p.rng.uniform());
                 let (r, phi) = (u1.sqrt(), 2.0 * std::f64::consts::PI * u2);
                 let wi =
                     t * (r * phi.cos()) + b * (r * phi.sin()) + nrm * (1.0 - u1).max(0.0).sqrt();
                 for tp in &mut p.throughput[..nw] {
-                    *tp *= scene.floor_albedo;
+                    *tp *= albedo;
                 }
                 p.ray = Ray::new(origin, wi);
                 continue;

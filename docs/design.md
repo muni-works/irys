@@ -321,7 +321,7 @@ Remaining risks and follow-ups:
 1. **Host scoring dominates.** ~140 ms of the 166 ms gradient is the host
    building the image, the loss and `δL` per lane from `L` (debug Rust).
    Image, loss and `lane_adjoint` belong on the device; then the host reads
-   back four floats.
+   back four floats. *Done in phase 2b, piece 1.*
 2. **Replay cost is the adjoint.** Four split reductions per bounce, each
    recomputing `f` and its derivative per lane: 20 ms vs 1 ms forward. A
    fused one-pass reduction over all four parameters (one kernel, width-4
@@ -329,7 +329,7 @@ Remaining risks and follow-ups:
 3. **The scene is hand-written in WGSL.** Two analytic prims, no BVH. Phase
    2 proper needs `irys-gpu`'s scene traversal inside `bounce`; bit-exactness
    then also depends on traversal order being deterministic (it is, for a
-   stackful BVH walk, but test it).
+   stackful BVH walk, but test it). *Done in phase 2b, piece 2; tested.*
 4. **Lane layout.** Graph inputs are seven separate `[lanes]` columns because
    that is how `to_wgsl` binds inputs; that is 9 storage bindings in `bounce`.
    A struct-of-columns input or a `[lanes, 7]` view would cut it.
@@ -338,6 +338,112 @@ Remaining risks and follow-ups:
    and nothing needs it.
 6. f32 everywhere on the device; long paths and big scenes will want the
    offset scaled to the hit distance.
+
+## Phase 2b: the real scene on the GPU wavefront (2026-10-17)
+
+Two pieces, both in `irys-diff::gpu`.
+
+**Piece 1 — scoring on the device** (phase 2a risk 1). Three more wavefront
+kernels: `score` (one thread per pixel sums its `spp × 4` contiguous lanes
+in lane order through a WGSL port of `spectrum::hero_weight`, then writes
+the residual's `∂loss/∂image` and squared error), `loss_sum` (one workgroup:
+a fixed per-thread stride, then a fixed tree), `lane_adjoint` (δL per lane
+from the adjoint frame's own wavelengths). No float atomics anywhere; the
+host writes uniforms and reads back five floats, `loss` and `δθ`
+(`GpuPrb::gradient_l2`). The host-scored `gpu::gradient` stays as the
+reference and for non-L2 losses.
+
+| Gate | Result |
+|---|---|
+| device image / δL vs host f64 scoring of the same `L` | max err / max 1.0e-6 / 1.6e-6; loss rel 5.3e-8; `δθ` rel ≤ 5.3e-5 |
+| device-scored gradient, two seeds, run twice | bit-identical loss and `δθ` |
+| gradient, 96×96×8, debug | 170–178 ms host-scored → **11.6–12.8 ms** device-scored; CPU compiled C 1583 ms (124×) |
+| same, `--release` | 27–42 ms → **7.0–7.8 ms**; CPU 116–129 ms (17×) |
+| `fit_gpu` | same θ to three places, 60 iterations 14 s → 5 s |
+
+**Piece 2 — irys's BVH on the wavefront.** `irys-gpu` has no traversal of
+its own (its geometry seam leaves `trace_scene` to the client), so the
+wavefront ports `irys-core`'s flat BVH: `Bvh::flatten` of two trees packed
+into one node array (opaque tree at 0, splat tree after it), one
+leaf-index array, one `vec4` record array — three bindings. `prb::Scene`
+is now that: `Bvh<Opaque>` (a `TriMesh` and an `Analytic` behind one
+`Geometry`, combined indices, a `Surface` per prim) plus an optional
+`Bvh<Splats>`; the CPU reference traces the same trees. `Scene::new` is the
+phase 1/2a scene, now traced through the BVH on the device too (its tests
+are unchanged and pass); `Scene::garden` is the ball on a 512-triangle
+checkered floor in front of a 900-splat procedural bush.
+
+- **Walk order.** A 64-entry stack, near child first by slab entry (left on
+  a tie), the far child pushed under it; nodes are culled against the
+  current closest `t`. The walk is a function of the ray, so replay
+  retraces it; tested bitwise across runs and across two wavefronts.
+- **Splats, 3DGRT-style.** The 3σ boxes are the proxies in the splat tree.
+  A segment (up to the opaque hit, or ∞) composites in rounds: each round
+  walks the tree and keeps a sorted K = 16 buffer of the nearest hits
+  strictly after the last one composited, ordered by `(t, index)` — a total
+  order, so the result does not depend on which nodes the walk visits
+  first — and culls boxes past the buffer's last entry once full.
+  `C += T α c; T *= 1 − α`, out at `T ≤ 1e-4`, exactly
+  `irys_light::splats::composite`'s model (emissive and absorbing, baked
+  lighting, no shading, no secondary rays). Spectral radiance is the sRGB
+  colour lifted onto the conductor's three hats (`prb::splat_radiance`).
+- **Differentiable in θ only.** Splats are θ-free factors on the path
+  (`L` gains `T_path · C`, the throughput gains `T`), so the PRB estimator
+  is unchanged. Splat parameters (means, covariances, opacity, colour) are
+  the follow-up: 3DGRT's backward is a second ordered walk per segment.
+
+| Gate (debug, M-series, Metal) | Result |
+|---|---|
+| replay vs forward, garden 64×64×4 × 4 λ | 65536/65536 lanes bit-identical at depth 2 and 6; `δθ` identical twice |
+| walk-order determinism | two wavefronts × two runs: `L`, image, loss, `δθ` bitwise identical |
+| GPU f32 vs CPU f64 (same trees, CPU `splats::composite`), frozen sampler, 32×32×4 | `L` median rel 1.2e-7, p99 2.5e-4, 31/16384 lanes > 1e-3; loss rel 5.2e-6; `δθ` rel 4.6e-5, 1.2e-5, 2.1e-5, 2.4e-4 |
+| GPU PRB vs GPU central differences (h = 4e-3, CRN, device loss) | rel 2.0e-4, 3.3e-5, 4.8e-5, 3.8e-3 (θ₃ again the f32 floor) |
+| the bush is composited | 277/2304 pixels change with the splats removed |
+| throughput, garden 96×96×8 | forward 5.6 ms (13 Mpaths/s), gradient 19.6 ms; release 4.6 / 18.4 ms; CPU compiled forward 665 ms debug, 56 ms release |
+| `examples/fit_scene`, 96×96×8, 60 its, same seeds and Adam | θ = [0.208, 0.339, 0.788, 0.998] vs truth [0.2, 0.34, 0.78, 1.0], 60 iterations in 1.3 s |
+| beauty, 384×384, 256 spp (64 × 4 spp), depth 6, fitted θ | 1.3 s |
+
+![phase 2b fit](phase2b-fit.png) (`phase2b-loss.csv` is its loss and θ.)
+
+![phase 2b beauty](phase2b-beauty.png)
+
+Deviations:
+
+1. **No reuse of irys-gpu traversal**, because there is none: irys-gpu's
+   integrator takes `trace_scene` from the client. The port is ~150 lines of
+   WGSL in `wavefront.wgsl`. Once a second client needs it, it belongs in
+   irys-gpu as the stock `GeometryModule` for `Bvh` + `TriMesh` + `Analytic`.
+2. **One BVH per kind, not a TLAS.** Two trees in one node buffer; no
+   instance transforms. `Tlas` is generic over one geometry type, and mixing
+   kinds needs either an enum geometry (what `Opaque` is) or per-instance
+   kinds in the WGSL. The traversal is the same code either way.
+3. **GPU analytic prims are spheres and discs**, and splat colour is
+   degree 0; `pack` panics on anything else rather than dropping it.
+4. **Splats are not differentiated**, and they cast no shadows (there are
+   no shadow rays: no NEE yet). The CPU and GPU agree on that model.
+5. Splat proxies use the CPU's 3σ box; the peak `t` is reported in f32, and
+   a peak computed a hair outside its own box can be culled by the K-buffer
+   — deterministic, so it never breaks replay, but CPU and GPU may differ on
+   such a splat.
+
+Risks and next:
+
+1. **Splat cost.** The garden's forward is 4.6× the two-prim scene's,
+   nearly all of it the compositing rounds (every round re-walks the splat
+   tree). Real captures are 10⁵–10⁶ splats: K = 16 with a re-walk per round
+   will not hold; 3DGRT's answer is hardware any-hit with a k-buffer, ours
+   is probably a larger K in workgroup memory and a per-ray resume point.
+2. **Replay cost is still the adjoint** (phase 2a risk 2): the fused
+   four-parameter reduction is unchanged work.
+3. **The IR's grid limit.** `to_wgsl` dispatches one-dimensional grids, so a
+   frame is capped at 65535 × 64 lanes (the beauty frame renders 4 spp at a
+   time). A 2D grid split, or chunking lanes, lifts it.
+4. **f32 offsets** (phase 2a risk 6) bite sooner in a mesh: the fixed
+   1e-4 offset is fine at unit scale; a CAD-scale scene needs it scaled to
+   the hit distance.
+5. **Splat gradients** need the backward walk per segment and per-splat
+   parameter accumulation, which brings back the reduction problem at
+   10⁵ parameters: per-splat accumulators can't be one workgroup each.
 
 ## Open questions
 

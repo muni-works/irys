@@ -64,7 +64,10 @@ struct Params {
     resp: [f32; 4],
     pixels: u32,
     inv_n: f32,
-    _pad: [u32; 2],
+    checker: f32,
+    splat_root: u32,
+    splat_base: u32,
+    _pad: [u32; 3],
 }
 
 /// Offset off a surface for the next ray. f32 cannot hold the CPU's 1e-6 at
@@ -232,8 +235,109 @@ pub struct GpuPrb {
     // gen, bounce, update, finish→l, finish→l2, accumulate, score,
     // loss_sum, lane_adjoint
     groups: [wgpu::BindGroup; 9],
+    layout: Layout,
     /// Timings of the last forward and replay.
     pub timing: Timing,
+}
+
+/// Where the splat tree and records start in the packed scene.
+#[derive(Clone, Copy)]
+struct Layout {
+    splat_root: u32,
+    splat_base: u32,
+}
+
+const NONE: u32 = u32::MAX;
+const LEAF: u32 = 1 << 31;
+
+/// A [`Scene`]'s two trees packed for the wavefront: one node array (the
+/// opaque tree at 0, the splat tree after it), one leaf-index array, one
+/// array of `vec4` records. Refuses what the WGSL cannot trace — an
+/// analytic prim other than a sphere or disc, view-dependent splat colour,
+/// a tree deeper than the traversal stack — rather than dropping it.
+fn pack(scene: &Scene) -> (Vec<[f32; 4]>, Vec<u32>, Vec<[f32; 4]>, Layout) {
+    use irys_core::Geometry;
+    use irys_prims::analytic::Prim;
+    let (mut nodes, mut ids, mut geo) = (Vec::new(), Vec::new(), Vec::new());
+    let mut tree = |flat: &[irys_core::FlatBvhNode], prims: &[u32], nodes: &mut Vec<[f32; 4]>| {
+        let depth = irys_gpu::geometry::tree_depth(flat);
+        assert!(depth <= 60, "tree {depth} deep: the WGSL stack holds 64");
+        let (base, first) = ((nodes.len() / 2) as u32, ids.len() as u32);
+        for &(b, leaf, a, c) in flat {
+            let (a, c) = if leaf {
+                (a + first, c | LEAF)
+            } else {
+                (a + base, c + base)
+            };
+            let (lo, hi) = (b.min, b.max);
+            nodes.push([lo.x as f32, lo.y as f32, lo.z as f32, f32::from_bits(a)]);
+            nodes.push([hi.x as f32, hi.y as f32, hi.z as f32, f32::from_bits(c)]);
+        }
+        ids.extend_from_slice(prims);
+        base
+    };
+    let (flat, prims) = scene.opaque.flatten();
+    assert!(!flat.is_empty(), "a scene with no opaque geometry");
+    tree(&flat, &prims, &mut nodes);
+    let o = scene.opaque.geometry();
+    let mesh = o.mesh();
+    let v = |p: irys_core::Point3, w: f32| [p.x as f32, p.y as f32, p.z as f32, w];
+    let surf = |i: usize| match o.surface(i) {
+        prb::Surface::Conductor => 0.0,
+        prb::Surface::Diffuse => 1.0,
+    };
+    for (i, t) in mesh.triangles().iter().enumerate() {
+        let p = |k: usize| mesh.positions()[t[k] as usize];
+        geo.extend([v(p(0), 0.0), v(p(1), surf(i)), v(p(2), 0.0)]);
+    }
+    for (k, prim) in o.analytic().prims().iter().enumerate() {
+        let s = surf(mesh.len() + k);
+        match *prim {
+            Prim::Sphere { center, radius } => geo.extend([
+                v(center, 1.0),
+                [0.0, 0.0, 0.0, s],
+                [0.0, 0.0, 0.0, radius as f32],
+            ]),
+            Prim::Disc {
+                center,
+                normal,
+                radius,
+            } => geo.extend([
+                v(center, 2.0),
+                [normal.x as f32, normal.y as f32, normal.z as f32, s],
+                [0.0, 0.0, 0.0, radius as f32],
+            ]),
+            other => panic!("irys-diff gpu: {other:?} has no WGSL intersector yet"),
+        }
+    }
+    let mut layout = Layout {
+        splat_root: NONE,
+        splat_base: geo.len() as u32,
+    };
+    if let Some(cloud) = &scene.splats
+        && !cloud.geometry().is_empty()
+    {
+        let (flat, prims) = cloud.flatten();
+        layout.splat_root = tree(&flat, &prims, &mut nodes);
+        let sp = cloud.geometry();
+        assert_eq!(
+            sp.degree(),
+            0,
+            "irys-diff gpu: splat colour is degree 0 only"
+        );
+        let up = irys_core::Dir3::new_normalize(irys_core::Vec3::new(0.0, 0.0, 1.0));
+        for i in 0..sp.len() {
+            let a = sp.inv_cov(i);
+            let c = sp.colour(i, up);
+            geo.extend([
+                v(sp.center(i), sp.opacity(i)),
+                [a[0] as f32, a[1] as f32, a[2] as f32, a[3] as f32],
+                [a[4] as f32, a[5] as f32, 0.0, 0.0],
+                [c[0], c[1], c[2], 0.0],
+            ]);
+        }
+    }
+    (nodes, ids, geo, layout)
 }
 
 /// The device, or why there is none. Tests skip on `Err`.
@@ -275,6 +379,17 @@ impl GpuPrb {
         let sq = storage("squared error", pixels * 4);
         let loss = storage("loss", 4);
         let path_buf = storage("paths", paths as u64 * PATH_BYTES);
+        let (nodes, ids, geo, layout) = pack(scene);
+        let init = |label: &str, bytes: &[u8]| {
+            dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+        };
+        let nodes = init("nodes", bytemuck::cast_slice(&nodes));
+        let ids = init("prim ids", bytemuck::cast_slice(&ids));
+        let geo = init("prims", bytemuck::cast_slice(&geo));
         let params = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
             size: std::mem::size_of::<Params>() as u64,
@@ -344,7 +459,13 @@ impl GpuPrb {
             })
         };
         let f_buf = eval.buffer(g.f);
-        let mut bounce: Vec<(u32, &wgpu::Buffer)> = vec![(0, &params), (1, &path_buf)];
+        let mut bounce: Vec<(u32, &wgpu::Buffer)> = vec![
+            (0, &params),
+            (1, &path_buf),
+            (23, &nodes),
+            (24, &ids),
+            (25, &geo),
+        ];
         bounce.extend(cols.iter().enumerate().map(|(c, b)| (2 + c as u32, b)));
         let groups = [
             bind(&pipes[0], &[(0, &params), (1, &path_buf)]),
@@ -398,6 +519,7 @@ impl GpuPrb {
             target,
             img,
             loss,
+            layout,
             eval,
             adjoint,
             f,
@@ -425,7 +547,7 @@ impl GpuPrb {
             fwd: v(scene.forward),
             right: v(scene.right),
             up: v(scene.up),
-            tan_half: (20.0f64).to_radians().tan() as f32,
+            tan_half: scene.tan_half as f32,
             albedo: scene.floor_albedo as f32,
             alpha: scene.frozen_alpha.unwrap_or(theta[0]) as f32,
             eps: EPS,
@@ -437,7 +559,10 @@ impl GpuPrb {
             },
             pixels: (scene.size.0 * scene.size.1) as u32,
             inv_n: 1.0 / (scene.size.0 * scene.size.1 * 3) as f32,
-            _pad: [0; 2],
+            checker: scene.floor_checker.unwrap_or(0.0) as f32,
+            splat_root: self.layout.splat_root,
+            splat_base: self.layout.splat_base,
+            _pad: [0; 3],
         }
     }
 

@@ -30,3 +30,7 @@ gpu = ["dep:irys-gpu", "dep:bytemuck", "dep:pollster"]
 [[example]]
 name = "fit_gpu"
 required-features = ["gpu"]
+
+[[example]]
+name = "fit_scene"
+required-features = ["gpu"]
