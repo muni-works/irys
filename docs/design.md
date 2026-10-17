@@ -1026,6 +1026,186 @@ basin, by a pyramid or a silhouette/feature loss.
 ![phase 2e rose in context](phase2e-rose-fit.png) (`phase2e-rose-loss.csv`:
 every run, every iteration, both pose terms and the time split.)
 
+## Phase 2f: secondary visibility, rose in context (2026-10-17)
+
+The question 2e left: does the rose arm fit converge with the whole robot,
+the checker floor and the forearm in front of the polished torso? **Yes,
+with 600 iterations**: φ = (−25.73, +16.07, −60.23)° vs truth (−25.78,
++16.04, −60.16)°, θ = (0.303, 0.855, 0.876, 0.895) vs (0.30, 0.86, 0.88,
+0.90), image MSE 8.57e-4 against the truth re-rendered at 8.60e-4. Same
+start, truth, θ, learning rates and schedule as 2e; the difference is the
+pose gradient. Four pieces, each a commit.
+
+### 1. Secondary edge sampling (`secondary.rs`, `interior::interior_with`)
+
+A path vertex `x` sees discontinuities of its own: an occluder's outline
+across the shadow ray, the arm's outline in the torso's reflection, a crease
+seen through a bounce. The forward pass estimates the vertex's direction
+integral twice — a light sample `ω_L` (fixed in the world at fixed random
+numbers) and a BSDF sample `ω_B` (drawn in the vertex's attached frame from
+`wo`) — with integrands `F_L = g Le V w_L` and `F_B = g C [w_B on escape]`.
+Both jump across every edge `x` sees, and Reynolds gives each a boundary
+term with the edge's angular speed *relative to its sampler's map*:
+
+```text
+∂/∂φ ⊇ ∮ ΔF_L · n·V + ΔF_B · n·(V − ω̇_B) dℓ_ω,    V = (I − ωωᵀ)(Ẋ_p − ẋ)/r
+```
+
+`ω̇_B` is the velocity of the direction the BSDF sampler draws at the `u`
+that draws the edge point: the GGX visible-normal sampler (and the cosine
+one) is inverted for that `u` and re-drawn in duals (round trip to 1e-7,
+unit test). One edge point per vertex from `Secondary` — one edge BVH per
+bottom-level tree in object space (built once: 1.34 M candidate edges for
+the whole robot in 0.65 s), nodes weighed `Σℓ / max(d², r²)`, leaves by 2e's
+owner rules seen from `x` — by one-sample MIS over three importances
+(geometry; the sun lobe over each node's cone of directions; at a
+conductor, its mirror lobe), exact density, the point along the edge
+piecewise-constant in 16 pieces. The two sides are continuation paths from
+`x` with common random numbers; the inner one must land on the owner (2e's
+coplanar-sliver rule). Candidates are the moving instances, and every
+instance when `x` or its `wo` moves. CPU f64, from the interior term's own
+paths; `IRYS_SEC_N` edge samples per vertex (4 in the fits).
+
+**The choice, measured** (`secondary_estimators_compared`, ignored): on 2e's
+arm over a floor, the light sample's share of the boundary term by edge
+sampling and by warped-area reparameterisation of the shadow ray (Bangaru
+et al. 2020: `K` auxiliary rays from a vMF around it, harmonic weights
+`1/(D² + B²)` with `B` the hit's angular distance to its triangle's
+candidate edges, the warp's divergence by central differences), 400 seeds
+of the same paths:
+
+| estimator | φ0 | φ1 | φ2 | time / estimate |
+|---|---|---|---|---|
+| edge sampling, light share | −5.68 ± 0.47 | +3.51 ± 0.56 | −0.33 ± 0.16 | 2.5 ms |
+| warp K=4, κ=400 | +3.3 ± 4.3 | +7.8 ± 6.4 | +7.1 ± 4.9 | 2.4 ms |
+| warp K=8, κ=400 | +0.9 ± 2.7 | +5.2 ± 3.7 | +3.8 ± 2.4 | 2.8 ms |
+| warp K=8, κ=100 | +17.6 ± 13 | +22 ± 16 | +18 ± 16 | 3.8 ms |
+| warp K=8, κ=1600 | −6.7 ± 1.8 | +8.8 ± 2.5 | −0.1 ± 0.7 | 4.1 ms |
+| warp K=32, κ=400 | −4.1 ± 1.9 | +8.0 ± 2.4 | +1.2 ± 0.9 | 8.3 ms |
+
+The warp's best setting has 14–19× edge sampling's variance at 1.6× its
+cost, heavy tails (an auxiliary ray crossing an edge jumps its weight) and
+a bias that moves with `κ`; edge sampling is unbiased by construction.
+Edge sampling, and on the CPU: the device has no dual trace (2e risk 4),
+and at 53 ms per iteration (below) the CPU is not the bottleneck.
+
+| Gate (`tests/phase2f.rs`, release; CD over 16² points per pixel, now Cranley–Patterson shifted per seed, 8 seeds) | Result |
+|---|---|
+| arm over a floor it shadows (2e's ignored gate), depth 4 + NEE, 24 seeds | edge −29.5, interior −1.5, secondary −4.2 ± 1.8: sum (−35.3, +12.6, −8.3) vs CD (−37.1 ± 1.4, +15.1 ± 1.5, −8.4 ± 0.6): **z +0.77, −1.07, +0.06** (2e alone +3.8, −3.9, +3.4) |
+| the same arm against the sky (2e's gated scene) | z +0.61, −1.12, +0.81 |
+| shaded arm under camera motion (2e's ignored gate), 7 parameters | **z +0.10, −1.07, −2.64, −2.16, −0.03, −0.38, −1.09** (2e alone +16, +2.3, −0.6, −0.3, −4.8, −9.2, −9.9) |
+| **rose in context, sun, `--check` at the start pose** (256-spp MSE, h 0.01), 64 seeds | edge −0.087 ± 0.009, interior +0.0046, secondary +0.149 ± 0.065, curves +0.0005: sum (+0.067 ± 0.067, −0.001 ± 0.030, +0.010 ± 0.034) vs CD (+0.0167, −0.0037, +0.0098): **z 1, 0, 0** (2e: −11, −5, −9) |
+| same, 256 seeds | secondary +0.014 ± 0.030: z −3, −2, −4 |
+| rose, loss only on pixels ≥ 3 px from the arm (`MASK=3`: what is left is the arm's shadows and reflections), 64 seeds | secondary (−3.8 ± 6.8, −17.7 ± 4.1, −5.6 ± 1.6)e-4 vs CD (−5.9 ± 1.2, −9.7 ± 0.8, −5.7 ± 0.5)e-4: z 0, −2, 0 |
+
+The rose gate is met at 64 seeds and missed at 256: the secondary term on
+rose is heavy-tailed (per-seed σ ≈ 30× the gradient at 4 spp), so its
+stderr is not a reliable error bar and neither number is a clean pass. What
+is solid: off the arm (`MASK`) it matches; on the arm the biggest samples
+are vertices on one aluminium plate a few millimetres from another link's
+edge (`IRYS_SEC_DUMP`: r ≈ 4 mm, |V| ≈ 100, pdf ≈ 5e-6 per mm) — joints and
+bolted plates in contact, where `m·V ∝ 1/r²` and the node bound caps at the
+node's size.
+
+*Two 2e residuals found on the way.* (a) **`GpuEdges` is biased low on
+rose**: on the control mask (depth 1, sky only) it gives 1.84e-3 on pitch
+where host samples under every importance (2d, front-only, ID buffer;
+traced on the device or in f64 on the host) give 2.43–2.57e-3 and central
+differences 2.62e-3 (h 0.003) to 2.82e-3 (h 0.01). The device refused real
+coplanar slivers (f32 tolerances; fixed, 5616 → 5869 of the host's 6068
+visible samples) and still weighs ~8 % of samples 5–20 % differently;
+not found. 2f's rose runs use host samples (`--vis`). (b) The CD reference
+on rose moves by ~7 % with the step (2.62 vs 2.82e-3); the box gates' did
+with its fixed grid points (now shifted per seed).
+
+### 2. Interpenetration (`secondary::pierces`, `vis::curves`, `EdgeSamples::for_curves`)
+
+Rose's arm does interpenetrate: at the start pose 6 instance pairs (shoA↔shoB,
+shoB↔elbA, shoA into two body trees), a few dozen edge crossings, 5 713
+triangle-pair intersection segments, 143 px of curve on screen. The
+intersection curves are now sampled like edges (two rays either side, each
+on one of the two instances at the curve's depth; normal speed from
+re-intersecting the two planes at φ ± h). On a box arm sunk 6 cm at both
+joints the curves carry −2.89 of φ0's −3.55 and the total gates (z +1.2,
++0.5, −1.9). **On rose they are 0.1–1 % of the gradient** (mask: +2.9e-6 of
+2.8e-3 on pitch; in context +5e-4 of 0.017) — not 2e's 27 % mask deficit,
+which was (a) above. They are in `--check`, not in the fit. Not done: the
+curves as seen through a bounce (secondary rays), where a curve point near
+`x` is a `1/r²` singularity.
+
+### 3. Basin width (`--pyramid`, `SCAN`)
+
+MSE along the elbow (pitch and roll at truth, 4 × 32 spp), per level of a
+block-average pyramid and per box blur:
+
+| elbow | −80 | −70 | −65 | **−60** | −55 | −50 | −45 | −40 | −30 | −20 | −10 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| full | 3.85e-3 | 4.22e-3 | 2.95e-3 | **9.3e-4** | 2.52e-3 | 2.81e-3 | 2.70e-3 | 2.85e-3 | 3.38e-3 | 3.45e-3 | 3.93e-3 |
+| pyr2 | 2.38e-3 | 2.32e-3 | 1.38e-3 | **2.5e-4** | 1.23e-3 | 1.68e-3 | 1.57e-3 | 1.70e-3 | 2.20e-3 | 2.25e-3 | 2.45e-3 |
+| pyr4 | 1.63e-3 | 1.43e-3 | 8.42e-4 | **6.0e-5** | 7.23e-4 | 1.14e-3 | 1.07e-3 | 1.17e-3 | 1.64e-3 | 1.64e-3 | 1.74e-3 |
+| pyr8 | 8.73e-4 | 7.13e-4 | 3.04e-4 | **1.5e-5** | 3.00e-4 | 6.70e-4 | 5.77e-4 | 6.91e-4 | 1.01e-3 | 9.86e-4 | 1.04e-3 |
+| blur16 | 6.67e-5 | 2.82e-5 | 1.16e-5 | **1.1e-6** | 1.21e-5 | 3.16e-5 | 6.10e-5 | 9.20e-5 | 1.09e-4 | 1.40e-4 | 1.53e-4 |
+
+(`docs/phase2f-scan.txt` has every 5°.) Downsampling sharpens the minimum
+relative to its surroundings but does not widen it: every pyramid level
+keeps the local minimum at −45° and the −80/−70 shoulder; only the 16-px
+blur is monotone from −10° to −60° (2e's finding). The pyramid schedule
+(pose-only phase on 8×, 4×, 2×, a third each) **diverged** (elbow +25°,
+pitch −2°). Not on by default; the fit converged without it because the
+start (−37°) is inside the region where the corrected gradient points the
+right way, not because the basin is wide.
+
+### 4. The fit
+
+`rose_fit --vis` with `IRYS_SEC_N=4` (192², 8 spp, depth 5 + NEE, host edge
+samples with the ID buffer, interior + secondary at 1 spp), Adam as 2e:
+
+| Run | φ (last-40 mean) vs (−25.78, +16.04, −60.16)° | θ vs (0.30, 0.86, 0.88, 0.90) | MSE (truth 8.60e-4) |
+|---|---|---|---|
+| **context, 2f, 600 iterations** | **(−25.73, +16.07, −60.23)** | (0.303, 0.855, 0.876, 0.895) | 8.57e-4 |
+| context, 2f, 300 | (−25.06, +16.12, −57.50) | (0.311, 0.841, 0.857, 0.873) | 2.57e-3 |
+| context, host edges + interior, no secondary, 300 | (−25.56, +8.04, +55.68): diverges | (0.336, 0.783, 0.791, 0.801) | 4.19e-3 |
+| context, 2f + pyramid, 300 | (−2.34, +19.05, +25.40): diverges | (0.364, 0.701, 0.702, 0.705) | 6.64e-3 |
+| control, 2f, 300 | (−25.74, +15.91, −60.34) | (0.257, 0.769, 0.788, 0.806) | 2.24e-3 (2.06e-3) |
+
+Per iteration, context, 600-iteration run (release, M-series, nothing else
+running): θ gradient 111.6 ms (GPU), edge term 166.8 ms (host sampling with
+the ID buffer + 16 384 pairs on the device), interior + secondary 66.2 ms
+(36 864 paths at 1 spp, 4 edge samples per vertex; interior alone is 13 ms,
+so the secondary term costs ~53 ms), 244 s in all. Control: 88 / 98 / 22 ms.
+
+![phase 2f rose fit](phase2f-rose-fit.png) (`phase2f-rose-loss.csv`: every
+run above, every iteration, the three pose terms and the time split.)
+
+Deviations:
+
+1. Edge sampling, not warped area, for the measured reason above; CPU only.
+2. The fit uses host edge samples (`--vis`), not `GpuEdges` (2e's default),
+   because the device's are biased on rose (piece 1 (a)). That alone does
+   not converge (table: no secondary).
+3. 600 iterations, not 300: at 300 the elbow is still 2.7° short (the
+   schedule's learning rate decays, so the extra 300 are small steps).
+4. One run per configuration: the fit's convergence is not measured over
+   seeds.
+5. The intersection-curve term is in `--check`, not the fit (it is ≤ 1 %).
+
+### Phase 2f risks and next
+
+1. **Variance of the secondary term on rose.** Heavy-tailed, from vertices
+   millimetres from another link's edge; the 256-seed check misses at z −3
+   to −4 while 64 seeds pass. An edge tree whose node bound does not cap at
+   the node's size near `x`, or a near-field strategy (edges within a few
+   `r` of `x`, by an exact local search), is the next lever; then fewer
+   iterations would do.
+2. **`GpuEdges`' remaining bias** on rose (weights on ~8 % of samples).
+3. The basin is still ±5° on the elbow; a fit started outside it fails.
+   The blur is the only lever measured monotone, and needs the corrected
+   gradient (2e's blurred fit had the biased one) — not re-tried here.
+4. Secondary intersection curves and the checker's albedo edges are not
+   sampled; the camera gate's c2/c3 sit at z −2.6/−2.2.
+5. The secondary term is CPU f64; at 4 samples per vertex it is a quarter
+   of an iteration. A device port needs the dual trace first.
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.
