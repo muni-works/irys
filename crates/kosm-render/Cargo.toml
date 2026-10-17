@@ -1,0 +1,28 @@
+[package]
+name = "kosm-render"
+# A compatibility shim: kosm-render 0.2.0 is now irys, and this is every one
+# of its public paths re-exported from the `irys` facade. kosm and vcad 0.10
+# depend on `kosm-render = "0.2"`; 0.2.1 satisfies that and keeps them
+# compiling while they move to irys directly.
+#
+# The history worth keeping (from 0.2.0's manifest): while vcad pinned an old
+# rev requiring 0.1.0, a bump to 0.2.0 made a `[patch]` silently stop
+# applying, cargo added a second kosm-render beside the local one, and
+# `kosm/src/brep/mod.rs` stopped compiling — two `Scene<G>` types, one call,
+# E0308. Every consumer in a graph must resolve to one kosm-render.
+version = "0.2.1"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Compatibility shim: kosm-render is now irys; this re-exports it under the old paths"
+keywords = ["raytracing", "pathtracing", "renderer", "bvh", "graphics"]
+categories = ["graphics", "rendering", "rendering::engine"]
+
+[dependencies]
+irys.workspace = true
+
+[features]
+default = []
+gpu = ["irys/gpu"]
