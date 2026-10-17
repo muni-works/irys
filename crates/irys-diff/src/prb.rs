@@ -623,6 +623,16 @@ impl Scene {
         ]
     }
 
+    /// Move the pinhole: eye, unit forward, right and up (orthonormal), `tan`
+    /// of the half field of view.
+    pub fn set_camera(&mut self, eye: Point3, forward: Vec3, right: Vec3, up: Vec3, tan_half: f64) {
+        self.eye = eye;
+        self.forward = forward;
+        self.right = right;
+        self.up = up;
+        self.tan_half = tan_half;
+    }
+
     /// The pinhole: eye, forward, right, up, `tan` of the half field of view.
     pub fn camera(&self) -> (Point3, Vec3, Vec3, Vec3, f64) {
         (self.eye, self.forward, self.right, self.up, self.tan_half)

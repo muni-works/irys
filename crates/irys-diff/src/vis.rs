@@ -28,14 +28,17 @@
 //! importance (stratified, `n` per call) — importance 1 on silhouettes and
 //! boundaries, a crease between front faces by its dihedral angle
 //! ([`crease_weight`]), [`BACK_WEIGHT`] behind — and weighs
-//! `(Σ ℓ w / (w_e n)) · v_n · ½?` the difference of two full paths traced through
+//! `(Σ ℓ w / (w_e n)) · v_n` times the difference of two full paths traced through
 //! `s ∓ εn` ([`Scene::set_points`]; the pair shares its generator, so
 //! the difference is common random numbers). Each triangle owns its edges:
 //! the inner ray must hit *that* triangle or one coplanar with it on the
 //! same face — CAD tessellations are full of slivers thinner than `ε` —
-//! (otherwise the edge is hidden at `s` and the sample is 0), and where the outer ray lands on the same
-//! instance right next to `X` — a crease, which the neighbour also samples
-//! from its side — each side takes half. Edges shared by two coplanar
+//! (otherwise the edge is hidden at `s` and the sample is 0). A crease
+//! between two front faces is sampled from one side only, the face that
+//! meets the eye more squarely (phase 2e: 2d sampled it from both and
+//! halved where the outer ray landed next to `X`, which lost half the jump
+//! whenever the grazing side's ownership test failed — invisible in a mask,
+//! O(1) when shaded). Edges shared by two coplanar
 //! triangles are never candidates: `f` is continuous across them. No mesh
 //! adjacency is assumed beyond that filter, so unwelded and T-junctioned
 //! tessellations stay correct.
@@ -83,6 +86,96 @@ impl Rig<'_> {
     }
 }
 
+/// A pinhole: eye, forward, right, up, `tan` of the half field of view.
+#[derive(Debug, Clone, Copy)]
+pub struct Pinhole {
+    /// Eye.
+    pub eye: Point3,
+    /// Unit forward.
+    pub forward: Vec3,
+    /// Unit right.
+    pub right: Vec3,
+    /// Unit up.
+    pub up: Vec3,
+    /// `tan` of the half field of view.
+    pub tan_half: f64,
+}
+
+impl Pinhole {
+    /// The scene's.
+    pub fn of(scene: &Scene) -> Self {
+        let (eye, forward, right, up, tan_half) = scene.camera();
+        Self {
+            eye,
+            forward,
+            right,
+            up,
+            tan_half,
+        }
+    }
+
+    /// [`Scene::project`] through this pinhole, without the Jacobian.
+    pub fn project(&self, size: (usize, usize), p: Point3) -> Option<[f64; 2]> {
+        let d = p - self.eye;
+        let z = d.dot(&self.forward);
+        if z <= 0.0 {
+            return None;
+        }
+        let (w, h) = (size.0 as f64, size.1 as f64);
+        let kx = w / (2.0 * self.tan_half * w / h);
+        let ky = h / (2.0 * self.tan_half);
+        Some([
+            d.dot(&self.right) / z * kx + w / 2.0,
+            h / 2.0 - d.dot(&self.up) / z * ky,
+        ])
+    }
+}
+
+/// The camera as a parameter (phase 2e): `c = (t, ω, δ)` — the eye moved
+/// by `t` (world), the frame turned about the eye by `R_z(ω_z) R_y(ω_y)
+/// R_x(ω_x)` (world axes), the half field of view widened by `δ` radians —
+/// all about a base pinhole, so `c = 0` is the base.
+#[derive(Debug, Clone, Copy)]
+pub struct CameraRig {
+    /// The pinhole at `c = 0`.
+    pub base: Pinhole,
+}
+
+/// Camera parameters: three of translation, three of rotation, one of fov.
+pub const CAMERA_PARAMS: usize = 7;
+
+impl CameraRig {
+    /// Rigged about `scene`'s current camera.
+    pub fn new(scene: &Scene) -> Self {
+        Self {
+            base: Pinhole::of(scene),
+        }
+    }
+
+    /// The pinhole at `c`.
+    pub fn pinhole(&self, c: &[f64]) -> Pinhole {
+        assert_eq!(c.len(), CAMERA_PARAMS);
+        let o = Point3::origin();
+        let r = about(o, Vec3::new(0.0, 0.0, 1.0), c[5])
+            .then(&about(o, Vec3::new(0.0, 1.0, 0.0), c[4]))
+            .then(&about(o, Vec3::new(1.0, 0.0, 0.0), c[3]));
+        let b = &self.base;
+        Pinhole {
+            eye: b.eye + Vec3::new(c[0], c[1], c[2]),
+            forward: r.apply_vec(&b.forward),
+            right: r.apply_vec(&b.right),
+            up: r.apply_vec(&b.up),
+            tan_half: (b.tan_half.atan() + c[6]).tan(),
+        }
+    }
+
+    /// Put `scene`'s camera at `c`.
+    pub fn pose(&self, scene: &mut Scene, c: &[f64]) {
+        let p = self.pinhole(c);
+        scene.set_camera(p.eye, p.forward, p.right, p.up, p.tan_half);
+    }
+}
+
 /// No neighbour across an edge (a boundary, or more than two triangles
 /// share it after welding).
 const NONE: u32 = u32::MAX;
@@ -107,8 +200,8 @@ const BACK_WEIGHT: f64 = 0.02;
 /// discontinuity (shared with one coplanar triangle), and how to weigh the
 /// rest when sampling.
 pub struct Edges {
-    nbr: Vec<Vec<[u32; 3]>>,
-    cos: Vec<Vec<[f32; 3]>>,
+    pub(crate) nbr: Vec<Vec<[u32; 3]>>,
+    pub(crate) cos: Vec<Vec<[f32; 3]>>,
     /// Object-space face normals (unnormalised: the winding's).
     normal: Vec<Vec<Vec3>>,
 }
@@ -191,12 +284,151 @@ impl Edges {
     }
 }
 
+/// A hidden edge's share of its importance under [`Visibility`].
+pub const HIDDEN_WEIGHT: f64 = 0.01;
+
+/// What an ID buffer says about an edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seen {
+    /// Behind the visible surface at every probe.
+    Hidden,
+    /// Visible somewhere, next to the sky or another instance.
+    Border,
+    /// Visible, surrounded by its own instance.
+    Inside,
+}
+
+/// The primary hit of every pixel centre: which instance (or the sky) and
+/// how far along the view axis. One ray a pixel; what [`EdgeSamples`]
+/// consults to stop spending samples on edges nobody can see.
+pub struct Visibility {
+    size: (usize, usize),
+    id: Vec<u32>,
+    depth: Vec<f64>,
+}
+
+/// The ID buffer's word for the sky.
+pub const SKY: u32 = u32::MAX;
+
+impl Visibility {
+    /// Trace one ray through every pixel centre of `scene`.
+    pub fn new(scene: &Scene) -> Self {
+        let (w, h) = scene.size;
+        let (eye, fwd, right, up, _) = scene.camera();
+        let mut id = vec![SKY; w * h];
+        let mut depth = vec![f64::INFINITY; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let [sx, sy] = scene.screen(x as f64 + 0.5, y as f64 + 0.5);
+                let r = Ray::new(eye, fwd + right * sx + up * sy);
+                if let Some(hit) = scene.tlas().trace_closest_range(&r, 0.0, f64::INFINITY) {
+                    id[y * w + x] = hit.payload as u32;
+                    depth[y * w + x] = (hit.hit.point - eye).dot(&fwd);
+                }
+            }
+        }
+        Self::from_parts(scene.size, id, depth)
+    }
+
+    /// A buffer from its columns (the device's, say).
+    pub fn from_parts(size: (usize, usize), id: Vec<u32>, depth: Vec<f64>) -> Self {
+        assert_eq!(id.len(), size.0 * size.1);
+        assert_eq!(depth.len(), id.len());
+        Self { size, id, depth }
+    }
+
+    /// [`Visibility::classify`] per probe interval of `[t0, t1]`, merged
+    /// into runs of one class: `(t0, t1, class)` covering it exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn runs(
+        &self,
+        k: usize,
+        pa: [f64; 2],
+        pb: [f64; 2],
+        za: f64,
+        zb: f64,
+        t0: f64,
+        t1: f64,
+    ) -> Vec<(f64, f64, Seen)> {
+        let len = (pb[0] - pa[0]).hypot(pb[1] - pa[1]) * (t1 - t0);
+        let m = ((len).ceil() as usize).clamp(1, 64);
+        let mut out: Vec<(f64, f64, Seen)> = Vec::new();
+        for i in 0..m {
+            let (a, b) = (
+                t0 + (t1 - t0) * i as f64 / m as f64,
+                if i + 1 == m {
+                    t1
+                } else {
+                    t0 + (t1 - t0) * (i + 1) as f64 / m as f64
+                },
+            );
+            let c = self.classify(k, pa, pb, za, zb, a, b);
+            match out.last_mut() {
+                Some(l) if l.2 == c => l.1 = b,
+                _ => out.push((a, b, c)),
+            }
+        }
+        out
+    }
+
+    /// Classify the screen segment `pa → pb` (view depths `za`, `zb` at its
+    /// ends) of an edge of instance `k`, over its clipped part `[t0, t1]`:
+    /// probes every half pixel; at each, the edge is visible if it is no
+    /// deeper than the farthest surface in the surrounding 3 × 3 pixels
+    /// (conservative: a silhouette always has sky or a farther surface
+    /// beside it).
+    #[allow(clippy::too_many_arguments)]
+    pub fn classify(
+        &self,
+        k: usize,
+        pa: [f64; 2],
+        pb: [f64; 2],
+        za: f64,
+        zb: f64,
+        t0: f64,
+        t1: f64,
+    ) -> Seen {
+        let (w, h) = (self.size.0 as i64, self.size.1 as i64);
+        let len = (pb[0] - pa[0]).hypot(pb[1] - pa[1]) * (t1 - t0);
+        let m = ((2.0 * len).ceil() as usize).clamp(1, 64);
+        let mut seen = Seen::Hidden;
+        for i in 0..m {
+            let t = t0 + (t1 - t0) * (i as f64 + 0.5) / m as f64;
+            let p = [pa[0] + t * (pb[0] - pa[0]), pa[1] + t * (pb[1] - pa[1])];
+            // 1/z is linear in screen space.
+            let z = 1.0 / ((1.0 - t) / za + t / zb);
+            let (cx, cy) = (p[0].floor() as i64, p[1].floor() as i64);
+            let (mut far, mut border) = (0.0f64, false);
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let (x, y) = (cx + dx, cy + dy);
+                    if x < 0 || y < 0 || x >= w || y >= h {
+                        far = f64::INFINITY;
+                        border = true;
+                        continue;
+                    }
+                    let j = (y * w + x) as usize;
+                    far = far.max(self.depth[j]);
+                    border |= self.id[j] != k as u32;
+                }
+            }
+            if z <= far * (1.0 + 2e-3) {
+                if border {
+                    return Seen::Border;
+                }
+                seen = Seen::Inside;
+            }
+        }
+        seen
+    }
+}
+
 /// One frame's edge samples: the ray pairs to trace and what each pair is
 /// worth per pose parameter.
 pub struct EdgeSamples {
     points: Vec<[f64; 2]>,
     pixel: Vec<usize>,
-    /// Per sample, per parameter: `½? · v_n · Σℓ / n`.
+    /// Per sample, per parameter: `v_n · Σℓw / (w_e n)`.
     weight: Vec<Vec<f64>>,
     /// Screen length of every candidate edge in the frame, pixels.
     pub total_len: f64,
@@ -207,7 +439,8 @@ pub struct EdgeSamples {
     /// Samples whose edge was visible at the sample (inner ray hit its own
     /// triangle).
     pub visible: usize,
-    /// Of those, crease samples split with the neighbour.
+    /// Of those, samples whose outer ray lands on the same instance next to
+    /// the edge point (creases; a diagnostic).
     pub halved: usize,
 }
 
@@ -252,9 +485,70 @@ fn clip(a: [f64; 2], b: [f64; 2], w: f64, h: f64) -> Option<(f64, f64)> {
 }
 
 impl EdgeSamples {
+    /// Samples drawn elsewhere (the device): pixel and weights per sample,
+    /// the points left where the device wrote them.
+    pub(crate) fn from_parts(pixel: Vec<usize>, weight: Vec<Vec<f64>>, visible: usize) -> Self {
+        Self {
+            points: Vec::new(),
+            pixel,
+            weight,
+            total_len: 0.0,
+            silhouette_len: 0.0,
+            segments: 0,
+            visible,
+            halved: 0,
+        }
+    }
+
     /// Draw `n` edge samples of `scene` as posed at `phi` (the caller has
     /// [`Rig::pose`]d it) with generator `seed`.
     pub fn new(scene: &Scene, edges: &Edges, rig: &Rig, phi: &[f64], n: usize, seed: u64) -> Self {
+        Self::with_visibility(scene, edges, rig, phi, n, seed, None)
+    }
+
+    /// [`EdgeSamples::new`] (`vis = None`: 2d's importance), or phase 2e's
+    /// importance from an ID buffer ([`Visibility`]): a silhouette is
+    /// sampled from its front face only (the back face's side scores 0),
+    /// and an edge the buffer shows hidden everywhere along it keeps
+    /// [`HIDDEN_WEIGHT`] of its importance — never 0, so a wrong guess
+    /// costs variance, not bias.
+    pub fn with_visibility(
+        scene: &Scene,
+        edges: &Edges,
+        rig: &Rig,
+        phi: &[f64],
+        n: usize,
+        seed: u64,
+        vis: Option<&Visibility>,
+    ) -> Self {
+        Self::for_rig(scene, edges, rig, phi, n, seed, vis.is_some(), vis)
+    }
+
+    /// 2e's front-only silhouettes without an ID buffer (what the device
+    /// draws, [`crate::gpu::GpuEdges`]), or 2d's importance.
+    pub fn with_policy(
+        scene: &Scene,
+        edges: &Edges,
+        rig: &Rig,
+        phi: &[f64],
+        n: usize,
+        seed: u64,
+        front_only: bool,
+    ) -> Self {
+        Self::for_rig(scene, edges, rig, phi, n, seed, front_only, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn for_rig(
+        scene: &Scene,
+        edges: &Edges,
+        rig: &Rig,
+        phi: &[f64],
+        n: usize,
+        seed: u64,
+        front_only: bool,
+        vis: Option<&Visibility>,
+    ) -> Self {
         let np = phi.len();
         // ± RIG_H placements per parameter, for the edges' velocities.
         let shifted: Vec<[Vec<Transform>; 2]> = (0..np)
@@ -266,34 +560,108 @@ impl EdgeSamples {
                 [plus, (rig.place)(&p)]
             })
             .collect();
+        // A material point carried by its instance: `J_π · ∂X/∂φ`.
+        let vel = |mi: usize, xl: Point3, _x: Point3, jac: [Vec3; 2]| {
+            shifted
+                .iter()
+                .map(|[p, q]| {
+                    let dx = (p[mi].apply_point(&xl) - q[mi].apply_point(&xl)) / (2.0 * RIG_H);
+                    [jac[0].dot(&dx), jac[1].dot(&dx)]
+                })
+                .collect::<Vec<_>>()
+        };
+        Self::build(
+            scene,
+            edges,
+            &rig.moving,
+            &vel,
+            np,
+            n,
+            seed,
+            front_only,
+            vis,
+        )
+    }
+
+    /// Edge samples for the camera's parameters ([`CameraRig`] at `c`; the
+    /// scene is set there): every instance's edges are candidates, and a
+    /// world point's screen velocity is the pinhole's derivative.
+    pub fn for_camera(
+        scene: &Scene,
+        edges: &Edges,
+        cam: &CameraRig,
+        c: &[f64],
+        n: usize,
+        seed: u64,
+    ) -> Self {
+        let shifted: Vec<[Pinhole; 2]> = (0..c.len())
+            .map(|j| {
+                let mut p = c.to_vec();
+                p[j] += RIG_H;
+                let a = cam.pinhole(&p);
+                p[j] -= 2.0 * RIG_H;
+                [a, cam.pinhole(&p)]
+            })
+            .collect();
+        let size = scene.size;
+        let vel = |_mi: usize, _xl: Point3, x: Point3, _jac: [Vec3; 2]| {
+            shifted
+                .iter()
+                .map(|[a, b]| match (a.project(size, x), b.project(size, x)) {
+                    (Some(p), Some(q)) => {
+                        [(p[0] - q[0]) / (2.0 * RIG_H), (p[1] - q[1]) / (2.0 * RIG_H)]
+                    }
+                    _ => [0.0, 0.0],
+                })
+                .collect::<Vec<_>>()
+        };
+        let all: Vec<usize> = (0..scene.placements().len()).collect();
+        Self::build(scene, edges, &all, &vel, c.len(), n, seed, true, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        scene: &Scene,
+        edges: &Edges,
+        moving: &[usize],
+        vel: &dyn Fn(usize, Point3, Point3, [Vec3; 2]) -> Vec<[f64; 2]>,
+        np: usize,
+        n: usize,
+        seed: u64,
+        front_only: bool,
+        vis: Option<&Visibility>,
+    ) -> Self {
         let (w, h) = (scene.size.0 as f64, scene.size.1 as f64);
         let mut segs = Vec::new();
         let mut cum = Vec::new();
         let (mut total, mut wtotal, mut sil) = (0.0, 0.0, 0.0);
         let (eye, fwd, right, up, _) = scene.camera();
-        for (mi, &k) in rig.moving.iter().enumerate() {
+        for (mi, &k) in moving.iter().enumerate() {
             let place = &scene.placements()[k];
             let m = scene.blas()[place.blas].geometry().mesh();
             let pos = m.positions();
             let (nbr, cos) = (&edges.nbr[place.blas], &edges.cos[place.blas]);
             let normal = &edges.normal[place.blas];
             let tris = m.triangles();
-            let front = |tri: usize| {
+            // How squarely triangle `tri` faces the eye: > 0 is front.
+            let facing = |tri: usize| {
                 let x = place.to_world.apply_point(&pos[tris[tri][0] as usize]);
-                place.to_world.apply_normal(&normal[tri]).dot(&(eye - x)) > 0.0
+                let n = place.to_world.apply_normal(&normal[tri]);
+                n.dot(&(eye - x)) / (n.norm() * (eye - x).norm()).max(1e-300)
             };
+            let front = |tri: usize| facing(tri) > 0.0;
             for (tri, t) in tris.iter().enumerate() {
-                let Some(px) = t
+                let wp: Vec<Point3> = t
                     .iter()
-                    .map(|&i| {
-                        scene
-                            .project(place.to_world.apply_point(&pos[i as usize]))
-                            .map(|p| p.0)
-                    })
-                    .collect::<Option<Vec<_>>>()
-                else {
+                    .map(|&i| place.to_world.apply_point(&pos[i as usize]))
+                    .collect();
+                let pz: Vec<Option<([f64; 2], f64)>> = wp
+                    .iter()
+                    .map(|&x| scene.project(x).map(|p| (p.0, (x - eye).dot(&fwd))))
+                    .collect();
+                if pz.iter().all(Option::is_none) {
                     continue;
-                };
+                }
                 let f = front(tri);
                 for e in 0..3 {
                     let imp = match nbr[tri][e] {
@@ -301,12 +669,45 @@ impl EdgeSamples {
                         NONE if f => 1.0,
                         NONE => BACK_WEIGHT,
                         n => match (f, front(n as usize)) {
-                            (true, true) => crease_weight(cos[tri][e] as f64),
+                            // A crease between front faces has one owner:
+                            // the squarer face, so its inner ray is the
+                            // robust one, and the jump is counted once
+                            // whatever the grazing side's ray lands on.
+                            (true, true) => {
+                                let (a, b) = (facing(tri), facing(n as usize));
+                                if a < b || (a == b && tri > n as usize) {
+                                    continue;
+                                }
+                                crease_weight(cos[tri][e] as f64)
+                            }
                             (false, false) => BACK_WEIGHT,
-                            _ => 1.0,
+                            // A silhouette is the front face's: the back
+                            // face's inner ray lands on the front one and
+                            // scores 0 (2d gives it weight 1 — half of
+                            // every silhouette sample wasted).
+                            (true, false) => 1.0,
+                            (false, true) if front_only => BACK_WEIGHT,
+                            (false, true) => 1.0,
                         },
                     };
-                    let (pa, pb, pc) = (px[e], px[(e + 1) % 3], px[(e + 2) % 3]);
+                    // The edge's ends must be in front of the eye; the
+                    // third corner only says which side is the triangle's,
+                    // so behind the eye a point just inside the triangle
+                    // next to the edge says it instead (2d dropped every
+                    // triangle with a corner behind the eye).
+                    let (Some((pa, za)), Some((pb, zb))) = (pz[e], pz[(e + 1) % 3]) else {
+                        continue;
+                    };
+                    let pc = match pz[(e + 2) % 3] {
+                        Some((p, _)) => p,
+                        None => {
+                            let m = wp[e] + (wp[(e + 1) % 3] - wp[e]) * 0.5;
+                            match scene.project(m + (wp[(e + 2) % 3] - m) * 1e-3) {
+                                Some((p, _)) => p,
+                                None => continue,
+                            }
+                        }
+                    };
                     let Some((t0, t1)) = clip(pa, pb, w, h) else {
                         continue;
                     };
@@ -314,24 +715,49 @@ impl EdgeSamples {
                     if len <= 0.0 {
                         continue;
                     }
-                    total += len;
-                    if imp == 1.0 {
-                        sil += len;
+                    let runs = match vis {
+                        None => vec![(t0, t1, imp)],
+                        Some(v) => {
+                            v.runs(k, pa, pb, za, zb, t0, t1)
+                                .into_iter()
+                                .map(|(a, b, seen)| {
+                                    // Visible creases stay: shaded, they
+                                    // jump too, inside the instance's own
+                                    // image.
+                                    let w = match seen {
+                                        Seen::Hidden => imp * HIDDEN_WEIGHT,
+                                        Seen::Border | Seen::Inside => imp,
+                                    };
+                                    (a, b, w)
+                                })
+                                .collect()
+                        }
+                    };
+                    let full = (pb[0] - pa[0]).hypot(pb[1] - pa[1]);
+                    for (t0, t1, imp) in runs {
+                        let len = full * (t1 - t0);
+                        if len <= 0.0 {
+                            continue;
+                        }
+                        total += len;
+                        if imp == 1.0 {
+                            sil += len;
+                        }
+                        wtotal += len * imp;
+                        cum.push(wtotal);
+                        segs.push(Seg {
+                            mi,
+                            k,
+                            tri,
+                            e,
+                            pa,
+                            pb,
+                            pc,
+                            t0,
+                            t1,
+                            w: imp,
+                        });
                     }
-                    wtotal += len * imp;
-                    cum.push(wtotal);
-                    segs.push(Seg {
-                        mi,
-                        k,
-                        tri,
-                        e,
-                        pa,
-                        pb,
-                        pc,
-                        t0,
-                        t1,
-                        w: imp,
-                    });
                 }
             }
         }
@@ -345,7 +771,6 @@ impl EdgeSamples {
             visible: 0,
             halved: 0,
         };
-        let mut rng = Rng::new(seed ^ 0x6564_6765, u64::MAX);
         for i in 0..n {
             let put = |o: &mut Self, s: [f64; 2], nrm: [f64; 2], wt: Vec<f64>| {
                 let at = |d: f64| scene.screen(s[0] + d * nrm[0], s[1] + d * nrm[1]);
@@ -356,7 +781,10 @@ impl EdgeSamples {
                 o.pixel.push(y * scene.size.0 + x);
                 o.weight.push(wt);
             };
-            let u = (i as f64 + rng.uniform()) / n as f64 * wtotal;
+            // One generator per sample (phase 2e: the device draws the
+            // same `u` in parallel).
+            let u =
+                (i as f64 + Rng::new(seed ^ 0x6564_6765, i as u64).uniform()) / n as f64 * wtotal;
             if segs.is_empty() {
                 put(&mut out, [0.0, 0.0], [1.0, 0.0], vec![0.0; np]);
                 continue;
@@ -445,24 +873,21 @@ impl EdgeSamples {
             let crease = hit(outer).is_some_and(|oh| {
                 oh.payload == seg.k && (oh.hit.point - x).norm() < 1e-4 * (x - eye).norm()
             });
-            let half = if crease {
+            if crease {
                 out.halved += 1;
-                0.5
-            } else {
-                1.0
-            };
-            let wt = (0..np)
-                .map(|j| {
-                    let [p, q] = &shifted[j];
-                    let dx =
-                        (p[seg.mi].apply_point(&xl) - q[seg.mi].apply_point(&xl)) / (2.0 * RIG_H);
-                    let vn = jac[0].dot(&dx) * nrm[0] + jac[1].dot(&dx) * nrm[1];
-                    half * vn * wtotal / (seg.w * n as f64)
-                })
+            }
+            let wt = vel(seg.mi, xl, x, jac)
+                .into_iter()
+                .map(|v| (v[0] * nrm[0] + v[1] * nrm[1]) * wtotal / (seg.w * n as f64))
                 .collect();
             put(&mut out, s, nrm, wt);
         }
         out
+    }
+
+    /// Per sample, per parameter, what its pair's difference is worth.
+    pub fn weights(&self) -> &[Vec<f64>] {
+        &self.weight
     }
 
     /// The ray pairs, inner then outer, as camera-plane points.
@@ -523,6 +948,27 @@ pub fn boundary(
     trace: impl FnOnce(&Scene) -> Vec<f64>,
 ) -> (Vec<f64>, EdgeSamples) {
     let es = EdgeSamples::new(scene, edges, rig, phi, n, seed);
+    scene.set_points(Some(es.points.clone()));
+    let l = trace(scene);
+    scene.set_points(None);
+    (es.gradient(scene, seed, &l, d_img), es)
+}
+
+/// [`boundary`] with candidate importance from `vis` (built for the
+/// scene as posed).
+#[allow(clippy::too_many_arguments)]
+pub fn boundary_with(
+    scene: &mut Scene,
+    edges: &Edges,
+    rig: &Rig,
+    phi: &[f64],
+    d_img: &[f64],
+    n: usize,
+    seed: u64,
+    vis: Option<&Visibility>,
+    trace: impl FnOnce(&Scene) -> Vec<f64>,
+) -> (Vec<f64>, EdgeSamples) {
+    let es = EdgeSamples::with_visibility(scene, edges, rig, phi, n, seed, vis);
     scene.set_points(Some(es.points.clone()));
     let l = trace(scene);
     scene.set_points(None);

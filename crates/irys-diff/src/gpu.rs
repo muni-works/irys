@@ -41,6 +41,7 @@ use crate::ggx::{COLUMNS, DF, Graph, PARAMS, THETA};
 use crate::prb::{self, Loss, Scene};
 
 const WAVEFRONT: &str = include_str!("gpu/wavefront.wgsl");
+const EDGES: &str = include_str!("gpu/edges.wgsl");
 const PATH_BYTES: u64 = 128;
 const WG: u32 = 64;
 
@@ -254,6 +255,8 @@ pub struct GpuPrb {
     layout: Layout,
     /// Timings of the last forward and replay.
     pub timing: Timing,
+    /// The next pass's points are on the device already ([`GpuEdges`]).
+    device_points: std::cell::Cell<bool>,
 }
 
 /// Where the instance and splat records start in the packed scene.
@@ -621,6 +624,7 @@ impl GpuPrb {
             pipes,
             groups,
             timing: Timing::default(),
+            device_points: std::cell::Cell::new(false),
         }
     }
 
@@ -751,7 +755,9 @@ impl GpuPrb {
             0,
             bytemuck::cast_slice(&theta.map(|x| x as f32)),
         );
-        if let Some(p) = scene.points() {
+        if let Some(p) = scene.points()
+            && !self.device_points.replace(false)
+        {
             let p32: Vec<[f32; 2]> = p.iter().map(|q| [q[0] as f32, q[1] as f32]).collect();
             assert!(
                 p32.len() as u64 * 8 <= self.points.size(),
@@ -1001,4 +1007,360 @@ pub fn loss(
 /// f32 lanes as f64, for the host-side image and loss.
 pub fn widen(l: &[f32]) -> Vec<f64> {
     l.iter().map(|&x| x as f64).collect()
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct EdgeParams {
+    seed: [u32; 2],
+    n: u32,
+    slots: u32,
+    moving: u32,
+    np: u32,
+    policy: u32,
+    blocks: u32,
+    eps_px: f32,
+    _p: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Mover {
+    rec: u32,
+    prim_base: u32,
+    tris: u32,
+    slot_base: u32,
+    edge_base: u32,
+    _p: [u32; 3],
+}
+
+const SCAN_BLOCK: u32 = 1024;
+
+/// What the last [`GpuEdges::sample`] cost.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EdgeTiming {
+    /// Host: the rig's placements and uniforms.
+    pub host: Duration,
+    /// Device: candidates, scan, samples, and reading the weights back.
+    pub device: Duration,
+}
+
+/// Phase 2e: [`vis::EdgeSamples`] drawn on the device (`edges.wgsl`), for a
+/// [`GpuPrb`] built for `2 n` points, writing them straight into its point
+/// buffer. The host keeps the rig (placements at `φ ± RIG_H`, a few
+/// matrices) and the final weighted sum; projection, importance, the prefix
+/// sum, sampling and the ownership rays are the device's, deterministic
+/// (no atomics; the scan runs in a fixed order).
+pub struct GpuEdges {
+    pipes: [wgpu::ComputePipeline; 5],
+    groups: [wgpu::BindGroup; 5],
+    ep: wgpu::Buffer,
+    params: wgpu::Buffer,
+    xf: wgpu::Buffer,
+    pts: wgpu::Buffer,
+    smp: wgpu::Buffer,
+    slots: u32,
+    blocks: u32,
+    n: u32,
+    np: u32,
+    policy: u32,
+    moving: Vec<usize>,
+    /// What the last draw cost.
+    pub timing: EdgeTiming,
+}
+
+impl GpuEdges {
+    /// Buffers and pipelines for `rig`'s moving instances of `scene`, `n`
+    /// samples, `np` parameters; `front_only` is phase 2e's silhouette
+    /// importance (2d's otherwise).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        gp: &GpuPrb,
+        scene: &Scene,
+        edges: &crate::vis::Edges,
+        moving: &[usize],
+        n: usize,
+        np: usize,
+        front_only: bool,
+    ) -> Self {
+        use irys_core::Geometry;
+        let dev = &gp.ctx.device;
+        let scope = dev.push_error_scope(wgpu::ErrorFilter::Validation);
+        assert!(np <= 8, "at most 8 parameters");
+        assert!(
+            gp.points.size() >= 2 * n as u64 * 8,
+            "the wavefront holds 2n points"
+        );
+        let mut base = vec![0u32; scene.blas().len()];
+        let mut acc = 0u32;
+        for (b, t) in scene.blas().iter().enumerate() {
+            base[b] = acc;
+            acc += t.geometry().len() as u32;
+        }
+        let (mut movers, mut nbr, mut dih) = (Vec::new(), Vec::<u32>::new(), Vec::<f32>::new());
+        let mut slot = 0u32;
+        for &k in moving {
+            let b = scene.placements()[k].blas;
+            let rec = scene
+                .tlas()
+                .instances()
+                .iter()
+                .position(|i| i.payload() == k)
+                .expect("placed") as u32;
+            let tris = edges.nbr[b].len() as u32;
+            movers.push(Mover {
+                rec,
+                prim_base: base[b],
+                tris,
+                slot_base: slot,
+                edge_base: nbr.len() as u32,
+                _p: [0; 3],
+            });
+            nbr.extend(edges.nbr[b].iter().flatten());
+            dih.extend(edges.cos[b].iter().flatten());
+            slot += 3 * tris;
+        }
+        let slots = slot.max(1);
+        let blocks = slots.div_ceil(SCAN_BLOCK);
+        let init = |label: &str, bytes: &[u8], usage: wgpu::BufferUsages| {
+            dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: if bytes.is_empty() { &[0; 16] } else { bytes },
+                usage,
+            })
+        };
+        let st = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let rw = |label: &str, bytes: u64| {
+            dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: bytes.max(16),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let movers_b = init("movers", bytemuck::cast_slice(&movers), st);
+        let nbr_b = init("nbr", bytemuck::cast_slice(&nbr), st);
+        let dih_b = init("dihedral", bytemuck::cast_slice(&dih), st);
+        let xf = rw("xf", (moving.len() * 3 * (1 + np) * 16) as u64);
+        let wt = rw("edge weights", slots as u64 * 4);
+        let rt = rw("edge ranges", slots as u64 * 16);
+        let btot = rw("block totals", (blocks as u64 + 1) * 4);
+        let pts = rw("edge points", 2 * n as u64 * 8);
+        let smp = rw("edge samples", n as u64 * (2 + np as u64) * 4);
+        let uni = |label: &str, bytes: u64| {
+            dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: bytes,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let ep = uni("edge params", std::mem::size_of::<EdgeParams>() as u64);
+        let params = uni("edge scene params", std::mem::size_of::<Params>() as u64);
+        let src = format!("{WAVEFRONT}\n{EDGES}");
+        let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("edges"),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+        let pipe = |entry: &str| {
+            dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: None,
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let pipes = [
+            "edge_cand",
+            "scan_block",
+            "scan_tops",
+            "scan_fill",
+            "edge_sample",
+        ]
+        .map(pipe);
+        let bind = |p: &wgpu::ComputePipeline, e: &[(u32, &wgpu::Buffer)]| {
+            dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &p.get_bind_group_layout(0),
+                entries: &e
+                    .iter()
+                    .map(|&(binding, b)| wgpu::BindGroupEntry {
+                        binding,
+                        resource: b.as_entire_binding(),
+                    })
+                    .collect::<Vec<_>>(),
+            })
+        };
+        let groups = [
+            bind(
+                &pipes[0],
+                &[
+                    (0, &params),
+                    (25, &gp.geo),
+                    (27, &ep),
+                    (28, &movers_b),
+                    (29, &xf),
+                    (30, &nbr_b),
+                    (31, &dih_b),
+                    (32, &wt),
+                    (33, &rt),
+                ],
+            ),
+            bind(&pipes[1], &[(27, &ep), (32, &wt), (34, &btot)]),
+            bind(&pipes[2], &[(27, &ep), (34, &btot)]),
+            bind(&pipes[3], &[(27, &ep), (32, &wt), (34, &btot)]),
+            bind(
+                &pipes[4],
+                &[
+                    (0, &params),
+                    (23, &gp.nodes),
+                    (24, &gp.ids),
+                    (25, &gp.geo),
+                    (27, &ep),
+                    (28, &movers_b),
+                    (29, &xf),
+                    (32, &wt),
+                    (33, &rt),
+                    (34, &btot),
+                    (35, &pts),
+                    (36, &smp),
+                ],
+            ),
+        ];
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            panic!("irys-diff gpu edges: {e}");
+        }
+        Self {
+            pipes,
+            groups,
+            ep,
+            params,
+            xf,
+            pts,
+            smp,
+            slots,
+            blocks,
+            n: n as u32,
+            np: np as u32,
+            policy: front_only as u32,
+            moving: moving.to_vec(),
+            timing: EdgeTiming::default(),
+        }
+    }
+
+    /// Draw the edge samples of `scene` posed at `phi` (and `gp` updated to
+    /// it) with generator `seed`, into `gp`'s point buffer: the next
+    /// [`GpuPrb::forward`] traces them (the scene must be in point mode with
+    /// `2 n` points; their values are ignored). Returns the weights.
+    pub fn sample(
+        &mut self,
+        gp: &GpuPrb,
+        scene: &Scene,
+        rig: &crate::vis::Rig,
+        phi: &[f64],
+        seed: u64,
+    ) -> crate::vis::EdgeSamples {
+        use crate::vis::RIG_H;
+        assert_eq!(
+            rig.moving, self.moving,
+            "the rig this sampler was built for"
+        );
+        assert_eq!(phi.len(), self.np as usize);
+        let t0 = Instant::now();
+        let np = phi.len();
+        let shifted: Vec<[Vec<irys_core::Transform>; 2]> = (0..np)
+            .map(|j| {
+                let mut p = phi.to_vec();
+                p[j] += RIG_H;
+                let a = (rig.place)(&p);
+                p[j] -= 2.0 * RIG_H;
+                [a, (rig.place)(&p)]
+            })
+            .collect();
+        let rows = |m: &irys_core::Transform| -> [[f64; 4]; 3] {
+            std::array::from_fn(|r| std::array::from_fn(|c| m.matrix.get(r, c)))
+        };
+        let mut xf: Vec<[f32; 4]> = Vec::new();
+        for (mi, &k) in self.moving.iter().enumerate() {
+            for r in rows(&scene.placements()[k].to_world) {
+                xf.push(r.map(|x| x as f32));
+            }
+            for [a, b] in &shifted {
+                let (ra, rb) = (rows(&a[mi]), rows(&b[mi]));
+                for r in 0..3 {
+                    xf.push(std::array::from_fn(|c| {
+                        ((ra[r][c] - rb[r][c]) / (2.0 * RIG_H)) as f32
+                    }));
+                }
+            }
+        }
+        let q = &gp.ctx.queue;
+        q.write_buffer(&self.xf, 0, bytemuck::cast_slice(&xf));
+        q.write_buffer(
+            &self.params,
+            0,
+            bytemuck::bytes_of(&gp.params(scene, &[0.0; PARAMS], seed, false, 0)),
+        );
+        q.write_buffer(
+            &self.ep,
+            0,
+            bytemuck::bytes_of(&EdgeParams {
+                seed: [seed as u32, (seed >> 32) as u32],
+                n: self.n,
+                slots: self.slots,
+                moving: self.moving.len() as u32,
+                np: self.np,
+                policy: self.policy,
+                blocks: self.blocks,
+                eps_px: crate::vis::EPS_PX as f32,
+                _p: [0; 3],
+            }),
+        );
+        let host = t0.elapsed();
+        let t1 = Instant::now();
+        let dev = &gp.ctx.device;
+        let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            let go = |pass: &mut wgpu::ComputePass, p: usize, groups: u32| {
+                pass.set_pipeline(&self.pipes[p]);
+                pass.set_bind_group(0, &self.groups[p], &[]);
+                let x = groups.clamp(1, 65535);
+                pass.dispatch_workgroups(x, groups.div_ceil(x), 1);
+            };
+            go(&mut pass, 0, self.slots.div_ceil(WG));
+            go(&mut pass, 1, self.blocks.div_ceil(WG));
+            go(&mut pass, 2, 1);
+            go(&mut pass, 3, self.blocks.div_ceil(WG));
+            go(&mut pass, 4, self.n.div_ceil(WG));
+        }
+        enc.copy_buffer_to_buffer(&self.pts, 0, &gp.points, 0, 2 * self.n as u64 * 8);
+        q.submit([enc.finish()]);
+        gp.device_points.set(true);
+        let stride = 2 + np;
+        let out = gp.read(&self.smp, self.n as usize * stride);
+        let (mut pixel, mut weight, mut visible) = (Vec::new(), Vec::new(), 0);
+        for s in out.chunks_exact(stride) {
+            pixel.push(s[0] as usize);
+            visible += (s[1] > 0.0) as usize;
+            weight.push(s[2..].iter().map(|&x| x as f64).collect());
+        }
+        self.timing = EdgeTiming {
+            host,
+            device: t1.elapsed(),
+        };
+        crate::vis::EdgeSamples::from_parts(pixel, weight, visible)
+    }
+
+    /// The device's points, as camera-plane pairs (for tests).
+    pub fn points(&self, gp: &GpuPrb) -> Vec<[f64; 2]> {
+        gp.read(&self.pts, 2 * self.n as usize * 2)
+            .chunks_exact(2)
+            .map(|p| [p[0] as f64, p[1] as f64])
+            .collect()
+    }
 }

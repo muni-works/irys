@@ -775,6 +775,188 @@ Risks and next:
    costs traversal and edge count; a coarser tolerance for rendering would
    cut both.
 
+## Phase 2e: the interior term, cheaper edges, the camera (2026-10-17)
+
+Continues 2d's pose gradients. Scenes are the tests' own (`tests/phase2e.rs`):
+an arm of boxes — a static post, a conductor upper link, a diffuse forearm,
+each pre-rolled so no face is axis-aligned, gaps at both joints — at depth 4
+with NEE, rigged by shoulder pitch, shoulder yaw and elbow.
+
+### 1. The interior term (`interior.rs`)
+
+`∂I/∂φ` at fixed random numbers, where the integrand is smooth: the hit
+point moving on a moving triangle, its normal turning, the next direction
+(drawn in the hit's frame) turning with it, and every cosine, GGX value,
+pdf, MIS weight and sky lookup downstream. **Hand-derived forward mode**: a
+dual number (`D`, ≤ 8 tangents) re-traces the frame with the primal trace's
+control flow — Möller–Trumbore against the triangle the primal hit, corners
+as duals; GGX visible-normal sampling and eval in duals; NEE and the
+environment in duals. Not the IR: the GGX graph differentiates to `θ` with
+the columns as data; making it take `∂cos/∂φ` lanes would need a second
+graph for one factor of many, and the duals cover all of them. The dual
+trace's values equal the forward pass's `L` to 9e-15.
+
+*Attached frames.* The renderer's `basis(n)` flips where `n_z` crosses 0 — a
+discontinuity in `φ` no edge sees. The derivative taken is that of the
+estimator whose frame on a moving instance is `R(φ)R(φ₀)ᵀ basis(n(φ₀))`:
+equal to the rendered one at `φ₀`, a valid estimator of the same `I(φ)` for
+every `φ`, so its derivative is unbiased from the very same paths. Rigid
+placements assumed (the frame's angular velocity is the skew part of
+`L̇L⁻¹`).
+
+*A 2d bug, found by this gate.* 2d sampled a crease between two front faces
+from both sides and halved where the outer ray landed next to the edge
+point. When the grazing side's ownership test failed (its inner ray at
+10⁻³ px onto a nearly edge-on face) half the jump was lost. A mask has no
+jump at creases, so every 2d gate passed; shaded, the edge term on the arm
+was +15.7 against a true total of −3.0 (z ≈ 25), and this — not the missing
+interior term — is what 2d's "shaded arm disagrees in sign" was. Now a
+crease has one owner, the face meeting the eye more squarely, at full
+weight, and the outer ray's `f` is whatever it lands on.
+
+| Gate (CPU f64; CD over 16² fixed points per pixel, h 0.01, 4 seeds) | Result |
+|---|---|
+| dual values vs `prb::forward` (interpreter), 3456 lanes | worst rel 9.3e-15 |
+| per-lane tangent vs CD at one seed, translations (frames fixed), depth 4 | 92/92, 20/20 moving lanes agree to 1e-4 |
+| per-lane, rotations, depth 1 + NEE | 44/44, 44/44, 12/12 |
+| **arm vs sky, depth 4, NEE**, 48×36, edge 24 × 8192 pairs + interior 24 × 4 spp | sum (−3.17 ± 0.67, −3.65 ± 0.28, −0.06 ± 0.18) vs CD (−5.41 ± 1.35, −2.83 ± 0.94, −0.26 ± 0.54): z 1.5, 0.8, 0.4. Edge alone z 2.5, 0.2, 2.0; interior (−1.49, −1.02, +1.31) |
+| same arm over a floor it shadows (ignored test, measured) | sum (−31.1, +8.5, −6.3) vs CD (−36.9 ± 1.4, +11.7 ± 2.1, −8.7 ± 1.3): z 3.6, 1.5, 1.9 — the floor shadow moving is ~15 % of φ0 and neither term sees it |
+| a conductor slab filling the frame (scratch, not kept) | edge + interior (523, 90, 11.3) vs CD (519 ± 12, 94 ± 8, 9.0 ± 2.7) |
+
+Deviations: CPU only (the device has no dual trace); triangles only on the
+path (analytic prims refused), no splats; the checker's edges ignored.
+Interpenetrating instances are a discontinuity (their intersection curve)
+that is no triangle's edge — the first arm, with links sunk into each other
+and into the post, disagreed by 10σ before the gaps; rose's links bolt
+plate-to-plate, so this matters there.
+
+### 2. Visibility-aware edge importance (`vis::Visibility`)
+
+An ID + depth buffer (one ray per pixel centre, 0.5 ms at 48×36) and two
+changes to the candidates' importance, both unbiased (nothing gets weight
+0): a silhouette is sampled from its **front face only** — 2d gave the back
+face's side weight 1, and its inner ray always lands on the front face and
+scores 0, so half of every silhouette sample was wasted — and each
+candidate, probed every pixel along its screen length, keeps
+`HIDDEN_WEIGHT = 0.01` of its importance over runs where it is deeper than
+the farthest surface in the surrounding 3 × 3 pixels. Visible creases keep
+their crease weight: the brief said to drop front-front edges, but shaded
+they carry real jumps (piece 1's bug is exactly that term), so dropping
+them would bias every shaded gradient.
+
+| Plate arm (links are three parallel plates in one tree, the post in front), 48×36, 24 × 4096 pairs | 2d importance | 2e | variance ratio |
+|---|---|---|---|
+| depth 1, visible samples | 35 % | 57 % | φ 2.2, 1.4, 2.3 (geo-mean **1.9**) |
+| depth 2 + NEE | 35 % | 57 % | 1.8, 1.2, 2.1 (geo-mean **1.7**) |
+
+Means agree to |z| < 1.6. **Not the 10× 2d expected.** Removing waste
+caps the gain at `1 / visible fraction`; what is left invisible (43 %) is
+mostly edges that coincide with a nearer edge to within a pixel (stacked
+plates share their outline), which no pixel-resolution buffer can tell
+apart, and the remaining variance is per-sample: `v_n · Σℓw / w_e` swings
+with crease weight and edge speed, and shaded the two paths' difference is
+itself noisy. A velocity-aware importance (`∝ |v_n|`, per parameter) is the
+next lever. The rose arm itself was not re-measured (its files are off
+limits here).
+
+### 3. The edge term's host work on the device (`gpu/edges.wgsl`, `GpuEdges`)
+
+`edges.wgsl` is appended to the wavefront's source and walks its tree.
+`edge_cand` (a thread per moving triangle edge: project, facing, crease
+owner, importance, clip, `len × w`), a fixed-order prefix sum (`scan_block`
+sums 1024 slots sequentially per thread, `scan_tops` the block totals in
+one thread, `scan_fill` writes the inclusive sums — no atomics, so the same
+weights give the same bits), and `edge_sample` (a thread per sample:
+stratified `u`, binary search, edge point, closest-approach material point,
+the ownership ray through the device's TLAS with the coplanar-sliver rule,
+the pinhole Jacobian, `v_n` per parameter from the rig's derivative
+matrices). The samples land straight in the wavefront's point buffer; the
+host keeps the rig (placements at `φ ± RIG_H`, a few matrices) and the
+final `O(n)` weighted sum. The host now draws each sample's `u` from its
+own generator (`Rng(seed ^ "edge", i)`), as the device does, so the two
+draw the same samples.
+
+| Gate (M-series, Metal) | Result |
+|---|---|
+| device vs host samples, plate arm, 16 384, both importances | 98.9–99.6 % of points within 1e-5 (the rest: f32 cumulative sums moving a `u` across a segment end); weights 16384/16384 within 2e-3; visible counts equal |
+| edge term from device samples vs host samples, both traced on the device | rel ≤ 2.1e-3 |
+| two device draws | bit-identical points and weights |
+| **split, 522 k triangles, 16 384 pairs, 192², depth 5 (release)** | before: host sampling **102.5 ms**, device pairs 2.7 ms, host sum 0.45 ms. After: host 0.04 ms, device sampling **3.0 ms**, device pairs 3.9 ms, host sum 0.43 ms — 105 → 7.4 ms |
+
+Deviations: the ID-buffer demotion (piece 2) is host-only; the device does
+2d's importance or 2e's front-only silhouettes. Velocities still come from
+central differences of the rig's closed form on the host (exact to 1e-10;
+f32 on the device).
+
+### 4. The camera as a parameter (`vis::CameraRig`, `Tangents::camera`)
+
+`c = (t, ω, δ)`: eye translated by `t` (world), the frame turned about the
+eye by `R_z R_y R_x(ω)` (world axes), the half field of view widened by `δ`
+— seven parameters about a base pinhole (`Scene::set_camera` is new). Edge
+term: every instance's edges are candidates (front-only silhouettes), and a
+fixed world point's screen velocity is the pinhole's derivative (central
+differences of the closed form). Interior: the eye, axes and `tan` of the
+half-angle are duals; the primary ray and everything downstream follow.
+Edges with a corner behind the eye are now kept on both tiers (the
+triangle's side is read from a point just inside it next to the edge); 2d
+dropped every triangle with a corner behind the eye, which a camera near a
+floor makes common. Edge ends behind the eye are still dropped (no near
+clip).
+
+| Gate | Result |
+|---|---|
+| per-lane, all 7 parameters, arm on floor, depth 4, NEE, one seed | rotations and fov: 376/376, 376/376, 44/44, 376/376 moving lanes agree to 1e-4; translations move no lane (flat faces, directional light, no second object on the path) |
+| **two boxes, conductor + diffuse, apart, depth 3 + NEE**, 48×36, 24 × (8192 pairs + 4 spp) vs CD (16² points, h 0.05 / 0.004 rad / 0.01 rad, 4 seeds) | z −0.54, +1.01, −2.34, −0.40, −0.59, +0.96, −1.57; e.g. fov: edge 55.5 + interior 89.9 = 145.4 ± 1.3 vs 150.1 ± 2.7 |
+| arm mask, depth 1 | z −0.52, +1.69, +1.72, +1.25, −2.74, −0.28, +0.80. The reference itself moves by a few per cent with the rotation step (c4: 6.5, 5.3, 4.3 at h = 0.01, 0.004, 0.025 rad) |
+| shaded arm, depth 4 + NEE (ignored test, measured) | translations and the roll disagree by 5–14σ (c0: 5.16 ± 0.25 vs 0.57 ± 0.21) — the arm's shadows on itself and the post are image discontinuities that are no triangle's edge, and every one of them moves when the camera does |
+
+### 5. Shadow edges: deferred
+
+Not built. What the gates measured it is worth: ~15 % of the shoulder
+pitch on the arm over a floor (−31.1 vs −36.9 ± 1.4), and for the camera on
+the shaded arm it dominates the translations (c0: 5.2 vs 0.6). Why not now:
+
+- The light is an environment (a vMF sun lobe plus the sky), so a shadow
+  edge is not a curve on a light source but the occluders' silhouettes as
+  seen from each shading point, over the whole sphere. Li et al. 2018's
+  secondary edge sampling needs, per shading point, a sample of a point on
+  an occluder silhouette edge with a density over all edges of the scene —
+  a per-vertex edge hierarchy (their 3D edge tree with cone bounds), not
+  the per-frame screen-space list pieces 2–3 built.
+- Each sample needs its own pair of shadow rays (`ω ± ε`), a weight with
+  the edge's motion projected onto the unit sphere around the shading
+  point, and the path's throughput up to it — so the replay's per-vertex
+  state, or a third pass. On the device that is a new kernel per bounce.
+- With a smooth environment the visibility integral is smooth in `x`; its
+  per-sample discontinuity is an artefact of point-sampling the light.
+  Warped-area reparameterisation of the shadow ray alone (Bangaru et al.
+  2020, restricted to NEE) is the cheaper candidate here, because a shadow
+  ray has one discontinuity family and no image-formation change.
+
+The camera and the floor arm stay as measured (ignored) tests, so the term
+has its gates waiting.
+
+### Phase 2e risks and next
+
+1. **Shadow edges** (above): the largest error left on any shaded scene
+   with contact or cast shadows, and for every camera parameter.
+2. **Interpenetration.** Intersection curves of overlapping instances are
+   discontinuities no edge list contains. Rose's links bolt plate to plate;
+   if they overlap in the tessellation, the edge term is biased there. A
+   check (instances' meshes intersecting) belongs in `Edges::new`.
+3. **Variance.** Piece 2 gave 1.7–1.9×, not 10×: per-sample variance now
+   dominates. Importance ∝ `|v_n|` per parameter, and fewer, fatter crease
+   samples, are next.
+4. **The interior term is CPU f64 only** (~0.25 s for 48×36×4 spp × depth 4
+   in debug); the fit on the device would need a dual (or adjoint) trace in
+   WGSL, or the IR graph extended to take the shading frame's tangents.
+5. **The CD references** are good to a few per cent at best (the rotation
+   step moves them by that much); gates at 3σ of combined error are as
+   tight as they can be made without a much costlier reference.
+6. The rose arm itself was not re-run (its files belonged to another
+   agent); the crease bug fixed in piece 1 changes 2d's shaded rose
+   numbers (`edge (+650, +479, +167)`), which should be re-measured.
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.
