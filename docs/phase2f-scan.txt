@@ -1,0 +1,15 @@
+scan elbow  -80.0°  mse 3.8481e-3  blur4 8.3946e-4  blur8 3.4443e-4  blur16 6.6749e-5  pyr2 2.3777e-3  pyr4 1.6317e-3  pyr8 8.7343e-4
+scan elbow  -75.0°  mse 4.1840e-3  blur4 8.2059e-4  blur8 3.1856e-4  blur16 4.6476e-5  pyr2 2.7643e-3  pyr4 1.7661e-3  pyr8 9.6582e-4
+scan elbow  -70.0°  mse 4.2150e-3  blur4 7.2775e-4  blur8 2.3355e-4  blur16 2.8185e-5  pyr2 2.3233e-3  pyr4 1.4289e-3  pyr8 7.1310e-4
+scan elbow  -65.0°  mse 2.9512e-3  blur4 3.1802e-4  blur8 8.7966e-5  blur16 1.1566e-5  pyr2 1.3780e-3  pyr4 8.4174e-4  pyr8 3.0434e-4
+scan elbow  -60.0°  mse 9.2915e-4  blur4 1.1588e-5  blur8 3.4905e-6  blur16 1.1026e-6  pyr2 2.5158e-4  pyr4 6.0054e-5  pyr8 1.4848e-5
+scan elbow  -55.0°  mse 2.5219e-3  blur4 3.1930e-4  blur8 8.4883e-5  blur16 1.2097e-5  pyr2 1.2316e-3  pyr4 7.2294e-4  pyr8 2.9994e-4
+scan elbow  -50.0°  mse 2.8138e-3  blur4 5.6708e-4  blur8 1.8329e-4  blur16 3.1592e-5  pyr2 1.6839e-3  pyr4 1.1440e-3  pyr8 6.6974e-4
+scan elbow  -45.0°  mse 2.6953e-3  blur4 5.2486e-4  blur8 2.2376e-4  blur16 6.0989e-5  pyr2 1.5685e-3  pyr4 1.0653e-3  pyr8 5.7695e-4
+scan elbow  -40.0°  mse 2.8451e-3  blur4 6.2127e-4  blur8 2.8057e-4  blur16 9.2032e-5  pyr2 1.6970e-3  pyr4 1.1699e-3  pyr8 6.9081e-4
+scan elbow  -35.0°  mse 3.2542e-3  blur4 8.3498e-4  blur8 3.4922e-4  blur16 1.0536e-4  pyr2 2.0656e-3  pyr4 1.5127e-3  pyr8 8.5886e-4
+scan elbow  -30.0°  mse 3.3786e-3  blur4 9.4065e-4  blur8 3.9797e-4  blur16 1.0932e-4  pyr2 2.1993e-3  pyr4 1.6351e-3  pyr8 1.0129e-3
+scan elbow  -25.0°  mse 3.4869e-3  blur4 9.7770e-4  blur8 4.3945e-4  blur16 1.2589e-4  pyr2 2.3005e-3  pyr4 1.7087e-3  pyr8 1.0460e-3
+scan elbow  -20.0°  mse 3.4532e-3  blur4 9.4351e-4  blur8 4.4420e-4  blur16 1.3978e-4  pyr2 2.2463e-3  pyr4 1.6393e-3  pyr8 9.8587e-4
+scan elbow  -15.0°  mse 3.5080e-3  blur4 9.1165e-4  blur8 4.3199e-4  blur16 1.4735e-4  pyr2 2.2820e-3  pyr4 1.5812e-3  pyr8 9.0988e-4
+scan elbow  -10.0°  mse 3.9306e-3  blur4 9.1228e-4  blur8 4.2491e-4  blur16 1.5272e-4  pyr2 2.4508e-3  pyr4 1.7378e-3  pyr8 1.0409e-3
