@@ -23,13 +23,13 @@
 //! Run with `--features gpu -- --ignored --test-threads=1 --nocapture`.
 #![cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 
-use kosm_render::Point3;
-use kosm_render::gpu::wgpu;
-use kosm_render::gpu::{
+use irys::Point3;
+use irys::gpu::wgpu;
+use irys::gpu::{
     AnalyticGeometry, AnalyticPrim, GpuAreaLight, GpuCamera, GpuContext, GpuDenoiseParams,
     GpuMaterial, GpuRenderState, HistoryPipeline, InstanceMotion, RayTracePipeline, SceneRef,
 };
-use kosm_render::pathtrace::{self, Pbr};
+use irys::pathtrace::{self, Pbr};
 
 const W: u32 = 64;
 const H: u32 = 64;
@@ -326,7 +326,7 @@ fn a_moving_sphere_keeps_its_history_and_its_trail_does_not() {
     let now = sphere_mask((FRAMES - 1) as f32 * step);
     let before = sphere_mask(0.0);
 
-    let mean_over = |h: &kosm_render::gpu::History, m: &dyn Fn(usize) -> bool| {
+    let mean_over = |h: &irys::gpu::History, m: &dyn Fn(usize) -> bool| {
         let mut s = 0.0f64;
         let mut k = 0usize;
         for i in 0..(W * H) as usize {
@@ -475,7 +475,7 @@ fn a_moved_light_is_clamped_out_within_four_frames() {
         out
     };
     let goal_b = blur(&goal.rgb);
-    let err = |h: &kosm_render::gpu::History| {
+    let err = |h: &irys::gpu::History| {
         let b = blur(&h.rgb);
         let mut s = 0.0f64;
         for i in 0..b.len() {

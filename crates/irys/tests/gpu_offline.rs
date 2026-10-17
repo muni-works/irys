@@ -13,17 +13,17 @@
 
 use std::sync::Arc;
 
-use kosm_render::analytic::Prim;
-use kosm_render::gpu::{
+use irys::analytic::Prim;
+use irys::gpu::{
     AnalyticGeometry, AnalyticPrim, GpuAreaLight, GpuCamera, GpuContext, GpuMaterial,
     MAX_TRAVERSAL_DEPTH, OfflineOptions, OfflineResult, RayTracePipeline, SceneRef,
     validate_tree_depth,
 };
-use kosm_render::math::Aabb;
-use kosm_render::pathtrace::{
+use irys::math::Aabb;
+use irys::pathtrace::{
     Camera, Environment, Object, PathTraceOptions, Pbr, Scene, studio_rig,
 };
-use kosm_render::{Analytic, Bvh, FlatBvhNode, Point3, Vec3};
+use irys::{Analytic, Bvh, FlatBvhNode, Point3, Vec3};
 
 const W: u32 = 64;
 const H: u32 = 64;
@@ -67,7 +67,7 @@ fn floor_pbr() -> Pbr {
 }
 
 /// The rig both tiers are lit by: the studio softboxes around the subject.
-fn rig() -> Vec<kosm_render::AreaLight> {
+fn rig() -> Vec<irys::AreaLight> {
     studio_rig(
         Point3::new(SPHERE_C[0], SPHERE_C[1], SPHERE_C[2]),
         3.0 * SPHERE_R,
@@ -190,7 +190,7 @@ fn cpu_scene() -> Scene<Analytic> {
     }]);
     let floor = Analytic::from_prims(vec![Prim::Plane {
         point: Point3::new(0.0, 0.0, FLOOR_Z),
-        normal: kosm_render::Dir3::new_normalize(Vec3::new(0.0, 0.0, 1.0)),
+        normal: irys::Dir3::new_normalize(Vec3::new(0.0, 0.0, 1.0)),
     }]);
     Scene {
         objects: vec![
@@ -221,7 +221,7 @@ fn cpu_mean_luminance(spp: u32) -> f32 {
         seed: 7,
         ..Default::default()
     };
-    let film = kosm_render::pathtrace::render(&cpu_scene(), &cam, W, H, &opts);
+    let film = irys::pathtrace::render(&cpu_scene(), &cam, W, H, &opts);
     let mut sum = 0.0f64;
     for p in film.rgb.chunks_exact(3) {
         sum += (0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]) as f64;
@@ -487,12 +487,12 @@ fn validate_tree_depth_refuses_a_tree_deeper_than_the_traversal_stack() {
     assert_eq!(MAX_TRAVERSAL_DEPTH, 64);
 
     let ok = deep_chain(MAX_TRAVERSAL_DEPTH);
-    assert_eq!(kosm_render::gpu::tree_depth(&ok), MAX_TRAVERSAL_DEPTH);
+    assert_eq!(irys::gpu::tree_depth(&ok), MAX_TRAVERSAL_DEPTH);
     validate_tree_depth(&ok).expect("a tree exactly as deep as the stack must be accepted");
 
     let too_deep = deep_chain(MAX_TRAVERSAL_DEPTH + 1);
     assert_eq!(
-        kosm_render::gpu::tree_depth(&too_deep),
+        irys::gpu::tree_depth(&too_deep),
         MAX_TRAVERSAL_DEPTH + 1
     );
     let err = validate_tree_depth(&too_deep).expect_err("a 65-deep tree must be refused");

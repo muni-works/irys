@@ -9,12 +9,12 @@
 //! Run with `--features gpu -- --ignored --test-threads=1`.
 #![cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 
-use kosm_render::Point3;
-use kosm_render::gpu::{
+use irys::Point3;
+use irys::gpu::{
     AnalyticGeometry, AnalyticPrim, GpuCamera, GpuContext, GpuMaterial, GpuRenderState,
     HistoryPipeline, RayTracePipeline, SceneRef,
 };
-use kosm_render::pathtrace::Pbr;
+use irys::pathtrace::Pbr;
 
 fn ctx_or_skip(name: &str) -> Option<&'static GpuContext> {
     match GpuContext::init_blocking() {
@@ -29,7 +29,7 @@ fn ctx_or_skip(name: &str) -> Option<&'static GpuContext> {
 struct Fixture {
     geometry: AnalyticGeometry,
     materials: Vec<GpuMaterial>,
-    lights: Vec<kosm_render::gpu::GpuAreaLight>,
+    lights: Vec<irys::gpu::GpuAreaLight>,
 }
 
 impl Fixture {
@@ -54,9 +54,9 @@ impl Fixture {
                 ..Default::default()
             }),
         ];
-        let lights = kosm_render::pathtrace::studio_rig(Point3::new(0.0, 0.0, 1.0), 3.0)
+        let lights = irys::pathtrace::studio_rig(Point3::new(0.0, 0.0, 1.0), 3.0)
             .iter()
-            .map(kosm_render::gpu::GpuAreaLight::from_area_light)
+            .map(irys::gpu::GpuAreaLight::from_area_light)
             .collect();
         Self {
             geometry,

@@ -10,7 +10,7 @@
 //! filter would pass through as blotches. White noise is flat, so its share
 //! is the area of that disc; blue noise has to come in well under it.
 
-use kosm_render::sampler::SamplePattern;
+use irys::sampler::SamplePattern;
 
 const N: usize = 128;
 

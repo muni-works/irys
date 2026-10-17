@@ -539,7 +539,7 @@ pub struct GpuRenderState {
     /// The camera the *previous* pass was rendered from, for ReSTIR's temporal
     /// reprojection: position in `.xyz`, and `.w` non-zero when there is one.
     ///
-    /// Filled in by [`crate::gpu::ResidentScene`] from the camera it was handed
+    /// Filled in by [`crate::ResidentScene`] from the camera it was handed
     /// last pass — a caller never sets these, and cannot get them wrong.
     pub prev_cam_position: [f32; 4],
     /// The previous pass's camera target in `.xyz`, its vertical field of view
@@ -577,7 +577,7 @@ pub struct GpuRenderState {
     /// The previous pass's screen `+x` in `.xyz` and its
     /// [`GpuCamera::basis_mode`] in `.w`, so ReSTIR's temporal reprojection
     /// rebuilds the same — possibly mirrored — basis the pass was rendered
-    /// with. Filled in by [`crate::gpu::ResidentScene`]; a caller never sets it.
+    /// with. Filled in by [`crate::ResidentScene`]; a caller never sets it.
     pub prev_cam_right: [f32; 4],
 }
 
@@ -742,7 +742,7 @@ impl GpuRenderState {
     /// the round the reprojection runs behind. See [`FLAG_BUDGET_MASK`] and
     /// [`FLAG_BUDGET_GUIDES`].
     ///
-    /// Set by [`crate::gpu::RayTracePipeline::accumulate_resident_round`] out
+    /// Set by [`crate::RayTracePipeline::accumulate_resident_round`] out
     /// of the budget it was handed; a caller driving the rounds itself never
     /// needs to.
     pub fn set_budget_mask(&mut self, on: bool, round: u32, guides: bool) {

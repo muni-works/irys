@@ -12,17 +12,17 @@
 
 use std::sync::Arc;
 
-use kosm_render::analytic::{Frame, Prim};
-use kosm_render::caustics::{self, CausticMap, CausticOptions, CausticPack};
-use kosm_render::gpu::{
+use irys::analytic::{Frame, Prim};
+use irys::caustics::{self, CausticMap, CausticOptions, CausticPack};
+use irys::gpu::{
     AnalyticGeometry, AnalyticPrim, GpuCamera, GpuContext, GpuMaterial, GpuRenderState,
     RayTracePipeline, SceneRef,
 };
-use kosm_render::pathtrace::{
+use irys::pathtrace::{
     Camera, Environment, GradientEnv, Ground, Object, PathTraceOptions, Pbr, Scene, Sun,
     render_with_caustics,
 };
-use kosm_render::{Analytic, Bvh, Point3, Vec3};
+use irys::{Analytic, Bvh, Point3, Vec3};
 
 const W: u32 = 48;
 const H: u32 = 48;

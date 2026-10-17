@@ -1,0 +1,26 @@
+[package]
+name = "irys-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "irys: the wgpu compute tier — device, buffers, WGSL integrator, history and denoisers"
+keywords = ["raytracing", "pathtracing", "wgpu", "graphics"]
+categories = ["graphics", "rendering", "rendering::engine"]
+
+[dependencies]
+irys-core.workspace = true
+irys-light.workspace = true
+tang.workspace = true
+wgpu = { version = "30", features = ["webgpu", "wgsl"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"

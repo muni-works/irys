@@ -12,8 +12,8 @@
 
 #![cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 
-use kosm_render::gpu::{GpuContext, shaders};
-use kosm_render::sampler::SamplePattern;
+use irys::gpu::{GpuContext, shaders};
+use irys::sampler::SamplePattern;
 
 const HARNESS: &str = r#"
 @group(0) @binding(0) var<storage, read> keys: array<vec4<u32>>;
@@ -34,66 +34,66 @@ fn parity(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 fn run(ctx: &GpuContext, keys: &[[u32; 4]]) -> Vec<[f32; 2]> {
-    use wgpu::util::DeviceExt;
+    use irys::gpu::wgpu::util::DeviceExt;
     let device = &ctx.device;
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+    let module = device.create_shader_module(irys::gpu::wgpu::ShaderModuleDescriptor {
         label: Some("sampler parity"),
-        source: wgpu::ShaderSource::Wgsl(
+        source: irys::gpu::wgpu::ShaderSource::Wgsl(
             format!("{}\n{HARNESS}", shaders::sampler_shader()).into(),
         ),
     });
     let out_size = (keys.len() * 8) as u64;
-    let in_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let in_buf = device.create_buffer_init(&irys::gpu::wgpu::util::BufferInitDescriptor {
         label: Some("keys"),
         contents: bytemuck::cast_slice(keys),
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: irys::gpu::wgpu::BufferUsages::STORAGE,
     });
-    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+    let out_buf = device.create_buffer(&irys::gpu::wgpu::BufferDescriptor {
         label: Some("out"),
         size: out_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        usage: irys::gpu::wgpu::BufferUsages::STORAGE | irys::gpu::wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
-    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+    let read_buf = device.create_buffer(&irys::gpu::wgpu::BufferDescriptor {
         label: Some("read"),
         size: out_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        usage: irys::gpu::wgpu::BufferUsages::COPY_DST | irys::gpu::wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+    let entry = |binding: u32, read_only: bool| irys::gpu::wgpu::BindGroupLayoutEntry {
         binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
+        visibility: irys::gpu::wgpu::ShaderStages::COMPUTE,
+        ty: irys::gpu::wgpu::BindingType::Buffer {
+            ty: irys::gpu::wgpu::BufferBindingType::Storage { read_only },
             has_dynamic_offset: false,
             min_binding_size: None,
         },
         count: None,
     };
-    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+    let layout = device.create_bind_group_layout(&irys::gpu::wgpu::BindGroupLayoutDescriptor {
         label: None,
         entries: &[entry(0, true), entry(1, false)],
     });
-    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let bind = device.create_bind_group(&irys::gpu::wgpu::BindGroupDescriptor {
         label: None,
         layout: &layout,
         entries: &[
-            wgpu::BindGroupEntry {
+            irys::gpu::wgpu::BindGroupEntry {
                 binding: 0,
                 resource: in_buf.as_entire_binding(),
             },
-            wgpu::BindGroupEntry {
+            irys::gpu::wgpu::BindGroupEntry {
                 binding: 1,
                 resource: out_buf.as_entire_binding(),
             },
         ],
     });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+    let pipeline_layout = device.create_pipeline_layout(&irys::gpu::wgpu::PipelineLayoutDescriptor {
         label: None,
         bind_group_layouts: &[Some(&layout)],
         immediate_size: 0,
     });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+    let pipeline = device.create_compute_pipeline(&irys::gpu::wgpu::ComputePipelineDescriptor {
         label: None,
         layout: Some(&pipeline_layout),
         module: &module,
@@ -112,8 +112,8 @@ fn run(ctx: &GpuContext, keys: &[[u32; 4]]) -> Vec<[f32; 2]> {
     ctx.queue.submit(Some(encoder.finish()));
     let slice = read_buf.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
-    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    slice.map_async(irys::gpu::wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+    device.poll(irys::gpu::wgpu::PollType::wait_indefinitely()).unwrap();
     rx.recv().unwrap().unwrap();
     let data = slice.get_mapped_range().expect("the readback maps");
     let out: Vec<[f32; 2]> = bytemuck::cast_slice(&data).to_vec();

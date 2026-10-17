@@ -9,13 +9,13 @@
 
 use std::sync::Arc;
 
-use kosm_render::analytic::{Frame, Prim};
-use kosm_render::caustics::{self, CausticOptions};
-use kosm_render::pathtrace::{
+use irys::analytic::{Frame, Prim};
+use irys::caustics::{self, CausticOptions};
+use irys::pathtrace::{
     Camera, Environment, Ground, Object, PathTraceOptions, Pbr, Scene, Sun, render,
     render_with_caustics,
 };
-use kosm_render::{Analytic, Bvh, Point3, Vec3};
+use irys::{Analytic, Bvh, Point3, Vec3};
 
 const SPHERE_R: f64 = 1.0;
 const FLOOR_Z: f64 = -1.5;

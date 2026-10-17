@@ -11,8 +11,8 @@
 //! HDR environment does — not in an eleventh storage buffer.
 #![cfg(feature = "gpu")]
 
-use kosm_render::gpu::geometry::MAX_GEOMETRY_BINDINGS;
-use kosm_render::gpu::shaders;
+use irys::gpu::geometry::MAX_GEOMETRY_BINDINGS;
+use irys::gpu::shaders;
 
 const BROWSER_LIMIT: usize = 10;
 
@@ -43,13 +43,13 @@ fn the_renderer_leaves_five_storage_bindings_for_geometry() {
 
 #[test]
 fn a_full_client_still_fits() {
-    let src = shaders::trace_shader(&kosm_render::gpu::AnalyticGeometry::module().wgsl);
+    let src = shaders::trace_shader(&irys::gpu::AnalyticGeometry::module().wgsl);
     assert!(storage_bindings(&src) <= BROWSER_LIMIT);
 }
 
 #[test]
 fn the_analytic_module_declares_one_binding() {
-    let m = kosm_render::gpu::AnalyticGeometry::module();
+    let m = irys::gpu::AnalyticGeometry::module();
     assert_eq!(m.layout.len(), 1);
     assert_eq!(m.layout[0].binding, 1);
 }

@@ -1,6 +1,6 @@
 //! The learned denoiser as a compute pass.
 //!
-//! [`crate::neural::Weights`] says what the network is; this says how to run
+//! [`irys_light::neural::Weights`] says what the network is; this says how to run
 //! it on the device, in the same place in the frame the à-trous chain runs.
 //! It reads the history's running mean, its per-pixel statistics and the
 //! resident scene's guide planes, and it writes the filter's answer into the
@@ -9,7 +9,7 @@
 //! tonemaps whichever filter ran.
 //!
 //! That is the whole of the seam.
-//! [`crate::gpu::RayTracePipeline::denoise_and_resolve_resident_neural`] is
+//! [`crate::RayTracePipeline::denoise_and_resolve_resident_neural`] is
 //! the à-trous call with the wavelet loop swapped out; everything either side
 //! of it — the trace, the fold, the reprojection, the clamp, the resolve — is
 //! unchanged and unaware.
@@ -31,7 +31,7 @@
 //! shown the answer.
 
 use super::context::{GpuContext, GpuError};
-use crate::neural::Weights;
+use irys_light::neural::Weights;
 use bytemuck::{Pod, Zeroable};
 
 /// Workgroup size in each dimension; mirrors `neural.wgsl`.
@@ -54,7 +54,7 @@ struct NeuralParams {
     b3: u32,
     count_cutoff: u32,
     /// Where the firefly veto's three scalars start; see
-    /// [`crate::neural::Veto`]. `tap_major` leaves them alone, so this is the
+    /// [`irys_light::neural::Veto`]. `tap_major` leaves them alone, so this is the
     /// file's own offset.
     veto: u32,
 }
@@ -151,7 +151,7 @@ impl NeuralPipeline {
 /// The veto's three scalars sit past the last bias and are not a matrix, so
 /// the clone carries them through untouched.
 fn tap_major(w: &Weights) -> Vec<f32> {
-    use crate::neural::{C_IN, K, KS};
+    use irys_light::neural::{C_IN, K, KS};
     let taps = KS * KS;
     let mut out = w.data.clone();
     let off = w.offsets();

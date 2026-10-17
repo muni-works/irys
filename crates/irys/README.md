@@ -1,4 +1,4 @@
-# kosm-render
+# irys
 
 The light.
 

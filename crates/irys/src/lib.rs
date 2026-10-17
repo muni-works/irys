@@ -2,6 +2,9 @@
 
 //! The light.
 //!
+//! A facade over `irys-core`, `irys-light`, `irys-prims` and (behind `gpu`)
+//! `irys-gpu`, with the paths `kosm-render` 0.2 had.
+//!
 //! Rays, acceleration structures and (eventually) an integrator, over
 //! anything that can be bounded and hit. The engine owns the renderer; the
 //! renderer owns no geometry.
@@ -19,46 +22,27 @@
 //!
 //! # The dependency rule
 //!
-//! `kosm-render` depends on [`tang`] (one scalar, one set of math types),
+//! `irys` depends on [`tang`] (one scalar, one set of math types),
 //! `rayon`, and later `wgpu`/`bytemuck`. **Never** on `vcad-*`, `phyz-*`, or
 //! any other Kosm crate. It has to build for `wasm32-unknown-unknown`, so
 //! anything native-only is feature-gated or off the main path.
 
 #[cfg(feature = "gpu")]
-pub mod gpu;
+pub use irys_gpu as gpu;
 
-pub mod analytic;
-pub mod bvh;
-pub mod caustics;
-pub mod cpu;
-pub mod env;
-pub mod geometry;
-pub mod heightfield;
-pub mod math;
-pub mod neural;
-pub mod optics;
-pub mod pathtrace;
-mod ray;
-mod sah;
-pub mod sampler;
-pub mod spectrum;
-pub mod splats;
-mod tables;
-pub use tables::spec_albedo;
-pub mod tlas;
+pub use irys_core::{bvh, geometry, math, sampler, tlas};
+pub use irys_light::{caustics, cpu, env, neural, optics, pathtrace, spectrum, splats};
+pub use irys_prims::{analytic, heightfield};
 
-pub use analytic::{Analytic, Frame, Prim};
-pub use bvh::{Bvh, BvhNode, FlatBvhNode};
-pub use env::{BuiltinEnv, generate as generate_env, parse_hdr};
-pub use geometry::{Geometry, TriMesh, TriangleHit, intersect_triangle};
-pub use heightfield::HeightField;
-pub use math::{Aabb, Dir3, Point2, Point3, Transform, Vec2, Vec3, transform_from_column_major};
-pub use optics::{fresnel, index, reflect, refract, sellmeier};
-pub use pathtrace::{
-    AreaLight, Camera, EnvMap, Environment, Film, GradientEnv, Ground, Object, PathTraceOptions,
-    Pbr, PixelFilter, Projection, Scene, Sun, denoise, render, render_into, studio_rig,
+pub use irys_core::{
+    Aabb, Bvh, BvhNode, Dir3, FlatBvhNode, FlatTlasNode, Geometry, Hit, Instance, InstanceHit,
+    Point2, Point3, Ray, Tlas, Transform, TriMesh, TriangleHit, Vec2, Vec3, intersect_triangle,
+    transform_from_column_major,
 };
-pub use ray::{Hit, Ray};
-pub use spectrum::{BK7_SELLMEIER, cauchy_index, cie_xyz, hero_weight, sellmeier_index};
-pub use splats::{Splats, unpack_payload};
-pub use tlas::{FlatTlasNode, Instance, InstanceHit, Tlas};
+pub use irys_light::{
+    AreaLight, BK7_SELLMEIER, BuiltinEnv, Camera, EnvMap, Environment, Film, GradientEnv, Ground,
+    Object, PathTraceOptions, Pbr, PixelFilter, Projection, Scene, Splats, Sun, cauchy_index,
+    cie_xyz, denoise, fresnel, generate_env, hero_weight, index, parse_hdr, reflect, refract,
+    render, render_into, sellmeier, sellmeier_index, spec_albedo, studio_rig, unpack_payload,
+};
+pub use irys_prims::{Analytic, Frame, HeightField, Prim};

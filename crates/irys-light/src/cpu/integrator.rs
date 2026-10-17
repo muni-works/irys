@@ -1852,8 +1852,8 @@ pub struct SurfaceHit {
 /// and every query traverses it.
 ///
 /// ```no_run
-/// # use kosm_render::pathtrace::{PathTraceOptions, Scene, Tracer};
-/// # use kosm_render::{Ray, TriMesh, math::{Point3, Vec3}};
+/// # use irys_light::pathtrace::{PathTraceOptions, Scene, Tracer};
+/// # use irys_core::{Ray, TriMesh, math::{Point3, Vec3}};
 /// # let scene: Scene<TriMesh> = unimplemented!();
 /// let tracer = Tracer::new(&scene, PathTraceOptions::default());
 /// let up = Ray::new(Point3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, 1.0));

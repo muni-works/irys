@@ -3,7 +3,7 @@
 //! Two things live here. The first is the parity claim that makes the GPU
 //! history trustworthy at all: with a one-sample history the device à-trous
 //! pass must produce, filter weight for filter weight, the frame
-//! [`kosm_render::pathtrace::denoise`] would have produced from the same
+//! [`irys::pathtrace::denoise`] would have produced from the same
 //! `Film`. Kept in the renderer's own suite over `AnalyticGeometry`, so no
 //! client crate is needed to run it.
 //!
@@ -14,13 +14,13 @@
 //! Run with `--features gpu -- --ignored --test-threads=1 --nocapture`.
 #![cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 
-use kosm_render::Point3;
-use kosm_render::gpu::wgpu;
-use kosm_render::gpu::{
+use irys::Point3;
+use irys::gpu::wgpu;
+use irys::gpu::{
     AnalyticGeometry, AnalyticPrim, GpuAreaLight, GpuCamera, GpuContext, GpuDenoiseParams,
     GpuMaterial, GpuRenderState, HistoryPipeline, RayTracePipeline, SceneRef, atrous_iters_for,
 };
-use kosm_render::pathtrace::{self, Pbr};
+use irys::pathtrace::{self, Pbr};
 
 const W: u32 = 64;
 const H: u32 = 64;

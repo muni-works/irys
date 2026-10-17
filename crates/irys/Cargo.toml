@@ -1,0 +1,30 @@
+[package]
+name = "irys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The light: rays, acceleration structures and a path tracer over any geometry that can be bounded and hit"
+readme = "README.md"
+keywords = ["raytracing", "pathtracing", "renderer", "bvh", "graphics"]
+categories = ["graphics", "rendering", "rendering::engine"]
+exclude = ["out/", "tests/snapshots/"]
+
+[dependencies]
+irys-core.workspace = true
+irys-light.workspace = true
+irys-prims.workspace = true
+irys-gpu = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The GPU tests reach wgpu as `irys::gpu::wgpu`; these two are small.
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+
+[features]
+default = []
+# The wgpu compute tier, as `irys::gpu`. Off by default; the CPU path tracer
+# needs nothing but tang and rayon.
+gpu = ["dep:irys-gpu"]

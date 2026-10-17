@@ -1,0 +1,8 @@
+# Developer override, not committed. Copy to .cargo/config.toml and point the
+# path at your own tang checkout; Cargo.toml is the truth and a clean clone
+# builds from crates.io with no sibling checkouts. Mirrors kosm's file of the
+# same name. Cargo rewrites Cargo.lock to this path on the first build; do not
+# commit that.
+
+[patch.crates-io]
+tang = { path = "../tang/crates/tang" }

@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/irys-core",
+    "crates/irys-light",
+    "crates/irys-prims",
+    "crates/irys-gpu",
+    "crates/irys",
+    "crates/kosm-render",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Cam Pedersen <cam@campedersen.com>"]
+repository = "https://github.com/ecto/irys"
+rust-version = "1.95"
+
+[workspace.dependencies]
+# crates.io tang, so a clean clone needs no sibling checkout. kosm's manifest
+# sends crates.io `tang` to its git rev; here the registry copy is the only one.
+# `.cargo/config.toml.example` points it at a local checkout instead.
+tang = "0.2"
+rayon = "1"
+irys-core  = { path = "crates/irys-core", version = "0.1" }
+irys-light = { path = "crates/irys-light", version = "0.1" }
+irys-prims = { path = "crates/irys-prims", version = "0.1" }
+irys-gpu   = { path = "crates/irys-gpu", version = "0.1" }
+irys       = { path = "crates/irys", version = "0.1" }

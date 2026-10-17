@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! The GPU tier: the same integrator, on a wgpu compute pipeline.
 //!
 //! Behind the `gpu` feature. What is here is *renderer*: the device, the
@@ -5,6 +7,10 @@
 //! per-pixel history and the denoiser. What is not here is geometry — a
 //! client supplies that as WGSL plus packed buffers. [`geometry`] is the whole
 //! of that seam, and documents the binding split it implies.
+
+// The modules were written as one crate; these keep their `crate::` paths.
+use irys_core::{bvh, sampler};
+use irys_light::{caustics, pathtrace};
 
 pub mod analytic;
 mod budget;

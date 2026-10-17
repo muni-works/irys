@@ -8,12 +8,12 @@
 //! Run with `--features gpu -- --ignored --test-threads=1`.
 #![cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 
-use kosm_render::gpu::{
+use irys::gpu::{
     AnalyticGeometry, AnalyticPrim, GpuCamera, GpuContext, GpuMaterial, GpuRenderState,
     RayTracePipeline, SceneRef,
 };
-use kosm_render::pathtrace::{GradientEnv, Pbr, Sun};
-use kosm_render::{Point3, Vec3};
+use irys::pathtrace::{GradientEnv, Pbr, Sun};
+use irys::{Point3, Vec3};
 
 const W: u32 = 32;
 const H: u32 = 32;
@@ -99,8 +99,8 @@ fn gpu_irradiance(ctx: &'static GpuContext, sun: &Sun) -> f64 {
 
 /// The same measurement from the CPU integrator, over the same plane.
 fn cpu_irradiance(sun: &Sun) -> f64 {
-    use kosm_render::TriMesh;
-    use kosm_render::pathtrace::{Environment, Ground, PathTraceOptions, Scene, render};
+    use irys::TriMesh;
+    use irys::pathtrace::{Environment, Ground, PathTraceOptions, Scene, render};
 
     let scene = Scene::<TriMesh> {
         objects: Vec::new(),
@@ -114,7 +114,7 @@ fn cpu_irradiance(sun: &Sun) -> f64 {
         }),
         splats: None,
     };
-    let cam = kosm_render::pathtrace::Camera::look_at(
+    let cam = irys::pathtrace::Camera::look_at(
         Point3::new(0.0, 0.0, 4.0),
         Point3::new(0.0, 0.0, 0.0),
         Vec3::new(0.0, 1.0, 0.0),

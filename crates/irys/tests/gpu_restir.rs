@@ -9,12 +9,12 @@
 //! Run with `--features gpu -- --ignored --test-threads=1`.
 #![cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 
-use kosm_render::gpu::{
+use irys::gpu::{
     AnalyticGeometry, AnalyticPrim, GpuAreaLight, GpuCamera, GpuContext, GpuMaterial,
     GpuRenderState, RayTracePipeline, ResidentScene, SceneRef,
 };
-use kosm_render::pathtrace::{AreaLight, Pbr};
-use kosm_render::{Point3, Vec3};
+use irys::pathtrace::{AreaLight, Pbr};
+use irys::{Point3, Vec3};
 
 /// Path length these tests trace. Three bounces of global illumination.
 const DEPTH: u32 = 3;

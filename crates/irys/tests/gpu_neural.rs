@@ -1,6 +1,6 @@
 //! The learned denoiser's WGSL against its Rust.
 //!
-//! [`kosm_render::neural::Weights::forward`] is the definition of the network
+//! [`irys::neural::Weights::forward`] is the definition of the network
 //! and `neural.wgsl` is the thing that actually runs, and the only way the
 //! second stays the first is a test that evaluates both on the same numbers.
 //! It is worth more here than for most shaders: a network whose features are
@@ -16,9 +16,9 @@
 //! Run with `--features gpu`.
 #![cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 
-use kosm_render::gpu::wgpu;
-use kosm_render::gpu::{GpuContext, NeuralDenoiser, NeuralPipeline};
-use kosm_render::neural::{C_IN, K, KS, VETO, Veto, Weights};
+use irys::gpu::wgpu;
+use irys::gpu::{GpuContext, NeuralDenoiser, NeuralPipeline};
+use irys::neural::{C_IN, K, KS, VETO, Veto, Weights};
 
 const W: u32 = 24;
 const H: u32 = 16;
@@ -278,7 +278,7 @@ fn the_shader_matches_the_reference_forward() {
             continue;
         }
         for ch in 0..3 {
-            let a = frame.albedo[p * 3 + ch].max(kosm_render::neural::DEMOD_FLOOR);
+            let a = frame.albedo[p * 3 + ch].max(irys::neural::DEMOD_FLOOR);
             let mine = got[p * 4 + ch] * a;
             let theirs = want[p * 3 + ch];
             let rel = (mine - theirs).abs() / theirs.abs().max(1e-3);
@@ -325,7 +325,7 @@ fn background_and_converged_pixels_are_passed_through() {
     for p in 0..n {
         for ch in 0..3 {
             let want = frame.mean[p * 3 + ch]
-                / frame.albedo[p * 3 + ch].max(kosm_render::neural::DEMOD_FLOOR);
+                / frame.albedo[p * 3 + ch].max(irys::neural::DEMOD_FLOOR);
             assert!(
                 (got[p * 4 + ch] - want).abs() <= want.abs() * 1e-4 + 1e-5,
                 "pixel {p} channel {ch}: {} is not the unfiltered {want}",

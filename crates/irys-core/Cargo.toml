@@ -1,60 +1,14 @@
 [package]
-name = "kosm-render"
-# Published on its own cadence: vcad depends on this by version, and the
-# workspace's 0.0.1 is the game's number, not the renderer's.
-#
-# 0.2.0: on crates.io, and vcad 0.10 depends on the registry crate
-# (`kosm-render = "0.2"`). The workspace no longer
-# carries a `[patch."https://github.com/ecto/kosm"]` back-edge — with vcad and
-# this workspace agreeing on 0.2, cargo resolves exactly one kosm-render.
-#
-# The history worth keeping: while vcad pinned an old rev requiring 0.1.0, a
-# bump to 0.2.0 made that patch silently stop applying, cargo added a second
-# kosm-render beside this one, and `kosm/src/brep/mod.rs` stopped compiling —
-# two `Scene<G>` types, one call, E0308. Version and vcad rev move together.
-version = "0.2.0"
+name = "irys-core"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The light: rays, acceleration structures and a path tracer over any geometry that can be bounded and hit"
-repository = "https://github.com/ecto/kosm"
-readme = "README.md"
-keywords = ["raytracing", "pathtracing", "renderer", "bvh", "graphics"]
-categories = ["graphics", "rendering", "rendering::engine"]
-exclude = ["out/", "tests/snapshots/"]
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "irys: the Geometry seam, rays, BVH/SAH, TLAS and the blue-noise sampler"
+keywords = ["raytracing", "bvh", "graphics"]
+categories = ["graphics", "rendering"]
 
 [dependencies]
-# The registry tang, not the workspace's path: vcad consumes this crate by git,
-# and a path outside the repo would resolve to nothing on any other machine (or
-# to a second `tang` here). The workspace's `[patch.crates-io]` still redirects
-# it to the local checkout for every build in this repo.
-tang = "0.2"
-# The GPU tier. `bytemuck` and `wgpu` only; the wasm glue below is what a
-# browser needs to await a buffer mapping without blocking.
-wgpu = { version = "30", features = ["webgpu", "wgsl"], optional = true }
-bytemuck = { version = "1", features = ["derive"], optional = true }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rayon = "1"
-pollster = { version = "0.4", optional = true }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen = { version = "0.2", optional = true }
-wasm-bindgen-futures = { version = "0.4", optional = true }
-js-sys = { version = "0.3", optional = true }
-
-[features]
-default = []
-
-# `gpu`: the wgpu compute tier — the device, the storage buffers, the WGSL
-# integrator and the device-side denoiser, alongside the CPU one. Off by
-# default; the CPU path tracer needs nothing but `tang` and `rayon`. It builds
-# for wasm32 too, which is why `pollster` is native-only and the browser's
-# buffer mapping goes through `js-sys` directly.
-gpu = [
-    "dep:wgpu",
-    "dep:bytemuck",
-    "dep:pollster",
-    "dep:wasm-bindgen",
-    "dep:wasm-bindgen-futures",
-    "dep:js-sys",
-]
+tang.workspace = true

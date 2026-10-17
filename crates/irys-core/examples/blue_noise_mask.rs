@@ -34,7 +34,7 @@
 //! Deterministic: a fixed seed, so the file is reproducible. Run with
 //! `cargo run -p kosm-render --release --example blue_noise_mask`.
 
-use kosm_render::sampler::{nested_uniform_scramble, sobol_dim0, sobol_dim1};
+use irys_core::sampler::{nested_uniform_scramble, sobol_dim0, sobol_dim1};
 
 const N: usize = 128;
 const SIGMA_I: f64 = 2.1;

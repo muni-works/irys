@@ -8,7 +8,7 @@
 //! comes out as the kernel's own footprint, and that the device aims at the
 //! same point the CPU does.
 
-use kosm_render::pathtrace::{GAUSSIAN_SIGMA, PixelFilter};
+use irys::pathtrace::{GAUSSIAN_SIGMA, PixelFilter};
 
 const FILTERS: [PixelFilter; 3] = [
     PixelFilter::Box,
@@ -152,7 +152,7 @@ fn the_wide_filters_span_more_than_a_pixel() {
 #[cfg(feature = "gpu")]
 #[test]
 fn the_device_jitter_is_the_cpu_warp() {
-    use kosm_render::gpu::GpuRenderState;
+    use irys::gpu::GpuRenderState;
 
     for f in FILTERS {
         for frame in 1..64u32 {

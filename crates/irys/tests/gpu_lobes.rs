@@ -6,7 +6,7 @@
 //!   lobe planes the integrator writes sum to the summed plane, pixel for
 //!   pixel, to the float;
 //! * the specular demodulator the integrator writes into its guide plane is
-//!   the same split-sum lookup [`kosm_render::spec_albedo`] evaluates on the
+//!   the same split-sum lookup [`irys::spec_albedo`] evaluates on the
 //!   CPU, at the same roughness, F0 and view cosine;
 //! * a mirror sliding in its own plane keeps its reflection's history under
 //!   the specular reprojection — which follows the reflected point — where
@@ -16,13 +16,13 @@
 //! Run with `--features gpu -- --ignored --test-threads=1 --nocapture`.
 #![cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 
-use kosm_render::Point3;
-use kosm_render::gpu::wgpu;
-use kosm_render::gpu::{
+use irys::Point3;
+use irys::gpu::wgpu;
+use irys::gpu::{
     AnalyticGeometry, AnalyticPrim, GpuAreaLight, GpuCamera, GpuContext, GpuDenoiseParams,
     GpuMaterial, GpuRenderState, HistoryPipeline, InstanceMotion, RayTracePipeline, SceneRef,
 };
-use kosm_render::pathtrace::{self, Pbr};
+use irys::pathtrace::{self, Pbr};
 
 const W: u32 = 64;
 const H: u32 = 64;
@@ -313,7 +313,7 @@ fn the_specular_albedo_guide_matches_the_cpu_lookup() {
             let d = pixel_dir(&cam, x, y);
             let n = &g.normal[i * 3..i * 3 + 3];
             let mu = (-(n[0] * d[0] + n[1] * d[1] + n[2] * d[2])).max(1e-3);
-            let cpu = kosm_render::spec_albedo(m.base_color, m.roughness, mu);
+            let cpu = irys::spec_albedo(m.base_color, m.roughness, mu);
             for k in 0..3 {
                 worst = worst.max((cpu[k] - g.spec_albedo[i * 3 + k]).abs());
             }

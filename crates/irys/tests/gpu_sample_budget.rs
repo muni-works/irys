@@ -16,14 +16,14 @@
 //! Run with `--features gpu -- --ignored --test-threads=1 --nocapture`.
 #![cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 
-use kosm_render::Point3;
-use kosm_render::gpu::wgpu;
-use kosm_render::gpu::{
+use irys::Point3;
+use irys::gpu::wgpu;
+use irys::gpu::{
     AnalyticGeometry, AnalyticPrim, Budget, GpuAreaLight, GpuCamera, GpuContext, GpuDenoiseParams,
     GpuMaterial, GpuRenderState, HistoryPipeline, InstanceMotion, RayTracePipeline, SampleBudget,
     SceneRef,
 };
-use kosm_render::pathtrace::{self, Pbr};
+use irys::pathtrace::{self, Pbr};
 
 const W: u32 = 64;
 const H: u32 = 64;
@@ -256,7 +256,7 @@ fn frame(
     ctx: &'static GpuContext,
     pipeline: &RayTracePipeline,
     history: &HistoryPipeline,
-    res: &mut kosm_render::gpu::ResidentScene,
+    res: &mut irys::gpu::ResidentScene,
     target: &Target,
     denoise: &GpuDenoiseParams,
     budget: &SampleBudget,
@@ -603,7 +603,7 @@ fn a_directed_spend_beats_a_uniform_one_at_equal_samples() {
         ..SampleBudget::directed(W, H, 1.0, 4)
     });
 
-    let rmse = |h: &kosm_render::gpu::History| {
+    let rmse = |h: &irys::gpu::History| {
         let mut s = 0.0f64;
         for k in 0..N * 3 {
             let d = (h.rgb[k] - reference.rgb[k]) as f64;
@@ -612,7 +612,7 @@ fn a_directed_spend_beats_a_uniform_one_at_equal_samples() {
         (s / (N * 3) as f64).sqrt()
     };
     let ball = sphere_mask((FRAMES - 1) as f32 * step);
-    let rmse_over = |h: &kosm_render::gpu::History, m: &dyn Fn(usize) -> bool| {
+    let rmse_over = |h: &irys::gpu::History, m: &dyn Fn(usize) -> bool| {
         let mut s = 0.0f64;
         let mut k = 0usize;
         for i in 0..N {

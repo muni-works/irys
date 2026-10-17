@@ -1,0 +1,15 @@
+[package]
+name = "irys-prims"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "irys: stock Geometry implementations — analytic primitives and heightfields"
+keywords = ["raytracing", "graphics"]
+categories = ["graphics", "rendering"]
+
+[dependencies]
+irys-core.workspace = true
+tang.workspace = true

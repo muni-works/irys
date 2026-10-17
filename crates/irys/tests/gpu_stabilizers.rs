@@ -22,14 +22,14 @@
 //! Run with `--features gpu -- --ignored --test-threads=1 --nocapture`.
 #![cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 
-use kosm_render::Point3;
-use kosm_render::gpu::wgpu;
-use kosm_render::gpu::{
+use irys::Point3;
+use irys::gpu::wgpu;
+use irys::gpu::{
     AnalyticGeometry, AnalyticPrim, GpuAreaLight, GpuCamera, GpuContext, GpuDenoiseParams,
     GpuMaterial, GpuRenderState, History, HistoryPipeline, RayTracePipeline, SceneRef,
     firefly_k_for, fresh_extra_iters_for, fresh_lum_relax_for, variance_gamma_for,
 };
-use kosm_render::pathtrace::{self, Pbr};
+use irys::pathtrace::{self, Pbr};
 
 const W: u32 = 64;
 const H: u32 = 64;
@@ -213,7 +213,7 @@ impl<'a> Rig<'a> {
 
     fn pass(
         &self,
-        res: &mut kosm_render::gpu::ResidentScene,
+        res: &mut irys::gpu::ResidentScene,
         f: u32,
         keep: &[u8],
         denoise: &GpuDenoiseParams,
@@ -232,7 +232,7 @@ impl<'a> Rig<'a> {
             .expect("pass");
     }
 
-    fn converge(&self, passes: u32, denoise: &GpuDenoiseParams) -> kosm_render::gpu::ResidentScene {
+    fn converge(&self, passes: u32, denoise: &GpuDenoiseParams) -> irys::gpu::ResidentScene {
         let mut res = self
             .pipeline
             .resident_scene(self.ctx, self.fx.scene(), W, H);
@@ -242,7 +242,7 @@ impl<'a> Rig<'a> {
         res
     }
 
-    fn read(&self, res: &mut kosm_render::gpu::ResidentScene) -> History {
+    fn read(&self, res: &mut irys::gpu::ResidentScene) -> History {
         pollster::block_on(self.pipeline.read_history(self.ctx, res))
             .expect("read")
             .expect("history")
@@ -262,7 +262,7 @@ impl<'a> Rig<'a> {
 
     fn fold(
         &self,
-        res: &mut kosm_render::gpu::ResidentScene,
+        res: &mut irys::gpu::ResidentScene,
         f: u32,
         raw: &[f32],
         denoise: &GpuDenoiseParams,

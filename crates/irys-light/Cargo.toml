@@ -1,0 +1,18 @@
+[package]
+name = "irys-light"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "irys: spectra, optics, environments, the CPU path tracer, caustics and splats"
+keywords = ["raytracing", "pathtracing", "renderer", "graphics"]
+categories = ["graphics", "rendering", "rendering::engine"]
+
+[dependencies]
+irys-core.workspace = true
+tang.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon.workspace = true

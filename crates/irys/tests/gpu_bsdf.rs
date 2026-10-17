@@ -25,9 +25,9 @@
 #![cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 
 use bytemuck::{Pod, Zeroable};
-use kosm_render::gpu::{GpuContext, GpuMaterial, shaders};
-use kosm_render::math::Vec3;
-use kosm_render::pathtrace::{Pbr, reference_bsdf_eval_at, reference_lobe_weights};
+use irys::gpu::{GpuContext, GpuMaterial, shaders};
+use irys::math::Vec3;
+use irys::pathtrace::{Pbr, reference_bsdf_eval_at, reference_lobe_weights};
 
 /// Mirrors `ParityIn` in [`HARNESS`].
 #[repr(C)]
@@ -132,70 +132,70 @@ fn ctx_or_skip(name: &str) -> Option<&'static GpuContext> {
 
 /// Run the harness over `inputs` and read the results back.
 fn run(ctx: &GpuContext, inputs: &[ParityIn]) -> Vec<ParityOut> {
-    use wgpu::util::DeviceExt;
+    use irys::gpu::wgpu::util::DeviceExt;
 
     let device = &ctx.device;
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+    let module = device.create_shader_module(irys::gpu::wgpu::ShaderModuleDescriptor {
         label: Some("bsdf parity"),
         // The BSDF alone, not `shaders::compose`: the environment module in
         // the full composition wants texture bindings this harness has no use
         // for, and the point here is to isolate the shading model.
-        source: wgpu::ShaderSource::Wgsl(format!("{}\n{HARNESS}", shaders::BSDF_SHADER).into()),
+        source: irys::gpu::wgpu::ShaderSource::Wgsl(format!("{}\n{HARNESS}", shaders::BSDF_SHADER).into()),
     });
 
     let out_size = (inputs.len() * std::mem::size_of::<ParityOut>()) as u64;
-    let in_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let in_buf = device.create_buffer_init(&irys::gpu::wgpu::util::BufferInitDescriptor {
         label: Some("parity in"),
         contents: bytemuck::cast_slice(inputs),
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: irys::gpu::wgpu::BufferUsages::STORAGE,
     });
-    let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+    let out_buf = device.create_buffer(&irys::gpu::wgpu::BufferDescriptor {
         label: Some("parity out"),
         size: out_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        usage: irys::gpu::wgpu::BufferUsages::STORAGE | irys::gpu::wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
-    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+    let read_buf = device.create_buffer(&irys::gpu::wgpu::BufferDescriptor {
         label: Some("parity read"),
         size: out_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        usage: irys::gpu::wgpu::BufferUsages::COPY_DST | irys::gpu::wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
 
-    let entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+    let entry = |binding: u32, read_only: bool| irys::gpu::wgpu::BindGroupLayoutEntry {
         binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
+        visibility: irys::gpu::wgpu::ShaderStages::COMPUTE,
+        ty: irys::gpu::wgpu::BindingType::Buffer {
+            ty: irys::gpu::wgpu::BufferBindingType::Storage { read_only },
             has_dynamic_offset: false,
             min_binding_size: None,
         },
         count: None,
     };
-    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+    let layout = device.create_bind_group_layout(&irys::gpu::wgpu::BindGroupLayoutDescriptor {
         label: Some("parity layout"),
         entries: &[entry(0, true), entry(1, false)],
     });
-    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let bind = device.create_bind_group(&irys::gpu::wgpu::BindGroupDescriptor {
         label: Some("parity bind"),
         layout: &layout,
         entries: &[
-            wgpu::BindGroupEntry {
+            irys::gpu::wgpu::BindGroupEntry {
                 binding: 0,
                 resource: in_buf.as_entire_binding(),
             },
-            wgpu::BindGroupEntry {
+            irys::gpu::wgpu::BindGroupEntry {
                 binding: 1,
                 resource: out_buf.as_entire_binding(),
             },
         ],
     });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+    let pipeline_layout = device.create_pipeline_layout(&irys::gpu::wgpu::PipelineLayoutDescriptor {
         label: Some("parity pipeline layout"),
         bind_group_layouts: &[Some(&layout)],
         immediate_size: 0,
     });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+    let pipeline = device.create_compute_pipeline(&irys::gpu::wgpu::ComputePipelineDescriptor {
         label: Some("parity pipeline"),
         layout: Some(&pipeline_layout),
         module: &module,
@@ -215,8 +215,8 @@ fn run(ctx: &GpuContext, inputs: &[ParityIn]) -> Vec<ParityOut> {
     ctx.queue.submit(Some(enc.finish()));
 
     let slice = read_buf.slice(..);
-    slice.map_async(wgpu::MapMode::Read, |_| {});
-    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    slice.map_async(irys::gpu::wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(irys::gpu::wgpu::PollType::wait_indefinitely());
     let data = slice
         .get_mapped_range()
         .expect("readback buffer did not map");
@@ -370,7 +370,7 @@ fn materials() -> Vec<Pbr> {
     // N-BK7 marble, an absorbing green slab, and a thin-walled pane.
     out.push(Pbr::glass(1.52, 0.05));
     out.push(Pbr::glass(1.33, 0.3));
-    out.push(Pbr::glass(1.5168, 0.02).with_sellmeier(kosm_render::spectrum::BK7_SELLMEIER));
+    out.push(Pbr::glass(1.5168, 0.02).with_sellmeier(irys::spectrum::BK7_SELLMEIER));
     out.push(Pbr::glass(1.52, 0.15).with_attenuation([0.82, 0.94, 0.86], 0.05));
     out.push(Pbr {
         thin_walled: true,
@@ -537,7 +537,7 @@ fn gpu_dispersion_matches_the_cpu_reference() {
             "n({lambda}nm): cpu {want} gpu {}\n  {m:?}",
             o.spectral[0]
         );
-        let hw = kosm_render::spectrum::hero_weight(lambda);
+        let hw = irys::spectrum::hero_weight(lambda);
         for c in 0..3 {
             assert!(
                 (hw[c] - o.spectral[1 + c]).abs() <= 2e-4,
