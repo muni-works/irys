@@ -329,10 +329,13 @@ dependencies = [
 name = "irys-diff"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "irys-core",
+ "irys-gpu",
  "irys-light",
  "irys-prims",
  "libloading",
+ "pollster",
  "tang",
  "tang-compile",
  "tang-expr",

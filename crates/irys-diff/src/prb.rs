@@ -121,10 +121,10 @@ pub struct Scene {
     /// with common random numbers see exactly the estimator PRB
     /// differentiates — the tight test.
     pub frozen_alpha: Option<f64>,
-    eye: Point3,
-    forward: Vec3,
-    right: Vec3,
-    up: Vec3,
+    pub(crate) eye: Point3,
+    pub(crate) forward: Vec3,
+    pub(crate) right: Vec3,
+    pub(crate) up: Vec3,
 }
 
 const BALL: u32 = 0;
@@ -524,15 +524,21 @@ pub fn gradient(
     } else {
         forward(scene, theta, adjoint, k).0
     };
-    let dl: Vec<f64> = (0..l.len())
+    let dl = lane_adjoint(scene, adjoint, &d_img);
+    let (grad, _, _) = replay(scene, theta, adjoint, k, &l, &dl);
+    (value, grad)
+}
+
+/// The loss adjoint per lane of the frame drawn with `seed`, from the
+/// adjoint per pixel channel.
+pub fn lane_adjoint(scene: &Scene, seed: u64, d_img: &[f64]) -> Vec<f64> {
+    (0..scene.lanes())
         .map(|j| {
-            let w = lane_weight(scene, adjoint, j);
+            let w = lane_weight(scene, seed, j);
             let px = j / scene.wavelengths / scene.spp;
             (0..3).map(|c| d_img[px * 3 + c] * w[c]).sum()
         })
-        .collect();
-    let (grad, _, _) = replay(scene, theta, adjoint, k, &l, &dl);
-    (value, grad)
+        .collect()
 }
 
 /// The loss alone, for central differences.

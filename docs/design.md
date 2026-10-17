@@ -270,6 +270,75 @@ is a flat ¼. Each lane is its own PRB path (`L`, `L_j`, `δL`).
 
 No tolerance changed.
 
+## Phase 2a: the PRB wavefront on the GPU (2026-10-17)
+
+`irys-diff::gpu` behind a `gpu` feature, on `irys-gpu`'s wgpu 30 context.
+The phase-2 risk was replay bit-exactness on a device; it held first time.
+
+**The IR does emit WGSL.** tang-compile at `bfc8003` has
+`TensorGraph::to_wgsl` (one kernel per materialised comp, views as index
+arithmetic, `split` schedules for reductions). So nothing is hand-lowered:
+the GGX eval lowering (`f`, `pdf`) and adjoint lowering (`δθ`) are the IR's
+own kernels, dispatched as wavefront stages. Only the path logic is hand
+WGSL (`src/gpu/wavefront.wgsl`): `gen`, `bounce` (intersect the two
+analytic prims, VNDF-sample at the hero, write the seven graph columns per
+lane), `update` (`T *= f cos/p`, and in replay `δf = δL (L − L_j)/f`),
+`finish` (`L` per lane), `accumulate`. A bounce is bounce → eval IR →
+update [→ adjoint IR → accumulate], one compute pass per frame.
+
+**Bit-exactness, by construction.** Forward and replay dispatch the same
+`ComputePipeline`s over the same bind groups — one shader module per
+kernel, built once — so `f` and everything feeding a path is the same
+machine code on the same inputs. The replay differs only in a uniform that
+gates the `δf` store. The adjoint program recomputes `f` internally; that
+copy never touches throughput (note 5 above). RNG: `prb::Rng` ported
+exactly (SplitMix64 on `u32` pairs, 64-bit add/mul by 16-bit limbs); a
+uniform keeps the top 24 of the CPU's 53 bits, so CPU and GPU walk the same
+paths up to f32 rounding. Nothing broke; the only f32 accommodation is the
+surface offset, 1e-4 (t_min 1e-5) instead of the CPU's 1e-6.
+
+**The reduction: no atomics.** WGSL has no float atomics and a CAS loop on
+`atomic<u32>` makes the sum order (so the gradient's low bits) depend on
+scheduling. Instead the adjoint's `Σ_lanes` stays the IR's own monoid
+reduction, scheduled `split = 256` (one workgroup per parameter, threads
+stride the lanes, tree combine); `accumulate` adds the four results per
+bounce in bounce order. The gradient is bit-deterministic run to run
+(tested).
+
+| Gate (debug build, M-series, Metal) | Result |
+|---|---|
+| replay `L` vs forward `L`, 64×64×4 × 4 λ | 65536/65536 lanes bit-identical, depth 2 and 8; `δθ` identical twice |
+| GPU f32 vs CPU f64 interpreter, frozen sampler, 32×32×4, one seed | `L` median rel 1.2e-7, p99 1.5e-4 (14/16384 lanes > 1e-3: silhouette rays); loss rel 5.8e-7; `δθ` rel 8.3e-5, 7.0e-6, 1.9e-5, 3.5e-4 |
+| GPU PRB vs GPU central differences (h = 1e-3, CRN) | rel 1.1e-6, 9.9e-6, 6.9e-6, 1.9e-3 (θ₃, the smallest gradient, is f32 FD noise) |
+| throughput, 96×96×8 (73 728 paths × 4 λ, depth 4) | forward 1.1 ms incl. readback (≈ 66 Mpaths/s); replay 20.6 ms; gradient with host scoring 166 ms |
+| CPU compiled-C path, same frame, same profile | forward 453 ms (0.16 Mpaths/s), gradient 1543 ms: GPU 9× end to end, ~400× on the forward pass |
+| `examples/fit_gpu`, same seeds and Adam as `fit` | θ = [0.188, 0.334, 0.783, 0.997] vs truth [0.2, 0.34, 0.78, 1.0] — the CPU run's numbers to three places; 60 iterations + previews in 14 s vs ≈ 2 min |
+
+![phase 2a fit](phase2a-fit.png) (`phase2a-loss.csv` is its loss and θ.)
+
+Remaining risks and follow-ups:
+
+1. **Host scoring dominates.** ~140 ms of the 166 ms gradient is the host
+   building the image, the loss and `δL` per lane from `L` (debug Rust).
+   Image, loss and `lane_adjoint` belong on the device; then the host reads
+   back four floats.
+2. **Replay cost is the adjoint.** Four split reductions per bounce, each
+   recomputing `f` and its derivative per lane: 20 ms vs 1 ms forward. A
+   fused one-pass reduction over all four parameters (one kernel, width-4
+   accumulator) is an IR schedule, not a design change.
+3. **The scene is hand-written in WGSL.** Two analytic prims, no BVH. Phase
+   2 proper needs `irys-gpu`'s scene traversal inside `bounce`; bit-exactness
+   then also depends on traversal order being deterministic (it is, for a
+   stackful BVH walk, but test it).
+4. **Lane layout.** Graph inputs are seven separate `[lanes]` columns because
+   that is how `to_wgsl` binds inputs; that is 9 storage bindings in `bounce`.
+   A struct-of-columns input or a `[lanes, 7]` view would cut it.
+5. **Cross-vendor.** Bit-exactness is per device and driver: the same
+   pipeline on the same GPU. Replaying on another adapter is not promised,
+   and nothing needs it.
+6. f32 everywhere on the device; long paths and big scenes will want the
+   offset scaled to the hit distance.
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.

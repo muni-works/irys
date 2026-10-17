@@ -19,3 +19,14 @@ tang-expr.workspace = true
 # dlopen for the compiled C kernels. tang-gpu's `CpuProgram` does the same,
 # but tang-gpu links wgpu 25 and irys is on 30 (principle 4).
 libloading = "0.8"
+# Phase 2a: the wavefront on the device, through irys-gpu's wgpu 30 context.
+irys-gpu = { workspace = true, optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+pollster = { version = "0.4", optional = true }
+
+[features]
+gpu = ["dep:irys-gpu", "dep:bytemuck", "dep:pollster"]
+
+[[example]]
+name = "fit_gpu"
+required-features = ["gpu"]

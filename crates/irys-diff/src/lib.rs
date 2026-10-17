@@ -15,5 +15,7 @@
 //! irys-light.
 
 pub mod ggx;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod ir;
 pub mod prb;
