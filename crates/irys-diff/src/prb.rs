@@ -56,7 +56,11 @@
 //! weight `p_k / Σ p` is `1/4` for each: the image averages the four lanes.
 //! Each lane is a path in the PRB sense, with its own `L`, `L_j`, `δL`.
 
-use irys_core::{Aabb, Bvh, Geometry, Hit, Point3, Ray, TriMesh, Vec3};
+use std::sync::Arc;
+
+use irys_core::{
+    Aabb, Bvh, Geometry, Hit, Instance, InstanceHit, Point3, Ray, Tlas, Transform, TriMesh, Vec3,
+};
 use irys_light::spectrum::{hero_weight, sample_lambda_nm};
 use irys_light::splats::{self, Splats};
 use irys_prims::analytic::{Analytic, Prim};
@@ -197,9 +201,114 @@ pub fn splat_radiance(rgb: [f32; 3], lambda_nm: f64) -> f64 {
     w[0] * rgb[2] as f64 + w[1] * rgb[1] as f64 + w[2] * rgb[0] as f64
 }
 
-/// The ball, the floor, the camera and the sky; optionally a splat cloud.
+/// Where one instance of a bottom-level tree sits, and what it is tinted.
+#[derive(Debug, Clone)]
+pub struct Placement {
+    /// Index into the scene's bottom-level trees.
+    pub blas: usize,
+    /// Object → world.
+    pub to_world: Transform,
+    /// Multiplies the diffuse albedo of this instance's diffuse prims.
+    pub albedo: f64,
+}
+
+impl Placement {
+    /// Tree `blas` placed by `to_world`, untinted.
+    pub fn new(blas: usize, to_world: Transform) -> Self {
+        Self {
+            blas,
+            to_world,
+            albedo: 1.0,
+        }
+    }
+
+    /// The same placement with diffuse albedo scaled by `albedo`.
+    pub fn tinted(mut self, albedo: f64) -> Self {
+        self.albedo = albedo;
+        self
+    }
+}
+
+/// Share of light samples [`Env::sample`] sends at the sun lobe; the rest
+/// are uniform over the sphere for the sky gradient.
+pub const SUN_PICK: f64 = 0.5;
+
+/// The environment: a dim sky gradient and a sun lobe,
+/// `L(d) = sky · tint(λ) (0.15 + 0.25 max(d_z, 0)) + sun_radiance · e^{κ (d·sun − 1)}`.
+/// The lobe is a von Mises–Fisher density up to scale, so it can be sampled
+/// exactly; [`Env::default`] is phases 1–2b's sky.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Env {
+    /// Unit direction to the sun.
+    pub sun: Vec3,
+    /// Lobe concentration: angular radius ≈ 1/√κ.
+    pub kappa: f64,
+    /// Peak sun radiance.
+    pub sun_radiance: f64,
+    /// Scale of the gradient.
+    pub sky: f64,
+}
+
+impl Default for Env {
+    fn default() -> Self {
+        Self {
+            sun: Vec3::new(0.5, -0.35, 0.8).normalize(),
+            kappa: 40.0,
+            sun_radiance: 6.0,
+            sky: 1.0,
+        }
+    }
+}
+
+impl Env {
+    /// Radiance towards `d` at `lambda_nm`.
+    pub fn radiance(&self, d: Vec3, lambda_nm: f64) -> f64 {
+        let tint = 1.0 + 0.4 * (550.0 - lambda_nm) / 200.0;
+        tint * self.sky * (0.15 + 0.25 * d.z.max(0.0))
+            + self.sun_radiance * (self.kappa * (d.dot(&self.sun) - 1.0)).exp()
+    }
+
+    /// A light-sampling direction from three uniforms: the first picks the
+    /// sun lobe (vMF, exactly) or the uniform sphere. Detached, like every
+    /// sampler here.
+    pub fn sample(&self, u: [f64; 3]) -> Vec3 {
+        let phi = 2.0 * std::f64::consts::PI * u[2];
+        if u[0] < SUN_PICK {
+            let k = self.kappa;
+            let c = (1.0 + (u[1] + (1.0 - u[1]) * (-2.0 * k).exp()).ln() / k).clamp(-1.0, 1.0);
+            let r = (1.0 - c * c).max(0.0).sqrt();
+            let (t, b) = basis(self.sun);
+            t * (r * phi.cos()) + b * (r * phi.sin()) + self.sun * c
+        } else {
+            let z = 1.0 - 2.0 * u[1];
+            let r = (1.0 - z * z).max(0.0).sqrt();
+            Vec3::new(r * phi.cos(), r * phi.sin(), z)
+        }
+    }
+
+    /// The density [`Env::sample`] draws from, per steradian.
+    pub fn pdf(&self, d: Vec3) -> f64 {
+        let k = self.kappa;
+        let vmf = k / (2.0 * std::f64::consts::PI * (1.0 - (-2.0 * k).exp()))
+            * (k * (d.dot(&self.sun) - 1.0)).exp();
+        SUN_PICK * vmf + (1.0 - SUN_PICK) / (4.0 * std::f64::consts::PI)
+    }
+}
+
+/// The power heuristic (β = 2): the weight of the strategy with pdf `a`
+/// against the one with pdf `b`.
+pub fn mis(a: f64, b: f64) -> f64 {
+    let (a2, b2) = (a * a, b * b);
+    if a2 + b2 > 0.0 { a2 / (a2 + b2) } else { 0.0 }
+}
+
+/// The scene: bottom-level trees of opaque prims placed by a [`Tlas`], the
+/// camera and the environment; optionally a splat cloud.
 pub struct Scene {
-    pub(crate) opaque: Bvh<Opaque>,
+    pub(crate) blas: Vec<Arc<Bvh<Opaque>>>,
+    pub(crate) tlas: Tlas<Opaque>,
+    /// By instance payload (the index it was placed with).
+    pub(crate) placements: Vec<Placement>,
     /// Gaussian splats, composited front to back along every segment
     /// ([`splats::composite`]): emissive and absorbing, θ-free.
     pub(crate) splats: Option<Bvh<Splats>>,
@@ -221,6 +330,13 @@ pub struct Scene {
     /// with common random numbers see exactly the estimator PRB
     /// differentiates — the tight test.
     pub frozen_alpha: Option<f64>,
+    /// Next-event estimation: a shadow ray to [`Env::sample`] at every
+    /// vertex, combined with BSDF sampling by the power heuristic. Off, the
+    /// estimator is phases 1–2b's, bit for bit. Not with splats (shadow rays
+    /// would have to composite them).
+    pub nee: bool,
+    /// The sky and sun.
+    pub env: Env,
     pub(crate) tan_half: f64,
     pub(crate) eye: Point3,
     pub(crate) forward: Vec3,
@@ -252,7 +368,7 @@ impl Scene {
             Analytic::from_prims(prims),
             &[Surface::Conductor, Surface::Diffuse],
         );
-        Self::with(opaque, None, (w, h), spp, Point3::new(0.0, -4.5, 2.2), 20.0)
+        Self::one(opaque, None, (w, h), spp, 20.0)
     }
 
     /// Phase 2b's scene: the ball on a triangle-mesh floor (a 16 × 16 grid,
@@ -268,31 +384,114 @@ impl Scene {
             }]),
             &[Surface::Conductor],
         );
-        let mut s = Self::with(
+        let mut s = Self::one(
             opaque,
             Some(Bvh::build(bush(BUSH_SPLATS, 17))),
             (w, h),
             spp,
-            Point3::new(0.0, -4.5, 2.2),
             24.0,
         );
         s.floor_checker = Some(1.0);
         s
     }
 
-    fn with(
+    /// Phase 2c's scene: one triangle-mesh ball ([`uv_sphere`], conductor)
+    /// placed twice — once uniformly scaled, once squashed and turned, so the
+    /// normal takes the inverse transpose — on the checkered mesh floor (a
+    /// third instance, of a second tree). NEE on. Everything, camera
+    /// included, is scaled by `scale`: 1000 is the same scene in millimetres.
+    pub fn pair(w: usize, h: usize, spp: usize, scale: f64) -> Self {
+        let ball = Opaque::new(
+            uv_sphere(16, 32),
+            Surface::Conductor,
+            Analytic::from_prims(Vec::new()),
+            &[],
+        );
+        let floor = Opaque::new(
+            grid_floor(16, 12.0),
+            Surface::Diffuse,
+            Analytic::from_prims(Vec::new()),
+            &[],
+        );
+        let s = |t: Transform| Transform::scale(scale, scale, scale).then(&t);
+        let placements = vec![
+            Placement::new(
+                0,
+                s(Transform::translation(-1.15, 0.0, 0.9).then(&Transform::scale(0.9, 0.9, 0.9))),
+            ),
+            Placement::new(
+                0,
+                s(Transform::translation(1.1, 0.6, 0.65)
+                    .then(&Transform::rotation_z(0.6))
+                    .then(&Transform::rotation_x(0.4))
+                    .then(&Transform::scale(0.95, 0.7, 0.65))),
+            ),
+            Placement::new(1, s(Transform::identity())),
+        ];
+        let mut sc = Self::instanced(
+            vec![ball, floor],
+            placements,
+            None,
+            (w, h),
+            spp,
+            (
+                Point3::new(0.0, -4.5 * scale, 2.2 * scale),
+                Point3::new(0.0, 0.0, 0.8 * scale),
+            ),
+            24.0,
+        );
+        sc.floor_checker = Some(scale);
+        sc.nee = true;
+        sc
+    }
+
+    fn one(
         opaque: Opaque,
         splats: Option<Bvh<Splats>>,
         size: (usize, usize),
         spp: usize,
-        eye: Point3,
         half_fov_deg: f64,
     ) -> Self {
-        let forward = (Point3::new(0.0, 0.0, 0.8) - eye).normalize();
+        Self::instanced(
+            vec![opaque],
+            vec![Placement::new(0, Transform::identity())],
+            splats,
+            size,
+            spp,
+            (Point3::new(0.0, -4.5, 2.2), Point3::new(0.0, 0.0, 0.8)),
+            half_fov_deg,
+        )
+    }
+
+    /// A scene of bottom-level trees placed by `placements` (one instance
+    /// each, its payload its index), a pinhole camera at `eye` looking at
+    /// `target` (`+z` up), NEE off and the default [`Env`].
+    pub fn instanced(
+        blas: Vec<Opaque>,
+        placements: Vec<Placement>,
+        splats: Option<Bvh<Splats>>,
+        size: (usize, usize),
+        spp: usize,
+        (eye, target): (Point3, Point3),
+        half_fov_deg: f64,
+    ) -> Self {
+        let blas: Vec<Arc<Bvh<Opaque>>> =
+            blas.into_iter().map(|o| Arc::new(Bvh::build(o))).collect();
+        let instances = placements
+            .iter()
+            .enumerate()
+            .map(|(k, p)| {
+                Instance::new(blas[p.blas].clone(), p.to_world.clone(), k)
+                    .unwrap_or_else(|| panic!("placement {k}: empty tree or singular transform"))
+            })
+            .collect();
+        let forward = (target - eye).normalize();
         let right = forward.cross(&Vec3::new(0.0, 0.0, 1.0)).normalize();
         let up = right.cross(&forward);
         Self {
-            opaque: Bvh::build(opaque),
+            blas,
+            tlas: Tlas::build(instances),
+            placements,
             splats,
             size,
             spp,
@@ -301,6 +500,8 @@ impl Scene {
             floor_albedo: 0.5,
             floor_checker: None,
             frozen_alpha: None,
+            nee: false,
+            env: Env::default(),
             tan_half: half_fov_deg.to_radians().tan(),
             eye,
             forward,
@@ -309,9 +510,19 @@ impl Scene {
         }
     }
 
-    /// The opaque tree.
-    pub fn opaque(&self) -> &Bvh<Opaque> {
-        &self.opaque
+    /// The top-level tree.
+    pub fn tlas(&self) -> &Tlas<Opaque> {
+        &self.tlas
+    }
+
+    /// The bottom-level trees.
+    pub fn blas(&self) -> &[Arc<Bvh<Opaque>>] {
+        &self.blas
+    }
+
+    /// The placements, by instance payload.
+    pub fn placements(&self) -> &[Placement] {
+        &self.placements
     }
 
     /// Replace (or with `None`, remove) the splat cloud.
@@ -322,6 +533,13 @@ impl Scene {
     /// The splat tree, if the scene has one.
     pub fn splats(&self) -> Option<&Bvh<Splats>> {
         self.splats.as_ref()
+    }
+
+    /// What the prim an instance hit is made of.
+    pub fn surface(&self, h: &InstanceHit) -> Surface {
+        self.blas[self.placements[h.payload].blas]
+            .geometry()
+            .surface(h.hit.prim as usize)
     }
 
     /// The diffuse albedo at `p`.
@@ -346,6 +564,12 @@ impl Scene {
         self.paths() * self.wavelengths
     }
 
+    /// The conductor graph's batch: one vertex per lane, and with NEE a
+    /// second, light-sampled one per lane after them (`lanes + j`).
+    pub fn graph_width(&self) -> usize {
+        self.lanes() * if self.nee { 2 } else { 1 }
+    }
+
     fn camera_ray(&self, path: usize, rng: &mut Rng) -> Ray {
         let (w, h) = self.size;
         let px = path / self.spp;
@@ -358,6 +582,38 @@ impl Scene {
         let sy = (1.0 - 2.0 * y / h as f64) * tan;
         Ray::new(self.eye, self.forward + self.right * sx + self.up * sy)
     }
+}
+
+/// A UV sphere of unit radius at the origin, `lat × lon` quads (the caps
+/// fans), wound outward, face normals only.
+pub fn uv_sphere(lat: usize, lon: usize) -> TriMesh {
+    let mut positions = vec![Point3::new(0.0, 0.0, 1.0)];
+    for i in 1..lat {
+        let th = std::f64::consts::PI * i as f64 / lat as f64;
+        for j in 0..lon {
+            let ph = 2.0 * std::f64::consts::PI * j as f64 / lon as f64;
+            positions.push(Point3::new(
+                th.sin() * ph.cos(),
+                th.sin() * ph.sin(),
+                th.cos(),
+            ));
+        }
+    }
+    positions.push(Point3::new(0.0, 0.0, -1.0));
+    let south = positions.len() as u32 - 1;
+    let v = |i: usize, j: usize| (1 + (i - 1) * lon + j % lon) as u32;
+    let mut idx = Vec::new();
+    for j in 0..lon {
+        idx.extend([0, v(1, j), v(1, j + 1)]);
+        idx.extend([south, v(lat - 1, j + 1), v(lat - 1, j)]);
+    }
+    for i in 1..lat - 1 {
+        for j in 0..lon {
+            let (a, b, c, d) = (v(i, j), v(i + 1, j), v(i + 1, j + 1), v(i, j + 1));
+            idx.extend([a, b, c, a, c, d]);
+        }
+    }
+    TriMesh::new(positions, Vec::new(), &idx)
 }
 
 /// A flat `n × n` grid of quads over `[−half, half]²` at `z = 0`, two
@@ -434,9 +690,7 @@ pub fn bush(n: usize, seed: u64) -> Splats {
 /// Sky radiance towards `d` at `lambda_nm`: a dim gradient and a soft sun.
 /// Smooth on purpose — the gradient's variance is the sun's edge.
 pub fn sky(d: Vec3, lambda_nm: f64) -> f64 {
-    let sun = Vec3::new(0.5, -0.35, 0.8).normalize();
-    let tint = 1.0 + 0.4 * (550.0 - lambda_nm) / 200.0;
-    tint * (0.15 + 0.25 * d.z.max(0.0)) + 6.0 * (40.0 * (d.dot(&sun) - 1.0)).exp()
+    Env::default().radiance(d, lambda_nm)
 }
 
 /// One path's whole state on the wavefront. Fixed size: this is the O(1).
@@ -448,6 +702,8 @@ struct Path {
     radiance: [f64; HERO],
     lambda: [f64; HERO],
     rng: Rng,
+    /// The BSDF pdf the current ray was drawn with; 0 for the camera ray.
+    prev_pdf: f64,
     alive: bool,
 }
 
@@ -465,17 +721,25 @@ pub struct Stats {
 pub struct Kernels {
     eval: Program,
     adjoint: Program,
+    width: usize,
 }
 
 impl Kernels {
     /// Compiled C when `native` (and a compiler exists), the f64
-    /// interpreter otherwise. `n` is lanes ([`Scene::lanes`]).
+    /// interpreter otherwise. `n` is the graph's batch,
+    /// [`Scene::graph_width`] (which is [`Scene::lanes`] without NEE).
     pub fn new(n: usize, native: bool) -> Self {
         let g = Graph::new(n);
         Self {
             eval: g.eval(native),
             adjoint: g.adjoint(native),
+            width: n,
         }
+    }
+
+    /// Sized for `scene`.
+    pub fn for_scene(scene: &Scene, native: bool) -> Self {
+        Self::new(scene.graph_width(), native)
     }
 
     /// Whether the eval program is compiled C.
@@ -495,9 +759,60 @@ fn basis(n: Vec3) -> (Vec3, Vec3) {
     )
 }
 
+/// Off-surface ray origin. Phases 1–2b's fixed `1e-6` along the normal.
+fn offset(p: Point3, n: Vec3) -> Point3 {
+    p + n * 1e-6
+}
+
+/// The light-sampled half of a conductor vertex: direction and the
+/// θ-free factor `s = cos_L · w_L / p_L` (visibility folded in).
+#[derive(Debug, Clone, Copy)]
+struct LightSample {
+    dir: Vec3,
+    s: f64,
+}
+
 /// Trace every path once. `replay = None` is the forward pass and returns
 /// each path's `L`; `Some((l, dl))` replays against the forward pass's `L`
 /// and the loss adjoint per path, accumulating into `grad`.
+///
+/// # NEE, MIS, and what the replay owes each vertex
+///
+/// With [`Scene::nee`], every surface vertex `j` (throughput `T_j` on
+/// arrival) also draws `ω_L ~ p_L` ([`Env::sample`]), traces a shadow ray,
+/// and collects
+///
+/// ```text
+/// C_j = T_j · f_j(ω_L) cos_L · Le(ω_L) · V · w_L / p_L,   w_L = p_L² / (p_L² + p_B(ω_L)²)
+/// ```
+///
+/// *before* the BSDF sample `ω_B ~ p_B` moves the path on; an escape after
+/// a BSDF bounce collects `T Le(ω_B) w_B`, `w_B = p_B² / (p_B² + p_L(ω_B)²)`
+/// (the camera ray's escape has no rival strategy: `w = 1`). The weights are
+/// functions of the two detached pdfs only, so they are numbers to `∂θ`
+/// exactly like `p` is (with a live sampler `p_B` moves with `α`, and the
+/// weights still sum to one for every `ω`, so treating them as constants
+/// leaves the estimator of `∫ ∂f` unbiased).
+///
+/// Every term of `L` is a product of BSDF values: the BSDF-sampled
+/// `f_i(ω_B,i)` of every vertex before it and, for `C_j`, the light-sampled
+/// `f_j(ω_L,j)` once. So `∂θ log` of a term is a sum over the `f` it
+/// contains, and regrouping by `f` as in the plain case,
+///
+/// ```text
+/// ∂L/∂θ = Σ_j [ ∂θ log f_j(ω_B,j) · (L − L_j⁺)  +  ∂θ log f_j(ω_L,j) · C_j ]
+/// ```
+///
+/// where `L_j⁺` is what the path had collected *including* `C_j` — the
+/// only terms carrying `f_j(ω_B,j)` are those collected after the BSDF
+/// sample, and `C_j` is not one of them. The replay therefore, at a
+/// conductor vertex and in this order: adds `C_j` to its running `L_j`,
+/// seeds the light lane with `δf_L = δL · C_j / f_j(ω_L) = δL · T_j s Le`
+/// (no division: `f_L` may be 0), then seeds the BSDF lane with
+/// `δf_B = δL (L − L_j⁺) / f_j(ω_B)`. Both lanes are columns of the same
+/// graph batch (light lanes after the BSDF lanes), so one adjoint
+/// reduction takes both. Diffuse vertices are θ-free: their `C_j` lands in
+/// `L_j` and nothing else.
 fn trace(
     scene: &Scene,
     theta: &[f64; PARAMS],
@@ -509,7 +824,14 @@ fn trace(
     let n = scene.paths();
     let nw = scene.wavelengths;
     assert!((1..=HERO).contains(&nw), "wavelengths {nw}");
+    assert!(
+        !(scene.nee && scene.splats.is_some()),
+        "NEE with splats: shadow rays do not composite them"
+    );
     let lanes = scene.lanes();
+    let width = scene.graph_width();
+    assert_eq!(k.width, width, "kernels built for another graph width");
+    let env = scene.env;
     let mut paths: Vec<Path> = (0..n)
         .map(|i| {
             let mut rng = Rng::new(seed, i as u64);
@@ -521,40 +843,64 @@ fn trace(
                 radiance: [0.0; HERO],
                 lambda,
                 rng,
+                prev_pdf: 0.0,
                 alive: true,
             }
         })
         .collect();
-    // The column buffer: one row of COLUMNS + δf per lane, reused.
-    let mut cols = vec![vec![0.0; lanes]; COLUMNS];
-    let mut df = vec![0.0; lanes];
+    // The column buffer: one row of COLUMNS + δf per graph lane, reused.
+    let mut cols = vec![vec![0.0; width]; COLUMNS];
+    let mut df = vec![0.0; width];
     let mut sampled = vec![(Vec3::zeros(), 0.0f64, 0.0f64); n]; // (wi, cos_i, pdf)
+    let mut light: Vec<Option<LightSample>> = vec![None; n];
     let mut ball = vec![false; n];
     let mut stats = Stats {
-        state_words: n * (std::mem::size_of::<Path>() + std::mem::size_of_val(&sampled[0]) + 1) / 8
-            + (COLUMNS + 1) * lanes,
+        state_words: n
+            * (std::mem::size_of::<Path>()
+                + std::mem::size_of_val(&sampled[0])
+                + std::mem::size_of::<Option<LightSample>>()
+                + 1)
+            / 8
+            + (COLUMNS + 1) * width,
         vertices: 0,
     };
     k.eval.write(THETA, theta);
     k.adjoint.write(THETA, theta);
+    let harmless = |cols: &mut [Vec<f64>], df: &mut [f64], j: usize| {
+        for (c, v) in cols.iter_mut().zip([1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]) {
+            c[j] = v;
+        }
+        df[j] = 0.0;
+    };
+    let lane = |cols: &mut [Vec<f64>], j: usize, li: [f64; 3], lo: [f64; 3], lam: f64| {
+        let h = normalize([li[0] + lo[0], li[1] + lo[1], li[2] + lo[2]]);
+        let oh = lo[0] * h[0] + lo[1] * h[1] + lo[2] * h[2];
+        let bw = band_weights(lam);
+        for (c, v) in cols
+            .iter_mut()
+            .zip([li[2], lo[2], h[2], oh, bw[0], bw[1], bw[2]])
+        {
+            c[j] = v;
+        }
+        h
+    };
 
     for _ in 0..scene.depth {
         let mut any = false;
         for (i, p) in paths.iter_mut().enumerate() {
             // Inactive slots get a harmless vertex and no adjoint.
             for j in i * nw..(i + 1) * nw {
-                for (c, v) in cols.iter_mut().zip([1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]) {
-                    c[j] = v;
+                harmless(&mut cols, &mut df, j);
+                if scene.nee {
+                    harmless(&mut cols, &mut df, lanes + j);
                 }
-                df[j] = 0.0;
             }
             ball[i] = false;
+            light[i] = None;
             if !p.alive {
                 continue;
             }
-            let hit = scene
-                .opaque
-                .trace_closest_range(&p.ray, 1e-6, f64::INFINITY);
+            let hit = scene.tlas.trace_closest_range(&p.ray, 1e-6, f64::INFINITY);
             // Splats in front of the surface (or of the sky): emissive and
             // absorbing, composited front to back, θ-free.
             if let Some(cloud) = &scene.splats {
@@ -562,7 +908,7 @@ fn trace(
                     cloud,
                     &p.ray,
                     1e-6,
-                    hit.as_ref().map_or(f64::INFINITY, |h| h.t),
+                    hit.as_ref().map_or(f64::INFINITY, |h| h.hit.t),
                 );
                 for w in 0..nw {
                     p.radiance[w] += p.throughput[w] * splat_radiance(seg.radiance, p.lambda[w]);
@@ -573,27 +919,58 @@ fn trace(
                     continue;
                 }
             }
-            let Some(hit) = hit else {
-                for w in 0..nw {
-                    p.radiance[w] += p.throughput[w] * sky(*p.ray.direction.as_ref(), p.lambda[w]);
+            let d: Vec3 = *p.ray.direction.as_ref();
+            let Some(ih) = hit else {
+                let w = if scene.nee && p.prev_pdf > 0.0 {
+                    mis(p.prev_pdf, env.pdf(d))
+                } else {
+                    1.0
+                };
+                for k in 0..nw {
+                    p.radiance[k] += p.throughput[k] * env.radiance(d, p.lambda[k]) * w;
                 }
                 p.alive = false;
                 continue;
             };
-            let nrm: Vec3 = *hit.normal.as_ref();
-            let wo = -*p.ray.direction.as_ref();
+            let mut nrm: Vec3 = *ih.hit.normal.as_ref();
+            if nrm.dot(&d) > 0.0 {
+                nrm = -nrm; // two-sided: shade the side the ray came from
+            }
+            let wo = -d;
             let (t, b) = basis(nrm);
-            let origin = hit.point + nrm * 1e-6;
-            if scene.opaque.geometry().surface(hit.prim as usize) == Surface::Diffuse {
-                // Lambertian floor: cosine sampling, weight = albedo. θ-free.
-                let albedo = scene.albedo(hit.point);
+            let origin = offset(ih.hit.point, nrm);
+            // The light sample: drawn before the BSDF's, three uniforms
+            // whether or not it lands, so the stream does not depend on it.
+            let nee = scene.nee.then(|| {
+                let dir = env.sample([p.rng.uniform(), p.rng.uniform(), p.rng.uniform()]);
+                let cos = dir.dot(&nrm);
+                let lit = cos > 0.0
+                    && !scene
+                        .tlas
+                        .occluded_range(&Ray::new(origin, dir), 1e-6, f64::INFINITY);
+                (dir, cos, env.pdf(dir), lit)
+            });
+            if scene.surface(&ih) == Surface::Diffuse {
+                // Lambertian: cosine sampling, weight = albedo. θ-free.
+                let albedo = scene.albedo(ih.hit.point) * scene.placements[ih.payload].albedo;
+                if let Some((dir, cos, pl, true)) = nee {
+                    let w = mis(pl, cos / std::f64::consts::PI);
+                    for k in 0..nw {
+                        p.radiance[k] += p.throughput[k] * albedo / std::f64::consts::PI
+                            * cos
+                            * env.radiance(dir, p.lambda[k])
+                            * w
+                            / pl;
+                    }
+                }
                 let (u1, u2) = (p.rng.uniform(), p.rng.uniform());
                 let (r, phi) = (u1.sqrt(), 2.0 * std::f64::consts::PI * u2);
-                let wi =
-                    t * (r * phi.cos()) + b * (r * phi.sin()) + nrm * (1.0 - u1).max(0.0).sqrt();
+                let cz = (1.0 - u1).max(0.0).sqrt();
+                let wi = t * (r * phi.cos()) + b * (r * phi.sin()) + nrm * cz;
                 for tp in &mut p.throughput[..nw] {
                     *tp *= albedo;
                 }
+                p.prev_pdf = cz / std::f64::consts::PI;
                 p.ray = Ray::new(origin, wi);
                 continue;
             }
@@ -601,25 +978,36 @@ fn trace(
             // depend on λ, so every wavelength's pdf is the hero's and the
             // hero-wavelength MIS weight reduces to `f_k cos / p`.
             let lo = [wo.dot(&t), wo.dot(&b), wo.dot(&nrm)];
-            let u = [p.rng.uniform(), p.rng.uniform()];
             let alpha = scene.frozen_alpha.unwrap_or(theta[0]);
+            if let Some((dir, cos, pl, true)) = nee
+                && lo[2] > 0.0
+            {
+                let li = [dir.dot(&t), dir.dot(&b), cos];
+                let mut h = [0.0; 3];
+                for w in 0..nw {
+                    h = lane(&mut cols, lanes + i * nw + w, li, lo, p.lambda[w]);
+                }
+                let pb = ggx::pdf(alpha, lo[2], h[2]);
+                light[i] = Some(LightSample {
+                    dir,
+                    s: cos * mis(pl, pb) / pl,
+                });
+                ball[i] = true;
+                any = true;
+            }
+            let u = [p.rng.uniform(), p.rng.uniform()];
             let (li, pdf) = ggx::sample(alpha, lo, u);
             if li[2] <= 0.0 || lo[2] <= 0.0 || !pdf.is_finite() || pdf <= 0.0 {
+                // Dead after this vertex; its light sample still counts.
+                sampled[i] = (Vec3::zeros(), 0.0, 0.0);
                 p.alive = false;
                 continue;
             }
-            let h = normalize([li[0] + lo[0], li[1] + lo[1], li[2] + lo[2]]);
-            let oh = lo[0] * h[0] + lo[1] * h[1] + lo[2] * h[2];
             for w in 0..nw {
-                let bw = band_weights(p.lambda[w]);
-                for (c, v) in cols
-                    .iter_mut()
-                    .zip([li[2], lo[2], h[2], oh, bw[0], bw[1], bw[2]])
-                {
-                    c[i * nw + w] = v;
-                }
+                lane(&mut cols, i * nw + w, li, lo, p.lambda[w]);
             }
             sampled[i] = (t * li[0] + b * li[1] + nrm * li[2], li[2], pdf);
+            p.prev_pdf = pdf;
             p.ray = Ray::new(origin, sampled[i].0);
             ball[i] = true;
             any = true;
@@ -641,6 +1029,18 @@ fn trace(
             let (_, cos_i, pdf) = sampled[i];
             for w in 0..nw {
                 let j = i * nw + w;
+                if let Some(ls) = light[i] {
+                    let le = env.radiance(ls.dir, p.lambda[w]);
+                    let g = p.throughput[w] * ls.s * le;
+                    if let Some((_, dl)) = replay {
+                        df[lanes + j] = dl[j] * g;
+                        need_adjoint |= df[lanes + j] != 0.0;
+                    }
+                    p.radiance[w] += g * f[lanes + j];
+                }
+                if pdf <= 0.0 {
+                    continue;
+                }
                 if let Some((l, dl)) = replay
                     && f[j] > 0.0
                 {

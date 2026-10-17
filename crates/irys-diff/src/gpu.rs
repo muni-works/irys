@@ -41,7 +41,7 @@ use crate::ggx::{COLUMNS, DF, Graph, PARAMS, THETA};
 use crate::prb::{self, Loss, Scene};
 
 const WAVEFRONT: &str = include_str!("gpu/wavefront.wgsl");
-const PATH_BYTES: u64 = 112;
+const PATH_BYTES: u64 = 128;
 const WG: u32 = 64;
 
 #[repr(C)]
@@ -67,7 +67,12 @@ struct Params {
     checker: f32,
     splat_root: u32,
     splat_base: u32,
-    _pad: [u32; 3],
+    inst_base: u32,
+    nee: u32,
+    cap: u32,
+    _pad: [u32; 4],
+    sun: [f32; 4],
+    env: [f32; 4],
 }
 
 /// Offset off a surface for the next ray. f32 cannot hold the CPU's 1e-6 at
@@ -219,6 +224,7 @@ pub struct GpuPrb {
     ctx: &'static GpuContext,
     paths: u32,
     lanes: usize,
+    width: usize,
     params: wgpu::Buffer,
     theta: wgpu::Buffer,
     dl: wgpu::Buffer,
@@ -240,28 +246,36 @@ pub struct GpuPrb {
     pub timing: Timing,
 }
 
-/// Where the splat tree and records start in the packed scene.
+/// Where the instance and splat records start in the packed scene.
 #[derive(Clone, Copy)]
 struct Layout {
     splat_root: u32,
     splat_base: u32,
+    inst_base: u32,
 }
 
 const NONE: u32 = u32::MAX;
 const LEAF: u32 = 1 << 31;
 
-/// A [`Scene`]'s two trees packed for the wavefront: one node array (the
-/// opaque tree at 0, the splat tree after it), one leaf-index array, one
-/// array of `vec4` records. Refuses what the WGSL cannot trace — an
-/// analytic prim other than a sphere or disc, view-dependent splat colour,
-/// a tree deeper than the traversal stack — rather than dropping it.
+/// A [`Scene`] packed for the wavefront: one node array (the top-level tree
+/// rooted at 0, then every bottom-level tree, then the splat tree), one
+/// leaf-index array, one array of `vec4` records (opaque prims, then
+/// instances, then splats). Refuses what the WGSL cannot trace — an analytic
+/// prim other than a sphere or disc, view-dependent splat colour, a tree
+/// deeper than its traversal stack — rather than dropping it.
 fn pack(scene: &Scene) -> (Vec<[f32; 4]>, Vec<u32>, Vec<[f32; 4]>, Layout) {
     use irys_core::Geometry;
     use irys_prims::analytic::Prim;
     let (mut nodes, mut ids, mut geo) = (Vec::new(), Vec::new(), Vec::new());
-    let mut tree = |flat: &[irys_core::FlatBvhNode], prims: &[u32], nodes: &mut Vec<[f32; 4]>| {
+    let mut tree = |flat: &[irys_core::FlatBvhNode],
+                    prims: &[u32],
+                    nodes: &mut Vec<[f32; 4]>,
+                    stack: usize| {
         let depth = irys_gpu::geometry::tree_depth(flat);
-        assert!(depth <= 60, "tree {depth} deep: the WGSL stack holds 64");
+        assert!(
+            depth + 4 <= stack,
+            "tree {depth} deep: the WGSL stack holds {stack}"
+        );
         let (base, first) = ((nodes.len() / 2) as u32, ids.len() as u32);
         for &(b, leaf, a, c) in flat {
             let (a, c) = if leaf {
@@ -276,49 +290,89 @@ fn pack(scene: &Scene) -> (Vec<[f32; 4]>, Vec<u32>, Vec<[f32; 4]>, Layout) {
         ids.extend_from_slice(prims);
         base
     };
-    let (flat, prims) = scene.opaque.flatten();
+    let (flat, inst) = scene.tlas.flatten();
     assert!(!flat.is_empty(), "a scene with no opaque geometry");
-    tree(&flat, &prims, &mut nodes);
-    let o = scene.opaque.geometry();
-    let mesh = o.mesh();
+    tree(&flat, &inst, &mut nodes, 32);
     let v = |p: irys_core::Point3, w: f32| [p.x as f32, p.y as f32, p.z as f32, w];
-    let surf = |i: usize| match o.surface(i) {
-        prb::Surface::Conductor => 0.0,
-        prb::Surface::Diffuse => 1.0,
-    };
-    for (i, t) in mesh.triangles().iter().enumerate() {
-        let p = |k: usize| mesh.positions()[t[k] as usize];
-        geo.extend([v(p(0), 0.0), v(p(1), surf(i)), v(p(2), 0.0)]);
-    }
-    for (k, prim) in o.analytic().prims().iter().enumerate() {
-        let s = surf(mesh.len() + k);
-        match *prim {
-            Prim::Sphere { center, radius } => geo.extend([
-                v(center, 1.0),
-                [0.0, 0.0, 0.0, s],
-                [0.0, 0.0, 0.0, radius as f32],
-            ]),
-            Prim::Disc {
-                center,
-                normal,
-                radius,
-            } => geo.extend([
-                v(center, 2.0),
-                [normal.x as f32, normal.y as f32, normal.z as f32, s],
-                [0.0, 0.0, 0.0, radius as f32],
-            ]),
-            other => panic!("irys-diff gpu: {other:?} has no WGSL intersector yet"),
+    // (root node, first prim record) per bottom-level tree.
+    let mut roots = Vec::new();
+    for blas in &scene.blas {
+        let (flat, prims) = blas.flatten();
+        let root = tree(&flat, &prims, &mut nodes, 64);
+        let prim_base = (geo.len() / 3) as u32;
+        roots.push((root, prim_base));
+        let o = blas.geometry();
+        let mesh = o.mesh();
+        let surf = |i: usize| match o.surface(i) {
+            prb::Surface::Conductor => 0.0,
+            prb::Surface::Diffuse => 1.0,
+        };
+        for (i, t) in mesh.triangles().iter().enumerate() {
+            let p = |k: usize| mesh.positions()[t[k] as usize];
+            geo.extend([v(p(0), 0.0), v(p(1), surf(i)), v(p(2), 0.0)]);
+        }
+        for (k, prim) in o.analytic().prims().iter().enumerate() {
+            let s = surf(mesh.len() + k);
+            match *prim {
+                Prim::Sphere { center, radius } => geo.extend([
+                    v(center, 1.0),
+                    [0.0, 0.0, 0.0, s],
+                    [0.0, 0.0, 0.0, radius as f32],
+                ]),
+                Prim::Disc {
+                    center,
+                    normal,
+                    radius,
+                } => geo.extend([
+                    v(center, 2.0),
+                    [normal.x as f32, normal.y as f32, normal.z as f32, s],
+                    [0.0, 0.0, 0.0, radius as f32],
+                ]),
+                other => panic!("irys-diff gpu: {other:?} has no WGSL intersector yet"),
+            }
         }
     }
     let mut layout = Layout {
         splat_root: NONE,
-        splat_base: geo.len() as u32,
+        splat_base: 0,
+        inst_base: geo.len() as u32,
     };
+    // Instance records in `Tlas::instances` order, which is what the
+    // top-level leaves index.
+    for i in scene.tlas.instances() {
+        let place = &scene.placements[i.payload()];
+        let m = i
+            .to_world()
+            .inverse()
+            .expect("placed, so invertible")
+            .matrix;
+        let row = |r: usize| {
+            [
+                m.get(r, 0) as f32,
+                m.get(r, 1) as f32,
+                m.get(r, 2) as f32,
+                m.get(r, 3) as f32,
+            ]
+        };
+        let (root, prim_base) = roots[place.blas];
+        geo.extend([
+            row(0),
+            row(1),
+            row(2),
+            [
+                f32::from_bits(root),
+                f32::from_bits(prim_base),
+                place.albedo as f32,
+                0.0,
+            ],
+        ]);
+    }
+    layout.splat_base = geo.len() as u32;
     if let Some(cloud) = &scene.splats
         && !cloud.geometry().is_empty()
     {
         let (flat, prims) = cloud.flatten();
-        layout.splat_root = tree(&flat, &prims, &mut nodes);
+        layout.splat_root = tree(&flat, &prims, &mut nodes, 64);
         let sp = cloud.geometry();
         assert_eq!(
             sp.degree(),
@@ -363,11 +417,12 @@ impl GpuPrb {
             })
         };
         let lane_bytes = lanes as u64 * 4;
+        let graph_bytes = scene.graph_width() as u64 * 4;
         let cols: Vec<wgpu::Buffer> = (0..COLUMNS)
-            .map(|_| storage("column", lane_bytes))
+            .map(|_| storage("column", graph_bytes))
             .collect();
         let theta = storage("theta", PARAMS as u64 * 4);
-        let df = storage("df", lane_bytes);
+        let df = storage("df", graph_bytes);
         let dl = storage("dl", lane_bytes);
         let l = storage("l", lane_bytes);
         let l2 = storage("l replayed", lane_bytes);
@@ -397,7 +452,12 @@ impl GpuPrb {
             mapped_at_creation: false,
         });
 
-        let mut g = Graph::new(lanes);
+        assert!(
+            !(scene.nee && scene.splats().is_some()),
+            "NEE with splats: shadow rays do not composite them"
+        );
+        let width = scene.graph_width();
+        let mut g = Graph::new(width);
         // The adjoint's reductions (δθ: four points, each over every lane)
         // split across a workgroup; the C and interpreter ignore this.
         let reductions: Vec<TensorId> =
@@ -510,6 +570,7 @@ impl GpuPrb {
             ctx,
             paths,
             lanes,
+            width,
             params,
             theta,
             dl,
@@ -562,7 +623,30 @@ impl GpuPrb {
             checker: scene.floor_checker.unwrap_or(0.0) as f32,
             splat_root: self.layout.splat_root,
             splat_base: self.layout.splat_base,
-            _pad: [0; 3],
+            inst_base: self.layout.inst_base,
+            nee: scene.nee as u32,
+            cap: self.paths,
+            _pad: [0; 4],
+            sun: {
+                let e = &scene.env;
+                [
+                    e.sun.x as f32,
+                    e.sun.y as f32,
+                    e.sun.z as f32,
+                    e.kappa as f32,
+                ]
+            },
+            env: {
+                let e = &scene.env;
+                let k = e.kappa;
+                let vmf = k / (2.0 * std::f64::consts::PI * (1.0 - (-2.0 * k).exp()));
+                [
+                    e.sun_radiance as f32,
+                    e.sky as f32,
+                    prb::SUN_PICK as f32,
+                    vmf as f32,
+                ]
+            },
         }
     }
 
@@ -619,6 +703,11 @@ impl GpuPrb {
             scene.lanes(),
             self.lanes,
             "scene does not match the wavefront"
+        );
+        assert_eq!(
+            scene.graph_width(),
+            self.width,
+            "NEE on one and off the other"
         );
         assert!(scene.wavelengths <= prb::HERO);
     }

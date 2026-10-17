@@ -37,9 +37,15 @@ struct Params {
     checker: f32,         // checker square size, 0 for plain
     splat_root: u32,      // node index of the splat tree, NONE without one
     splat_base: u32,      // first splat record in `geo`, in vec4s
+    inst_base: u32,       // first instance record in `geo`, in vec4s
+    nee: u32,             // next-event estimation + MIS on
+    cap: u32,             // paths the graph batch holds: light lanes start at cap × nw
     _p0: u32,
     _p1: u32,
     _p2: u32,
+    _p3: u32,
+    sun: vec4<f32>,       // unit sun direction, κ
+    env: vec4<f32>,       // sun radiance, sky scale, SUN_PICK, vMF normaliser κ / (2π (1 − e^{−2κ}))
 }
 
 const NONE: u32 = 0xffffffffu;
@@ -51,7 +57,8 @@ struct Path {
     tp: vec4<f32>,        // throughput per wavelength
     rad: vec4<f32>,       // L_j per wavelength
     lam: vec4<f32>,       // wavelengths, nm
-    smp: vec4<f32>,       // (cos_i, pdf, on the ball this bounce, _)
+    smp: vec4<f32>,       // (cos_i, pdf, conductor vertex this bounce, pdf of the ray's own BSDF sample)
+    ldir: vec4<f32>,      // light sample at this conductor vertex: (ω_L, s = cos w_L / p_L), s = 0 for none
     rng: vec2<u32>,       // SplitMix64 state (lo, hi)
     alive: u32,
     _pad: u32,
@@ -81,7 +88,9 @@ struct Path {
 @group(0) @binding(21) var<storage, read_write> loss_out: array<f32>;
 @group(0) @binding(22) var<storage, read_write> dl_out: array<f32>;
 // The scene: nodes (min.xyz, a) (max.xyz, b | LEAF), leaf prim indices, and
-// prim records (opaque: three vec4 each, splats: four from `splat_base`).
+// records: opaque prims (three vec4 each, from 0), instances (four from
+// `inst_base`: world → local rows, then (blas root, prim base, albedo, _)),
+// splats (four from `splat_base`). Node 0 is the top-level tree's root.
 @group(0) @binding(23) var<storage, read> nodes: array<vec4<f32>>;
 @group(0) @binding(24) var<storage, read> prim_ids: array<u32>;
 @group(0) @binding(25) var<storage, read> geo: array<vec4<f32>>;
@@ -146,15 +155,44 @@ fn rand(s: ptr<function, vec2<u32>>) -> f32 {
 
 // ---- the scene ----
 
+// `prb::Env::radiance`.
 fn sky(d: vec3<f32>, lambda: f32) -> f32 {
-    let sun = normalize(vec3<f32>(0.5, -0.35, 0.8));
     let tint = 1.0 + 0.4 * (550.0 - lambda) / 200.0;
-    return tint * (0.15 + 0.25 * max(d.z, 0.0)) + 6.0 * exp(40.0 * (dot(d, sun) - 1.0));
+    return tint * params.env.y * (0.15 + 0.25 * max(d.z, 0.0))
+        + params.env.x * exp(params.sun.w * (dot(d, params.sun.xyz) - 1.0));
+}
+
+// `prb::Env::pdf`: SUN_PICK × vMF + the rest uniform over the sphere.
+fn light_pdf(d: vec3<f32>) -> f32 {
+    let vmf = params.env.w * exp(params.sun.w * (dot(d, params.sun.xyz) - 1.0));
+    return params.env.z * vmf + (1.0 - params.env.z) * (0.25 / PI);
+}
+
+// `prb::Env::sample`.
+fn light_sample(u: vec3<f32>) -> vec3<f32> {
+    let phi = 2.0 * PI * u.z;
+    if (u.x < params.env.z) {
+        let k = params.sun.w;
+        let c = clamp(1.0 + log(u.y + (1.0 - u.y) * exp(-2.0 * k)) / k, -1.0, 1.0);
+        let r = sqrt(max(1.0 - c * c, 0.0));
+        let m = params.sun.xyz;
+        return basis_t(m) * (r * cos(phi)) + basis_b(m) * (r * sin(phi)) + m * c;
+    }
+    let z = 1.0 - 2.0 * u.y;
+    let r = sqrt(max(1.0 - z * z, 0.0));
+    return vec3<f32>(r * cos(phi), r * sin(phi), z);
+}
+
+// The power heuristic.
+fn mis(a: f32, b: f32) -> f32 {
+    let s = a * a + b * b;
+    return select(0.0, a * a / s, s > 0.0);
 }
 
 struct Hit {
     t: f32,
-    prim: u32,   // combined opaque index, NONE on a miss
+    prim: u32,   // opaque prim record, NONE on a miss
+    inst: u32,   // instance record
 }
 
 // The slab test, as `Ray::intersect_aabb`: (enter, exit), enter > exit on a
@@ -200,15 +238,18 @@ fn hit_prim(o: vec3<f32>, d: vec3<f32>, i: u32, tmin: f32) -> f32 {
         return dot(e2, qv) * inv;
     }
     if (kind == 1u) {
+        // `d` is an instance-local direction, not unit: t stays the world
+        // ray's parameter.
         let oc = o - r0.xyz;
+        let a = dot(d, d);
         let b = dot(oc, d);
         let c = dot(oc, oc) - r2.w * r2.w;
-        let disc = b * b - c;
+        let disc = b * b - a * c;
         if (disc < 0.0) { return -1.0; }
         let sq = sqrt(disc);
-        let t0 = -b - sq;
+        let t0 = (-b - sq) / a;
         if (t0 > tmin) { return t0; }
-        return -b + sq;
+        return (-b + sq) / a;
     }
     let n = r1.xyz;
     let den = dot(d, n);
@@ -220,15 +261,16 @@ fn hit_prim(o: vec3<f32>, d: vec3<f32>, i: u32, tmin: f32) -> f32 {
     return t;
 }
 
-// Closest opaque hit. Near child first (left on a tie), far child pushed
-// under it; the walk is a function of the ray alone, so replay retraces it.
-fn intersect(o: vec3<f32>, d: vec3<f32>) -> Hit {
-    let tmin = params.eps * 0.1;
+// One bottom-level tree, from `root`, for a ray already in its instance's
+// space: the closest prim in (tmin, tmax). Near child first (left on a tie),
+// far child pushed under it; the walk is a function of the ray alone, so
+// replay retraces it.
+fn walk_blas(o: vec3<f32>, d: vec3<f32>, root: u32, prim_base: u32, tmin: f32, tmax: f32) -> Hit {
     let inv = 1.0 / d;
-    var best = Hit(3.4e38, NONE);
+    var best = Hit(tmax, NONE, NONE);
     var stack: array<u32, 64>;
     var sp = 1u;
-    stack[0] = 0u;
+    stack[0] = root;
     loop {
         if (sp == 0u) { break; }
         sp = sp - 1u;
@@ -239,10 +281,10 @@ fn intersect(o: vec3<f32>, d: vec3<f32>) -> Hit {
         let b = node_b(n);
         if ((b & LEAF) != 0u) {
             for (var k = a; k < a + (b & ~LEAF); k = k + 1u) {
-                let i = prim_ids[k];
+                let i = prim_base + prim_ids[k];
                 let t = hit_prim(o, d, i, tmin);
                 if (t > tmin && t < best.t) {
-                    best = Hit(t, i);
+                    best = Hit(t, i, NONE);
                 }
             }
             continue;
@@ -269,6 +311,93 @@ fn intersect(o: vec3<f32>, d: vec3<f32>) -> Hit {
         }
     }
     return best;
+}
+
+// The world ray in instance `k`'s space, `(o, d)` with `d` not renormalised,
+// so a local hit's t is the world ray's.
+fn to_local(k: u32, o: vec3<f32>, d: vec3<f32>) -> array<vec3<f32>, 2> {
+    let r = params.inst_base + 4u * k;
+    let m0 = geo[r];
+    let m1 = geo[r + 1u];
+    let m2 = geo[r + 2u];
+    return array<vec3<f32>, 2>(
+        vec3<f32>(dot(m0.xyz, o) + m0.w, dot(m1.xyz, o) + m1.w, dot(m2.xyz, o) + m2.w),
+        vec3<f32>(dot(m0.xyz, d), dot(m1.xyz, d), dot(m2.xyz, d)),
+    );
+}
+
+// Closest opaque hit in (tmin, tmax), or with `any` the first found: the
+// top-level tree (`irys_core::Tlas::flatten`, rooted at node 0) walked like
+// a bottom-level one, each leaf's instances in leaf order, each through its
+// own bottom-level walk.
+fn intersect(o: vec3<f32>, d: vec3<f32>, tmax: f32, any: bool) -> Hit {
+    let tmin = params.eps * 0.1;
+    let inv = 1.0 / d;
+    var best = Hit(tmax, NONE, NONE);
+    var stack: array<u32, 32>;
+    var sp = 1u;
+    stack[0] = 0u;
+    loop {
+        if (sp == 0u) { break; }
+        sp = sp - 1u;
+        let n = stack[sp];
+        let e = slab(o, inv, n);
+        if (e.x > e.y || e.x >= best.t || e.y <= tmin) { continue; }
+        let a = node_a(n);
+        let b = node_b(n);
+        if ((b & LEAF) != 0u) {
+            for (var k = a; k < a + (b & ~LEAF); k = k + 1u) {
+                let inst = prim_ids[k];
+                let info = geo[params.inst_base + 4u * inst + 3u];
+                let l = to_local(inst, o, d);
+                let h = walk_blas(l[0], l[1], bitcast<u32>(info.x), bitcast<u32>(info.y), tmin, best.t);
+                if (h.prim != NONE) {
+                    best = Hit(h.t, h.prim, inst);
+                    if (any) { return best; }
+                }
+            }
+            continue;
+        }
+        let ea = slab(o, inv, a);
+        let eb = slab(o, inv, b);
+        let ha = ea.x <= ea.y;
+        let hb = eb.x <= eb.y;
+        if (ha && hb) {
+            if (ea.x <= eb.x) {
+                stack[sp] = b;
+                stack[sp + 1u] = a;
+            } else {
+                stack[sp] = a;
+                stack[sp + 1u] = b;
+            }
+            sp = sp + 2u;
+        } else if (ha) {
+            stack[sp] = a;
+            sp = sp + 1u;
+        } else if (hb) {
+            stack[sp] = b;
+            sp = sp + 1u;
+        }
+    }
+    return best;
+}
+
+// Anything in the way of a shadow ray to the environment.
+fn occluded(o: vec3<f32>, d: vec3<f32>) -> bool {
+    return intersect(o, d, 3.4e38, true).prim != NONE;
+}
+
+// The world normal at a hit: the prim's local normal by the inverse
+// transpose of the instance's linear part (the transpose of world → local).
+fn hit_normal(h: Hit, o: vec3<f32>, d: vec3<f32>) -> vec3<f32> {
+    let l = to_local(h.inst, o, d);
+    let nl = prim_normal(h.prim, l[0] + l[1] * h.t);
+    let r = params.inst_base + 4u * h.inst;
+    return normalize(geo[r].xyz * nl.x + geo[r + 1u].xyz * nl.y + geo[r + 2u].xyz * nl.z);
+}
+
+fn inst_albedo(k: u32) -> f32 {
+    return geo[params.inst_base + 4u * k + 3u].z;
 }
 
 fn prim_normal(i: u32, x: vec3<f32>) -> vec3<f32> {
@@ -522,30 +651,44 @@ fn gen(@builtin(global_invocation_id) gid: vec3<u32>) {
         vec4<f32>(0.0),
         lam,
         vec4<f32>(0.0),
+        vec4<f32>(0.0),
         s,
         1u,
         0u,
     );
 }
 
+// The harmless vertex: `f` of it is 0 and `update` seeds it no adjoint.
+fn harmless(j: u32) {
+    write_lane(j, 1.0, 1.0, 1.0, 1.0, vec3<f32>(0.0));
+}
+
+// See `prb::trace` for the estimator, NEE and MIS included, and what the
+// replay owes each vertex; this is that, step for step.
 @compute @workgroup_size(64)
 fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.paths) { return; }
     var p = paths[i];
     let base = i * params.nw;
+    let light_base = params.cap * params.nw + base;
     // Inactive lanes get a harmless vertex; `update` gives them no adjoint.
     for (var k = 0u; k < params.nw; k = k + 1u) {
-        write_lane(base + k, 1.0, 1.0, 1.0, 1.0, vec3<f32>(0.0));
+        harmless(base + k);
+        if (params.nee != 0u) {
+            harmless(light_base + k);
+        }
     }
-    p.smp = vec4<f32>(0.0);
+    let prev_pdf = p.smp.w;
+    p.smp = vec4<f32>(0.0, 0.0, 0.0, prev_pdf);
+    p.ldir = vec4<f32>(0.0);
     if (p.alive == 0u) {
         paths[i] = p;
         return;
     }
     let o = p.o.xyz;
     let d = p.d.xyz;
-    let hit = intersect(o, d);
+    let hit = intersect(o, d, 3.4e38, false);
     if (params.splat_root != NONE) {
         let seg = composite(o, d, params.eps * 0.1, hit.t);
         for (var k = 0u; k < params.nw; k = k + 1u) {
@@ -559,30 +702,58 @@ fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     if (hit.prim == NONE) {
+        var w = 1.0;
+        if (params.nee != 0u && prev_pdf > 0.0) {
+            w = mis(prev_pdf, light_pdf(d));
+        }
         for (var k = 0u; k < params.nw; k = k + 1u) {
-            p.rad[k] = p.rad[k] + p.tp[k] * sky(d, p.lam[k]);
+            p.rad[k] = p.rad[k] + p.tp[k] * sky(d, p.lam[k]) * w;
         }
         p.alive = 0u;
         paths[i] = p;
         return;
     }
     let x = o + d * hit.t;
-    let n = prim_normal(hit.prim, x);
+    var n = hit_normal(hit, o, d);
+    if (dot(n, d) > 0.0) {
+        n = -n;
+    }
     let conductor = prim_conductor(hit.prim);
     let t = basis_t(n);
     let b = basis_b(n);
     let origin = x + n * params.eps;
     var s = p.rng;
+    // The light sample: three uniforms, drawn before the BSDF's whether or
+    // not it lands.
+    var lit = false;
+    var ld = vec3<f32>(0.0);
+    var lcos = 0.0;
+    var lpdf = 0.0;
+    if (params.nee != 0u) {
+        let u = vec3<f32>(rand(&s), rand(&s), rand(&s));
+        ld = light_sample(u);
+        lcos = dot(ld, n);
+        lpdf = light_pdf(ld);
+        lit = lcos > 0.0 && !occluded(origin, ld);
+    }
     if (!conductor) {
-        let albedo = albedo_at(x);
+        let albedo = albedo_at(x) * inst_albedo(hit.inst);
+        if (lit) {
+            let w = mis(lpdf, lcos / PI);
+            for (var k = 0u; k < params.nw; k = k + 1u) {
+                p.rad[k] = p.rad[k] + p.tp[k] * albedo / PI * lcos * sky(ld, p.lam[k]) * w / lpdf;
+            }
+        }
         let u1 = rand(&s);
         let u2 = rand(&s);
         let r = sqrt(u1);
         let phi = 2.0 * PI * u2;
-        let wi = t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(1.0 - u1, 0.0));
+        let cz = sqrt(max(1.0 - u1, 0.0));
+        let wi = t * (r * cos(phi)) + b * (r * sin(phi)) + n * cz;
         for (var k = 0u; k < params.nw; k = k + 1u) {
             p.tp[k] = p.tp[k] * albedo;
         }
+        p.smp.w = cz / PI;
         p.o = vec4<f32>(origin, 0.0);
         p.d = vec4<f32>(normalize(wi), 0.0);
         p.rng = s;
@@ -591,12 +762,24 @@ fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let wo = -d;
     let lo = vec3<f32>(dot(wo, t), dot(wo, b), dot(wo, n));
+    if (lit && lo.z > 0.0) {
+        let li = vec3<f32>(dot(ld, t), dot(ld, b), lcos);
+        let hl = normalize(li + lo);
+        let ohl = dot(lo, hl);
+        for (var k = 0u; k < params.nw; k = k + 1u) {
+            write_lane(light_base + k, li.z, lo.z, hl.z, ohl, band_weights(p.lam[k]));
+        }
+        let pb = ggx_pdf(params.alpha, lo.z, hl.z);
+        p.ldir = vec4<f32>(ld, lcos * mis(lpdf, pb) / lpdf);
+        p.smp.z = 1.0;
+    }
     let u = vec2<f32>(rand(&s), rand(&s));
     p.rng = s;
     let sm = ggx_sample(params.alpha, lo, u);
     let li = sm.xyz;
     let pdf = sm.w;
     if (li.z <= 0.0 || lo.z <= 0.0 || !(pdf > 0.0) || !(pdf < 3.4e38)) {
+        // Dead after this vertex; its light sample still counts.
         p.alive = 0u;
         paths[i] = p;
         return;
@@ -606,7 +789,7 @@ fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var k = 0u; k < params.nw; k = k + 1u) {
         write_lane(base + k, li.z, lo.z, hh.z, oh, band_weights(p.lam[k]));
     }
-    p.smp = vec4<f32>(li.z, pdf, 1.0, 0.0);
+    p.smp = vec4<f32>(li.z, pdf, 1.0, pdf);
     p.o = vec4<f32>(origin, 0.0);
     p.d = vec4<f32>(normalize(t * li.x + b * li.y + n * li.z), 0.0);
     paths[i] = p;
@@ -618,21 +801,35 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.paths) { return; }
     var p = paths[i];
     let base = i * params.nw;
+    let light_base = params.cap * params.nw + base;
     for (var k = 0u; k < params.nw; k = k + 1u) {
         df_out[base + k] = 0.0;
+        if (params.nee != 0u) {
+            df_out[light_base + k] = 0.0;
+        }
     }
     if (p.smp.z == 0.0) { return; }
-    var lit = false;
+    var live = false;
     for (var k = 0u; k < params.nw; k = k + 1u) {
         let j = base + k;
-        let f = f_in[j];
-        if (params.replay != 0u && f > 0.0) {
-            df_out[j] = dl_in[j] * (l_in[j] - p.rad[k]) / f;
+        // NEE first: C_j joins L_j before the BSDF lane's δf reads it.
+        if (p.ldir.w > 0.0) {
+            let g = p.tp[k] * p.ldir.w * sky(p.ldir.xyz, p.lam[k]);
+            if (params.replay != 0u) {
+                df_out[light_base + k] = dl_in[j] * g;
+            }
+            p.rad[k] = p.rad[k] + g * f_in[light_base + k];
         }
-        p.tp[k] = p.tp[k] * (f * p.smp.x / p.smp.y);
-        lit = lit || p.tp[k] > 0.0;
+        if (p.smp.y > 0.0) {
+            let f = f_in[j];
+            if (params.replay != 0u && f > 0.0) {
+                df_out[j] = dl_in[j] * (l_in[j] - p.rad[k]) / f;
+            }
+            p.tp[k] = p.tp[k] * (f * p.smp.x / p.smp.y);
+            live = live || p.tp[k] > 0.0;
+        }
     }
-    if (!lit) {
+    if (!live) {
         p.alive = 0u;
     }
     paths[i] = p;
