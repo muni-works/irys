@@ -4,7 +4,7 @@ One renderer for the stack. vcad, kosm, ipse, rose and muni each draw pixels
 today, in five different ways. irys is where the light lives; every repo above
 it is a client that hands over geometry and a camera and gets a frame back.
 
-Status: proposal, 2026-10-17. Nothing has moved yet.
+Status: proposal, 2026-10-17. Phase 0 (seed + split) has landed; see below.
 
 ## Why now
 
@@ -159,6 +159,39 @@ Each step lands green on its own; nothing is a flag day.
 
 Steps 1–4 are kosm-only and low risk. Step 5 is the big one: two BVHs with
 the same names, a wgpu major bump, and wasm in the vcad app.
+
+## Phase 0: the split as built (2026-10-17)
+
+Pure moves (`git mv`), no behaviour change. What landed differs from the
+sketch above in three places, all because a module-line split would have
+made a cycle:
+
+- **Splats live in `irys-light`, not `irys-prims`.** `splats.rs` shades
+  through `pathtrace`'s surface model and the CPU integrator composites
+  splats itself (`Scene::splats`), so prims → light → prims. `irys-prims` is
+  `analytic` + `heightfield`.
+- **TriMesh stays in `irys-core`.** It is defined in `geometry.rs` beside
+  the trait, and the integrator, the GPU tier and the tests all name it.
+- **The sampler (blue-noise mask, Sobol) is in `irys-core`**, because both
+  tiers read it; `spectrum`/`optics` call each other and go to `irys-light`
+  together with `tables`, `env`, `caustics`, the CPU tier (`cpu/`,
+  `pathtrace`) and the CPU half of the neural denoiser (`neural`). There is
+  no `irys-neural`: the device half is `irys-gpu::neural`.
+
+```
+irys-core   (tang)                       math ray geometry bvh sah tlas sampler
+irys-prims  -> core                      analytic heightfield
+irys-light  -> core   (rayon native)     spectrum optics tables env cpu pathtrace
+                                         caustics splats neural
+irys-gpu    -> core, light (wgpu 30)     the old gpu/ module + shaders
+irys        -> core, light, prims, gpu?  facade, kosm-render 0.2's public paths;
+                                         `gpu` feature pulls irys-gpu
+kosm-render -> irys                      0.2.1 shim, `pub use irys::*`
+```
+
+Each moved module keeps its `crate::x` paths through a private
+`use irys_core::{..}` at its new crate root. The integration tests live in
+the facade (`crates/irys/tests`) since they span tiers.
 
 ## Open questions
 
