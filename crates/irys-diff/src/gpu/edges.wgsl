@@ -274,6 +274,14 @@ fn edge_sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     let start = select(0.0, wt[si - 1u], si > 0u);
     let frac = clamp((u - start) / (wt[si] - start), 0.0, 1.0);
     let r = rng_t[si];
+    // f32 cumulative sums can put `u` past the last slot's sum, onto a
+    // trailing slot that is no candidate (importance 0): its weight would
+    // be `x / 0`. Score it 0 (probability ~1e-7 per sample).
+    if (r.z <= 0.0 || wt[si] <= start) {
+        pts_out[2u * i] = vec2<f32>(0.0);
+        pts_out[2u * i + 1u] = vec2<f32>(0.0);
+        return;
+    }
     let mi = mover_of(si);
     let mv = movers[mi];
     let local = si - mv.slot_base;

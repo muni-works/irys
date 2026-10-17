@@ -957,6 +957,75 @@ has its gates waiting.
    agent); the crease bug fixed in piece 1 changes 2d's shaded rose
    numbers (`edge (+650, +479, +167)`), which should be re-measured.
 
+### Phase 2e: rose in context (2026-10-17)
+
+The question: with 2e's pose gradient (edge term on the device,
+`GpuEdges` with front-only silhouettes, plus the interior term on the CPU),
+does the rose arm fit converge with the body behind the forearm? **No.**
+`examples/rose_fit.rs` now runs the whole robot from rose-full.loon on the
+checker floor by default, from 2d's fit camera so the only change from 2d is
+what is behind the forearm (the torso); `--control` is 2d's arm-alone
+scene, `--edge-only` 2d's gradient. Same start, truth, θ, and schedule (300
+iterations, pose alone for 100); interior at 1 spp per iteration.
+
+| Run (192², 8 spp, depth 5 + NEE) | φ (last-40 mean) vs (−25.78, +16.04, −60.16)° | θ vs (0.30, 0.86, 0.88, 0.90) |
+|---|---|---|
+| control, 2e gradient | (−25.78, +16.02, −60.16) | (0.293, 0.845, 0.864, 0.886) |
+| control, edge only (2d) | (−25.78, +16.00, −60.17) | (0.293, 0.845, 0.865, 0.886) |
+| **context, 2e gradient** | (−2.66, −40.74, +0.49): diverges | (0.432, 0.678, 0.679, 0.681) |
+| context, edge only | (−9.19, +60.34, +13.37) | (0.289, 0.818, 0.834, 0.846) |
+| context, camera looking down on the checker | (+4.09, +36.43, +12.78) | (0.318, 0.833, 0.847, 0.862) |
+| context, no sun (sky only) | (−25.81, +16.21, **−20.12**) | (0.262, 0.804, 0.823, 0.842) |
+| context, depth 1 + NEE | (−20.31, −15.91, −79.08) | (0.346, 0.702, 0.713, 0.723) |
+| context, 16 px box-blurred pose loss for the first 100 (schedule change) | (−9.09, +57.00, +17.07) | (0.287, 0.816, 0.832, 0.843) |
+
+Per iteration, context (release, M-series): θ gradient 122 ms, edge term
+93 ms (including re-uploading the whole robot's top-level tree to the pairs'
+wavefront and tracing 16 384 pairs at depth 5; `GpuEdges`'s own draw is
+the 3 ms of piece 3), interior 15 ms (36 864 paths, 1 spp, depth 5, 16
+threads; 4 spp is 67 ms and changes nothing), 94 s for 300. Control: 87 /
+21 / 7 ms. The interior term was not too slow at full resolution.
+
+Why, measured with `--check` (the pose gradient at the start pose, θ at
+truth, against central differences of the 256-spp MSE, h = 0.01):
+
+1. **Discontinuities seen through a bounce.** Context with the sun, 256
+   seeds: edge + interior (−0.099 ± 0.010, −0.024 ± 0.004, −0.052 ± 0.006)
+   vs CD (+0.017 ± 0.002, −0.004 ± 0.001, +0.010 ± 0.002): z −11, −5, −9,
+   the wrong sign on pitch and elbow. With no sun it agrees (z 1, 1, 2); at
+   depth 1 with NEE (so primary cast shadows are in the image) it agrees (z
+   −1, 2, −1); at depth 2 with NEE it is already off (z −3, −3, −2). So the
+   missing term is not primary visibility and not the shadows the arm casts
+   on what the camera sees directly: it is the arm moving *in reflection* in
+   the polished torso (and the torso in the arm), and shadow boundaries
+   seen through that reflection. Neither 2e term samples those. The control
+   has the same bias in kind (z 6, 6, 6) but there the target is still the
+   fixed point and the reflections are of sky; in context the bias is 6× the
+   true gradient. The per-sample distribution is heavy-tailed on top of that
+   (median −0.098, p90 +0.020, max +0.66 on pitch).
+2. **The loss itself.** Even where the gradient is right, the image L2 along
+   the elbow (pitch, roll at truth) has a basin only ±5° wide around −60°:
+   with the sky only, a local minimum at −20° (MSE 2.81e-4 vs 3.01e-4 at
+   −40°), which is exactly where the no-sun fit stopped with pitch and roll
+   exact; at depth 1, one near −40°. Aluminium forearm over aluminium torso
+   gives the edge term little contrast to pull on away from the target
+   silhouette. A 16 px blur makes the sun-lit elbow scan monotone from −10° to
+   −60°, but with the biased gradient the blurred fit diverges anyway.
+3. Not interpenetration: the arm's mask gradient (depth 1, sky only,
+   control) is 27 % low on pitch (z −7) — a sign of 2e's interpenetration
+   risk or of stacked plates — but it is the same in both scenes and the
+   control converges.
+
+Fixed on the way: `edges.wgsl`'s sampler could land past the last
+cumulative sum (f32) on a trailing zero-importance slot and return `x / 0`;
+one such sample in a few thousand iterations NaN'd every fit. It now scores
+0. Next: secondary edges (reflection and shadow) for the conductor, or
+warped-area reparameterisation of the secondary rays (5. above), then the
+basin, by a pyramid or a silhouette/feature loss.
+
+![phase 2e rose in context](phase2e-rose-fit.png) (`phase2e-rose-loss.csv`:
+every run, every iteration, both pose terms and the time split.)
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.
