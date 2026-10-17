@@ -759,9 +759,19 @@ fn basis(n: Vec3) -> (Vec3, Vec3) {
     )
 }
 
-/// Off-surface ray origin. Phases 1–2b's fixed `1e-6` along the normal.
-fn offset(p: Point3, n: Vec3) -> Point3 {
-    p + n * 1e-6
+/// Off-surface origin for a hit at `x = o + t d`: along the normal by
+/// `ε = max(2⁻¹⁵ |x|∞, 2⁻¹⁷ (|o|∞ + t))`, the device's `offset_ray` in f64
+/// (same constants, so both tiers push off by the same relative amount at
+/// any scale). The first term is Wächter & Binder's 256 ulps of the position
+/// ("A Fast and Robust Method for Avoiding Self-Intersection", Ray Tracing
+/// Gems ch. 6); their per-coordinate integer form assumes a hit point
+/// interpolated from the vertices, and `o + t d` has rounding that grows with
+/// `|o| + t` (a floor at `z = 0` seen from far off has a `z` error of
+/// `ulp(t)`, not `ulp(0)`), hence the second. Hits then need only `t > 0`.
+pub fn offset(x: Point3, n: Vec3, o: Point3, t: f64) -> Point3 {
+    let inf = |p: Point3| p.x.abs().max(p.y.abs()).max(p.z.abs());
+    let e = (inf(x) / 32768.0).max((inf(o) + t) / 131072.0);
+    x + n * e
 }
 
 /// The light-sampled half of a conductor vertex: direction and the
@@ -900,7 +910,7 @@ fn trace(
             if !p.alive {
                 continue;
             }
-            let hit = scene.tlas.trace_closest_range(&p.ray, 1e-6, f64::INFINITY);
+            let hit = scene.tlas.trace_closest_range(&p.ray, 0.0, f64::INFINITY);
             // Splats in front of the surface (or of the sky): emissive and
             // absorbing, composited front to back, θ-free.
             if let Some(cloud) = &scene.splats {
@@ -938,7 +948,7 @@ fn trace(
             }
             let wo = -d;
             let (t, b) = basis(nrm);
-            let origin = offset(ih.hit.point, nrm);
+            let origin = offset(ih.hit.point, nrm, p.ray.origin, ih.hit.t);
             // The light sample: drawn before the BSDF's, three uniforms
             // whether or not it lands, so the stream does not depend on it.
             let nee = scene.nee.then(|| {
@@ -947,7 +957,7 @@ fn trace(
                 let lit = cos > 0.0
                     && !scene
                         .tlas
-                        .occluded_range(&Ray::new(origin, dir), 1e-6, f64::INFINITY);
+                        .occluded_range(&Ray::new(origin, dir), 0.0, f64::INFINITY);
                 (dir, cos, env.pdf(dir), lit)
             });
             if scene.surface(&ih) == Surface::Diffuse {

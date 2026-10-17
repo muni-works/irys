@@ -70,13 +70,16 @@ struct Params {
     inst_base: u32,
     nee: u32,
     cap: u32,
-    _pad: [u32; 4],
+    base: u32,
+    total: u32,
+    _pad: [u32; 2],
     sun: [f32; 4],
     env: [f32; 4],
 }
 
-/// Offset off a surface for the next ray. f32 cannot hold the CPU's 1e-6 at
-/// unit scale; hits need `t > eps / 10`.
+/// The splat compositor's segment start, `EPS / 10` (phase 2b's, unchanged).
+/// Opaque hits no longer use it: origins are pushed off by `offset_ray`,
+/// scaled to the scene ([`prb::offset`]).
 pub const EPS: f32 = 1e-4;
 
 /// One tang-emitted program: a pipeline, bind group and grid per kernel.
@@ -222,7 +225,9 @@ pub struct Timing {
 /// The scene's wavefront on the GPU, sized for one [`Scene`].
 pub struct GpuPrb {
     ctx: &'static GpuContext,
+    /// Paths per chunk: what the path buffer and the graph batch hold.
     paths: u32,
+    chunks: u32,
     lanes: usize,
     width: usize,
     params: wgpu::Buffer,
@@ -400,12 +405,24 @@ pub fn context() -> Result<&'static GpuContext, GpuError> {
 }
 
 impl GpuPrb {
-    /// Build every pipeline and buffer for `scene`'s lane count.
+    /// Build every pipeline and buffer for `scene`'s lane count. A frame
+    /// of any size is one call: the wavefront runs it in chunks of as many
+    /// paths as one dispatch of the IR's one-dimensional grid holds.
     pub fn new(ctx: &'static GpuContext, scene: &Scene) -> Self {
+        Self::chunked(ctx, scene, usize::MAX)
+    }
+
+    /// [`new`](Self::new) with chunks of at most `max_paths` paths, so tests
+    /// can split a small frame.
+    pub fn chunked(ctx: &'static GpuContext, scene: &Scene, max_paths: usize) -> Self {
         let dev = &ctx.device;
         let scope = dev.push_error_scope(wgpu::ErrorFilter::Validation);
         let lanes = scene.lanes();
-        let paths = scene.paths() as u32;
+        let per_path = scene.graph_width() / scene.paths().max(1);
+        // `to_wgsl` grids are 1-D: 65535 workgroups of (at most) 64.
+        let fit = 65535 * WG as usize / per_path.max(1);
+        let paths = scene.paths().min(fit).min(max_paths).max(1) as u32;
+        let chunks = scene.paths().div_ceil(paths as usize) as u32;
         let storage = |label: &str, bytes: u64| {
             dev.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -417,7 +434,8 @@ impl GpuPrb {
             })
         };
         let lane_bytes = lanes as u64 * 4;
-        let graph_bytes = scene.graph_width() as u64 * 4;
+        let width = paths as usize * per_path;
+        let graph_bytes = width as u64 * 4;
         let cols: Vec<wgpu::Buffer> = (0..COLUMNS)
             .map(|_| storage("column", graph_bytes))
             .collect();
@@ -456,7 +474,6 @@ impl GpuPrb {
             !(scene.nee && scene.splats().is_some()),
             "NEE with splats: shadow rays do not composite them"
         );
-        let width = scene.graph_width();
         let mut g = Graph::new(width);
         // The adjoint's reductions (δθ: four points, each over every lane)
         // split across a workgroup; the C and interpreter ignore this.
@@ -548,7 +565,6 @@ impl GpuPrb {
                 &pipes[5],
                 &[
                     (0, &params),
-                    (1, &path_buf),
                     (10, &l),
                     (17, &img),
                     (18, &target),
@@ -557,10 +573,7 @@ impl GpuPrb {
                 ],
             ),
             bind(&pipes[6], &[(0, &params), (20, &sq), (21, &loss)]),
-            bind(
-                &pipes[7],
-                &[(0, &params), (1, &path_buf), (19, &d_img), (22, &dl)],
-            ),
+            bind(&pipes[7], &[(0, &params), (19, &d_img), (22, &dl)]),
         ];
         let f = g.f;
         if let Some(e) = pollster::block_on(scope.pop()) {
@@ -569,8 +582,9 @@ impl GpuPrb {
         Self {
             ctx,
             paths,
+            chunks,
             lanes,
-            width,
+            width: scene.graph_width(),
             params,
             theta,
             dl,
@@ -595,14 +609,22 @@ impl GpuPrb {
         self.lanes
     }
 
-    fn params(&self, scene: &Scene, theta: &[f64; PARAMS], seed: u64, replay: bool) -> Params {
+    fn params(
+        &self,
+        scene: &Scene,
+        theta: &[f64; PARAMS],
+        seed: u64,
+        replay: bool,
+        chunk: u32,
+    ) -> Params {
+        let base = chunk * self.paths;
         let v = |v: irys_core::Vec3| [v.x as f32, v.y as f32, v.z as f32, 0.0];
         Params {
             seed: [seed as u32, (seed >> 32) as u32],
             size: [scene.size.0 as u32, scene.size.1 as u32],
             spp: scene.spp as u32,
             nw: scene.wavelengths as u32,
-            paths: self.paths,
+            paths: self.paths.min(scene.paths() as u32 - base),
             replay: replay as u32,
             eye: v(scene.eye - irys_core::Point3::origin()),
             fwd: v(scene.forward),
@@ -626,7 +648,9 @@ impl GpuPrb {
             inst_base: self.layout.inst_base,
             nee: scene.nee as u32,
             cap: self.paths,
-            _pad: [0; 4],
+            base,
+            total: scene.paths() as u32,
+            _pad: [0; 2],
             sun: {
                 let e = &scene.env;
                 [
@@ -650,11 +674,9 @@ impl GpuPrb {
         }
     }
 
-    fn encode(&self, scene: &Scene, replay: bool) -> wgpu::CommandBuffer {
-        self.encode_with(scene, replay, Score::None)
-    }
-
-    fn encode_with(&self, scene: &Scene, replay: bool, score: Score) -> wgpu::CommandBuffer {
+    /// One chunk's paths, start to finish: `gen`, then per bounce `bounce`
+    /// → eval IR → `update` [→ adjoint IR → `accumulate`], then `finish`.
+    fn encode_trace(&self, scene: &Scene, replay: bool) -> wgpu::CommandBuffer {
         let mut enc = self
             .ctx
             .device
@@ -673,29 +695,66 @@ impl GpuPrb {
                 }
             }
             self.dispatch(&mut pass, 3, if replay { 4 } else { 3 }, groups);
-            match score {
-                Score::None => {}
-                Score::Loss => {
-                    let px = (scene.size.0 * scene.size.1) as u32;
-                    self.dispatch(&mut pass, 5, 6, px.div_ceil(WG));
-                    self.dispatch(&mut pass, 6, 7, 1);
-                }
-                Score::LaneAdjoint => self.dispatch(&mut pass, 7, 8, groups),
-                Score::Both => {
-                    let px = (scene.size.0 * scene.size.1) as u32;
-                    self.dispatch(&mut pass, 5, 6, px.div_ceil(WG));
-                    self.dispatch(&mut pass, 6, 7, 1);
-                    self.dispatch(&mut pass, 7, 8, groups);
-                }
+        }
+        enc.finish()
+    }
+
+    /// Scoring over the whole frame, after every chunk is traced.
+    fn encode_score(&self, scene: &Scene, score: Score) -> wgpu::CommandBuffer {
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            let px = (scene.size.0 * scene.size.1) as u32;
+            let all = (scene.paths() as u32).div_ceil(WG);
+            if matches!(score, Score::Loss | Score::Both) {
+                self.dispatch(&mut pass, 5, 6, px.div_ceil(WG));
+                self.dispatch(&mut pass, 6, 7, 1);
+            }
+            if matches!(score, Score::LaneAdjoint | Score::Both) {
+                self.dispatch(&mut pass, 7, 8, all);
             }
         }
         enc.finish()
     }
 
+    /// Trace the frame chunk by chunk, each its own submit after its own
+    /// uniforms (queued writes land at the start of the next submit), then
+    /// score it.
+    fn run(&self, scene: &Scene, theta: &[f64; PARAMS], seed: u64, replay: bool, score: Score) {
+        let q = &self.ctx.queue;
+        q.write_buffer(
+            &self.theta,
+            0,
+            bytemuck::cast_slice(&theta.map(|x| x as f32)),
+        );
+        for c in 0..self.chunks {
+            q.write_buffer(
+                &self.params,
+                0,
+                bytemuck::bytes_of(&self.params(scene, theta, seed, replay, c)),
+            );
+            q.submit([self.encode_trace(scene, replay)]);
+        }
+        if score != Score::None {
+            q.submit([self.encode_score(scene, score)]);
+        }
+    }
+
+    /// `groups` workgroups as a grid WGSL's 65535-per-dimension limit takes;
+    /// kernels flatten it back (`flat` in the WGSL).
     fn dispatch(&self, pass: &mut wgpu::ComputePass, p: usize, b: usize, groups: u32) {
         pass.set_pipeline(&self.pipes[p]);
         pass.set_bind_group(0, &self.groups[b], &[]);
-        pass.dispatch_workgroups(groups, 1, 1);
+        let x = groups.min(65535);
+        pass.dispatch_workgroups(x, groups.div_ceil(x.max(1)), 1);
+    }
+
+    /// Chunks a frame is traced in.
+    pub fn chunks(&self) -> u32 {
+        self.chunks
     }
 
     fn check(&self, scene: &Scene) {
@@ -717,18 +776,7 @@ impl GpuPrb {
     pub fn forward(&mut self, scene: &Scene, theta: &[f64; PARAMS], seed: u64) -> Vec<f32> {
         self.check(scene);
         let t = Instant::now();
-        let q = &self.ctx.queue;
-        q.write_buffer(
-            &self.params,
-            0,
-            bytemuck::bytes_of(&self.params(scene, theta, seed, false)),
-        );
-        q.write_buffer(
-            &self.theta,
-            0,
-            bytemuck::cast_slice(&theta.map(|x| x as f32)),
-        );
-        q.submit([self.encode(scene, false)]);
+        self.run(scene, theta, seed, false, Score::None);
         let l = self.read(&self.l, self.lanes);
         self.timing.forward = t.elapsed();
         l
@@ -747,38 +795,14 @@ impl GpuPrb {
         assert_eq!(dl.len(), self.lanes);
         let t = Instant::now();
         let q = &self.ctx.queue;
-        q.write_buffer(
-            &self.params,
-            0,
-            bytemuck::bytes_of(&self.params(scene, theta, seed, true)),
-        );
-        q.write_buffer(
-            &self.theta,
-            0,
-            bytemuck::cast_slice(&theta.map(|x| x as f32)),
-        );
         let dl32: Vec<f32> = dl.iter().map(|&x| x as f32).collect();
         q.write_buffer(&self.dl, 0, bytemuck::cast_slice(&dl32));
         q.write_buffer(&self.grad, 0, bytemuck::cast_slice(&[0.0f32; PARAMS]));
-        q.submit([self.encode(scene, true)]);
+        self.run(scene, theta, seed, true, Score::None);
         let g = self.read(&self.grad, PARAMS);
         let l2 = self.read(&self.l2, self.lanes);
         self.timing.replay = t.elapsed();
         (std::array::from_fn(|p| g[p] as f64), l2)
-    }
-
-    fn upload(&self, scene: &Scene, theta: &[f64; PARAMS], seed: u64, replay: bool) {
-        let q = &self.ctx.queue;
-        q.write_buffer(
-            &self.params,
-            0,
-            bytemuck::bytes_of(&self.params(scene, theta, seed, replay)),
-        );
-        q.write_buffer(
-            &self.theta,
-            0,
-            bytemuck::cast_slice(&theta.map(|x| x as f32)),
-        );
     }
 
     /// The image [`gradient_l2`] and [`loss_l2`] score against, linear sRGB
@@ -804,21 +828,18 @@ impl GpuPrb {
         self.check(scene);
         let (primal, adjoint) = seeds;
         let t = Instant::now();
-        let ctx = self.ctx;
-        let q = &ctx.queue;
-        self.upload(scene, theta, primal, false);
         if adjoint == primal {
-            q.submit([self.encode_with(scene, false, Score::Both)]);
+            self.run(scene, theta, primal, false, Score::Both);
         } else {
-            q.submit([self.encode_with(scene, false, Score::Loss)]);
-            self.upload(scene, theta, adjoint, false);
-            q.submit([self.encode_with(scene, false, Score::LaneAdjoint)]);
+            self.run(scene, theta, primal, false, Score::Loss);
+            self.run(scene, theta, adjoint, false, Score::LaneAdjoint);
         }
         self.timing.forward = t.elapsed();
         let t = Instant::now();
-        self.upload(scene, theta, adjoint, true);
-        q.write_buffer(&self.grad, 0, bytemuck::cast_slice(&[0.0f32; PARAMS]));
-        q.submit([self.encode(scene, true)]);
+        self.ctx
+            .queue
+            .write_buffer(&self.grad, 0, bytemuck::cast_slice(&[0.0f32; PARAMS]));
+        self.run(scene, theta, adjoint, true, Score::None);
         let out = self.read_many(&[(&self.loss, 1), (&self.grad, PARAMS)]);
         self.timing.replay = t.elapsed();
         (out[0] as f64, std::array::from_fn(|p| out[1 + p] as f64))
@@ -828,20 +849,14 @@ impl GpuPrb {
     /// float.
     pub fn loss_l2(&mut self, scene: &Scene, theta: &[f64; PARAMS], seed: u64) -> f64 {
         self.check(scene);
-        self.upload(scene, theta, seed, false);
-        self.ctx
-            .queue
-            .submit([self.encode_with(scene, false, Score::Loss)]);
+        self.run(scene, theta, seed, false, Score::Loss);
         self.read(&self.loss, 1)[0] as f64
     }
 
     /// Render one frame and splat it on the device: linear sRGB `w·h·3`.
     pub fn image(&mut self, scene: &Scene, theta: &[f64; PARAMS], seed: u64) -> Vec<f32> {
         self.check(scene);
-        self.upload(scene, theta, seed, false);
-        self.ctx
-            .queue
-            .submit([self.encode_with(scene, false, Score::Loss)]);
+        self.run(scene, theta, seed, false, Score::Loss);
         self.last_image()
     }
 

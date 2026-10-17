@@ -269,3 +269,117 @@ fn nee_throughput() {
         );
     }
 }
+
+/// Piece 2: the same scene in millimetres. Light transport is scale-free,
+/// so the ×1000 frame is the unit frame up to rounding; self-intersection
+/// ("acne") shows as pixels that went dark. Both images are normalised by
+/// their mean before comparing.
+#[test]
+fn cad_scale_renders_without_acne() {
+    let ctx = device!();
+    let (w, h) = (96, 96);
+    let render = |scale: f64| {
+        let scene = Scene::pair(w, h, 8, scale);
+        let mut g = GpuPrb::new(ctx, &scene);
+        let img = gpu::widen(&g.image(&scene, &GOLD, 21));
+        let m = img.iter().sum::<f64>() / img.len() as f64;
+        img.iter().map(|x| x / m).collect::<Vec<f64>>()
+    };
+    let unit = render(1.0);
+    for scale in [1e3, 1e5] {
+        let big = render(scale);
+        let px = |im: &[f64], p: usize| im[3 * p] + im[3 * p + 1] + im[3 * p + 2];
+        let mad = (0..w * h)
+            .map(|p| (px(&big, p) - px(&unit, p)).abs())
+            .sum::<f64>()
+            / (0..w * h).map(|p| px(&unit, p)).sum::<f64>();
+        let dark = (0..w * h)
+            .filter(|&p| px(&big, p) < 0.8 * px(&unit, p))
+            .count();
+        eprintln!(
+            "×{scale:e}: mean |Δ| / mean {mad:.2e}, {dark}/{} pixels > 20% darker",
+            w * h
+        );
+        assert!(mad < 2e-2, "×{scale}: images differ by {mad}");
+        assert!(dark * 200 < w * h, "×{scale}: {dark} acne pixels");
+    }
+}
+
+/// Chunking is invisible: a frame traced in ten chunks (the last one
+/// short) has the same `L`, image and loss bits as in one dispatch, the same
+/// gradient up to the reduction's grouping, and replays bit-exactly.
+#[test]
+fn chunks_are_invisible() {
+    let ctx = device!();
+    let scene = Scene::pair(48, 48, 4, 1.0);
+    let target = vec![0.1; 48 * 48 * 3];
+    let mut one = GpuPrb::new(ctx, &scene);
+    let mut ten = GpuPrb::chunked(ctx, &scene, 1000);
+    assert_eq!((one.chunks(), ten.chunks()), (1, 10));
+    one.set_target(&target);
+    ten.set_target(&target);
+    let l1 = one.forward(&scene, &THETA0, 3);
+    let l10 = ten.forward(&scene, &THETA0, 3);
+    assert_eq!(bits(&l1), bits(&l10), "L");
+    assert_eq!(
+        bits(&one.image(&scene, &THETA0, 3)),
+        bits(&ten.image(&scene, &THETA0, 3)),
+        "image"
+    );
+    let (v1, d1) = one.gradient_l2(&scene, &THETA0, (3, 4));
+    let (v10, d10) = ten.gradient_l2(&scene, &THETA0, (3, 4));
+    assert_eq!(v1.to_bits(), v10.to_bits(), "loss");
+    for p in 0..PARAMS {
+        eprintln!(
+            "θ{p}: one {:+.7e} ten {:+.7e} rel {:.1e}",
+            d1[p],
+            d10[p],
+            rel(d1[p], d10[p])
+        );
+        assert!(rel(d1[p], d10[p]) < 1e-4);
+    }
+    let l = ten.forward(&scene, &THETA0, 9);
+    let (_, l2) = ten.replay(&scene, &THETA0, 9, &vec![1.0; l.len()]);
+    assert_eq!(bits(&l), bits(&l2), "chunked replay");
+}
+
+/// A 1024 × 1024 frame (4 spp, NEE: 4.2 M paths, 16.8 M lanes, past the old
+/// 65535 × 64-lane cap) in one call: rendered, replayed bit-exactly, and
+/// the same picture as a small frame.
+#[test]
+fn megapixel_in_one_call() {
+    let ctx = device!();
+    let scene = Scene::pair(1024, 1024, 4, 1.0);
+    let t = std::time::Instant::now();
+    let mut g = GpuPrb::new(ctx, &scene);
+    let built = t.elapsed();
+    let t = std::time::Instant::now();
+    let img = gpu::widen(&g.image(&scene, &GOLD, 1));
+    let render = t.elapsed();
+    let l = g.forward(&scene, &GOLD, 2);
+    let t = std::time::Instant::now();
+    let (d, l2) = g.replay(&scene, &GOLD, 2, &vec![1e-6; l.len()]);
+    let replay = t.elapsed();
+    let same = l
+        .iter()
+        .zip(&l2)
+        .filter(|(a, b)| a.to_bits() == b.to_bits())
+        .count();
+    eprintln!(
+        "1024² × 4 spp in {} chunks: build {built:.0?}, image {render:.0?}, replay {replay:.0?}; {same}/{} lanes bit-identical; δθ {d:.3?}",
+        g.chunks(),
+        l.len()
+    );
+    assert!(g.chunks() > 1);
+    assert_eq!(same, l.len());
+    assert!(img.iter().all(|x| x.is_finite()));
+    let small = Scene::pair(128, 128, 64, 1.0);
+    let s = gpu::widen(&GpuPrb::new(ctx, &small).image(&small, &GOLD, 1));
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    eprintln!(
+        "mean 1024² {:.5}, 128² × 64 spp {:.5}",
+        mean(&img),
+        mean(&s)
+    );
+    assert!(rel(mean(&img), mean(&s)) < 1e-2);
+}

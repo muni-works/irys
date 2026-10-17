@@ -21,7 +21,7 @@ struct Params {
     size: vec2<u32>,      // image w, h
     spp: u32,
     nw: u32,              // wavelengths per path, 1..4
-    paths: u32,
+    paths: u32,           // paths in this chunk
     replay: u32,
     eye: vec4<f32>,
     fwd: vec4<f32>,
@@ -39,11 +39,11 @@ struct Params {
     splat_base: u32,      // first splat record in `geo`, in vec4s
     inst_base: u32,       // first instance record in `geo`, in vec4s
     nee: u32,             // next-event estimation + MIS on
-    cap: u32,             // paths the graph batch holds: light lanes start at cap × nw
+    cap: u32,             // paths a chunk holds: light lanes start at cap × nw
+    base: u32,            // this chunk's first path in the frame
+    total: u32,           // paths in the frame
     _p0: u32,
     _p1: u32,
-    _p2: u32,
-    _p3: u32,
     sun: vec4<f32>,       // unit sun direction, κ
     env: vec4<f32>,       // sun radiance, sky scale, SUN_PICK, vMF normaliser κ / (2π (1 − e^{−2κ}))
 }
@@ -331,7 +331,8 @@ fn to_local(k: u32, o: vec3<f32>, d: vec3<f32>) -> array<vec3<f32>, 2> {
 // a bottom-level one, each leaf's instances in leaf order, each through its
 // own bottom-level walk.
 fn intersect(o: vec3<f32>, d: vec3<f32>, tmax: f32, any: bool) -> Hit {
-    let tmin = params.eps * 0.1;
+    // Origins are pushed off their surface by `offset_ray`.
+    let tmin = 0.0;
     let inv = 1.0 / d;
     var best = Hit(tmax, NONE, NONE);
     var stack: array<u32, 32>;
@@ -380,6 +381,20 @@ fn intersect(o: vec3<f32>, d: vec3<f32>, tmax: f32, any: bool) -> Hit {
         }
     }
     return best;
+}
+
+// Off-surface origin, `prb::offset`: along the normal by
+// ε = max(2⁻¹⁵ |x|∞, 2⁻¹⁷ (|o|∞ + t)). The first term is Wächter & Binder's
+// ("A Fast and Robust Method for Avoiding Self-Intersection", Ray Tracing
+// Gems ch. 6) 256 ulps of the position; their per-coordinate integer form
+// assumes a barycentric hit point, and ours is o + t d, whose rounding grows
+// with |o| + t — a floor at z = 0 seen from 5 m has z error ~ulp(5 m), not
+// ulp(0) — hence the second. Both scale with the scene; hits need only t > 0.
+fn offset_ray(x: vec3<f32>, n: vec3<f32>, o: vec3<f32>, t: f32) -> vec3<f32> {
+    let ax = abs(x);
+    let ao = abs(o);
+    let e = max(max(ax.x, max(ax.y, ax.z)) * (1.0 / 32768.0), (max(ao.x, max(ao.y, ao.z)) + t) * (1.0 / 131072.0));
+    return x + n * e;
 }
 
 // Anything in the way of a shadow ray to the environment.
@@ -624,21 +639,52 @@ fn write_lane(j: u32, ci: f32, co: f32, ch: f32, oh: f32, b: vec3<f32>) {
 }
 
 // ---- the kernels ----
+//
+// A frame is traced in chunks of `cap` paths (the most one 1-D dispatch of
+// the IR's kernels holds). Path `i` of a chunk is path `base + i` of the
+// frame: its generator, pixel, and `L`/`δL` slots are the frame's; its
+// state, graph columns and `δf` are the chunk's. Slots past the chunk's
+// `paths` are dead paths with harmless lanes, so a short last chunk feeds
+// the graph nothing.
 
-@compute @workgroup_size(64)
-fn gen(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= params.paths) { return; }
-    var s = rng_new(i);
-    let u = rand(&s);
+// A 2-D grid flattened: kernels over a whole frame can need more than 65535
+// workgroups (`GpuPrb::dispatch`).
+fn flat(gid: vec3<u32>, nwg: vec3<u32>) -> u32 {
+    return gid.x + gid.y * nwg.x * 64u;
+}
+
+// The path's wavelengths: the first draw of its generator, as `gen` makes
+// them, so scoring can rebuild them for any path of the frame.
+fn lambdas(s: ptr<function, vec2<u32>>) -> vec4<f32> {
+    let u = rand(s);
     var lam = vec4<f32>(0.0);
     for (var k = 0u; k < params.nw; k = k + 1u) {
         let v = u + f32(k) / f32(params.nw);
         lam[k] = 380.0 + 400.0 * (v - floor(v));
     }
+    return lam;
+}
+
+fn path_lambdas(path: u32) -> vec4<f32> {
+    var s = rng_new(path);
+    return lambdas(&s);
+}
+
+@compute @workgroup_size(64)
+fn gen(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.cap) { return; }
+    if (i >= params.paths) {
+        paths[i].smp = vec4<f32>(0.0);
+        paths[i].alive = 0u;
+        return;
+    }
+    let g = params.base + i;
+    var s = rng_new(g);
+    let lam = lambdas(&s);
     let w = params.size.x;
     let h = params.size.y;
-    let px = i / params.spp;
+    let px = g / params.spp;
     let x = f32(px % w) + rand(&s);
     let y = f32(px / w) + rand(&s);
     let sx = (2.0 * x / f32(w) - 1.0) * params.tan_half * f32(w) / f32(h);
@@ -668,7 +714,7 @@ fn harmless(j: u32) {
 @compute @workgroup_size(64)
 fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if (i >= params.paths) { return; }
+    if (i >= params.cap) { return; }
     var p = paths[i];
     let base = i * params.nw;
     let light_base = params.cap * params.nw + base;
@@ -721,7 +767,7 @@ fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
     let conductor = prim_conductor(hit.prim);
     let t = basis_t(n);
     let b = basis_b(n);
-    let origin = x + n * params.eps;
+    let origin = offset_ray(x, n, o, hit.t);
     var s = p.rng;
     // The light sample: three uniforms, drawn before the BSDF's whether or
     // not it lands.
@@ -798,9 +844,10 @@ fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(64)
 fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if (i >= params.paths) { return; }
+    if (i >= params.cap) { return; }
     var p = paths[i];
     let base = i * params.nw;
+    let frame = (params.base + i) * params.nw;
     let light_base = params.cap * params.nw + base;
     for (var k = 0u; k < params.nw; k = k + 1u) {
         df_out[base + k] = 0.0;
@@ -812,18 +859,19 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     var live = false;
     for (var k = 0u; k < params.nw; k = k + 1u) {
         let j = base + k;
+        let fj = frame + k;
         // NEE first: C_j joins L_j before the BSDF lane's δf reads it.
         if (p.ldir.w > 0.0) {
             let g = p.tp[k] * p.ldir.w * sky(p.ldir.xyz, p.lam[k]);
             if (params.replay != 0u) {
-                df_out[light_base + k] = dl_in[j] * g;
+                df_out[light_base + k] = dl_in[fj] * g;
             }
             p.rad[k] = p.rad[k] + g * f_in[light_base + k];
         }
         if (p.smp.y > 0.0) {
             let f = f_in[j];
             if (params.replay != 0u && f > 0.0) {
-                df_out[j] = dl_in[j] * (l_in[j] - p.rad[k]) / f;
+                df_out[j] = dl_in[fj] * (l_in[fj] - p.rad[k]) / f;
             }
             p.tp[k] = p.tp[k] * (f * p.smp.x / p.smp.y);
             live = live || p.tp[k] > 0.0;
@@ -841,7 +889,7 @@ fn finish(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.paths) { return; }
     let p = paths[i];
     for (var k = 0u; k < params.nw; k = k + 1u) {
-        l_out[i * params.nw + k] = p.rad[k];
+        l_out[(params.base + i) * params.nw + k] = p.rad[k];
     }
 }
 
@@ -883,13 +931,13 @@ fn lane_rgb(l: f32) -> vec3<f32> {
 // lane order (as `prb::image`), then the residual against the target, the
 // pixel's share of `∂loss/∂image`, and its squared error for `loss_sum`.
 @compute @workgroup_size(64)
-fn score(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let px = gid.x;
+fn score(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let px = flat(gid, nwg);
     if (px >= params.pixels) { return; }
     var c = vec3<f32>(0.0);
     for (var s = 0u; s < params.spp; s = s + 1u) {
         let i = px * params.spp + s;
-        let lam = paths[i].lam;
+        let lam = path_lambdas(i);
         for (var k = 0u; k < params.nw; k = k + 1u) {
             c = c + l_in[i * params.nw + k] * lane_rgb(lam[k]);
         }
@@ -927,15 +975,16 @@ fn loss_sum(@builtin(local_invocation_id) lid: vec3<u32>) {
 }
 
 // `prb::lane_adjoint`: δL per lane from the pixel adjoint and the lane's own
-// wavelength response. Runs after the adjoint seed's forward pass, so the
-// wavelengths in `paths` are that frame's.
+// wavelength response, over every path of the frame. The wavelengths are
+// rebuilt from the generators of `params.seed`, which is the adjoint frame's
+// when this runs.
 @compute @workgroup_size(64)
-fn lane_adjoint(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= params.paths) { return; }
+fn lane_adjoint(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let i = flat(gid, nwg);
+    if (i >= params.total) { return; }
     let px = i / params.spp;
     let g = vec3<f32>(d_img[px * 3u], d_img[px * 3u + 1u], d_img[px * 3u + 2u]);
-    let lam = paths[i].lam;
+    let lam = path_lambdas(i);
     for (var k = 0u; k < params.nw; k = k + 1u) {
         dl_out[i * params.nw + k] = dot(g, lane_rgb(lam[k]));
     }
