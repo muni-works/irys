@@ -745,6 +745,61 @@ Risks and next:
    costs traversal and edge count; a coarser tolerance for rendering would
    cut both.
 
+## Phase 2e: the interior term, cheaper edges, the camera (2026-10-17)
+
+Continues 2d's pose gradients. Scenes are the tests' own (`tests/phase2e.rs`):
+an arm of boxes — a static post, a conductor upper link, a diffuse forearm,
+each pre-rolled so no face is axis-aligned, gaps at both joints — at depth 4
+with NEE, rigged by shoulder pitch, shoulder yaw and elbow.
+
+### 1. The interior term (`interior.rs`)
+
+`∂I/∂φ` at fixed random numbers, where the integrand is smooth: the hit
+point moving on a moving triangle, its normal turning, the next direction
+(drawn in the hit's frame) turning with it, and every cosine, GGX value,
+pdf, MIS weight and sky lookup downstream. **Hand-derived forward mode**: a
+dual number (`D`, ≤ 8 tangents) re-traces the frame with the primal trace's
+control flow — Möller–Trumbore against the triangle the primal hit, corners
+as duals; GGX visible-normal sampling and eval in duals; NEE and the
+environment in duals. Not the IR: the GGX graph differentiates to `θ` with
+the columns as data; making it take `∂cos/∂φ` lanes would need a second
+graph for one factor of many, and the duals cover all of them. The dual
+trace's values equal the forward pass's `L` to 9e-15.
+
+*Attached frames.* The renderer's `basis(n)` flips where `n_z` crosses 0 — a
+discontinuity in `φ` no edge sees. The derivative taken is that of the
+estimator whose frame on a moving instance is `R(φ)R(φ₀)ᵀ basis(n(φ₀))`:
+equal to the rendered one at `φ₀`, a valid estimator of the same `I(φ)` for
+every `φ`, so its derivative is unbiased from the very same paths. Rigid
+placements assumed (the frame's angular velocity is the skew part of
+`L̇L⁻¹`).
+
+*A 2d bug, found by this gate.* 2d sampled a crease between two front faces
+from both sides and halved where the outer ray landed next to the edge
+point. When the grazing side's ownership test failed (its inner ray at
+10⁻³ px onto a nearly edge-on face) half the jump was lost. A mask has no
+jump at creases, so every 2d gate passed; shaded, the edge term on the arm
+was +15.7 against a true total of −3.0 (z ≈ 25), and this — not the missing
+interior term — is what 2d's "shaded arm disagrees in sign" was. Now a
+crease has one owner, the face meeting the eye more squarely, at full
+weight, and the outer ray's `f` is whatever it lands on.
+
+| Gate (CPU f64; CD over 16² fixed points per pixel, h 0.01, 4 seeds) | Result |
+|---|---|
+| dual values vs `prb::forward` (interpreter), 3456 lanes | worst rel 9.3e-15 |
+| per-lane tangent vs CD at one seed, translations (frames fixed), depth 4 | 92/92, 20/20 moving lanes agree to 1e-4 |
+| per-lane, rotations, depth 1 + NEE | 44/44, 44/44, 12/12 |
+| **arm vs sky, depth 4, NEE**, 48×36, edge 24 × 8192 pairs + interior 24 × 4 spp | sum (−3.17 ± 0.67, −3.65 ± 0.28, −0.06 ± 0.18) vs CD (−5.41 ± 1.35, −2.83 ± 0.94, −0.26 ± 0.54): z 1.5, 0.8, 0.4. Edge alone z 2.5, 0.2, 2.0; interior (−1.49, −1.02, +1.31) |
+| same arm over a floor it shadows (ignored test, measured) | sum (−31.1, +8.5, −6.3) vs CD (−36.9 ± 1.4, +11.7 ± 2.1, −8.7 ± 1.3): z 3.6, 1.5, 1.9 — the floor shadow moving is ~15 % of φ0 and neither term sees it |
+| a conductor slab filling the frame (scratch, not kept) | edge + interior (523, 90, 11.3) vs CD (519 ± 12, 94 ± 8, 9.0 ± 2.7) |
+
+Deviations: CPU only (the device has no dual trace); triangles only on the
+path (analytic prims refused), no splats; the checker's edges ignored.
+Interpenetrating instances are a discontinuity (their intersection curve)
+that is no triangle's edge — the first arm, with links sunk into each other
+and into the post, disagreed by 10σ before the gaps; rose's links bolt
+plate-to-plate, so this matters there.
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.

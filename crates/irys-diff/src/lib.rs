@@ -17,6 +17,7 @@
 pub mod ggx;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+pub mod interior;
 pub mod ir;
 pub mod prb;
 pub mod vis;

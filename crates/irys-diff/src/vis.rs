@@ -28,14 +28,17 @@
 //! importance (stratified, `n` per call) — importance 1 on silhouettes and
 //! boundaries, a crease between front faces by its dihedral angle
 //! ([`crease_weight`]), [`BACK_WEIGHT`] behind — and weighs
-//! `(Σ ℓ w / (w_e n)) · v_n · ½?` the difference of two full paths traced through
+//! `(Σ ℓ w / (w_e n)) · v_n` times the difference of two full paths traced through
 //! `s ∓ εn` ([`Scene::set_points`]; the pair shares its generator, so
 //! the difference is common random numbers). Each triangle owns its edges:
 //! the inner ray must hit *that* triangle or one coplanar with it on the
 //! same face — CAD tessellations are full of slivers thinner than `ε` —
-//! (otherwise the edge is hidden at `s` and the sample is 0), and where the outer ray lands on the same
-//! instance right next to `X` — a crease, which the neighbour also samples
-//! from its side — each side takes half. Edges shared by two coplanar
+//! (otherwise the edge is hidden at `s` and the sample is 0). A crease
+//! between two front faces is sampled from one side only, the face that
+//! meets the eye more squarely (phase 2e: 2d sampled it from both and
+//! halved where the outer ray landed next to `X`, which lost half the jump
+//! whenever the grazing side's ownership test failed — invisible in a mask,
+//! O(1) when shaded). Edges shared by two coplanar
 //! triangles are never candidates: `f` is continuous across them. No mesh
 //! adjacency is assumed beyond that filter, so unwelded and T-junctioned
 //! tessellations stay correct.
@@ -207,7 +210,8 @@ pub struct EdgeSamples {
     /// Samples whose edge was visible at the sample (inner ray hit its own
     /// triangle).
     pub visible: usize,
-    /// Of those, crease samples split with the neighbour.
+    /// Of those, samples whose outer ray lands on the same instance next to
+    /// the edge point (creases; a diagnostic).
     pub halved: usize,
 }
 
@@ -278,10 +282,13 @@ impl EdgeSamples {
             let (nbr, cos) = (&edges.nbr[place.blas], &edges.cos[place.blas]);
             let normal = &edges.normal[place.blas];
             let tris = m.triangles();
-            let front = |tri: usize| {
+            // How squarely triangle `tri` faces the eye: > 0 is front.
+            let facing = |tri: usize| {
                 let x = place.to_world.apply_point(&pos[tris[tri][0] as usize]);
-                place.to_world.apply_normal(&normal[tri]).dot(&(eye - x)) > 0.0
+                let n = place.to_world.apply_normal(&normal[tri]);
+                n.dot(&(eye - x)) / (n.norm() * (eye - x).norm()).max(1e-300)
             };
+            let front = |tri: usize| facing(tri) > 0.0;
             for (tri, t) in tris.iter().enumerate() {
                 let Some(px) = t
                     .iter()
@@ -301,7 +308,17 @@ impl EdgeSamples {
                         NONE if f => 1.0,
                         NONE => BACK_WEIGHT,
                         n => match (f, front(n as usize)) {
-                            (true, true) => crease_weight(cos[tri][e] as f64),
+                            // A crease between front faces has one owner:
+                            // the squarer face, so its inner ray is the
+                            // robust one, and the jump is counted once
+                            // whatever the grazing side's ray lands on.
+                            (true, true) => {
+                                let (a, b) = (facing(tri), facing(n as usize));
+                                if a < b || (a == b && tri > n as usize) {
+                                    continue;
+                                }
+                                crease_weight(cos[tri][e] as f64)
+                            }
                             (false, false) => BACK_WEIGHT,
                             _ => 1.0,
                         },
@@ -445,19 +462,16 @@ impl EdgeSamples {
             let crease = hit(outer).is_some_and(|oh| {
                 oh.payload == seg.k && (oh.hit.point - x).norm() < 1e-4 * (x - eye).norm()
             });
-            let half = if crease {
+            if crease {
                 out.halved += 1;
-                0.5
-            } else {
-                1.0
-            };
+            }
             let wt = (0..np)
                 .map(|j| {
                     let [p, q] = &shifted[j];
                     let dx =
                         (p[seg.mi].apply_point(&xl) - q[seg.mi].apply_point(&xl)) / (2.0 * RIG_H);
                     let vn = jac[0].dot(&dx) * nrm[0] + jac[1].dot(&dx) * nrm[1];
-                    half * vn * wtotal / (seg.w * n as f64)
+                    vn * wtotal / (seg.w * n as f64)
                 })
                 .collect();
             put(&mut out, s, nrm, wt);
