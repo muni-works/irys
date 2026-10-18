@@ -83,7 +83,11 @@ fn node(tx: f32, ty: f32, tz: f32, s: f32) -> [f32; 16] {
 }
 
 fn tiny() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("irys-phase5a-{}", std::process::id()));
+    // One directory per call: tests run in parallel in one process, and two
+    // writing the same files raced (one read a half-written glb).
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("irys-phase5a-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // Mesh 0: the floor (diffuse 0.6), placed twice; mesh 1: a ceiling
     // panel facing down (emitter, radiance 4), placed once; mesh 2: glass,
