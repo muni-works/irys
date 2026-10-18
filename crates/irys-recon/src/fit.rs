@@ -339,13 +339,21 @@ impl Fitter {
                         mu *= 4.0;
                         continue;
                     }
-                    let Ok(ce) = self.eval(&cand, true) else {
+                    // The image alone decides; the Jacobian is only built
+                    // where a step is taken.
+                    let Ok(ce) = self.eval(&cand, false) else {
                         mu *= 4.0;
                         continue;
                     };
                     evals += 1;
                     let cl = self.linearise(&ce, level, np);
                     if cl.cost < lin.cost {
+                        let Ok(ce) = self.eval(&cand, true) else {
+                            mu *= 4.0;
+                            continue;
+                        };
+                        evals += 1;
+                        let cl = self.linearise(&ce, level, np);
                         let step = delta.iter().fold(0.0f64, |m, d| m.max(d.abs()));
                         solved = Some((cand, ce, cl, step));
                         mu = (mu / 3.0).max(1e-7);

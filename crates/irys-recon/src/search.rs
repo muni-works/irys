@@ -394,6 +394,10 @@ impl Algorithmic {
                     out.push(Proposal { program: swap(Feature::Boss { x, y, r, bh: 3.0 }), why: format!("f{i} hole → boss"), group: None });
                 }
                 Feature::Counterbore { x, y, r, cr, .. } => {
+                    if let Some(raised) = raised_near(x, y) {
+                        out.push(Proposal { program: swap(raised), why: format!("f{i} counterbore → boss by parallax"), group: None });
+                    }
+                    out.push(Proposal { program: swap(Feature::Boss { x, y, r: cr, bh: 3.0 }), why: format!("f{i} counterbore → boss"), group: None });
                     out.push(Proposal { program: swap(Feature::Hole { x, y, r }), why: format!("f{i} counterbore → hole"), group: None });
                     out.push(Proposal { program: swap(Feature::Hole { x, y, r: cr }), why: format!("f{i} counterbore → hole (outer)"), group: None });
                 }
@@ -604,7 +608,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Self { workers: 4, rounds: 8 }
+        Self { workers: 8, rounds: 8 }
     }
 }
 

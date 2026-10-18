@@ -79,7 +79,14 @@ fn candidates(scene: &Scene, p: &[Point3], t: &[[u32; 3]]) -> Vec<Cand> {
         })
         .collect();
     let mut edges: HashMap<(usize, usize), Vec<(usize, usize)>> = HashMap::new();
+    // Slivers (vcad's repair leaves some along booleans' seams) have no
+    // usable normal: they are not neighbours, so the crease beside one is
+    // still a candidate (the per-sample test sorts out what it really is).
+    let area: Vec<f64> = t.iter().map(|tri| face_normal(p, tri).norm()).collect();
     for (ti, tri) in t.iter().enumerate() {
+        if area[ti] < 1e-6 {
+            continue;
+        }
         for k in 0..3 {
             let (a, b) = (id[tri[k] as usize], id[tri[(k + 1) % 3] as usize]);
             if a == b {

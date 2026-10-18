@@ -268,15 +268,22 @@ impl Program {
     /// a counterbore's depth and its inner hole's radius change what the
     /// bore's floor and the hole below it see of the sky (occlusion — the
     /// secondary visibility and interior terms), which the primary edge
-    /// term leaves out; its column there has the wrong sign. Their columns
-    /// are forward differences instead ([`crate::model::Renderer::eval`]).
+    /// term leaves out; its column there has the wrong sign. A boss's
+    /// shadow and sky occlusion on the plate move with all four of its
+    /// parameters. Their columns are forward differences instead
+    /// ([`crate::model::Renderer::eval`]).
     pub fn occluded_params(&self) -> Vec<usize> {
         let mut out = Vec::new();
         let mut j = 3 + matches!(self.corner, Corner::Fillet(_) | Corner::Chamfer(_)) as usize;
         for f in &self.features {
-            if let Feature::Counterbore { .. } = f {
-                out.push(j + 2);
-                out.push(j + 4);
+            match f {
+                Feature::Counterbore { .. } => out.extend([j + 2, j + 4]),
+                // A boss casts a shadow and occludes the sky of the plate
+                // around it; moving it moves both, and that change is larger
+                // than its own edges' (the edge column is half the size, and
+                // LM steps the boss away from the target with it).
+                Feature::Boss { .. } => out.extend([j, j + 1, j + 2, j + 3]),
+                _ => {}
             }
             j += f.params().len();
         }
@@ -520,27 +527,17 @@ impl Program {
                         .map_err(|e| format!("counterbore: {e:?}"))?
                 }
                 Feature::Slot { x, y, len, r, axis } => {
-                    // A stadium sketch, extruded through: one analytic cutter
-                    // (a box unioned with two cylinders loses faces in vcad 0.10).
+                    // Three plain through-cuts — the box between the centres,
+                    // then each end's cylinder — like holes. (A stadium sketch
+                    // extruded as one cutter, or the three unioned first, lose
+                    // faces in vcad 0.10's booleans for some sizes.)
                     let (ux, uy) = if axis == Axis::X { (1.0, 0.0) } else { (0.0, 1.0) };
-                    let (wx, wy) = (-uy, ux);
-                    let p = |a: f64, b: f64| km::Point2::new(x + ux * a + wx * b, y + uy * a + wy * b);
-                    let l2 = len / 2.0;
-                    let segs = vec![
-                        SketchSegment::Line { start: p(-l2, -r), end: p(l2, -r) },
-                        SketchSegment::Arc { start: p(l2, -r), end: p(l2, r), center: p(l2, 0.0), ccw: true },
-                        SketchSegment::Line { start: p(l2, r), end: p(-l2, r) },
-                        SketchSegment::Arc { start: p(-l2, r), end: p(-l2, -r), center: p(-l2, 0.0), ccw: true },
-                    ];
-                    let prof = SketchProfile::new(
-                        km::Point3::new(0.0, 0.0, -1.0),
-                        km::Vec3::new(1.0, 0.0, 0.0),
-                        km::Vec3::new(0.0, 1.0, 0.0),
-                        segs,
-                    )
-                    .map_err(|e| format!("slot sketch: {e:?}"))?;
-                    let cutter = Solid::extrude(prof, km::Vec3::new(0.0, 0.0, h + 2.0)).map_err(|e| format!("slot: {e:?}"))?;
-                    s.try_difference(&cutter).map_err(|e| format!("slot: {e:?}"))?
+                    let (bx, by) = if axis == Axis::X { (len, 2.0 * r) } else { (2.0 * r, len) };
+                    let bar = Solid::cube(bx, by, h + 2.0).translate(x - bx / 2.0, y - by / 2.0, -1.0);
+                    s.try_difference(&bar)
+                        .and_then(|s| s.try_difference(&through(x - ux * len / 2.0, y - uy * len / 2.0, r)))
+                        .and_then(|s| s.try_difference(&through(x + ux * len / 2.0, y + uy * len / 2.0, r)))
+                        .map_err(|e| format!("slot: {e:?}"))?
                 }
                 Feature::Boss { x, y, r, bh } => {
                     let boss = Solid::cylinder(r, bh + h / 2.0, SEGMENTS).translate(x, y, h / 2.0);
