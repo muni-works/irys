@@ -304,14 +304,14 @@ pub fn bump(s: &Shading, rgb: [f64; 3], strength: f64) -> Vec3 {
     }
     let t = t.normalize();
     let b = n.cross(&t) * s.tangent[3];
-    // Green is image-up (OpenGL), and `b` points along `+v`, which is
-    // image-down in glTF's UVs: green enters negated. (The map's own
-    // evidence: `(r, −g)` is 2.7× closer to curl-free than `(r, g)` as a
-    // height gradient in image coordinates; `skin_head.rs` checks it.)
+    // Green is `+b` (`+v`): OpenGL's green-up, with `v` running up the
+    // image as in this asset's UVs ([`load`] flips glTF's). The map's own
+    // evidence: as a height gradient in image-down coordinates, `(r, −g)`
+    // is 2.3× closer to curl-free than `(r, g)` (`skin_head.rs`).
     let d = rgb.map(|c| 2.0 * c - 1.0);
     let m = [
         d[0] * strength,
-        -d[1] * strength,
+        d[1] * strength,
         1.0 - strength + d[2].max(0.0) * strength,
     ];
     let out = t * m[0] + b * m[1] + n * m[2];
@@ -413,10 +413,20 @@ pub fn load_glb(path: &std::path::Path) -> Result<Mesh, String> {
 
 /// Load the Lee Perry-Smith head and its three maps from `dir`
 /// ([`asset_dir`]).
+///
+/// This file's UVs run `v` up the image, against glTF's top-left origin
+/// (the three.js copy went through an export that did not flip them): read
+/// as glTF says, the lips land on the chin and the eyebrows on the neck.
+/// So `v ← 1 − v` here, and the tangents are recomputed.
 #[cfg(feature = "assets")]
 pub fn load(dir: &std::path::Path) -> Result<Asset, String> {
+    let mut mesh = load_glb(&dir.join("LeePerrySmith.glb"))?;
+    for t in &mut mesh.uvs {
+        t[1] = 1.0 - t[1];
+    }
+    mesh.compute_tangents();
     Ok(Asset {
-        mesh: load_glb(&dir.join("LeePerrySmith.glb"))?,
+        mesh,
         albedo: load_texture(&dir.join("Map-COL.jpg"), true)?,
         spec: load_texture(&dir.join("Map-SPEC.jpg"), false)?,
         normal: load_texture(&dir.join("Infinite-Level_02_Tangent_SmoothUV.jpg"), false)?,

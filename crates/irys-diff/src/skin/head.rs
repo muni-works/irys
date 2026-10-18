@@ -47,62 +47,85 @@ pub fn scene(asset: &Asset, chromo: Chromophores, view: View) -> Scene {
         chromo,
         MM_PER_UNIT,
     );
+    // Map-SPEC is relative: scale it so its mean is 0.7 of skin's own F0
+    // (k = 1 everywhere reads as oiled under softboxes this large).
+    s.spec_gain = 0.7 / asset.spec.mean()[0];
     frame(&mut s, view);
     s
 }
 
-/// Set lights and camera for `view`.
+/// Set lights and camera for `view`: a large warm key, a dim cool fill, a
+/// strip rim behind, all softboxes out of frame, a dark grey studio around.
 pub fn frame(s: &mut Scene, view: View) {
     let c = Point3::new(HEAD[0], HEAD[1], HEAD[2]);
-    let warm = [1.0, 0.93, 0.84];
-    let cool = [0.85, 0.92, 1.0];
     let at = |x: f64, y: f64, z: f64| Point3::new(c.x + x, c.y + y, c.z + z);
-    match view {
-        View::Front => {
-            s.lights = vec![
-                Light::facing(at(-6.5, -8.5, 4.5), at(0.0, -1.0, 0.3), 6.0, 6.0, 2.4, warm),
-                Light::facing(
-                    at(9.0, -7.0, -0.5),
-                    at(0.0, -1.0, 0.0),
-                    8.0,
-                    8.0,
-                    0.35,
-                    cool,
-                ),
-                Light::facing(
-                    at(5.0, 7.0, 4.0),
-                    at(0.0, 0.0, 0.5),
-                    2.0,
-                    7.0,
-                    5.0,
-                    [1.0, 0.97, 0.92],
-                ),
-            ];
-            s.camera = Camera::look_at(at(0.0, -30.0, 0.4), at(0.0, -2.0, 0.1), 10.5, 0.06);
-        }
-        View::ThreeQuarter => {
-            s.lights = vec![
-                Light::facing(at(8.0, -7.5, 4.5), at(0.0, -1.0, 0.3), 6.0, 6.0, 2.4, warm),
-                Light::facing(
-                    at(-9.0, -6.0, 0.0),
-                    at(0.0, -1.0, 0.0),
-                    8.0,
-                    8.0,
-                    0.25,
-                    cool,
-                ),
-                Light::facing(
-                    at(-6.0, 7.0, 4.0),
-                    at(0.0, 0.0, 0.5),
-                    2.0,
-                    7.0,
-                    7.0,
-                    [1.0, 0.97, 0.92],
-                ),
-            ];
-            s.camera = Camera::look_at(at(-16.0, -24.0, 0.8), at(-0.4, -1.4, 0.2), 10.5, 0.06);
-        }
-    }
-    s.env = 0.03;
+    let (key, fill, rim, eye, target) = match view {
+        View::Front => (
+            at(-7.0, -8.0, 6.0),
+            at(9.0, -8.0, 0.0),
+            at(8.5, 6.0, 3.5),
+            at(0.0, -30.0, 0.2),
+            at(0.0, -2.0, -0.35),
+        ),
+        View::ThreeQuarter => (
+            at(8.0, -8.5, 5.5),
+            at(-10.0, -6.0, 0.5),
+            at(-8.0, 6.5, 3.0),
+            at(-16.0, -24.5, 0.6),
+            at(-0.5, -1.3, -0.3),
+        ),
+    };
+    s.lights = vec![
+        Light::facing(key, at(0.0, -1.0, 0.3), 7.0, 7.0, 6.0, WARM),
+        Light::facing(fill, at(0.0, -1.0, 0.0), 10.0, 10.0, 0.2, COOL),
+        Light::facing(rim, at(0.0, 0.0, 0.6), 1.6, 8.0, 9.0, [1.0, 0.97, 0.92]),
+    ];
+    s.camera = Camera::look_at(eye, target, 11.0, 0.05);
+    s.env = 0.006;
+    s.depth = 5;
+    s.lights_changed();
+}
+
+/// Warm key: about 4500 K on the three hats.
+pub const WARM: [f64; 3] = [1.0, 0.92, 0.80];
+/// Cool fill.
+pub const COOL: [f64; 3] = [0.82, 0.90, 1.0];
+
+/// The comparison strip's framing at `size`: close on the cheek, the ear
+/// and the nose from three-quarter left, with a backlight behind the ear —
+/// where light through thin tissue shows what a surface model cannot.
+pub fn compare_frame(s: &mut Scene, size: (usize, usize)) {
+    let c = Point3::new(HEAD[0], HEAD[1], HEAD[2]);
+    let at = |x: f64, y: f64, z: f64| Point3::new(c.x + x, c.y + y, c.z + z);
+    s.lights = vec![
+        Light::facing(
+            at(-5.0, -9.0, 6.0),
+            at(-0.5, -1.0, 0.3),
+            6.0,
+            6.0,
+            4.0,
+            WARM,
+        ),
+        Light::facing(
+            at(8.0, -8.0, 0.0),
+            at(0.0, -1.0, 0.0),
+            10.0,
+            10.0,
+            0.15,
+            COOL,
+        ),
+        Light::facing(
+            at(-3.5, 5.5, 0.8),
+            at(-1.6, 0.2, 0.4),
+            2.5,
+            3.0,
+            25.0,
+            [1.0, 0.95, 0.88],
+        ),
+    ];
+    s.camera = Camera::look_at(at(-17.0, -21.0, 0.8), at(-0.8, -0.9, -0.2), 11.0, 0.04);
+    s.env = 0.006;
+    s.depth = 5;
+    s.set_size(size.0, size.1);
     s.lights_changed();
 }

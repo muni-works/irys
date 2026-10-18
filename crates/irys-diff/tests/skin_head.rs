@@ -42,10 +42,48 @@ fn loads_the_scan_and_its_maps() {
 }
 
 #[test]
+fn the_eyebrows_are_above_the_eyes() {
+    // The darkest texels are the eyebrows. With `v` read the right way up
+    // (`mesh::load`) the front-facing vertices they colour sit above the
+    // nose tip; read as glTF says, they land on the neck.
+    let Some(a) = asset() else { return };
+    let mut m = a.mesh.clone();
+    head::to_scene(&mut m);
+    let tip = *m
+        .positions
+        .iter()
+        .min_by(|p, q| p.y.total_cmp(&q.y))
+        .unwrap();
+    let mut dark: Vec<(f64, f64)> = m
+        .positions
+        .iter()
+        .zip(&m.uvs)
+        .filter(|(p, _)| p.y < tip.y + 1.5 && (p.x - tip.x).abs() < 1.6)
+        .map(|(p, uv)| {
+            let c = a.albedo.sample(uv[0], uv[1]);
+            (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2], p.z)
+        })
+        .collect();
+    dark.sort_by(|p, q| p.0.total_cmp(&q.0));
+    let z = dark[..20].iter().map(|r| r.1).sum::<f64>() / 20.0;
+    println!(
+        "nose tip z {:.2}, darkest front vertices z {z:.2} ({:+.2})",
+        tip.z,
+        z - tip.z
+    );
+    assert!(
+        z - tip.z > 0.3,
+        "eyebrows {:+.2} from the nose tip",
+        z - tip.z
+    );
+}
+
+#[test]
 fn the_normal_map_is_opengl() {
     // A tangent-space normal map is a height gradient: `(r, ±g)` is
     // curl-free for the right sign. Image `y` runs down, so OpenGL's
-    // green-up map is the one where `(r, −g)` wins.
+    // green-up map is the one where `(r, −g)` wins; with this asset's `v`
+    // running up the image (`mesh::load`), green is then `+v`.
     let Some(a) = asset() else { return };
     let (w, h) = a.normal.size;
     let n = |x: usize, y: usize| {

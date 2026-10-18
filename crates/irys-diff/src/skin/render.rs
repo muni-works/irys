@@ -8,30 +8,29 @@
 //! Camera ray (thin lens) → closest hit among the mesh and the lights. At a
 //! skin vertex (outside the medium):
 //!
-//! 1. **NEE**: one light sample (pick by power, uniform on the quad); the
-//!    specular layer's `f` (the [`Spec`](super::graph::Spec) graph) times
-//!    `cos · Le / p_L`, weighted against the reflection pdf by the power
-//!    heuristic. In [`Mode::sss`] off, the Lambertian base adds
-//!    `ρ (1 − F(cos_o))/π`.
+//! 1. **NEE**: one light sample (pick by power × the two cosines / d²,
+//!    uniform on the quad); the specular layer's `f` (the
+//!    [`Spec`](super::graph::Spec) graph) times `cos · Le / p_L`, weighted
+//!    against the reflection pdf by the power heuristic. With [`Mode::sss`]
+//!    off, the Lambertian base adds `ρ (1 − F(cos_o))/π`.
 //! 2. **Reflect or enter**: with `P_r = clamp(4 F(cos_o) k, 0.1, 0.6)`
 //!    (detached), reflect off one GGX lobe (VNDF at the lobe picked by its
 //!    mix weight; the pdf is the mixture's); otherwise go through, weight
 //!    `(1 − F(cos_o))/(1 − P_r)`. Through means, in SSS mode, a cosine
 //!    direction into the medium; without SSS, a cosine bounce off the
 //!    Lambertian base of albedo `ρ`.
-//! 3. **The walk** (SSS): coefficients from the entry texel's chromophores,
-//!    four lanes `σa_k, σs_k` at the path's four wavelengths. Each event
-//!    picks a lane `c` with probability `q_c ∝ T_c` (the throughput,
-//!    detached), draws `t ~ σt_c e^{−σt_c t}`, and traces to the boundary at
-//!    `d`. `t < d` scatters (`f_k = σs_k e^{−σt_k t}`, pdf
-//!    `Σ q_c σt_c e^{−σt_c t}`, a Henyey–Greenstein turn); otherwise it
-//!    leaves (`f_k = e^{−σt_k d}`, probability `Σ q_c e^{−σt_c d}`). Spectral
-//!    MIS (the one-sample balance heuristic over the lanes) keeps all four
-//!    wavelengths on one walk; the walk is the [`Medium`](super::graph::Medium)
-//!    graph's events. Nothing inside, no Fresnel at the inner boundary
-//!    (Cycles' random walk does the same).
-//! 4. **Exit**: a Lambertian vertex on the far side (`1/π`, θ-free): NEE,
-//!    then a cosine direction out.
+//! 3. **The walks** (SSS): coefficients from the entry texel's chromophores,
+//!    one analog walk ([`walk_g`]) per wavelength: distances drawn at the
+//!    sampler's `σt`, `f = σs e^{−σt t}` per scatter and `e^{−σt d}` at the
+//!    boundary — the [`Medium`](super::graph::Medium) graph's events —
+//!    Henyey–Greenstein turns, no Fresnel at the inner boundary (Cycles'
+//!    random walk does the same). (Four wavelengths on one walk with
+//!    spectral MIS compounds the per-event weight variance over hundreds of
+//!    events; it was tried, and was chroma noise.)
+//! 4. **Exits**: each walk's exit is a Lambertian vertex (`1/π`, θ-free,
+//!    about the smooth normal) with NEE for its own wavelength; the path
+//!    goes on from one exit, picked uniformly, that wavelength alone
+//!    (weight 4), with a cosine direction out.
 //!
 //! # What the replay owes the parameters
 //!
@@ -755,13 +754,21 @@ pub fn trace_path(
                     ne = -ne;
                 }
                 let xo = offset(eh.point, ne, *x, eh.t);
-                exit_at = Some((xo, ne));
+                // The exit lobe shades with the smooth normal (the faceted
+                // geometric one shows the mesh); it must agree in side.
+                let sm = mesh::shade(&scene.mesh, &scene.bvh, eh);
+                let mut ns = if sm.ng.dot(&ne) < 0.0 { -sm.ns } else { sm.ns };
+                if ns.dot(&ne) <= 0.0 {
+                    ns = ne;
+                }
+                exit_at = Some((xo, ne, ns));
                 // 4. The exit's NEE, this wavelength only.
                 let u3 = [rng.uniform(), rng.uniform(), rng.uniform()];
-                if let Some((i, wi, dist, pl)) = sample_light(scene, xo, ne, u3)
+                if let Some((i, wi, dist, pl)) = sample_light(scene, xo, ns, u3)
+                    && wi.dot(&ne) > 0.0
                     && !scene.occluded(xo, wi, dist)
                 {
-                    let ci = wi.dot(&ne);
+                    let ci = wi.dot(&ns);
                     let w = mis(pl, ci / PI);
                     rad[k] += tp[k] * wk.weight / PI * ci * scene.lights[i].le(lam[k]) * w / pl;
                 }
@@ -790,15 +797,18 @@ pub fn trace_path(
             }
         }
         // The path goes on from walk `c`'s exit, that wavelength alone.
-        let Some(((xo, ne), wgt)) = cont else {
+        let Some(((xo, ne, ns), wgt)) = cont else {
             break;
         };
         for (k, v) in tp.iter_mut().enumerate() {
             *v = if k == c { *v * wgt * NW as f64 } else { 0.0 };
         }
         let (u1, u2) = (rng.uniform(), rng.uniform());
-        let (wi, cz) = cosine(ne, u1, u2);
-        prev = (xo, ne, cz / PI);
+        let (wi, cz) = cosine(ns, u1, u2);
+        if wi.dot(&ne) <= 0.0 {
+            break;
+        }
+        prev = (xo, ns, cz / PI);
         ray = Ray::new(xo, wi);
     }
     (rad, rec)

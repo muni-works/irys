@@ -440,6 +440,15 @@ fn geo_normal(i: u32) -> vec3<f32> {
     return normalize(cross(tris[9u * i + 1u].xyz - p0, tris[9u * i + 2u].xyz - p0));
 }
 
+// mesh::shade's interpolated normal (unflipped, normalised; the geometric
+// one where the blend cancels).
+fn smooth_normal(h: Hit) -> vec3<f32> {
+    let i = h.prim;
+    let n = tris[9u * i + 3u].xyz * (1.0 - h.u - h.v) + tris[9u * i + 5u].xyz * h.u + tris[9u * i + 7u].xyz * h.v;
+    if (length(n) > 1e-12) { return normalize(n); }
+    return geo_normal(i);
+}
+
 // Bilinear, wrapped: mesh::Texture::sample.
 fn texel(which: u32, u: f32, v: f32) -> vec4<f32> {
     let w = P.tex.x;
@@ -505,7 +514,7 @@ fn surface(h: Hit, d: vec3<f32>) -> Surf {
             let rgb = texel(1u, uv.x, uv.y).xyz;
             let dd = rgb * 2.0 - vec3<f32>(1.0);
             let s = P.th1.z;
-            let m = vec3<f32>(dd.x * s, -dd.y * s, 1.0 - s + max(dd.z, 0.0) * s);
+            let m = vec3<f32>(dd.x * s, dd.y * s, 1.0 - s + max(dd.z, 0.0) * s);
             let o = t * m.x + b * m.y + ns * m.z;
             if (length(o) >= 1e-9) { n = normalize(o); }
         }
@@ -798,6 +807,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
         var cont = false;
         var cx = vec3<f32>(0.0);
         var cn = vec3<f32>(0.0);
+        var cs = vec3<f32>(0.0);
         var cw = 0.0;
         for (var k = 0u; k < NW; k = k + 1u) {
             let cf = coefficients(lam[k]);
@@ -808,10 +818,13 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
                 var ne = geo_normal(wk.hit.prim);
                 if (dot(ne, wk.w) < 0.0) { ne = -ne; }
                 let xo = offset_ray(wk.x + wk.w * wk.hit.t, ne, wk.x, wk.hit.t);
+                var ns = smooth_normal(wk.hit);
+                if (dot(geo_normal(wk.hit.prim), ne) < 0.0) { ns = -ns; }
+                if (dot(ns, ne) <= 0.0) { ns = ne; }
                 let ue = vec3<f32>(rand(&rng), rand(&rng), rand(&rng));
-                let el = sample_light(xo, ne, ue);
-                if (el.ok && !occluded(xo, el.wi, el.dist)) {
-                    let ci = dot(el.wi, ne);
+                let el = sample_light(xo, ns, ue);
+                if (el.ok && dot(el.wi, ne) > 0.0 && !occluded(xo, el.wi, el.dist)) {
+                    let ci = dot(el.wi, ns);
                     let wm = mis(el.pdf, ci / PI);
                     rad[k] = rad[k] + tp[k] * wk.weight / PI * ci * light_le(el.i, lam[k]) * wm / el.pdf;
                 }
@@ -819,6 +832,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
                     cont = true;
                     cx = xo;
                     cn = ne;
+                    cs = ns;
                     cw = wk.weight;
                 }
             }
@@ -829,9 +843,10 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
         }
         let v1 = rand(&rng);
         let v2 = rand(&rng);
-        let cd = cosine(cn, v1, v2);
+        let cd = cosine(cs, v1, v2);
+        if (dot(cd.xyz, cn) <= 0.0) { break; }
         prev_x = cx;
-        prev_n = cn;
+        prev_n = cs;
         prev_pdf = cd.w / PI;
         ro = cx;
         rd = normalize(cd.xyz);

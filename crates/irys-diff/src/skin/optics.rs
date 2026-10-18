@@ -304,15 +304,16 @@ pub const MEL_MAX: f64 = 0.25;
 pub const HB_MAX: f64 = 0.12;
 
 /// Chromophores for an albedo map: per texel the `(m, h)` whose
-/// [`slab_rgb`] is nearest (in log colour) to the texel's. Solved once per
-/// cell of a 32³ grid over linear RGB and looked up nearest, so the cost is
-/// the grid's. Returns the map (`[m, h, err]`, `err` the RGB distance) and
-/// the mean error.
+/// [`slab_rgb`] is nearest (in log colour) to the texel's. Solved by search
+/// over a 96² candidate grid (quadratic in each axis, fine near zero) at the
+/// nodes of a 48³ grid over `√rgb`, and trilinearly interpolated between
+/// nodes, so the map is smooth where the albedo is and costs the grid's
+/// solves. Returns the map (`[m, h, err]`, `err` the RGB distance of the
+/// interpolated chromophores' colour from the texel) and the mean error.
 pub fn invert(albedo: &crate::skin::mesh::Texture) -> (Vec<[f32; 3]>, f64) {
     use rayon::prelude::*;
-    const C: usize = 48;
-    const Q: usize = 32;
-    // Candidates on a grid quadratic in each axis (fine near zero).
+    const C: usize = 96;
+    const Q: usize = 48;
     let cands: Vec<(f64, f64, [f64; 3])> = (0..C * C)
         .into_par_iter()
         .map(|i| {
@@ -321,41 +322,50 @@ pub fn invert(albedo: &crate::skin::mesh::Texture) -> (Vec<[f32; 3]>, f64) {
                 (i / C) as f64 / (C - 1) as f64,
             );
             let (m, h) = (MEL_MAX * a * a, HB_MAX * b * b);
-            (m, h, slab_rgb(m, h))
+            (m, h, slab_rgb(m, h).map(|x| x.max(1e-4).ln()))
         })
         .collect();
-    let lg = |c: [f64; 3]| c.map(|x| (x.max(1e-4)).ln());
     let best = |rgb: [f64; 3]| {
-        let t = lg(rgb);
+        let t = rgb.map(|x| x.max(1e-4).ln());
         cands
             .iter()
-            .map(|&(m, h, c)| {
-                let l = lg(c);
-                let d = (0..3).map(|k| (l[k] - t[k]).powi(2)).sum::<f64>();
-                (d, m, h, c)
-            })
+            .map(|&(m, h, l)| ((0..3).map(|k| (l[k] - t[k]).powi(2)).sum::<f64>(), m, h))
             .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, m, h)| (m, h))
             .unwrap()
     };
-    let cell = |x: f64| ((x.clamp(0.0, 1.0).sqrt() * (Q - 1) as f64).round() as usize).min(Q - 1);
-    let grid: Vec<(f64, f64, [f64; 3])> = (0..Q * Q * Q)
+    let node = |k: usize| {
+        let v = k as f64 / (Q - 1) as f64;
+        v * v
+    };
+    let grid: Vec<(f64, f64)> = (0..Q * Q * Q)
         .into_par_iter()
-        .map(|i| {
-            let f = |k: usize| {
-                let v = k as f64 / (Q - 1) as f64;
-                v * v
-            };
-            let rgb = [f(i % Q), f((i / Q) % Q), f(i / (Q * Q))];
-            let (_, m, h, c) = best(rgb);
-            (m, h, c)
-        })
+        .map(|i| best([node(i % Q), node((i / Q) % Q), node(i / (Q * Q))]))
         .collect();
     let out: Vec<[f32; 3]> = albedo
         .texels
         .par_iter()
         .map(|t| {
-            let rgb = t.map(|x| x as f64);
-            let (m, h, c) = grid[cell(rgb[0]) + Q * cell(rgb[1]) + Q * Q * cell(rgb[2])];
+            let rgb = t.map(|x| (x as f64).clamp(0.0, 1.0));
+            // Trilinear in √rgb.
+            let at = rgb.map(|x| {
+                let g = x.sqrt() * (Q - 1) as f64;
+                let i = (g.floor() as usize).min(Q - 2);
+                (i, g - i as f64)
+            });
+            let (mut m, mut h) = (0.0, 0.0);
+            for corner in 0..8 {
+                let mut w = 1.0;
+                let mut idx = 0;
+                for (k, &(i, f)) in at.iter().enumerate() {
+                    let bit = (corner >> k) & 1;
+                    w *= if bit == 1 { f } else { 1.0 - f };
+                    idx += (i + bit) * Q.pow(k as u32);
+                }
+                m += w * grid[idx].0;
+                h += w * grid[idx].1;
+            }
+            let c = slab_rgb(m, h);
             let err = (0..3).map(|k| (c[k] - rgb[k]).powi(2)).sum::<f64>().sqrt();
             [m as f32, h as f32, err as f32]
         })
