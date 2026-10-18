@@ -522,7 +522,8 @@ fn env_pdf(scene: &Scene, d: &V3) -> D {
     let k = e.kappa;
     let vmf = k / (2.0 * std::f64::consts::PI * (1.0 - (-2.0 * k).exp()))
         * (k * (d.dot(&V3::c(e.sun)) - 1.0)).exp();
-    crate::prb::SUN_PICK * vmf + (1.0 - crate::prb::SUN_PICK) / (4.0 * std::f64::consts::PI)
+    let pick = e.sun_pick();
+    pick * vmf + (1.0 - pick) / (4.0 * std::f64::consts::PI)
 }
 
 fn mis_d(a: D, b: D) -> D {

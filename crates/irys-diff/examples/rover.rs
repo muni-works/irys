@@ -207,6 +207,7 @@ fn rover(size: (usize, usize), spp: usize, blas: &[TriMesh]) -> Scene {
         kappa: 900.0,
         sun_radiance: 5.0 * 900.0 / (2.0 * std::f64::consts::PI),
         sky: 0.8,
+        ..Env::default()
     };
     s
 }

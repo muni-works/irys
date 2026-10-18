@@ -82,7 +82,7 @@ fn scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.cap) { return; }
     let bits = lane_bits[i];
     if (bits == 0u) { return; }
-    let lam = paths[i].lam;
+    let lam = lams[params.base + i];
     var j = lane_slot(i) * params.nw;
     if ((bits & 1u) != 0u) {
         let a = stage[2u * i];

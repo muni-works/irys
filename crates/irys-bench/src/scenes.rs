@@ -118,6 +118,7 @@ fn room(w: usize, h: usize, spp: usize) -> Bench {
         kappa: 400.0,
         sun_radiance: 300.0,
         sky: 1.0,
+        ..Env::default()
     };
     Bench {
         name: "room",
@@ -145,6 +146,7 @@ pub fn apply(scene: &mut Scene, features: &[&str]) {
             "sobol" => scene.qmc = true,
             "spectral" => scene.spectral_is = true,
             "rr" => scene.roulette = Some(irys_diff::prb::Roulette::default()),
+            "sun" => scene.env = scene.env.pick_by_peak(),
             other => panic!("unknown sampler {other}"),
         }
     }

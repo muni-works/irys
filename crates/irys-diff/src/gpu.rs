@@ -83,7 +83,7 @@ fn sobol_const() -> String {
         keys.join(", ")
     )
 }
-const PATH_BYTES: u64 = 128;
+const PATH_BYTES: u64 = 80;
 const WG: u32 = 64;
 
 #[repr(C)]
@@ -692,6 +692,8 @@ impl GpuPrb {
         // Lane compaction (`compact.wgsl`).
         let lane_bits = storage("lane bits", paths as u64 * 4);
         let stage = storage("lane stage", paths as u64 * 32);
+        let cold = storage("path cold", paths as u64 * 32);
+        let lams = storage("wavelengths", scene.paths() as u64 * 16);
         let lane_off = storage("lane offsets", paths as u64 * 4);
         let lane_top = storage("lane block offsets", (paths as u64).div_ceil(256) * 4);
         let ind = dev.create_buffer(&wgpu::BufferDescriptor {
@@ -795,10 +797,12 @@ impl GpuPrb {
             (54, &g_nrec),
             (59, &lane_bits),
             (60, &stage),
+            (71, &cold),
+            (72, &lams),
         ];
         let mut scatter: Vec<(u32, &wgpu::Buffer)> = vec![
             (0, &params),
-            (1, &path_buf),
+            (72, &lams),
             (59, &lane_bits),
             (60, &stage),
             (61, &lane_off),
@@ -814,6 +818,7 @@ impl GpuPrb {
                     (26, &points),
                     (54, &g_nrec),
                     (56, &qtab),
+                    (72, &lams),
                 ],
             ),
             bind_rt(&pipes[1], &bounce),
@@ -827,6 +832,8 @@ impl GpuPrb {
                     (11, &dl),
                     (12, &df),
                     (59, &lane_bits),
+                    (71, &cold),
+                    (72, &lams),
                     (61, &lane_off),
                     (62, &lane_top),
                 ],
@@ -861,6 +868,7 @@ impl GpuPrb {
                 &[
                     (0, &params),
                     (56, &qtab),
+                    (72, &lams),
                     (10, &l),
                     (17, &img),
                     (18, &target),
@@ -871,7 +879,7 @@ impl GpuPrb {
             bind(&pipes[6], &[(0, &params), (20, &sq), (21, &loss)]),
             bind(
                 &pipes[7],
-                &[(0, &params), (19, &d_img), (22, &dl), (56, &qtab)],
+                &[(0, &params), (19, &d_img), (22, &dl), (56, &qtab), (72, &lams)],
             ),
             bind_rt(&pipes[8], &bounce),
             bind_rt(
@@ -1045,7 +1053,7 @@ impl GpuPrb {
                 [
                     e.sun_radiance as f32,
                     e.sky as f32,
-                    prb::SUN_PICK as f32,
+                    e.sun_pick() as f32,
                     vmf as f32,
                 ]
             },
@@ -1432,6 +1440,19 @@ impl GpuPrb {
     /// The image the last scoring pass splatted.
     pub fn last_image(&self) -> Vec<f32> {
         self.read(&self.img, (self.img.size() / 4) as usize)
+    }
+
+    /// Speed round 3's probe: the wall time of `reps` scorings (the image,
+    /// the loss, δL per lane) of the frame last traced, one submit, waited
+    /// on. Only `irys-bench` calls it.
+    #[doc(hidden)]
+    pub fn time_score(&self, scene: &Scene, reps: usize) -> std::time::Duration {
+        let _ = self.read(&self.loss, 1);
+        let t = Instant::now();
+        let cmds: Vec<_> = (0..reps).map(|_| self.encode_score(scene, Score::Both)).collect();
+        self.ctx.queue.submit(cmds);
+        let _ = self.read(&self.loss, 1);
+        t.elapsed()
     }
 
     /// δL per lane as the last [`gradient_l2`](Self::gradient_l2) computed it.

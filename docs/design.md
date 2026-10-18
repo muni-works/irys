@@ -1734,6 +1734,120 @@ keeping the wavelengths from `gen` for scoring are the two named
 candidates; on the error side, pair is the one scene where guiding hurts
 (1.32), so a cheaper guided variant is not the answer there.
 
+### Round 3: slim `Path`, stored wavelengths, the sun share (2026-10-18)
+
+Three commits on `claude/speed3`, then the re-bench:
+
+| piece | commit | what |
+|---|---|---|
+| 1 | slim `Path` | `smp.xyz`, `ldir`, `lkind` (read only by `update`, only for a path with lane bits) move to a cold buffer of two `vec4`s per path that `bounce` writes at a conductor vertex; the MIS pdf keeps a scalar field. 128 → 96 bytes |
+| 2 | stored wavelengths | `gen` writes each path's four wavelengths to a frame-sized buffer; `bounce`, `update`, `scatter`, `score` and `lane_adjoint` read them there. `Path` drops `lam`: 96 → **80 bytes**; scoring no longer redraws a Sobol point and runs four CDF searches per path |
+| 3 | the sun share | `Env::pick` (default ½, as before) and `Env::pick_by_peak`: NEE's share of the sun lobe by peak radiance, sun against the gradient's peak (pair 0.94, room 0.999). The bench's `sun` feature |
+
+**Path and bounce** (frame ms/spp at 256 spp, fastest of 4 × 3
+interleaved; the frame is `bounce` but for ≈ 0.03 ms of scoring and
+floor): pair 0.744 → 0.694 (piece 1) → 0.695 (piece 2), room 2.01 → 1.94
+→ 1.82, cornell 1.74 → 1.68 → 1.67. Piece 1 is not bit-identical to
+round 2: pixels differ by ≤ 6e-7 relative (the Metal compiler contracts
+`update`'s arithmetic differently once the loads change), and replay,
+rerun, chunking and CPU agreement are unchanged. Piece 2 is bit-identical
+to piece 1 on every sweep image of all three scenes and three variants.
+Packing `tp` into f16 or octahedral directions was not tried: the 48
+bytes left are throughput, radiance and the ray, which the CPU-agreement
+tolerances and replay would feel.
+
+**Scoring** (`irys-bench score`: image, loss and δL per lane over a
+64-spp frame, fastest of 5 × 20): 0.052 / 0.054 / 0.060 → **0.023**
+ms/spp (pair / room / cornell). The bench's renders call `score` + `accum`
+only, so they gain about half that.
+
+**Error per sample on pair.** The image is sun-lit, and half of NEE's
+samples went to the uniform sphere for a sky gradient that a BSDF sample
+finds anyway. relMSE at 512 spp, two to four seeds (spread < 1 %), against
+the round 2 reference (0.7–0.99 measured with the upper-hemisphere sky
+sampler below, ≈ 3 % under the uniform sphere at those shares):
+
+| sun share | 0.5 | 0.7 | 0.8 | 0.9 | 0.99 | 1.0 |
+|---|---|---|---|---|---|---|
+| pair | 7.6e-5 | 5.6e-5 | 5.1e-5 | 4.7e-5 | 4.3e-5 | 4.2e-5 |
+
+Room (guided, 256 spp): 1.9e-3 at ½, 9.9e-4 at 0.9, 8.7e-4 at 1. At 1024
+spp the peak share takes pair from 4.2e-5 to **2.6e-5** (Cycles 4.0e-5)
+and the room from 8.2e-4 to 3.4e-4 (guided: 4.8e-4 → 2.3e-4); cornell has
+no environment and is unchanged. It is unbiased: the 4096-spp means agree
+with the 32768-spp reference to 1e-5, and `tests/speed.rs` checks the
+mean, CPU against device, and the gradient against central differences
+under it. The peak ratio rather than 1 keeps sky NEE alive where there is
+no sun (`sun_radiance = 0` gives 0). Two other candidates: an
+upper-hemisphere sky sampler (pdf ∝ 0.15 + 0.25 z, exact) cut 9 % at a
+½ share and ~3 % at 0.8, but its pdf jumps at the horizon, which the
+interior term does not differentiate (the camera gate's c4 failed), so it
+was dropped; and a luminance-importance map with alias tables, Cycles'
+way, was not needed — this environment is analytic, and its lobe is
+already sampled exactly. MIS stays the power heuristic.
+
+`pick_by_peak` is **not the default**: as the default it trips two phase
+2e gates measured at ½ — the camera gate's c4 (z −3.1; its
+central-difference reference itself moves 7.4 → 11.6 → 14.1 across
+rotation steps 0.0025 / 0.01 / 0.004 while the estimate stays at 11.0) and
+the ID-buffer variance ratio at depth 2 (1.28 against its 1.3 floor, from
+1.87: less NEE noise leaves the edge term less to win). Neither is a
+bias; re-baselining them is Cam's call.
+
+**Results.** Same protocol as round 2: raw times, fastest per level;
+irys four sweeps × 2 reps; Cycles the fastest per level of every earlier
+sweep and four more run here, interleaved with irys's (load average 7–15
+from other sessions; pair's and room's Cycles 1024-spp time improved
+slightly, room's budget is 2.005 s now). Time per sample, ms (64 / 1024
+spp):
+
+| scene | Cycles | sobol+spectral: round 2 → 3 | + sun | + guide + sun |
+|---|---|---|---|---|
+| pair | 0.71 | 0.75 / 0.75 → **0.69 / 0.68** | 0.69 / 0.68 | 0.76 / 0.75 |
+| room | 1.96 | 1.93 / 1.92 → 1.78 / 1.78 | **1.76 / 1.75** | 1.94 / 1.94 |
+| cornell | 1.44 | 1.68 / 1.67 → **1.62 / 1.61** | 1.61 / 1.61 | 1.92 / 1.90 |
+
+irys now takes a sample faster than Cycles on pair (4 %) and the room
+(11 %), 12 % slower on cornell.
+
+Equal-time relMSE, irys / Cycles:
+
+| scene | budget | Cycles | sobol+spectral | ratio | + sun | ratio | + guide + sun | ratio | round 2 best |
+|---|---|---|---|---|---|---|---|---|---|
+| pair | 0.089 s | 8.8e-4 | 3.1e-4 | 0.35 | 1.9e-4 | **0.21** | 2.8e-4 | 0.31 | 0.39 |
+| pair | 0.219 s | 1.7e-4 | 1.2e-4 | 0.72 | 7.1e-5 | **0.42** | 1.0e-4 | 0.61 | 0.78 |
+| pair | 0.729 s | 4.0e-5 | 4.0e-5 | 1.01 | 2.6e-5 | **0.64** | 3.2e-5 | 0.82 | 1.09 |
+| room | 0.164 s | 1.6e-2 | 9.2e-3 | 0.58 | 3.7e-3 | 0.24 | 2.8e-3 | **0.18** | 0.43 |
+| room | 0.534 s | 3.8e-3 | 2.7e-3 | 0.72 | 1.1e-3 | 0.28 | 8.1e-4 | **0.21** | 0.52 |
+| room | 2.005 s | 9.5e-4 | 7.4e-4 | 0.78 | 3.0e-4 | 0.31 | 2.2e-4 | **0.24** | 0.52 |
+| cornell | 0.141 s | 5.7e-3 | 2.5e-3 | **0.45** | 2.5e-3 | 0.45 | 3.1e-3 | 0.55 | 0.46 |
+| cornell | 0.415 s | 1.3e-3 | 7.9e-4 | **0.60** | 8.1e-4 | 0.61 | 9.3e-4 | 0.71 | 0.63 |
+| cornell | 1.474 s | 3.2e-4 | 2.2e-4 | **0.68** | 2.2e-4 | 0.68 | 2.4e-4 | 0.74 | 0.71 |
+
+(+ sun is the same images as sobol+spectral on cornell; the 0.60 / 0.61
+is timing.)
+
+![pair](speed3-pair.png)
+![room](speed3-room.png)
+![cornell](speed3-cornell.png)
+
+(`irys-bench report --prefix speed3 --variants sobol+spectral,sobol+spectral+sun,sobol+spectral+guide+sun --image-variants sobol+spectral,sobol+spectral+sun`.)
+
+**Gate verdict: met at every budget on every scene** with the sun share
+(worst 0.68, cornell at 1.47 s), and with the room guided. Without it,
+speed alone brings pair's largest budget from 1.09 to 1.01 — level, not
+below. The gate therefore rests on `sun`, which is opt-in until the two
+phase 2e gates are re-baselined.
+
+**Next lever (not started).** Make `pick_by_peak` the default once
+those two gates are re-measured at it (more central-difference seeds for
+c4; the variance-ratio floor). On speed, cornell is the slowest per
+sample (1.61 against 1.44 ms): its `bounce` is the trace and diffuse
+shading of eight bounces in a closed box, where `Path` traffic (80 bytes
+× 2 per bounce) is no longer the named cost; a split diffuse/conductor
+kernel (the conductor's stage, scan and scatter skipped for the paths
+that cannot need them) is the next thing to measure there.
+
 ### Speed risks
 
 1. **`EXPERIMENTAL_RAY_QUERY` is experimental** in wgpu 30 and needs the
@@ -1751,6 +1865,11 @@ candidates; on the error side, pair is the one scene where guiding hurts
    is summed in a different order than the IR's old reduction (≈ 1e-7
    relative), deterministic run to run.
 5. The edge sampler and splats still walk in WGSL.
+6. **Round 3's `Path` is 80 bytes** with conductor lane state in a cold
+   buffer and wavelengths in a frame buffer that `gen` fills; a kernel that
+   reads the wavelengths must run after `gen` of the same seed (scoring
+   does). `Env::pick` is part of the estimator: CPU, device and the interior
+   term must read the same share.
 
 ## Open questions
 
