@@ -65,3 +65,10 @@ required-features = ["gpu"]
 name = "rose_fit"
 required-features = ["gpu"]
 
+[[example]]
+name = "skin"
+required-features = ["gpu", "assets"]
+
+[[example]]
+name = "skin_fit"
+required-features = ["assets"]
