@@ -1640,6 +1640,100 @@ budget. Then the per-call floor (0.21 ms/spp, a quarter of pair's frame):
 the bench reads the image back after every 16-spp call; accumulating on
 the device would remove most of it. Neither was started.
 
+### Round 2: sampler, readback, replay compaction (2026-10-18)
+
+Three commits on `claude/speed2`, then the re-bench:
+
+| piece | commit | what |
+|---|---|---|
+| 1 | byte-table Sobol | four 256-entry tables per dimension (Burley 2020) instead of the 32-column walk; a tuple's pixel key, seed and scrambled index computed once for all its draws (`pdraws`); one hash per value scramble (`QKEY`) |
+| 2 | device accumulation | `GpuPrb::accumulate` / `accumulated`: a render's frames summed on the device, read back once; calls without ReSTIR or guiding go from 16 to 64 spp |
+| 3 | compacted replay | `ggx::LaneAdjoint` (θ read as θ + z, z ≡ 0, backward w.r.t. z: the adjoint per lane, pointwise) over the compact lanes by indirect dispatch, summed by fixed trees in `compact.wgsl` |
+
+**Sampler** (sobol+spectral minus base, 256 spp, fastest of 4 × 2
+interleaved runs, ms/spp): pair 0.17 → 0.05, room 0.54 → 0.10, cornell
+0.47 → 0.13. Images are bit-identical to before on all three scenes; the
+tables are tested against the walk (200 k indices) and the device gets
+the same array as a module constant.
+
+**Readback floor.** Per-call fixed cost (1-spp calls minus 64-spp calls,
+sobol+spectral): pair 0.69 → 0.20 ms, room 2.2 → 0.38, cornell 1.8 → 0.37.
+At the old 16-spp calls that was 0.09 / 0.13 / 0.23 ms/spp; with 64-spp
+calls it is under 0.01. The guided variant keeps 4-spp calls (it learns
+between them) and gained 0.12–0.14 ms/spp from the readback alone. The
+device sum is `image()`'s frames summed in f32 in frame order, bit for
+bit, rerun and chunked (`tests/speed.rs`).
+
+**Gradient pass** (`irys-bench grad`, `gradient_l2` wall time, fastest of
+5, sobol+spectral, 400 × 300): the old replay's δθ was the IR's own
+reduction — four workgroups, one per parameter, each striding every lane
+of the wavefront — and it dominated everything.
+
+| scene | 4 spp before → after | 16 spp before → after |
+|---|---|---|
+| pair | 142 → 8.0 ms (18×) | 624 → 31 ms (20×) |
+| room | 195 → 17 ms (11×) | 861 → 69 ms (12×) |
+| cornell | 194 → 16 ms (12×) | 852 → 64 ms (13×) |
+
+rose_fit's θ gradient per iteration: 78.9 → 20.3 ms (3.9×; the edge and
+interior terms, 83 and 33 ms, are untouched and now dominate). δθ agrees
+with the old reduction to ~1e-7 relative; replay and rerun stay bit-exact
+and the gradient tests against central differences pass.
+
+**Results.** Same protocol as above: raw times, fastest per level; irys
+four sweeps × 2 reps; Cycles the fastest per level of every earlier sweep
+and two more run here, interleaved with irys's. Time per sample, ms
+(irys at 64 / 1024 spp):
+
+| scene | Cycles | sobol+spectral: round 1 → 2 | + guiding: round 1 → 2 |
+|---|---|---|---|
+| pair | 0.71 | 0.88 / 0.89 → **0.75 / 0.75** | 1.03 / 1.03 → 0.81 / 0.81 |
+| room | 2.05 | 2.55 / 2.85 → **1.93 / 1.92** | 2.92 / 3.53 → 2.07 / 2.10 |
+| cornell | 1.44 | 2.14 / 2.88 → **1.68 / 1.67** | 2.77 / 3.55 → 1.98 / 1.99 |
+
+The drift with render length on the closed scenes is gone (it went with
+the per-call readbacks). irys now takes a sample faster than Cycles in the
+room, 5 % slower on pair, 16 % slower on cornell.
+
+Equal-time relMSE, irys / Cycles:
+
+| scene | budget | Cycles | sobol+spectral | ratio | + guiding | ratio | round 1 best |
+|---|---|---|---|---|---|---|---|
+| pair | 0.089 s | 8.8e-4 | 3.4e-4 | **0.39** | 4.4e-4 | 0.50 | 0.47 |
+| pair | 0.219 s | 1.7e-4 | 1.3e-4 | **0.78** | 1.7e-4 | 1.01 | 0.93 |
+| pair | 0.729 s | 4.0e-5 | 4.4e-5 | **1.09** | 5.2e-5 | 1.32 | 1.27 |
+| room | 0.167 s | 1.6e-2 | 9.8e-3 | 0.62 | 6.8e-3 | **0.43** | 0.62 |
+| room | 0.534 s | 3.8e-3 | 3.0e-3 | 0.78 | 2.0e-3 | **0.52** | 0.79 |
+| room | 2.095 s | 9.5e-4 | 7.6e-4 | 0.80 | 5.0e-4 | **0.52** | 0.82 |
+| cornell | 0.144 s | 5.7e-3 | 2.6e-3 | **0.46** | 3.1e-3 | 0.55 | 0.60 |
+| cornell | 0.415 s | 1.3e-3 | 8.2e-4 | **0.63** | 9.7e-4 | 0.74 | 0.98 |
+| cornell | 1.474 s | 3.2e-4 | 2.3e-4 | **0.71** | 2.5e-4 | 0.78 | 1.23 |
+
+![pair](speed2-pair.png)
+![room](speed2-room.png)
+![cornell](speed2-cornell.png)
+
+(`irys-bench report --prefix speed2 --variants sobol+spectral,sobol+spectral+guide`.)
+
+**Gate verdict: met on room and cornell at every budget; missed on pair
+at the largest budget (1.09).** Eight of nine budgets are below 1, cornell
+by 0.71 at its largest; pair is ahead at 0.39 and 0.78 and 9 % behind at
+0.73 s.
+
+**Next lever (not started): pair's time per sample and its error per
+sample.** At 1024 spp pair's relMSE is 4.2e-5 against Cycles' 4.0e-5 (level
+per sample), and irys takes 0.75 ms against 0.71; the 1.09 is those two
+5 % gaps multiplied. What is left of pair's frame is `bounce`: the sampler
+is now 0.05 ms/spp and the per-call floor under 0.01, so the ~0.7 ms is
+the trace (≈ 0.2 at the microbenchmark's 2.4 G rays/s on pair) and
+shading and path state — every kernel loads and stores the 128-byte
+`Path` per bounce, and scoring rebuilds each path's wavelengths
+(`path_lambdas`: a Sobol draw and four 8-step CDF searches per path per
+call). Slimming `Path` (the state that is dead past a diffuse vertex) and
+keeping the wavelengths from `gen` for scoring are the two named
+candidates; on the error side, pair is the one scene where guiding hurts
+(1.32), so a cheaper guided variant is not the answer there.
+
 ### Speed risks
 
 1. **`EXPERIMENTAL_RAY_QUERY` is experimental** in wgpu 30 and needs the
@@ -1653,9 +1747,9 @@ the device would remove most of it. Neither was started.
    second's, on both walks; the bench reports raw times for that reason.
    Whether it is power management under the other sessions' load or
    intrinsic is not separated.
-4. **The replay is not compacted**: it zeroes `δf` and runs the adjoint IR
-   over every lane, so gradient passes gained the trace speed-up but not
-   the eval one.
+4. **The replay is compacted** since round 2 (`ggx::LaneAdjoint`); its δθ
+   is summed in a different order than the IR's old reduction (≈ 1e-7
+   relative), deterministic run to run.
 5. The edge sampler and splats still walk in WGSL.
 
 ## Open questions

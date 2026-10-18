@@ -109,7 +109,7 @@ struct Path {
 // (v1, 0), (v2, 0) — the cumulative area share light sampling picks by.
 @group(0) @binding(40) var<storage, read> lights: array<vec4<f32>>;
 // Phase 3 sampler (`qmc.rs`): Sobol's four direction matrices (32 words
-// each; the device reads dimensions 1–3 from the `SOBOL` constant instead),
+// each; the device reads dimensions 1–3 from the `SOBOL_T` byte tables instead),
 // then the wavelength CDF's 257 f32s as bits.
 @group(0) @binding(56) var<storage, read> qtab: array<u32>;
 // Speed piece 2, lane compaction (`compact.wgsl`): `bounce` stages a
@@ -756,7 +756,11 @@ fn flat(gid: vec3<u32>, nwg: vec3<u32>) -> u32 {
 // The path's wavelengths: the first draw of its generator, as `gen` makes
 // them, so scoring can rebuild them for any path of the frame.
 fn lambdas(s: ptr<function, vec2<u32>>) -> vec4<f32> {
-    let u = prand(s);
+    return lambdas_u(prand(s));
+}
+
+// The wavelengths the camera tuple's first uniform `u` picks.
+fn lambdas_u(u: f32) -> vec4<f32> {
     var lam = vec4<f32>(0.0);
     for (var k = 0u; k < params.nw; k = k + 1u) {
         let v = u + f32(k) / f32(params.nw);
@@ -800,24 +804,18 @@ fn owen(x0: u32, seed: u32) -> u32 {
 }
 
 // Sobol dimension d of index i. Dimension 0 is van der Corput (the bits
-// reversed); the others XOR the columns of `SOBOL` (a module constant the
-// host splices in from `qmc::sobol_matrices`) for the index's set bits.
+// reversed); the others XOR four byte-table entries of `SOBOL_T` (a module
+// constant the host splices in from `qmc::byte_tables`, the column walk's
+// integers bit for bit).
 fn sobol(i: u32, d: u32) -> u32 {
     if (d == 0u) {
         return reverseBits(i);
     }
-    var x = 0u;
-    var b = i;
-    var k = (d - 1u) * 32u;
-    loop {
-        if (b == 0u) { break; }
-        if ((b & 1u) != 0u) {
-            x = x ^ SOBOL[k];
-        }
-        b = b >> 1u;
-        k = k + 1u;
-    }
-    return x;
+    let t = (d - 1u) * 1024u;
+    return SOBOL_T[t + (i & 255u)]
+        ^ SOBOL_T[t + 256u + ((i >> 8u) & 255u)]
+        ^ SOBOL_T[t + 512u + ((i >> 16u) & 255u)]
+        ^ SOBOL_T[t + 768u + (i >> 24u)];
 }
 
 // A path's generator: SplitMix64, or (Sobol) the draw counter and the
@@ -829,20 +827,36 @@ fn path_rng(g: u32) -> vec2<u32> {
     return rng_new(select(g, g >> 1u, params.points != 0u));
 }
 
-// A path's next uniform: `PathRng::uniform`.
-fn prand(s: ptr<function, vec2<u32>>) -> f32 {
+// The next `n` (≤ 4, within one tuple) uniforms, `PathRng::uniform` `n`
+// times: the pixel key, the tuple's seed and its scrambled index are
+// computed once for the `n` draws, and each value scramble is one hash
+// (`QKEY` holds the seed-free half of `qhash2(seed, d + 1)`).
+fn pdraws(s: ptr<function, vec2<u32>>, n: u32) -> vec4<f32> {
+    var u = vec4<f32>(0.0);
     if (params.qmc.x == 0u || params.points != 0u) {
-        return rand(s);
+        for (var k = 0u; k < n; k = k + 1u) {
+            u[k] = rand(s);
+        }
+        return u;
     }
     let c = (*s).x;
-    (*s).x = c + 1u;
+    (*s).x = c + n;
     let g = (*s).y;
     let index = params.seed.x * params.spp + g % params.spp;
     let pixel = qhash2(g / params.spp, params.seed.y);
     let seed = qhash2(pixel, c >> 2u);
-    let d = c & 3u;
-    let x = owen(sobol(owen(index, seed), d), qhash2(seed, d + 1u));
-    return f32(x >> 8u) * (1.0 / 16777216.0);
+    let j = owen(index, seed);
+    for (var k = 0u; k < n; k = k + 1u) {
+        let d = (c & 3u) + k;
+        let x = owen(sobol(j, d), qhash(seed ^ QKEY[d]));
+        u[k] = f32(x >> 8u) * (1.0 / 16777216.0);
+    }
+    return u;
+}
+
+// A path's next uniform: `PathRng::uniform`.
+fn prand(s: ptr<function, vec2<u32>>) -> f32 {
+    return pdraws(s, 1u).x;
 }
 
 // `PathRng::align`: the next draw starts a tuple.
@@ -900,12 +914,13 @@ fn gen(@builtin(global_invocation_id) gid: vec3<u32>) {
         g_nrec[i] = 0u;
     }
     var s = path_rng(g);
-    let lam = lambdas(&s);
+    let cam = pdraws(&s, 3u);
+    let lam = lambdas_u(cam.x);
     let w = params.size.x;
     let h = params.size.y;
     let px = g / params.spp;
-    let x = f32(px % w) + prand(&s);
-    let y = f32(px / w) + prand(&s);
+    let x = f32(px % w) + cam.y;
+    let y = f32(px / w) + cam.z;
     var sx = (2.0 * x / f32(w) - 1.0) * params.tan_half * f32(w) / f32(h);
     var sy = (1.0 - 2.0 * y / f32(h)) * params.tan_half;
     if (params.points != 0u) {
@@ -1031,9 +1046,7 @@ fn bounce_at(i: u32, last: bool) {
     var ldiv = 1.0;
     if (params.nee != 0u) {
         palign(&s);
-        let u0 = prand(&s);
-        let u1 = prand(&s);
-        let u = vec3<f32>(u0, u1, prand(&s));
+        let u = pdraws(&s, 3u).xyz;
         let dr = sample_light(origin, u);
         ld = dr.dir;
         lcos = dot(ld, n);
@@ -1075,8 +1088,9 @@ fn bounce_at(i: u32, last: bool) {
             }
         }
         palign(&s);
-        let u1 = prand(&s);
-        let u2 = prand(&s);
+        let ud = pdraws(&s, 2u);
+        let u1 = ud.x;
+        let u2 = ud.y;
         let proxy = p.d.w * albedo;
         let q = roulette(p.o.w, proxy, &s);
         p.rng = s;
@@ -1111,8 +1125,7 @@ fn bounce_at(i: u32, last: bool) {
         p.smp.z = 1.0;
     }
     palign(&s);
-    let u0 = prand(&s);
-    let u = vec2<f32>(u0, prand(&s));
+    let u = pdraws(&s, 2u).xy;
     let q = roulette(p.o.w, p.d.w, &s);
     p.rng = s;
     let sm = ggx_sample(params.alpha, lo, u);
@@ -1179,9 +1192,10 @@ fn bounce_guided(
         }
     }
     palign(s);
-    let u1 = prand(s);
-    let u2 = prand(s);
-    let us = prand(s);
+    let ug = pdraws(s, 3u);
+    let u1 = ug.x;
+    let u2 = ug.y;
+    let us = ug.z;
     let proxy = p.d.w * albedo;
     let q = roulette(p.o.w, proxy, s);
     if (q == 0.0) {
@@ -1342,6 +1356,20 @@ fn score(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
         d_img[px * 3u + ch] = 2.0 * r[ch] * params.inv_n;
     }
     sq[px] = dot(r, r);
+}
+
+// Speed round 2: the frames of a render summed on the device
+// (`GpuPrb::accumulate`), so a render reads its image back once.
+@group(0) @binding(64) var<storage, read_write> acc_img: array<f32>;
+
+// One thread per pixel: add the frame `score` just splatted.
+@compute @workgroup_size(64)
+fn accum(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let px = flat(gid, nwg);
+    if (px >= params.pixels) { return; }
+    for (var ch = 0u; ch < 3u; ch = ch + 1u) {
+        acc_img[px * 3u + ch] = acc_img[px * 3u + ch] + img[px * 3u + ch];
+    }
 }
 
 var<workgroup> red: array<f32, 256>;
