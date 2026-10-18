@@ -94,6 +94,7 @@ struct Params {
     gres: [u32; 4],
     gres2: [u32; 4],
     qmc: [u32; 4],
+    rr: [f32; 4],
 }
 
 /// The splat compositor's segment start, `EPS / 10` (phase 2b's, unchanged).
@@ -907,6 +908,10 @@ impl GpuPrb {
                 0,
             ],
             qmc: [scene.qmc as u32, scene.spectral_is as u32, 0, 0],
+            rr: match scene.roulette {
+                Some(r) => [1.0, r.start as f32, r.floor as f32, 0.0],
+                None => [0.0; 4],
+            },
             restir: match scene.restir {
                 Some(r) => [
                     (r.neighbours.min(9) << 8) | r.radius.min(255),

@@ -135,7 +135,7 @@ fn cornell(w: usize, h: usize, spp: usize) -> Bench {
 }
 
 /// Turn on the samplers a variant names (`base`, `restir`, `guide`,
-/// `sobol`, `spectral`, joined by `+`).
+/// `sobol`, `spectral`, `rr`, joined by `+`).
 pub fn apply(scene: &mut Scene, features: &[&str]) {
     for f in features {
         match *f {
@@ -144,6 +144,7 @@ pub fn apply(scene: &mut Scene, features: &[&str]) {
             "guide" => scene.guide = Some(irys_diff::prb::Guide::default()),
             "sobol" => scene.qmc = true,
             "spectral" => scene.spectral_is = true,
+            "rr" => scene.roulette = Some(irys_diff::prb::Roulette::default()),
             other => panic!("unknown sampler {other}"),
         }
     }

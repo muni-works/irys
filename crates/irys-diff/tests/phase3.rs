@@ -601,3 +601,70 @@ fn base_clone(s: &Scene) -> Scene {
     out.depth = s.depth;
     out
 }
+
+// ---- Russian roulette ----
+
+use irys_diff::prb::Roulette;
+
+fn rouletted(mut s: Scene) -> Scene {
+    s.roulette = Some(Roulette {
+        start: 1,
+        floor: 0.1,
+    });
+    s
+}
+
+/// The roulette's draw and survival are the same on both tiers, and PRB
+/// through it (q detached, θ-free) matches central differences on the CPU.
+#[test]
+fn roulette_gpu_matches_cpu_and_differences() {
+    let scene = rouletted(sampled(frozen(16, 16, 2)));
+    let mut k = Kernels::for_scene(&scene, false);
+    let t = prb::image(&scene, 99, &prb::forward(&scene, &GOLD, 99, &mut k).0);
+    let (_, d) = prb::gradient(&scene, &THETA0, (7, 7), &mut k, &L2(&t));
+    let h = 1e-5;
+    for p in 0..PARAMS {
+        let (mut lo, mut hi) = (THETA0, THETA0);
+        lo[p] -= h;
+        hi[p] += h;
+        let fd = (prb::loss(&scene, &hi, 7, &mut k, &L2(&t))
+            - prb::loss(&scene, &lo, 7, &mut k, &L2(&t)))
+            / (2.0 * h);
+        let e = rel(d[p], fd);
+        eprintln!("θ{p}: cpu prb {:+.9e}  fd {fd:+.9e}  rel {e:.1e}", d[p]);
+        assert!(e < 1e-5, "θ{p}: prb {} vs fd {fd}", d[p]);
+    }
+    let ctx = device!();
+    let scene = rouletted(sampled(frozen(32, 32, 4)));
+    let mut k = Kernels::for_scene(&scene, false);
+    let mut g = GpuPrb::new(ctx, &scene);
+    let lg = gpu::widen(&g.forward(&scene, &THETA0, 7));
+    let lc = prb::forward(&scene, &THETA0, 7, &mut k).0;
+    let far = lg.iter().zip(&lc).filter(|(a, b)| rel(**a, **b) > 1e-3).count();
+    eprintln!("roulette L gpu vs cpu: {far}/{} lanes off by > 1e-3", lg.len());
+    assert!(far * 50 < lg.len(), "{far} lanes diverge");
+    let l = g.forward(&scene, &THETA0, 9);
+    let (_, l2) = g.replay(&scene, &THETA0, 9, &vec![1.0; l.len()]);
+    assert_eq!(bits(&l), bits(&l2), "replay");
+}
+
+/// Unbiased: the box with and without the roulette, block by block.
+#[test]
+fn roulette_is_unbiased() {
+    let ctx = device!();
+    let mut base = Scene::cornell(48, 48, 8);
+    base.depth = 6;
+    let (t0, v0, b0) = stats_of(&mut GpuPrb::new(ctx, &base), &base, 96);
+    let mut rr = Scene::cornell(48, 48, 8);
+    rr.depth = 6;
+    let rr = rouletted(rr);
+    let (t1, v1, b1) = stats_of(&mut GpuPrb::new(ctx, &rr), &rr, 96);
+    let bias = rel(t0, t1);
+    let z = b0
+        .iter()
+        .zip(&b1)
+        .map(|(a, b)| (a.0 - b.0).abs() / (a.1 + b.1).sqrt())
+        .fold(0.0, f64::max);
+    eprintln!("cornell roulette: means rel {bias:.1e}, worst block z {z:.2}; variance {v0:.3e} -> {v1:.3e}");
+    assert!(bias < 1e-2 && z < 4.5);
+}

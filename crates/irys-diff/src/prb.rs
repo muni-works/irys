@@ -432,6 +432,41 @@ impl Default for Guide {
     }
 }
 
+/// [`Scene::roulette`]'s knobs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Roulette {
+    /// The first vertex (0 is the camera ray's hit) that may end a path.
+    pub start: u32,
+    /// The least survival probability.
+    pub floor: f64,
+}
+
+impl Default for Roulette {
+    fn default() -> Self {
+        Self {
+            start: 3,
+            floor: 0.1,
+        }
+    }
+}
+
+impl Scene {
+    /// The roulette at a vertex with `vertex` vertices before it and
+    /// throughput proxy `proxy`: 1 when off or too early (no draw), else one
+    /// draw and the survival probability, or 0 when the path ends.
+    fn roulette_at(&self, vertex: u32, proxy: f64, rng: &mut PathRng) -> f64 {
+        match self.roulette {
+            Some(r) if vertex >= r.start => {
+                let u = rng.uniform();
+                // f32, as the device computes it
+                let q = (proxy as f32).clamp(r.floor as f32, 1.0) as f64;
+                if u < q { q } else { 0.0 }
+            }
+            _ => 1.0,
+        }
+    }
+}
+
 /// One light sample: direction, solid-angle pdf, distance to the point on
 /// an emitter (∞ for the environment), and which it is.
 #[derive(Debug, Clone, Copy)]
@@ -514,6 +549,13 @@ pub struct Scene {
     /// Importance-sample wavelengths by the film's response
     /// ([`crate::qmc::Spectral`]) instead of uniformly.
     pub spectral_is: bool,
+    /// Russian roulette: from this vertex on, each vertex continues with
+    /// probability `q = clamp(proxy, floor, 1)` and divides the throughput
+    /// by it. The proxy is the product of the diffuse albedos over the
+    /// earlier survivals' `q` — a throughput without the conductor's `f`, so
+    /// it is θ-free, the decision is detached, and CRN central differences
+    /// see the same paths.
+    pub roulette: Option<Roulette>,
     /// Online path guiding at diffuse vertices (GPU only; see
     /// `gpu/guide.wgsl`). `None` is cosine sampling.
     pub guide: Option<Guide>,
@@ -762,6 +804,7 @@ impl Scene {
             restir: None,
             qmc: false,
             spectral_is: false,
+            roulette: None,
             guide: None,
             points: None,
             tan_half: half_fov_deg.to_radians().tan(),
@@ -1187,6 +1230,9 @@ struct Path {
     /// The BSDF pdf the current ray was drawn with; 0 for the camera ray.
     prev_pdf: f64,
     alive: bool,
+    /// Vertices so far, and the roulette's θ-free throughput proxy.
+    vertex: u32,
+    proxy: f64,
 }
 
 /// What a pass measured.
@@ -1350,6 +1396,8 @@ fn trace(
                 rng,
                 prev_pdf: 0.0,
                 alive: true,
+                vertex: 0,
+                proxy: 1.0,
             }
         })
         .collect();
@@ -1513,14 +1561,22 @@ fn trace(
                 }
                 p.rng.align();
                 let (u1, u2) = (p.rng.uniform(), p.rng.uniform());
+                let proxy = ((p.proxy as f32) * (albedo as f32)) as f64;
+                let q = scene.roulette_at(p.vertex, proxy, &mut p.rng);
+                if q == 0.0 {
+                    p.alive = false;
+                    continue;
+                }
                 let (r, phi) = (u1.sqrt(), 2.0 * std::f64::consts::PI * u2);
                 let cz = (1.0 - u1).max(0.0).sqrt();
                 let wi = t * (r * phi.cos()) + b * (r * phi.sin()) + nrm * cz;
                 for tp in &mut p.throughput[..nw] {
-                    *tp *= albedo;
+                    *tp *= albedo / q;
                 }
                 p.prev_pdf = cz / std::f64::consts::PI;
                 p.ray = Ray::new(origin, wi);
+                p.vertex += 1;
+                p.proxy = ((proxy as f32) / (q as f32)) as f64;
                 continue;
             }
             // The hero alone picks the direction. GGX's sampling does not
@@ -1547,8 +1603,9 @@ fn trace(
             }
             p.rng.align();
             let u = [p.rng.uniform(), p.rng.uniform()];
+            let q = scene.roulette_at(p.vertex, p.proxy, &mut p.rng);
             let (li, pdf) = ggx::sample(alpha, lo, u);
-            if li[2] <= 0.0 || lo[2] <= 0.0 || !pdf.is_finite() || pdf <= 0.0 {
+            if q == 0.0 || li[2] <= 0.0 || lo[2] <= 0.0 || !pdf.is_finite() || pdf <= 0.0 {
                 // Dead after this vertex; its light sample still counts.
                 sampled[i] = (Vec3::zeros(), 0.0, 0.0);
                 p.alive = false;
@@ -1557,8 +1614,11 @@ fn trace(
             for w in 0..nw {
                 lane(&mut cols, i * nw + w, li, lo, p.lambda[w]);
             }
-            sampled[i] = (t * li[0] + b * li[1] + nrm * li[2], li[2], pdf);
+            // the roulette's 1/q rides on the pdf the throughput divides by
+            sampled[i] = (t * li[0] + b * li[1] + nrm * li[2], li[2], pdf * q);
             p.prev_pdf = pdf;
+            p.vertex += 1;
+            p.proxy = ((p.proxy as f32) / (q as f32)) as f64;
             p.ray = Ray::new(origin, sampled[i].0);
             ball[i] = true;
             any = true;

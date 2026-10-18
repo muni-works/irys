@@ -53,6 +53,7 @@ struct Params {
     gres: vec4<u32>,      // grid cells per axis, flags (1 on, 2 training)
     gres2: vec4<u32>,     // records per path, cells, samples a cell needs, 0
     qmc: vec4<u32>,       // phase 3 sampler: (Sobol on, wavelengths by importance, 0, 0)
+    rr: vec4<f32>,        // phase 3 Russian roulette: (on, first vertex, survival floor, 0)
 }
 
 const NONE: u32 = 0xffffffffu;
@@ -898,7 +899,7 @@ fn gen(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d = normalize(params.fwd.xyz + params.right.xyz * sx + params.up.xyz * sy);
     paths[i] = Path(
         vec4<f32>(params.eye.xyz, 0.0),
-        vec4<f32>(d, 0.0),
+        vec4<f32>(d, 1.0),   // .w: the roulette's θ-free throughput proxy
         vec4<f32>(1.0),
         vec4<f32>(0.0),
         lam,
@@ -1064,17 +1065,24 @@ fn bounce_at(i: u32, last: bool) {
         palign(&s);
         let u1 = prand(&s);
         let u2 = prand(&s);
+        let proxy = p.d.w * albedo;
+        let q = roulette(p.o.w, proxy, &s);
+        p.rng = s;
+        if (q == 0.0) {
+            p.alive = 0u;
+            paths[i] = p;
+            return;
+        }
         let r = sqrt(u1);
         let phi = 2.0 * PI * u2;
         let cz = sqrt(max(1.0 - u1, 0.0));
         let wi = t * (r * cos(phi)) + b * (r * sin(phi)) + n * cz;
         for (var k = 0u; k < params.nw; k = k + 1u) {
-            p.tp[k] = p.tp[k] * albedo;
+            p.tp[k] = p.tp[k] * albedo / q;
         }
         p.smp.w = cz / PI;
-        p.o = vec4<f32>(origin, 0.0);
-        p.d = vec4<f32>(normalize(wi), 0.0);
-        p.rng = s;
+        p.o = vec4<f32>(origin, p.o.w + 1.0);
+        p.d = vec4<f32>(normalize(wi), proxy / q);
         paths[i] = p;
         return;
     }
@@ -1094,11 +1102,12 @@ fn bounce_at(i: u32, last: bool) {
     palign(&s);
     let u0 = prand(&s);
     let u = vec2<f32>(u0, prand(&s));
+    let q = roulette(p.o.w, p.d.w, &s);
     p.rng = s;
     let sm = ggx_sample(params.alpha, lo, u);
     let li = sm.xyz;
     let pdf = sm.w;
-    if (li.z <= 0.0 || lo.z <= 0.0 || !(pdf > 0.0) || !(pdf < 3.4e38)) {
+    if (q == 0.0 || li.z <= 0.0 || lo.z <= 0.0 || !(pdf > 0.0) || !(pdf < 3.4e38)) {
         // Dead after this vertex; its light sample still counts.
         p.alive = 0u;
         paths[i] = p;
@@ -1109,10 +1118,26 @@ fn bounce_at(i: u32, last: bool) {
     for (var k = 0u; k < params.nw; k = k + 1u) {
         write_lane(base + k, li.z, lo.z, hh.z, oh, band_weights(p.lam[k]));
     }
-    p.smp = vec4<f32>(li.z, pdf, 1.0, pdf);
-    p.o = vec4<f32>(origin, 0.0);
-    p.d = vec4<f32>(normalize(t * li.x + b * li.y + n * li.z), 0.0);
+    // The roulette's 1/q rides on the pdf `update` divides by; MIS keeps
+    // the sampler's own pdf.
+    p.smp = vec4<f32>(li.z, pdf * q, 1.0, pdf);
+    p.o = vec4<f32>(origin, p.o.w + 1.0);
+    p.d = vec4<f32>(normalize(t * li.x + b * li.y + n * li.z), p.d.w / q);
     paths[i] = p;
+}
+
+// Russian roulette (`Scene::roulette`) at a vertex with `vertex` vertices
+// before it: one more draw of the BSDF tuple, survival q from the path's
+// θ-free throughput proxy (diffuse albedos over earlier survivals' q, so a
+// survivor's proxy returns towards 1, as a throughput would), floored. 1 when off or too
+// early, 0 when the path ends here. q is a detached sampling decision.
+fn roulette(vertex: f32, proxy: f32, s: ptr<function, vec2<u32>>) -> f32 {
+    if (params.rr.x == 0.0 || vertex < params.rr.y) {
+        return 1.0;
+    }
+    let u = prand(s);
+    let q = clamp(proxy, params.rr.z, 1.0);
+    return select(0.0, q, u < q);
 }
 
 // The diffuse vertex with guiding on (`guide.wgsl`): NEE weighed against
@@ -1147,6 +1172,14 @@ fn bounce_guided(
     let u1 = prand(s);
     let u2 = prand(s);
     let us = prand(s);
+    let proxy = p.d.w * albedo;
+    let q = roulette(p.o.w, proxy, s);
+    if (q == 0.0) {
+        p.rng = *s;
+        p.alive = 0u;
+        paths[i] = p;
+        return;
+    }
     var wi: vec3<f32>;
     if (us < c) {
         wi = guide_sample(cell, u1, u2);
@@ -1159,14 +1192,14 @@ fn bounce_guided(
         wi = normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * cz);
     }
     let cz = dot(wi, n);
-    let q = c * guide_pdf(cell, wi) + (1.0 - c) * max(cz, 0.0) / PI;
+    let qm = c * guide_pdf(cell, wi) + (1.0 - c) * max(cz, 0.0) / PI;
     p.rng = *s;
-    if (!(cz > 0.0) || !(q > 0.0)) {
+    if (!(cz > 0.0) || !(qm > 0.0)) {
         p.alive = 0u;
         paths[i] = p;
         return;
     }
-    let f = albedo * cz / PI / q;
+    let f = albedo * cz / PI / qm / q;
     var lplus = 0.0;
     var tn = 0.0;
     for (var k = 0u; k < params.nw; k = k + 1u) {
@@ -1175,11 +1208,11 @@ fn bounce_guided(
         tn = tn + p.tp[k];
     }
     if (guide_training()) {
-        guide_record(i, cell, guide_bin(wi), lplus, tn, q);
+        guide_record(i, cell, guide_bin(wi), lplus, tn, qm * q);
     }
-    p.smp.w = q;
-    p.o = vec4<f32>(origin, 0.0);
-    p.d = vec4<f32>(wi, 0.0);
+    p.smp.w = qm;
+    p.o = vec4<f32>(origin, p.o.w + 1.0);
+    p.d = vec4<f32>(wi, proxy / q);
     paths[i] = p;
 }
 
