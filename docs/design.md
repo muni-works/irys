@@ -1918,6 +1918,121 @@ term less to win), not below the floor, and the gate draws 64 seeds now:
 Neither is a bias, so `pick_by_peak` is the default; the full suite passes
 under it.
 
+### 2. Scene import through Blender (`scripts/blend_export.py`, `blend.rs`)
+
+`blender -b -Y file.blend -P scripts/blend_export.py -- <dir>` writes
+`scene.glb` and `irys.json`; `irys_diff::blend::load` (feature `assets`)
+reads them. glTF 2.0 plus a sidecar, as planned, but the glTF is written by
+the script from the render-time depsgraph rather than by Blender's
+exporter: that one does not keep particle or geometry-node instances as
+shared meshes (the pavilion's 20 000 pebbles), has no area lights, and only
+reads Principled factors, while both demo files are built from
+Diffuse / Anisotropic / Mix graphs. The glb is standard (Y-up, one
+primitive per material, a node per instance, a perspective camera); what
+glTF cannot say is in the sidecar.
+
+| | kept | dropped / approximated |
+|---|---|---|
+| geometry | meshes, curves and text as meshes, render subdivision levels, particle / collection / geometry-node instances (one tree per mesh × material, a placement per instance) | hair curves; per-ray visibility flags (a camera- and shadow-invisible emitter, a *light portal*, is folded into the sky instead) |
+| materials | grey diffuse with the material's albedo, one GGX conductor θ (the conductor covering most placed triangles), one-sided emitters (a Backfacing mix keeps the emitting side) | colour (irys's albedo is a scalar: luminance kept), textures (averaged — and where the camera sees the material, replaced by Cycles' own Diffuse/Glossy Color passes, which fixed 20 of the classroom's 55 visible materials by > 0.1 albedo, e.g. leather 0.79 → 0.03), glossy coats over diffuse, anisotropy, bump / normal / displacement, glass and water (left out: no dielectric), alpha cut-outs (the pavilion's leaves), SSS (flagged, rendered diffuse), all conductors but one |
+| lights | sun → the env lobe (κ = 2/r², same irradiance), area quad/disc, point/spot → emitter spheres; light node trees' Emission strength / Light Falloff | spot cones, blackbody tints, every emitter's own radiance (one shared radiance; dimmer emitters shrunk by √(L/L_max): same power, same place) |
+| world | baked by Cycles to an equirect and fitted to `sky · (0.15 + 0.25 z⁺)` | its colour and shape (pavilion fit rel. rms 0.43), anything > 20× the median |
+| camera | pinhole, sensor fit, aspect | depth of field, lens shift |
+
+Units were calibrated in Cycles rather than assumed: sun strength is
+irradiance, an area light's radiance P/(πA), a point light's P/(4π²r²) on
+its soft radius, Emission strength is radiance.
+
+### 3. Real scenes
+
+Two files from blender.org's demo page, stored outside the repo with
+an `ATTRIBUTION.md`: **classroom** (Christophe Seux, CC0, 70 MB zip) and
+the **Barcelona Pavilion** (eMirage, CC-BY, 25 MB zip), both via
+mirror.blender.org (download.blender.org/demo/test answers 403). Bistro is
+not a blender.org file (NVIDIA ORCA, FBX). Barbershop is only on svn, so it
+was not used.
+
+| scene | instances | triangles (unique / placed) | lights |
+|---|---|---|---|
+| classroom (`_mainScene`) | 893 | 433 k / 1.23 M | sun, 7 point, 2 area, 3 emissive materials, a portal |
+| pavilion (`1- time: midday`) | 20 722 | 198 k / 54.9 M (25 M after glass and leaves) | sun, sky texture + HDRI |
+
+480 × 270, depth 8, references **32 768 spp** for both renderers (Cycles
+146 / 344 / 119 / 66 s, irys 158 / 146 / 109 / 100 s), sweeps to 1024 spp,
+otherwise phase 3's protocol (fastest of two per level, budgets at Cycles'
+64 / 256 / 1024-spp times, each renderer against its own reference).
+
+- **grey** (`<scene>-grey`, the clean bench): irys's import with every
+  non-emitter grey Lambertian 0.8, exported by `irys-bench export` and
+  rebuilt in Cycles instanced (geometry-node Instance on Points: linked
+  duplicates cost 7 s of sync per render on the pavilion), the sun a lamp
+  of the same irradiance and solid angle. One scene: reference means agree
+  to 0.1 % (classroom 1.6847 vs 1.6858, pavilion 0.7229 vs 0.7216), cross
+  relMSE 1.4e-3 and 3e-4.
+- **true**: Cycles renders the .blend itself (`scripts/cycles_blend.py`),
+  irys its import. The mismatch is the model, not noise: reference means
+  0.33 vs 0.56 (classroom) and 0.34 vs 0.56 (pavilion), cross relMSE 26
+  and 8.7. irys is brighter in both: the glass that Cycles renders (and
+  that shadows, refracts and tints) is left out, the classroom's warm
+  wood and leather are luminance only, the coats' energy is dropped
+  into nothing rather than reflected, and the pavilion loses its water.
+
+Equal-time relMSE, irys / Cycles (by-peak sun share, the new default):
+
+| scene | budget | Cycles | sobol+spectral | ratio | + guide | ratio |
+|---|---|---|---|---|---|---|
+| classroom-grey | 0.78 s | 0.234 | 0.108 | **0.46** | 0.113 | 0.48 |
+| classroom-grey | 2.50 s | 0.057 | 0.031 | **0.54** | 0.035 | 0.62 |
+| classroom-grey | 9.30 s | 0.0143 | 0.0084 | **0.58** | 0.0095 | 0.66 |
+| pavilion-grey | 0.44 s | 2.9e-3 | 5e-4 | **0.16** | 8e-4 | 0.27 |
+| pavilion-grey | 0.95 s | 7e-4 | 3e-4 | **0.36** | 4e-4 | 0.54 |
+| pavilion-grey | 2.49 s | 2e-4 | 1e-4 | **0.59** | 1e-4 | 0.85 |
+| classroom (true) | 0.60 s | 0.160 | 0.208 | 1.30 | 0.132 | **0.83** |
+| classroom (true) | 1.80 s | 0.113 | 0.069 | 0.61 | 0.047 | **0.41** |
+| classroom (true) | 5.58 s | 0.021 | 0.020 | 0.96 | 0.013 | **0.63** |
+| pavilion (true) | 0.34–3.84 s | ∞ / 31 / 2013 | 9e-4 / 3e-4 / 1e-4 | — | — | — |
+
+Time per sample at 1024 spp: classroom-grey irys 4.4 ms vs Cycles 9.1 ms;
+pavilion-grey 2.8 vs 2.4 ms. **The gate is met on both real scenes at every
+budget in the equal-material bench** (worst 0.59). The true-material rows
+compare different pictures: on the classroom irys converges faster to its
+own (wrong-coloured, brighter) image; on the pavilion Cycles' sweep is
+dominated by caustic fireflies through the glass and water (pixels up to
+3·10⁴ at 64 spp, 3·10³ at 1024, against a reference max of 167; no
+clamping by protocol), scenes irys does not render at all, so that row is
+not a speed result.
+
+![classroom grey](scenes-classroom-grey.png)
+![pavilion grey](scenes-pavilion-grey.png)
+![classroom](scenes-classroom.png)
+![pavilion](scenes-pavilion.png)
+
+(`scripts/scenes_bench.sh classroom,pavilion`; each image Cycles at its
+64-spp time, irys's two variants at their nearest levels, both
+references, labelled.)
+
+### Phase 5a risks and next
+
+1. **The true-material gap is the look, not sampling**: glass/water
+   (a dielectric), RGB albedo, coats and textures are phase 4's OpenPBR
+   work (claude/look); until they land, the true bench measures different
+   images and only the grey bench is a speed comparison.
+2. **One emitter radiance, one conductor.** Shrinking emitters keeps power
+   and position but sharpens their shadows and makes them harder to hit
+   by BSDF sampling (the classroom's smallest is shrunk to 6 % of its
+   size); per-emitter radiance and per-placement θ need device changes.
+3. **Portals and visibility flags**: the classroom's daylight portal is
+   folded into a sky of 8.3, which lights every opening, not only its
+   window; per-ray visibility would be the faithful fix.
+4. **The colour passes are view-dependent**: materials the camera does not
+   see keep the reducer's estimate, which was off by > 0.1 for a third of
+   the visible ones.
+5. The pavilion's world fit is poor (rel. rms 0.43): irys's analytic sky
+   cannot hold an HDRI; an environment map with alias-table sampling is
+   needed for any real exterior.
+6. Not verified: other demo files, mirrored instances' emitter sidedness,
+   and timings were taken on a shared GPU (fastest of two per level).
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.
@@ -1940,7 +2055,7 @@ Each phase ends on a measured gate, not a demo.
 | 2 unified scene + wavefront GPU | 3DGRT splats + BRep + mesh in one BVH, vcad on wgpu 30 | CAD rover in a splat street; pose fit from a photo |
 | 3 sampling | ReSTIR PT, neural guiding, NRC | equal-time error ≤ Cycles on classroom, bistro (2026-10-17: not met; equal-spp error ≤ Cycles, throughput 2.4–3.6× short — see Phase 3; after Speed: met on room, ahead at small budgets everywhere, 1.23–1.27× behind at the largest budget on pair and cornell) |
 | 4 the look | OpenPBR, layering, volumes, SSS, hair | OpenPBR reference scenes match |
-| 5 product | USD + .blend import, denoiser, RL batch lane | Blender demo files render; public bench vs Cycles |
+| 5 product | USD + .blend import, denoiser, RL batch lane | Blender demo files render; public bench vs Cycles (2026-10-18, 5a: classroom and the Barcelona pavilion import and render; equal-material equal-time relMSE 0.16–0.59× Cycles; true materials differ, see Phase 5a) |
 
 muni lands after phase 2. Phases 1–2 are the research risk; 3–5 are
 known techniques and a lot of engineering.
