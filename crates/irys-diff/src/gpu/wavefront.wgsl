@@ -65,12 +65,18 @@ struct Path {
     tp: vec4<f32>,        // throughput per wavelength
     rad: vec4<f32>,       // L_j per wavelength
     lam: vec4<f32>,       // wavelengths, nm
-    smp: vec4<f32>,       // (cos_i, pdf, conductor vertex this bounce, pdf of the ray's own BSDF sample)
-    ldir: vec4<f32>,      // light sample at this conductor vertex: (ω_L, s = cos w_L / p_L), s = 0 for none
     rng: vec2<u32>,       // SplitMix64 state (lo, hi)
     alive: u32,
-    lkind: u32,           // the light sample in `ldir` is an emitter (1) or the environment (0)
+    pdf: f32,             // the pdf of the ray's own BSDF sample (MIS at the next hit), 0 for none
 }
+
+// Speed round 3: what only a conductor vertex's lanes need, out of `Path`
+// (which every kernel loads and stores per bounce) into two vec4s per path
+// that `bounce` writes and `update` reads only where `lane_bits` says so:
+// [2i] the light sample (ω_L, s = cos w_L / p_L), [2i + 1] (cos_i, pdf · 1/q
+// of the BSDF sample, the light sample is an emitter (1) or the environment
+// (0), 0).
+@group(0) @binding(71) var<storage, read_write> cold: array<vec4<f32>>;
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read_write> paths: array<Path>;
@@ -905,7 +911,6 @@ fn gen(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.cap) { return; }
     if (i >= params.paths) {
-        paths[i].smp = vec4<f32>(0.0);
         paths[i].alive = 0u;
         return;
     }
@@ -934,11 +939,9 @@ fn gen(@builtin(global_invocation_id) gid: vec3<u32>) {
         vec4<f32>(1.0),
         vec4<f32>(0.0),
         lam,
-        vec4<f32>(0.0),
-        vec4<f32>(0.0),
         s,
         select(1u, 2u, params.restir.y > 0u),   // 2: the first vertex takes the ReSTIR reservoir
-        0u,
+        0.0,
     );
 }
 
@@ -968,13 +971,8 @@ fn bounce_at(i: u32, last: bool) {
         return;
     }
     var p = paths[i];
-    let prev_pdf = p.smp.w;
-    p.smp = vec4<f32>(0.0, 0.0, 0.0, prev_pdf);
-    p.ldir = vec4<f32>(0.0);
-    if (p.alive == 0u) {
-        paths[i] = p;
-        return;
-    }
+    let prev_pdf = p.pdf;
+    p.pdf = 0.0;
     let o = p.o.xyz;
     let d = p.d.xyz;
     let hit = intersect(o, d, 3.4e38, false);
@@ -1072,8 +1070,6 @@ fn bounce_at(i: u32, last: bool) {
         }
         lit = ok && lcos > 0.0 && intersect(origin, ld, tmax, true).prim == NONE;
     }
-    // Radiance of the light sample at the path's wavelength `l`.
-    p.lkind = select(0u, 1u, lem);
     if (!conductor) {
         let info = geo[params.inst_base + 4u * hit.inst + 3u];
         let albedo = albedo_at(x, info.w != 0.0) * info.z;
@@ -1106,7 +1102,7 @@ fn bounce_at(i: u32, last: bool) {
         for (var k = 0u; k < params.nw; k = k + 1u) {
             p.tp[k] = p.tp[k] * albedo / q;
         }
-        p.smp.w = cz / PI;
+        p.pdf = cz / PI;
         p.o = vec4<f32>(origin, p.o.w + 1.0);
         p.d = vec4<f32>(normalize(wi), proxy / q);
         paths[i] = p;
@@ -1121,9 +1117,9 @@ fn bounce_at(i: u32, last: bool) {
         stage[2u * i + 1u] = vec4<f32>(li.z, lo.z, hl.z, ohl);
         lane_bits[i] = 2u;
         let pb = ggx_pdf(params.alpha, lo.z, hl.z);
-        p.ldir = vec4<f32>(ld, lcos * mis(lpdf, pb) / ldiv * lw);
-        p.smp.z = 1.0;
+        cold[2u * i] = vec4<f32>(ld, lcos * mis(lpdf, pb) / ldiv * lw);
     }
+    let lkind = select(0.0, 1.0, lem);
     palign(&s);
     let u = pdraws(&s, 2u).xy;
     let q = roulette(p.o.w, p.d.w, &s);
@@ -1133,6 +1129,9 @@ fn bounce_at(i: u32, last: bool) {
     let pdf = sm.w;
     if (q == 0.0 || li.z <= 0.0 || lo.z <= 0.0 || !(pdf > 0.0) || !(pdf < 3.4e38)) {
         // Dead after this vertex; its light sample still counts.
+        if (lane_bits[i] != 0u) {
+            cold[2u * i + 1u] = vec4<f32>(0.0, 0.0, lkind, 0.0);
+        }
         p.alive = 0u;
         paths[i] = p;
         return;
@@ -1143,7 +1142,8 @@ fn bounce_at(i: u32, last: bool) {
     lane_bits[i] = lane_bits[i] | 1u;
     // The roulette's 1/q rides on the pdf `update` divides by; MIS keeps
     // the sampler's own pdf.
-    p.smp = vec4<f32>(li.z, pdf * q, 1.0, pdf);
+    cold[2u * i + 1u] = vec4<f32>(li.z, pdf * q, lkind, 0.0);
+    p.pdf = pdf;
     p.o = vec4<f32>(origin, p.o.w + 1.0);
     p.d = vec4<f32>(normalize(t * li.x + b * li.y + n * li.z), p.d.w / q);
     paths[i] = p;
@@ -1234,7 +1234,7 @@ fn bounce_guided(
     if (guide_training()) {
         guide_record(i, cell, guide_bin(wi), lplus, tn, qm * q);
     }
-    p.smp.w = qm;
+    p.pdf = qm;
     p.o = vec4<f32>(origin, p.o.w + 1.0);
     p.d = vec4<f32>(wi, proxy / q);
     paths[i] = p;
@@ -1250,6 +1250,8 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let bits = lane_bits[i];
     if (bits == 0u) { return; }
     var p = paths[i];
+    let ls = cold[2u * i];
+    let bs = cold[2u * i + 1u];
     let slot = lane_slot(i) * params.nw;
     let base = slot;
     let light_base = slot + select(0u, params.nw, (bits & 1u) != 0u);
@@ -1264,19 +1266,19 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
             if ((bits & 2u) != 0u) { df_out[light_base + k] = 0.0; }
         }
         // NEE first: C_j joins L_j before the BSDF lane's δf reads it.
-        if ((bits & 2u) != 0u && p.ldir.w > 0.0) {
-            let g = p.tp[k] * p.ldir.w * light_le(p.ldir.xyz, p.lkind == 1u, p.lam[k]);
+        if ((bits & 2u) != 0u && ls.w > 0.0) {
+            let g = p.tp[k] * ls.w * light_le(ls.xyz, bs.z == 1.0, p.lam[k]);
             if (params.replay != 0u) {
                 df_out[light_base + k] = dl_in[fj] * g;
             }
             p.rad[k] = p.rad[k] + g * f_in[light_base + k];
         }
-        if ((bits & 1u) != 0u && p.smp.y > 0.0) {
+        if ((bits & 1u) != 0u && bs.y > 0.0) {
             let f = f_in[j];
             if (params.replay != 0u && f > 0.0) {
                 df_out[j] = dl_in[fj] * (l_in[fj] - p.rad[k]) / f;
             }
-            p.tp[k] = p.tp[k] * (f * p.smp.x / p.smp.y);
+            p.tp[k] = p.tp[k] * (f * bs.x / bs.y);
             live = live || p.tp[k] > 0.0;
         }
     }

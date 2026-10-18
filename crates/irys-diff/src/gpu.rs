@@ -83,7 +83,7 @@ fn sobol_const() -> String {
         keys.join(", ")
     )
 }
-const PATH_BYTES: u64 = 128;
+const PATH_BYTES: u64 = 96;
 const WG: u32 = 64;
 
 #[repr(C)]
@@ -692,6 +692,7 @@ impl GpuPrb {
         // Lane compaction (`compact.wgsl`).
         let lane_bits = storage("lane bits", paths as u64 * 4);
         let stage = storage("lane stage", paths as u64 * 32);
+        let cold = storage("path cold", paths as u64 * 32);
         let lane_off = storage("lane offsets", paths as u64 * 4);
         let lane_top = storage("lane block offsets", (paths as u64).div_ceil(256) * 4);
         let ind = dev.create_buffer(&wgpu::BufferDescriptor {
@@ -795,6 +796,7 @@ impl GpuPrb {
             (54, &g_nrec),
             (59, &lane_bits),
             (60, &stage),
+            (71, &cold),
         ];
         let mut scatter: Vec<(u32, &wgpu::Buffer)> = vec![
             (0, &params),
@@ -827,6 +829,7 @@ impl GpuPrb {
                     (11, &dl),
                     (12, &df),
                     (59, &lane_bits),
+                    (71, &cold),
                     (61, &lane_off),
                     (62, &lane_top),
                 ],
