@@ -316,3 +316,133 @@ fn restir_gpu_gradient_matches_gpu_central_differences() {
         assert!(e < 1e-2, "θ{p}: prb {} vs fd {fd}", d[p]);
     }
 }
+
+// ---- path guiding ----
+
+use irys_diff::prb::Guide;
+
+fn with_guide(mut s: Scene) -> Scene {
+    s.guide = Some(Guide::default());
+    s
+}
+
+/// Train a fresh wavefront's guide on `frames` frames, rebuilding after each.
+fn trained(ctx: &'static irys_gpu::GpuContext, scene: &Scene, frames: u64) -> GpuPrb {
+    let mut g = GpuPrb::new(ctx, scene);
+    g.set_guide_training(true);
+    for f in 0..frames {
+        g.image(scene, &GOLD, 900 + f);
+        g.guide_build(scene);
+    }
+    g.set_guide_training(false);
+    g
+}
+
+/// Image mean, per-pixel variance, per-8×8-block (mean, variance of the
+/// mean) of `frames` independent frames from a wavefront.
+fn stats_of(g: &mut GpuPrb, scene: &Scene, frames: usize) -> (f64, f64, Vec<(f64, f64)>) {
+    let (w, h) = scene.size;
+    let imgs: Vec<Vec<f64>> = (0..frames)
+        .map(|f| gpu::widen(&g.image(scene, &GOLD, 500 + f as u64)))
+        .collect();
+    let n = imgs[0].len();
+    let mean = |v: &dyn Fn(&Vec<f64>) -> f64| imgs.iter().map(v).sum::<f64>() / frames as f64;
+    let px_var = (0..n)
+        .map(|i| {
+            let m = mean(&|im| im[i]);
+            imgs.iter().map(|im| (im[i] - m).powi(2)).sum::<f64>() / (frames - 1) as f64
+        })
+        .sum::<f64>()
+        / n as f64;
+    let block = |im: &Vec<f64>, b: usize| {
+        (0..h * w)
+            .filter(|p| (p / w) * 8 / h * 8 + (p % w) * 8 / w == b)
+            .map(|p| im[3 * p] + im[3 * p + 1] + im[3 * p + 2])
+            .sum::<f64>()
+    };
+    let blocks = (0..64)
+        .map(|b| {
+            let m = mean(&|im| block(im, b));
+            let v = imgs.iter().map(|im| (block(im, b) - m).powi(2)).sum::<f64>()
+                / ((frames - 1) * frames) as f64;
+            (m, v)
+        })
+        .collect();
+    (mean(&|im| im.iter().sum::<f64>()), px_var, blocks)
+}
+
+/// A trained guide leaves the image unbiased — the same as cosine sampling
+/// block by block, on the emitter box and the sky-lit pair. (What it buys
+/// is the benchmark's question, at equal time.)
+#[test]
+fn guide_is_unbiased() {
+    let ctx = device!();
+    for (name, base) in [
+        ("cornell", {
+            let mut s = Scene::cornell(48, 48, 8);
+            s.depth = 5;
+            s
+        }),
+        ("pair", {
+            let mut s = Scene::pair(48, 48, 8, 1.0);
+            s.complete = true;
+            s
+        }),
+    ] {
+        let frames = 96;
+        let (t0, v0, b0) = stats_of(&mut GpuPrb::new(ctx, &base), &base, frames);
+        let gs = with_guide(base);
+        let (t1, v1, b1) = stats_of(&mut trained(ctx, &gs, 16), &gs, frames);
+        let bias = rel(t0, t1);
+        let z = b0
+            .iter()
+            .zip(&b1)
+            .map(|(a, b)| (a.0 - b.0).abs() / (a.1 + b.1).sqrt())
+            .fold(0.0, f64::max);
+        eprintln!(
+            "{name}: means rel {bias:.1e}, worst 8×8 block z {z:.2}; per-pixel variance cosine {v0:.3e}, guided {v1:.3e} ({:.2}×)",
+            v0 / v1
+        );
+        assert!(bias < 1e-2, "{name}: means differ by {bias}");
+        assert!(z < 4.5, "{name}: a block differs by {z} σ");
+    }
+}
+
+/// Training is integer atomics, so two wavefronts learn the same guide to
+/// the bit and render the same image; with the guide frozen, replay is
+/// bit-exact and PRB matches central differences on the device.
+#[test]
+fn guide_is_deterministic_and_replays() {
+    let ctx = device!();
+    let mut scene = with_guide(Scene::cornell(48, 48, 4));
+    scene.frozen_alpha = Some(0.3);
+    let mut a = trained(ctx, &scene, 6);
+    let mut b = trained(ctx, &scene, 6);
+    assert_eq!(
+        bits(&a.image(&scene, &THETA0, 3)),
+        bits(&b.image(&scene, &THETA0, 3)),
+        "two trainings differ"
+    );
+    let l = a.forward(&scene, &THETA0, 11);
+    let (_, l2) = a.replay(&scene, &THETA0, 11, &vec![1.0; l.len()]);
+    assert_eq!(bits(&l), bits(&l2), "replay");
+    let target = gpu::widen(&a.image(&scene, &GOLD, 99));
+    a.set_target(&target);
+    let (_, d) = a.gradient_l2(&scene, &THETA0, (7, 7));
+    let h = 4e-3;
+    let fd: Vec<f64> = (0..PARAMS)
+        .map(|p| {
+            let (mut lo, mut hi) = (THETA0, THETA0);
+            lo[p] -= h;
+            hi[p] += h;
+            (a.loss_l2(&scene, &hi, 7) - a.loss_l2(&scene, &lo, 7)) / (2.0 * h)
+        })
+        .collect();
+    // f32 differences: judge each component against the gradient's scale
+    let scale = fd.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    for p in 0..PARAMS {
+        let e = (d[p] - fd[p]).abs() / scale;
+        eprintln!("θ{p}: guided prb {:+.6e}  fd {:+.6e}  err/|∇| {e:.1e}", d[p], fd[p]);
+        assert!(e < 1e-2, "θ{p}: prb {} vs fd {}", d[p], fd[p]);
+    }
+}

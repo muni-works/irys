@@ -406,6 +406,31 @@ impl Default for Restir {
     }
 }
 
+/// Path guiding's knobs: a grid of `res` cells along the scene's longest
+/// side (×6 normal classes), 16 × 16 directional bins each, sampled with
+/// probability `mix` against the cosine lobe once a cell has `min_samples`
+/// training samples. GPU only (`gpu/guide.wgsl`); the CPU reference refuses
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Guide {
+    /// Cells along the longest side of the scene's bounds.
+    pub res: u32,
+    /// Probability of drawing from the guide in a trained cell.
+    pub mix: f64,
+    /// Samples a cell needs before it guides.
+    pub min_samples: u32,
+}
+
+impl Default for Guide {
+    fn default() -> Self {
+        Self {
+            res: 16,
+            mix: 0.5,
+            min_samples: 64,
+        }
+    }
+}
+
 /// One light sample: direction, solid-angle pdf, distance to the point on
 /// an emitter (∞ for the environment), and which it is.
 #[derive(Debug, Clone, Copy)]
@@ -479,6 +504,9 @@ pub struct Scene {
     /// ReSTIR DI at the first vertex (GPU only; see `gpu/restir.wgsl`).
     /// `None` is the plain NEE draw.
     pub restir: Option<Restir>,
+    /// Online path guiding at diffuse vertices (GPU only; see
+    /// `gpu/guide.wgsl`). `None` is cosine sampling.
+    pub guide: Option<Guide>,
     /// When set, the frame is these primary rays instead of the image's:
     /// path `i` leaves the camera through camera-plane point `points[i]`
     /// (`(sx, sy)`, [`Scene::screen`]) and is keyed `i / 2`, so the two rays
@@ -722,6 +750,7 @@ impl Scene {
             lights,
             complete: false,
             restir: None,
+            guide: None,
             points: None,
             tan_half: half_fov_deg.to_radians().tan(),
             eye,
@@ -1248,6 +1277,10 @@ fn trace(
     assert!(
         scene.restir.is_none(),
         "ReSTIR DI is GPU-only: the CPU reference has no reservoirs"
+    );
+    assert!(
+        scene.guide.is_none(),
+        "path guiding is GPU-only: the CPU reference has no guide"
     );
     let lanes = scene.lanes();
     let width = scene.graph_width();

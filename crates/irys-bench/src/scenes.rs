@@ -140,6 +140,7 @@ pub fn apply(scene: &mut Scene, features: &[&str]) {
         match *f {
             "base" => {}
             "restir" => scene.restir = Some(irys_diff::prb::Restir::default()),
+            "guide" => scene.guide = Some(irys_diff::prb::Guide::default()),
             other => panic!("unknown sampler {other}"),
         }
     }

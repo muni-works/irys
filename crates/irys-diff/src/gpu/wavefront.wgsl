@@ -48,6 +48,10 @@ struct Params {
     env: vec4<f32>,       // sun radiance, sky scale, SUN_PICK, vMF normaliser κ / (2π (1 − e^{−2κ}))
     light: vec4<f32>,     // phase 3: emitter triangles, env pick share, emitter area, emission
     restir: vec4<u32>,    // phase 3 ReSTIR DI: (k << 8 | radius px, candidates M0 (0 = off), temporal, M cap)
+    guide: vec4<f32>,     // phase 3 guiding: (mix c, 0, 0, 0)
+    gmin: vec4<f32>,      // grid origin, 1 / cell size
+    gres: vec4<u32>,      // grid cells per axis, flags (1 on, 2 training)
+    gres2: vec4<u32>,     // records per path, cells, samples a cell needs, 0
 }
 
 const NONE: u32 = 0xffffffffu;
@@ -754,6 +758,9 @@ fn gen(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let g = params.base + i;
+    if (guide_training()) {
+        g_nrec[i] = 0u;
+    }
     var s = rng_new(select(g, g >> 1u, params.points != 0u));
     let lam = lambdas(&s);
     let w = params.size.x;
@@ -920,6 +927,10 @@ fn bounce_at(i: u32, last: bool) {
     if (!conductor) {
         let info = geo[params.inst_base + 4u * hit.inst + 3u];
         let albedo = albedo_at(x, info.w != 0.0) * info.z;
+        if (guide_on()) {
+            bounce_guided(i, &p, &s, x, n, origin, albedo, lit, ld, lcos, lpdf, lem, ldiv, lw);
+            return;
+        }
         if (lit) {
             let w = mis(lpdf, lcos / PI);
             for (var k = 0u; k < params.nw; k = k + 1u) {
@@ -977,6 +988,73 @@ fn bounce_at(i: u32, last: bool) {
     paths[i] = p;
 }
 
+// The diffuse vertex with guiding on (`guide.wgsl`): NEE weighed against
+// the mixture pdf, a direction from the mixture, records for training.
+fn bounce_guided(
+    i: u32,
+    pp: ptr<function, Path>,
+    s: ptr<function, vec2<u32>>,
+    x: vec3<f32>,
+    n: vec3<f32>,
+    origin: vec3<f32>,
+    albedo: f32,
+    lit: bool,
+    ld: vec3<f32>,
+    lcos: f32,
+    lpdf: f32,
+    lem: bool,
+    ldiv: f32,
+    lw: f32,
+) {
+    var p = *pp;
+    let cell = guide_cell(x, n);
+    let c = guide_mix(cell);
+    if (lit) {
+        let pb = c * guide_pdf(cell, ld) + (1.0 - c) * lcos / PI;
+        let w = mis(lpdf, pb);
+        for (var k = 0u; k < params.nw; k = k + 1u) {
+            p.rad[k] = p.rad[k] + p.tp[k] * albedo / PI * lcos * light_le(ld, lem, p.lam[k]) * w / ldiv * lw;
+        }
+    }
+    let us = rand(s);
+    let u1 = rand(s);
+    let u2 = rand(s);
+    var wi: vec3<f32>;
+    if (us < c) {
+        wi = guide_sample(cell, u1, u2);
+    } else {
+        let b = basis_b(n);
+        let t = basis_t(n);
+        let r = sqrt(u1);
+        let phi = 2.0 * PI * u2;
+        let cz = sqrt(max(1.0 - u1, 0.0));
+        wi = normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * cz);
+    }
+    let cz = dot(wi, n);
+    let q = c * guide_pdf(cell, wi) + (1.0 - c) * max(cz, 0.0) / PI;
+    p.rng = *s;
+    if (!(cz > 0.0) || !(q > 0.0)) {
+        p.alive = 0u;
+        paths[i] = p;
+        return;
+    }
+    let f = albedo * cz / PI / q;
+    var lplus = 0.0;
+    var tn = 0.0;
+    for (var k = 0u; k < params.nw; k = k + 1u) {
+        lplus = lplus + p.rad[k];
+        p.tp[k] = p.tp[k] * f;
+        tn = tn + p.tp[k];
+    }
+    if (guide_training()) {
+        guide_record(i, cell, guide_bin(wi), lplus, tn, q);
+    }
+    p.smp.w = q;
+    p.o = vec4<f32>(origin, 0.0);
+    p.d = vec4<f32>(wi, 0.0);
+    paths[i] = p;
+}
+
 @compute @workgroup_size(64)
 fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -1024,8 +1102,13 @@ fn finish(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.paths) { return; }
     let p = paths[i];
+    var l = 0.0;
     for (var k = 0u; k < params.nw; k = k + 1u) {
         l_out[(params.base + i) * params.nw + k] = p.rad[k];
+        l = l + p.rad[k];
+    }
+    if (guide_training()) {
+        guide_flush(i, l);
     }
 }
 

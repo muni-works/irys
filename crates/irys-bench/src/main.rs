@@ -94,8 +94,10 @@ fn irys(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
     let variant = a.get("variant", "base");
     let features: Vec<&str> = variant.split('+').collect();
     let restir = features.contains(&"restir");
-    // ReSTIR reuses across the frame, which must fit one chunk.
-    let call_max = a.num("call-spp", if restir { 4 } else { 16 });
+    let guide = features.contains(&"guide");
+    // ReSTIR reuses across the frame, which must fit one chunk; the guide
+    // learns between calls, so it wants them small.
+    let call_max = a.num("call-spp", if restir || guide { 4 } else { 16 });
     let mut wf: HashMap<usize, (scenes::Bench, GpuPrb)> = HashMap::new();
     // One frame of `spp` paths per pixel: `spp / call` calls of `call` spp
     // each, seeds `seed0 + k`, averaged. Returns the image and the seconds
@@ -111,16 +113,24 @@ fn irys(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
         });
         // warm: pipelines compiled, buffers touched
         let _ = g.image(&b.scene, &b.theta, u64::MAX);
-        if restir {
-            g.advance();
-        }
+        g.reset_history();
         let n = spp / call;
         let t = Instant::now();
         let mut acc = vec![0.0f64; w * h * 3];
         for k in 0..n {
+            // Guiding: learn during the first half of the calls (at least
+            // one), rebuilding the guide after each; every call counts
+            // towards the image.
+            let train = guide && (k == 0 || 2 * (k + 1) <= n);
+            if guide {
+                g.set_guide_training(train);
+            }
             let img = g.image(&b.scene, &b.theta, seed0 + k as u64);
             if restir {
                 g.advance();
+            }
+            if train {
+                g.guide_build(&b.scene);
             }
             for (a, v) in acc.iter_mut().zip(img) {
                 *a += v as f64;
