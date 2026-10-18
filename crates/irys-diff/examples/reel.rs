@@ -224,7 +224,11 @@ fn head(out: &Path, args: &[String]) {
     let (w, h) = (opt(args, "--width", 1920usize), opt(args, "--height", 1080usize));
     let n: usize = opt(args, "--frames", 120);
     let spp: usize = opt(args, "--spp", 24);
-    let degrees: f64 = opt(args, "--degrees", 50.0);
+    let degrees: f64 = opt(args, "--degrees", 24.0);
+    // GpuSkin frames the head for a square image (16:9 renders came out
+    // dark): render h × h and letterbox it into w × h.
+    let (fw, fh) = (w, h);
+    let (w, h) = (h, h);
     let ctx = gpu::context().expect("gpu");
     let asset = mesh::load(&mesh::asset_dir()).expect("the Lee Perry-Smith asset");
     let (chromo, _) = optics::invert(&asset.albedo);
@@ -237,7 +241,7 @@ fn head(out: &Path, args: &[String]) {
     s.spp = spp;
     s.mode = Mode { sss: true, dual: true };
     let mut low = hd::scene(&asset, Chromophores::Map(chromo.clone()), hd::View::Front);
-    low.set_size(192, 108);
+    low.set_size(144, 144);
     low.spp = 4;
     low.mode = Mode { sss: true, dual: true };
     let gs = GpuSkin::with_strands(ctx, &s, false, Some(hair()));
@@ -249,7 +253,7 @@ fn head(out: &Path, args: &[String]) {
     let mut seq = Seq::new(out, serde_json::json!({"name": "look2_head", "fps": 30, "spp": spp,
         "caption": "Lee Perry-Smith, spectral SSS skin with 243k GPU hair strands, slow orbit",
         "credit": "Lee Perry-Smith head by Infinite-Realities, CC BY 3.0",
-        "spectrum_source": "GpuSkin per-path lanes, 192x108 x 4 spp per frame (before tone mapping)"}));
+        "spectrum_source": "GpuSkin per-path lanes, 144x144 x 4 spp per frame (before tone mapping); 1080x1080 letterboxed into 1920x1080"}));
     for k in 0..n {
         let u = k as f64 / (n - 1) as f64;
         let e = u * u * (3.0 - 2.0 * u);
@@ -264,9 +268,21 @@ fn head(out: &Path, args: &[String]) {
         let (img, _) = gs.render(&s, &THETA, 1 + k as u64, false);
         let img: Vec<f64> = img.iter().map(|&x| x as f64).collect();
         if exposure == 0.0 {
-            exposure = auto_exposure(&img);
+            // from the straight-on view, not the first frame of the orbit
+            let mut f = hd::scene(&asset, Chromophores::Map(chromo.clone()), hd::View::Front);
+            f.set_size(w, h);
+            f.spp = 8;
+            f.mode = Mode { sss: true, dual: true };
+            let gf = GpuSkin::with_strands(ctx, &f, false, Some(hair()));
+            let (e, _) = gf.render(&f, &THETA, 99, false);
+            exposure = auto_exposure(&e.iter().map(|&x| x as f64).collect::<Vec<_>>());
         }
-        let px = tonemap(&img, exposure);
+        let sq = tonemap(&img, exposure);
+        let mut px = vec![0u8; fw * fh * 3];
+        let x0 = (fw - w) / 2;
+        for y in 0..h {
+            px[(y * fw + x0) * 3..(y * fw + x0 + w) * 3].copy_from_slice(&sq[y * w * 3..(y + 1) * w * 3]);
+        }
         let seed = 7_000 + k as u64;
         let (_, lanes) = gl.render(&low, &THETA, seed, true);
         let sp = bin((0..low.paths()).flat_map(|i| {
@@ -279,7 +295,7 @@ fn head(out: &Path, args: &[String]) {
                 (380.0 + 400.0 * (v - v.floor()), lanes[i * 4 + k] as f64)
             })
         }));
-        seq.push(k, &px, w, h, sp, t.elapsed().as_secs_f64(), serde_json::json!({"orbit_deg": a.to_degrees()}));
+        seq.push(k, &px, fw, fh, sp, t.elapsed().as_secs_f64(), serde_json::json!({"orbit_deg": a.to_degrees()}));
     }
 }
 
