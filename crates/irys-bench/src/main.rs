@@ -9,6 +9,7 @@
 //! Sizes default to 400 × 300. Everything a run writes lands in
 //! `<out>/<scene>/`.
 
+use irys_diff::ggx::PARAMS;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -85,6 +86,11 @@ fn main() {
                     m(&imgs[0]), m(&imgs[1]), m(&imgs[2]), m(&imgs[3]), m(&imgs[4]),
                     diff(&imgs[1], &imgs[2]), diff(&imgs[1], &imgs[4]), diff(&imgs[0], &imgs[3]), diff(&imgs[0], &imgs[1])
                 );
+            }
+        }
+        "grad" => {
+            for name in a.get("scene", "pair").split(',') {
+                grad(&a, name, w, h);
             }
         }
         "retime" => {
@@ -262,6 +268,41 @@ fn speed(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
             relmse(&img, &reference)
         );
     }
+}
+
+/// Gradient-pass time (speed round 2): `gradient_l2` of the scene's
+/// conductor against its own image at another θ, fastest of `rounds`, split
+/// into the forward passes and the replay; prints δθ so two builds can be
+/// compared.
+fn grad(a: &Args, name: &str, w: usize, h: usize) {
+    let ctx = context();
+    let spp = a.num("spp", 4);
+    let mut b = scenes::build(name, w, h, spp);
+    let features: Vec<String> = a.get("variant", "base").split('+').map(str::to_string).collect();
+    let f: Vec<&str> = features.iter().map(String::as_str).collect();
+    scenes::apply(&mut b.scene, &f);
+    let mut g = GpuPrb::new(ctx, &b.scene);
+    let target = g.image(&b.scene, &b.theta, 5);
+    g.set_target(&target.iter().map(|&v| v as f64).collect::<Vec<_>>());
+    let theta = [b.theta[0] * 1.3, b.theta[1] * 0.9, b.theta[2], b.theta[3] * 0.95];
+    let (mut fw, mut rp) = (f64::INFINITY, f64::INFINITY);
+    let mut d = [0.0; PARAMS];
+    for _ in 0..a.num("rounds", 5) {
+        let (_, dd) = g.gradient_l2(&b.scene, &theta, (7, 7));
+        d = dd;
+        fw = fw.min(g.timing.forward.as_secs_f64());
+        rp = rp.min(g.timing.replay.as_secs_f64());
+    }
+    println!(
+        "{name} {} {spp} spp: forward {:.2} ms, replay {:.2} ms, δθ {:+.6e} {:+.6e} {:+.6e} {:+.6e}",
+        a.get("variant", "base"),
+        fw * 1e3,
+        rp * 1e3,
+        d[0],
+        d[1],
+        d[2],
+        d[3]
+    );
 }
 
 /// Render `name` with irys: the reference (cached) and the sweep.

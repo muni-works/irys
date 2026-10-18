@@ -12,9 +12,12 @@
 //!    ([`TensorGraph::to_wgsl`]) — `f` and `pdf` per lane, dispatched
 //!    indirectly over the compact lanes alone;
 //! 3. `update`: throughput `*= f cos / p`, and in replay `δf` per lane;
-//! 4. replay only: the **adjoint lowering**, the same way — `Σ_lanes δf ∂f/∂θ`
-//!    as the IR's own sum, scheduled `split = 256` (one workgroup per
-//!    parameter, threads stride the lanes and tree-combine);
+//! 4. replay only: the **adjoint lowering of [`ggx::LaneAdjoint`]** —
+//!    `δf_v ∂f_v/∂θ` per lane, `TensorGraph::backward`'s, pointwise and
+//!    dispatched indirectly over the compact lanes like the eval — then
+//!    `lane_sum` / `lane_sum_top` (`compact.wgsl`) sum it over the compact
+//!    lanes by a fixed tree (speed round 2; it used to be the IR's own
+//!    reduction over every lane of the wavefront, four workgroups wide);
 //! 5. replay only: `accumulate`, `grad += δθ`, one thread per parameter.
 //!
 //! The forward pass keeps `L` per lane in a device buffer; the replay reads
@@ -28,8 +31,8 @@
 //! recomputation of `f` is never used for throughput (design note 5).
 //!
 //! **The reduction.** No float atomics: WGSL has none, and a CAS loop on
-//! `atomic<u32>` would make the gradient depend on scheduling. The IR's
-//! reduction (workgroup tree per parameter) gives four numbers per bounce
+//! `atomic<u32>` would make the gradient depend on scheduling. The lane
+//! sum (fixed trees over the compact lanes) gives four numbers per bounce
 //! and `accumulate` adds them in bounce order, so the gradient is
 //! deterministic run to run.
 //!
@@ -40,9 +43,9 @@ use std::time::{Duration, Instant};
 
 use irys_gpu::wgpu::{self, util::DeviceExt};
 use irys_gpu::{GpuContext, GpuError};
-use tang_compile::tensor::{Op, TensorGraph, TensorId, numel};
+use tang_compile::tensor::{TensorGraph, TensorId};
 
-use crate::ggx::{COLUMNS, DF, Graph, PARAMS, THETA};
+use crate::ggx::{COLUMNS, DF, Graph, LaneAdjoint, PARAMS, THETA};
 use crate::prb::{self, Loss, Scene};
 
 const WAVEFRONT: &str = include_str!("gpu/wavefront.wgsl");
@@ -133,6 +136,8 @@ pub const EPS: f32 = 1e-4;
 /// One tang-emitted program: a pipeline, bind group and grid per kernel.
 struct Ir {
     kernels: Vec<(wgpu::ComputePipeline, wgpu::BindGroup, u32)>,
+    /// Each kernel's point count.
+    counts: Vec<u32>,
     buffers: Vec<(TensorId, wgpu::Buffer)>,
 }
 
@@ -228,7 +233,8 @@ impl Ir {
                 (pipe, bg, groups)
             })
             .collect();
-        Self { kernels, buffers }
+        let counts = prog.kernels.iter().map(|k| k.count).collect();
+        Self { kernels, counts, buffers }
     }
 
     fn buffer(&self, t: TensorId) -> &wgpu::Buffer {
@@ -240,11 +246,17 @@ impl Ir {
             .1
     }
 
-    fn dispatch(&self, pass: &mut wgpu::ComputePass) {
-        for (pipe, bg, groups) in &self.kernels {
+    /// The kernels over `width` lanes indirectly, over the workgroups
+    /// `args` holds (the compact lanes), the others (constants) in full.
+    fn dispatch_compact(&self, pass: &mut wgpu::ComputePass, args: &wgpu::Buffer, width: u32) {
+        for (k, (pipe, bg, groups)) in self.kernels.iter().enumerate() {
             pass.set_pipeline(pipe);
             pass.set_bind_group(0, bg, &[]);
-            pass.dispatch_workgroups(*groups, 1, 1);
+            if self.counts[k] == width {
+                pass.dispatch_workgroups_indirect(args, 0);
+            } else {
+                pass.dispatch_workgroups(*groups, 1, 1);
+            }
         }
     }
 
@@ -317,10 +329,10 @@ pub struct GpuPrb {
     eval: Ir,
     adjoint: Ir,
     f: TensorId,
-    pipes: [wgpu::ComputePipeline; 18],
+    pipes: [wgpu::ComputePipeline; 20],
     // gen, bounce, update, finish→l, finish→l2, accumulate, score,
     // loss_sum, lane_adjoint
-    groups: [wgpu::BindGroup; 19],
+    groups: [wgpu::BindGroup; 21],
     /// The running sum of [`accumulate`](Self::accumulate)d frames.
     acc: wgpu::Buffer,
     /// Frames in `acc`.
@@ -704,28 +716,23 @@ impl GpuPrb {
             !(scene.nee && scene.splats().is_some()),
             "NEE with splats: shadow rays do not composite them"
         );
-        let mut g = Graph::new(width);
-        // The adjoint's reductions (δθ: four points, each over every lane)
-        // split across a workgroup; the C and interpreter ignore this.
-        let reductions: Vec<TensorId> =
-            g.g.nodes()
-                .iter()
-                .enumerate()
-                .filter(|(_, n)| {
-                    matches!(&n.op, Op::Comp(c) if c.monoid.is_some()) && numel(&n.shape) <= PARAMS
-                })
-                .map(|(i, _)| TensorId::from_index(i))
-                .collect();
-        for t in reductions {
-            g.g.set_schedule(t, 256, (0, 0, 0), (0, 0));
-        }
+        let g = Graph::new(width);
         let mut inputs: Vec<&wgpu::Buffer> = cols.iter().collect();
         assert_eq!(inputs.len(), THETA);
         inputs.push(&theta);
         assert_eq!(inputs.len(), DF);
         inputs.push(&df);
         let eval = Ir::new(dev, &g.g, &[g.f, g.pdf], &inputs, "ggx eval");
-        let adjoint = Ir::new(dev, &g.g, &[g.dtheta], &inputs, "ggx adjoint");
+        // Speed round 2: the replay's adjoint per lane (`LaneAdjoint`),
+        // pointwise over the compact lanes, then summed over them in
+        // `compact.wgsl`. Its `z` inputs are one zero buffer, never written.
+        let zero = storage("lane adjoint zero", graph_bytes);
+        let la = LaneAdjoint::new(width);
+        let mut la_inputs = inputs.clone();
+        la_inputs.extend([&zero; PARAMS]);
+        let adjoint = Ir::new(dev, &la.g, &la.dz, &la_inputs, "ggx lane adjoint");
+        let partials = storage("lane adjoint partials", (width as u64).div_ceil(256) * 16);
+        let dsum = storage("lane adjoint sum", PARAMS as u64 * 4);
 
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("prb wavefront"),
@@ -762,6 +769,8 @@ impl GpuPrb {
             "scatter",
             "clear",
             "accum",
+            "lane_sum",
+            "lane_sum_top",
         ]
         .map(pipe);
         let bind = |p: &wgpu::ComputePipeline, e: &[(u32, &wgpu::Buffer)]| {
@@ -846,7 +855,7 @@ impl GpuPrb {
                     (55, &g_cnt),
                 ],
             ),
-            bind(&pipes[4], &[(14, &grad), (15, adjoint.buffer(g.dtheta))]),
+            bind(&pipes[4], &[(14, &grad), (15, &dsum)]),
             bind(
                 &pipes[5],
                 &[
@@ -902,6 +911,18 @@ impl GpuPrb {
             bind(&pipes[15], &scatter),
             bind(&pipes[16], &[(12, &df), (63, &ind)]),
             bind(&pipes[17], &[(0, &params), (17, &img), (64, &acc)]),
+            bind(
+                &pipes[18],
+                &[
+                    (63, &ind),
+                    (65, adjoint.buffer(la.dz[0])),
+                    (66, adjoint.buffer(la.dz[1])),
+                    (67, adjoint.buffer(la.dz[2])),
+                    (68, adjoint.buffer(la.dz[3])),
+                    (69, &partials),
+                ],
+            ),
+            bind(&pipes[19], &[(69, &partials), (70, &dsum)]),
         ];
         let f = g.f;
         if let Some(e) = pollster::block_on(scope.pop()) {
@@ -1088,13 +1109,16 @@ impl GpuPrb {
                 self.dispatch(&mut pass, 13, 14, self.paths.div_ceil(256));
                 self.dispatch(&mut pass, 14, 15, 1);
                 self.dispatch(&mut pass, 15, 16, groups);
-                if replay {
-                    self.dispatch(&mut pass, 16, 17, (self.chunk_width as u32).div_ceil(WG));
-                }
                 self.eval.dispatch_indirect(&mut pass, &self.ind);
                 self.dispatch(&mut pass, 2, 2, groups);
                 if replay {
-                    self.adjoint.dispatch(&mut pass);
+                    // The adjoint per lane over the compact lanes, their
+                    // sum (a fixed tree), then `grad += δθ`.
+                    self.adjoint.dispatch_compact(&mut pass, &self.ind, self.chunk_width as u32);
+                    // (`ind` is bound as storage there, so not indirect: the
+                    // workgroups past the compact lanes write zeros.)
+                    self.dispatch(&mut pass, 18, 19, (self.chunk_width as u32).div_ceil(256));
+                    self.dispatch(&mut pass, 19, 20, 1);
                     self.dispatch(&mut pass, 4, 5, 1);
                 }
             }

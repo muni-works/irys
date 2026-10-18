@@ -171,6 +171,86 @@ impl Graph {
     }
 }
 
+/// The adjoint per lane, for the device's compacted replay (speed round 2).
+///
+/// [`Graph`]'s `f`, with each `θ_k` read as `θ_k + z_k[v]` through four
+/// extra `[n]` inputs that are always zero, so `f` is the same numbers; the
+/// gradient of `Σ_v δf_v f_v` with respect to `z_k` is then
+/// `δf_v ∂f_v/∂θ_k` per lane — `TensorGraph::backward`'s, pointwise, with
+/// no reduction over lanes. The device sums those over the compact lanes
+/// only (a fixed-shape tree, `compact.wgsl`), where [`Graph::dtheta`]'s
+/// reduction runs over every lane of the wavefront.
+///
+/// Inputs, in order: `cos_i, cos_o, cos_h, o·h, b₀, b₁, b₂` (each `[n]`),
+/// `θ` (`[PARAMS]`), `δf` (`[n]`), `z₀ … z₃` (each `[n]`).
+pub struct LaneAdjoint {
+    /// The graph itself.
+    pub g: TensorGraph,
+    /// `δf_v ∂f_v/∂θ_k`, four `[n]`.
+    pub dz: [TensorId; PARAMS],
+}
+
+impl LaneAdjoint {
+    /// Build it for a wavefront of `n`.
+    pub fn new(n: usize) -> Self {
+        let mut g = TensorGraph::new();
+        let cols: Vec<TensorId> = (0..COLUMNS).map(|_| g.input(&[n])).collect();
+        let theta = g.input(&[PARAMS]);
+        let df = g.input(&[n]);
+        let z: Vec<TensorId> = (0..PARAMS).map(|_| g.input(&[n])).collect();
+        let col = |t: TensorId| Arg {
+            src: t,
+            view: View::identity(1, 1),
+        };
+        let param = |k: i64| Arg {
+            src: theta,
+            view: View {
+                guard: false,
+                forms: vec![Form {
+                    coefs: vec![0],
+                    offset: k,
+                }],
+            },
+        };
+        let mut args: Vec<Arg> = cols.iter().map(|&c| col(c)).collect();
+        args.extend((0..PARAMS as i64).map(param));
+        args.extend(z.iter().map(|&t| col(t)));
+        let f = g
+            .comp(&[n], &[] as &[usize], args, None, |x| {
+                let (ci, co, ch, oh) = (x[0], x[1], x[2], x[3]);
+                let t = |k: usize| x[7 + k] + x[7 + PARAMS + k];
+                let a2 = t(0) * t(0);
+                let f0 = x[4] * t(1) + x[5] * t(2) + x[6] * t(3);
+                let m = lit(1.0) - oh;
+                let m2 = m * m;
+                let fresnel = f0 + (lit(1.0) - f0) * m2 * m2 * m;
+                let k = ch * ch * (a2 - lit(1.0)) + lit(1.0);
+                let d = a2 / (lit(std::f64::consts::PI) * k * k);
+                let g2 = lit(1.0) / (lit(1.0) + lambda(a2, ci) + lambda(a2, co));
+                vec![fresnel * d * g2 / (lit(4.0) * ci * co)]
+            })
+            .unwrap();
+        let pick = |t: TensorId| Arg {
+            src: t,
+            view: View::pick(2, &[Some(1)]),
+        };
+        let s = g
+            .comp(
+                &[1usize],
+                &[n],
+                vec![pick(df), pick(f)],
+                Some(Monoid::sum()),
+                |x| vec![x[0] * x[1]],
+            )
+            .unwrap();
+        let dz = g.backward(s, &z).unwrap();
+        Self {
+            g,
+            dz: std::array::from_fn(|k| dz[k]),
+        }
+    }
+}
+
 /// Graph input index of `θ`.
 pub const THETA: usize = COLUMNS;
 /// Graph input index of `δf`.
