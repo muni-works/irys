@@ -80,3 +80,7 @@ required-features = ["assets"]
 [[example]]
 name = "look_volume"
 required-features = ["assets"]
+
+[[example]]
+name = "look_hair"
+required-features = ["assets"]

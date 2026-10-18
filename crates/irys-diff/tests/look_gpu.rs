@@ -72,3 +72,47 @@ fn stack_on_the_gpu_is_the_f64_twin() {
     assert!(worst < 1e-3 && over < n / 100);
     assert!(ad.iter().all(|&e| e < 1e-3));
 }
+
+#[test]
+fn volume_and_hair_graphs_on_the_gpu() {
+    use irys_diff::look::{hair, volume};
+    let Ok(ctx) = irys_diff::gpu::context() else {
+        eprintln!("no device: skipped");
+        return;
+    };
+    let n = 2048;
+    let mut rng = Rng::new(5, 0);
+    // Volume events.
+    let rows: Vec<[f64; volume::COLUMNS]> = (0..n)
+        .map(|_| {
+            let real = (rng.uniform() < 0.4) as u8 as f64;
+            let b = irys_diff::ggx::band_weights(380.0 + 400.0 * rng.uniform());
+            [real, 1.0 - real, 0.2 + rng.uniform(), 0.3 + rng.uniform(), 6.0, b[0], b[1], b[2]]
+        })
+        .collect();
+    let th = [1.2, 0.7, 0.8, 0.9];
+    let mut inputs: Vec<Vec<f64>> = (0..volume::COLUMNS).map(|k| rows.iter().map(|r| r[k]).collect()).collect();
+    inputs.push(th.to_vec());
+    inputs.push(vec![0.0; n]);
+    let g = volume::VolEvent::new(n);
+    let out = irys_diff::look::gpu::run(ctx, &g.g, &[g.ell], &inputs);
+    let wv = rows.iter().zip(&out[0]).map(|(r, &v)| (v as f64 - volume::ell(r, &th)).abs()).fold(0.0, f64::max);
+    // Hair lanes.
+    let bc = hair::Bcsdf::new(&hair::Fiber::default(), 0.4);
+    let hr: Vec<[f64; hair::COLUMNS]> = (0..n)
+        .map(|_| bc.columns(dir(&mut rng), dir(&mut rng), 380.0 + 400.0 * rng.uniform()))
+        .collect();
+    let ht = [1.3, 0.4];
+    let mut inputs: Vec<Vec<f64>> = (0..hair::COLUMNS).map(|k| hr.iter().map(|r| r[k]).collect()).collect();
+    inputs.push(ht.to_vec());
+    inputs.push(vec![0.0; n]);
+    let g = hair::Hair::new(n);
+    let out = irys_diff::look::gpu::run(ctx, &g.g, &[g.f], &inputs);
+    let wh = hr
+        .iter()
+        .zip(&out[0])
+        .map(|(r, &v)| (v as f64 - hair::hair_f(r, &ht)).abs() / hair::hair_f(r, &ht).abs().max(1e-3))
+        .fold(0.0, f64::max);
+    println!("GPU volume ℓ worst abs {wv:.2e}; hair f worst rel {wh:.2e}");
+    assert!(wv < 1e-5 && wh < 1e-4);
+}
