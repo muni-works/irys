@@ -1358,6 +1358,20 @@ fn score(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
     sq[px] = dot(r, r);
 }
 
+// Speed round 2: the frames of a render summed on the device
+// (`GpuPrb::accumulate`), so a render reads its image back once.
+@group(0) @binding(64) var<storage, read_write> acc_img: array<f32>;
+
+// One thread per pixel: add the frame `score` just splatted.
+@compute @workgroup_size(64)
+fn accum(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+    let px = flat(gid, nwg);
+    if (px >= params.pixels) { return; }
+    for (var ch = 0u; ch < 3u; ch = ch + 1u) {
+        acc_img[px * 3u + ch] = acc_img[px * 3u + ch] + img[px * 3u + ch];
+    }
+}
+
 var<workgroup> red: array<f32, 256>;
 
 // The L2 mean in one workgroup: each thread sums a fixed stride of pixels in

@@ -126,8 +126,11 @@ impl Runner {
         let features: Vec<String> = variant.split('+').map(str::to_string).collect();
         let has = |f: &str| features.iter().any(|x| x == f);
         // ReSTIR reuses across the frame, which must fit one chunk; the
-        // guide learns between calls, so it wants them small.
-        let call_max = call.unwrap_or(if has("restir") || has("guide") { 4 } else { 16 });
+        // guide learns between calls, so it wants them small. Otherwise a
+        // call is as large as the wavefront takes in a few chunks: with the
+        // image summed on the device a call costs a submit, not a readback,
+        // but fewer calls still save the per-call scoring and encoding.
+        let call_max = call.unwrap_or(if has("restir") || has("guide") { 4 } else { 64 });
         Self { ctx, name: name.to_string(), w, h, features, call_max, wf: HashMap::new() }
     }
 
@@ -155,7 +158,8 @@ impl Runner {
         g.reset_history();
         let n = spp / call;
         let t = Instant::now();
-        let mut acc = vec![0.0f64; w * h * 3];
+        // The frames are summed on the device and read back once, at the end.
+        g.clear_accumulated();
         for k in 0..n {
             // Guiding: learn during the first half of the calls (at least
             // one), rebuilding the guide after each; every call counts
@@ -171,19 +175,18 @@ impl Runner {
             } else {
                 seed0 + k as u64
             };
-            let img = g.image(&b.scene, &b.theta, seed);
+            g.accumulate(&b.scene, &b.theta, seed);
             if restir {
                 g.advance();
             }
             if train {
                 g.guide_build(&b.scene);
             }
-            for (a, v) in acc.iter_mut().zip(img) {
-                *a += v as f64;
-            }
         }
+        let (img, frames) = g.accumulated();
+        assert_eq!(frames, n);
         let secs = t.elapsed().as_secs_f64();
-        (acc.iter().map(|v| (v / n as f64) as f32).collect(), secs)
+        (img, secs)
     }
 }
 
@@ -241,8 +244,9 @@ fn speed(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
     let ctx = context();
     let reference = read_f32(&out.join(name).join("irys_ref.f32"));
     let spp = a.num("spp", 256);
+    let call = a.0.get("call-spp").map(|v| v.parse().unwrap());
     for v in a.get("variants", "base").split(',') {
-        let mut r = Runner::new(ctx, name, w, h, v, None);
+        let mut r = Runner::new(ctx, name, w, h, v, call);
         let mut best = f64::INFINITY;
         let mut img = Vec::new();
         for _ in 0..a.num("rounds", 3) {

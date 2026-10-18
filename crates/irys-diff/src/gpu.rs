@@ -270,6 +270,8 @@ enum Score {
     LaneAdjoint,
     /// Both, for one seed.
     Both,
+    /// The image only, added to the device's running sum.
+    Accumulate,
 }
 
 /// What the last pass cost on the device (submit to readback).
@@ -315,10 +317,14 @@ pub struct GpuPrb {
     eval: Ir,
     adjoint: Ir,
     f: TensorId,
-    pipes: [wgpu::ComputePipeline; 17],
+    pipes: [wgpu::ComputePipeline; 18],
     // gen, bounce, update, finish→l, finish→l2, accumulate, score,
     // loss_sum, lane_adjoint
-    groups: [wgpu::BindGroup; 18],
+    groups: [wgpu::BindGroup; 19],
+    /// The running sum of [`accumulate`](Self::accumulate)d frames.
+    acc: wgpu::Buffer,
+    /// Frames in `acc`.
+    acc_frames: usize,
     /// Lane compaction's indirect dispatch: (workgroups, 1, 1, lanes).
     ind: wgpu::Buffer,
     /// Graph lanes per chunk.
@@ -624,6 +630,7 @@ impl GpuPrb {
         let target = storage("target", pixels * 12);
         let img = storage("image", pixels * 12);
         let d_img = storage("d image", pixels * 12);
+        let acc = storage("image sum", pixels * 12);
         let sq = storage("squared error", pixels * 4);
         let loss = storage("loss", 4);
         let path_buf = storage("paths", paths as u64 * PATH_BYTES);
@@ -754,6 +761,7 @@ impl GpuPrb {
             "cscan_tops",
             "scatter",
             "clear",
+            "accum",
         ]
         .map(pipe);
         let bind = |p: &wgpu::ComputePipeline, e: &[(u32, &wgpu::Buffer)]| {
@@ -893,6 +901,7 @@ impl GpuPrb {
             bind(&pipes[14], &[(0, &params), (62, &lane_top), (63, &ind)]),
             bind(&pipes[15], &scatter),
             bind(&pipes[16], &[(12, &df), (63, &ind)]),
+            bind(&pipes[17], &[(0, &params), (17, &img), (64, &acc)]),
         ];
         let f = g.f;
         if let Some(e) = pollster::block_on(scope.pop()) {
@@ -930,6 +939,8 @@ impl GpuPrb {
             groups,
             ind,
             chunk_width: width,
+            acc,
+            acc_frames: 0,
             timing: Timing::default(),
             device_points: std::cell::Cell::new(false),
             accel,
@@ -1111,6 +1122,10 @@ impl GpuPrb {
             }
             if matches!(score, Score::LaneAdjoint | Score::Both) {
                 self.dispatch(&mut pass, 7, 8, all);
+            }
+            if score == Score::Accumulate {
+                self.dispatch(&mut pass, 5, 6, px.div_ceil(WG));
+                self.dispatch(&mut pass, 17, 18, px.div_ceil(WG));
             }
         }
         enc.finish()
@@ -1357,6 +1372,37 @@ impl GpuPrb {
         self.check(scene);
         self.run(scene, theta, seed, false, Score::Loss);
         self.last_image()
+    }
+
+    /// Render one frame and add its image to the device's running sum,
+    /// reading nothing back: a render of many frames costs one readback
+    /// ([`accumulated`](Self::accumulated)) instead of one per frame. The
+    /// frame's image is [`image`](Self::image)'s, bit for bit.
+    pub fn accumulate(&mut self, scene: &Scene, theta: &[f64; PARAMS], seed: u64) {
+        self.check(scene);
+        self.run(scene, theta, seed, false, Score::Accumulate);
+        self.acc_frames += 1;
+    }
+
+    /// The mean of the frames [`accumulate`](Self::accumulate)d since the
+    /// last [`clear_accumulated`](Self::clear_accumulated) (summed on the
+    /// device in f32, in frame order, so the same frames give the same
+    /// bits), and the number of frames.
+    pub fn accumulated(&self) -> (Vec<f32>, usize) {
+        let sum = self.read(&self.acc, (self.acc.size() / 4) as usize);
+        let n = self.acc_frames.max(1) as f32;
+        (sum.iter().map(|v| v / n).collect(), self.acc_frames)
+    }
+
+    /// Start a new running sum.
+    pub fn clear_accumulated(&mut self) {
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.clear_buffer(&self.acc, 0, None);
+        self.ctx.queue.submit([enc.finish()]);
+        self.acc_frames = 0;
     }
 
     /// The image the last scoring pass splatted.

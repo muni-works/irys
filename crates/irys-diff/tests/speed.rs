@@ -126,6 +126,41 @@ fn compaction_is_independent_of_chunking() {
     }
 }
 
+/// Speed round 2: frames summed on the device are the frames `image`
+/// returns, summed in f32 in frame order, bit for bit; chunked and whole
+/// wavefronts agree on the sum; and nothing is read back until asked.
+#[test]
+fn device_accumulation_is_the_frames_summed() {
+    let ctx = device!();
+    for (name, scene) in scenes() {
+        let mut g = GpuPrb::new(ctx, &scene);
+        let seeds = [11u64, 12, 13];
+        let frames: Vec<Vec<f32>> = seeds.iter().map(|&s| g.image(&scene, &GOLD, s)).collect();
+        let mut want = vec![0.0f32; frames[0].len()];
+        for f in &frames {
+            for (w, v) in want.iter_mut().zip(f) {
+                *w += v;
+            }
+        }
+        let want: Vec<f32> = want.iter().map(|v| v / seeds.len() as f32).collect();
+        let mut run = |g: &mut GpuPrb| {
+            g.clear_accumulated();
+            for &s in &seeds {
+                g.accumulate(&scene, &GOLD, s);
+            }
+            let (img, n) = g.accumulated();
+            assert_eq!(n, seeds.len());
+            bits(&img)
+        };
+        let a = run(&mut g);
+        assert_eq!(a, bits(&want), "{name}: the device sum is not the frames'");
+        assert_eq!(a, run(&mut g), "{name}: rerun");
+        let mut c = GpuPrb::chunked(ctx, &scene, 1000);
+        assert!(c.chunks() > 1);
+        assert_eq!(a, run(&mut c), "{name}: chunked");
+    }
+}
+
 /// Moving an instance rebuilds the TLAS: the hardware walk still renders
 /// the software walk's image.
 #[test]
