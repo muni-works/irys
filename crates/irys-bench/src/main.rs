@@ -221,6 +221,8 @@ fn retime(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
         let at = rows.iter().find(|r| r["spp"].as_u64() == Some(spp as u64)).expect("spp level")["seconds"]
             .as_f64()
             .unwrap();
+        // Fastest observation: a slower round never slows the sweep down.
+        let t = t.min(at);
         let f = t / at;
         for r in rows.iter_mut() {
             let s = r["seconds"].as_f64().unwrap();
@@ -443,7 +445,7 @@ fn report(a: &Args, out: &Path) {
             font::label(&mut canvas, pw, ph, ox + 4, oy + 4, 1, text);
         }
         std::fs::create_dir_all(&docs).unwrap();
-        let p = docs.join(format!("phase3-{name}.png"));
+        let p = docs.join(format!("{}-{name}.png", a.get("prefix", "phase3")));
         write_png(&p, pw, ph, &canvas);
         println!("wrote {}", p.display());
     }
