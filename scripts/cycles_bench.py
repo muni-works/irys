@@ -238,8 +238,9 @@ if not os.path.exists(ref_path):
 rows = []
 spp = 1
 while spp <= max_spp:
-    render(spp, 7 + spp)  # once to settle, then the timed run
+    render(spp, 7 + spp)  # once to settle, then the fastest of two timed runs
     img, secs = render(spp, 1000 + spp)
+    secs = min(secs, render(spp, 1000 + spp)[1])
     img.tofile(os.path.join(root, f"cycles_{spp}.f32"))
     rows.append({"spp": spp, "seconds": secs})
     print(f"cycles {spp:5d} spp {secs:8.4f} s", flush=True)

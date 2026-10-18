@@ -489,6 +489,7 @@ version = "0.1.0"
 dependencies = [
  "irys-core",
  "irys-diff",
+ "irys-gpu",
  "irys-light",
  "irys-prims",
  "png",

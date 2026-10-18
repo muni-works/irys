@@ -63,6 +63,11 @@ fn main() {
             }
         }
         "report" => report(&a, &out),
+        "retime" => {
+            for name in a.get("scene", "pair,room").split(',') {
+                retime(&a, &out, name, w, h);
+            }
+        }
         "png" => {
             let img = read_f32(Path::new(&a.get("in", "")));
             let m = mean_rgb(&img);
@@ -80,33 +85,43 @@ fn main() {
     }
 }
 
-/// Render `name` with irys: the reference (cached) and the sweep.
-fn irys(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
-    let ctx = match gpu::context() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("no GPU ({e}): irys-bench needs one");
-            std::process::exit(1);
-        }
-    };
-    let dir = out.join(name);
-    std::fs::create_dir_all(&dir).unwrap();
-    let variant = a.get("variant", "base");
-    let features: Vec<&str> = variant.split('+').collect();
-    let restir = features.contains(&"restir");
-    let guide = features.contains(&"guide");
-    // ReSTIR reuses across the frame, which must fit one chunk; the guide
-    // learns between calls, so it wants them small.
-    let call_max = a.num("call-spp", if restir || guide { 4 } else { 16 });
-    let mut wf: HashMap<usize, (scenes::Bench, GpuPrb)> = HashMap::new();
-    // One frame of `spp` paths per pixel: `spp / call` calls of `call` spp
-    // each, seeds `seed0 + k`, averaged. Returns the image and the seconds
-    // the calls took (the wavefronts are built and warm beforehand).
-    let mut render = |spp: usize, seed0: u64| -> (Vec<f32>, f64) {
-        let call = spp.min(call_max);
+/// One irys configuration of one scene, ready to render frames: a warm
+/// wavefront per calls-of-`call`-spp size.
+struct Runner {
+    ctx: &'static irys_gpu::GpuContext,
+    name: String,
+    w: usize,
+    h: usize,
+    features: Vec<String>,
+    call_max: usize,
+    wf: HashMap<usize, (scenes::Bench, GpuPrb)>,
+}
+
+impl Runner {
+    fn new(ctx: &'static irys_gpu::GpuContext, name: &str, w: usize, h: usize, variant: &str, call: Option<usize>) -> Self {
+        let features: Vec<String> = variant.split('+').map(str::to_string).collect();
+        let has = |f: &str| features.iter().any(|x| x == f);
+        // ReSTIR reuses across the frame, which must fit one chunk; the
+        // guide learns between calls, so it wants them small.
+        let call_max = call.unwrap_or(if has("restir") || has("guide") { 4 } else { 16 });
+        Self { ctx, name: name.to_string(), w, h, features, call_max, wf: HashMap::new() }
+    }
+
+    fn has(&self, f: &str) -> bool {
+        self.features.iter().any(|x| x == f)
+    }
+
+    /// One frame of `spp` paths per pixel: `spp / call` calls of `call` spp
+    /// each, averaged. Returns the image and the seconds the calls took (the
+    /// wavefronts are built and warm beforehand, the history reset).
+    fn render(&mut self, spp: usize, seed0: u64) -> (Vec<f32>, f64) {
+        let (restir, guide) = (self.has("restir"), self.has("guide"));
+        let call = spp.min(self.call_max);
         assert!(spp % call == 0, "spp {spp} is not a multiple of {call}");
-        let (b, g) = wf.entry(call).or_insert_with(|| {
-            let mut b = scenes::build(name, w, h, call);
+        let (name, w, h, ctx) = (self.name.clone(), self.w, self.h, self.ctx);
+        let features: Vec<&str> = self.features.iter().map(String::as_str).collect();
+        let (b, g) = self.wf.entry(call).or_insert_with(|| {
+            let mut b = scenes::build(&name, w, h, call);
             scenes::apply(&mut b.scene, &features);
             let g = GpuPrb::new(ctx, &b.scene);
             (b, g)
@@ -145,7 +160,62 @@ fn irys(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
         }
         let secs = t.elapsed().as_secs_f64();
         (acc.iter().map(|v| (v / n as f64) as f32).collect(), secs)
-    };
+    }
+}
+
+fn context() -> &'static irys_gpu::GpuContext {
+    match gpu::context() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("no GPU ({e}): irys-bench needs one");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Re-time variants on a shared machine: `rounds` rounds, each rendering
+/// `spp` with every variant in turn (so a slow spell hits them alike), the
+/// fastest time per variant kept; each variant's sweep times are then
+/// rescaled by (clean time / its sweep's time at `spp`). Images and relMSE
+/// are untouched.
+fn retime(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
+    let ctx = context();
+    let variants: Vec<String> = a.get("variants", "base").split(',').map(str::to_string).collect();
+    let spp = a.num("spp", 256);
+    let mut runners: Vec<Runner> = variants.iter().map(|v| Runner::new(ctx, name, w, h, v, None)).collect();
+    let mut best = vec![f64::INFINITY; variants.len()];
+    for _ in 0..a.num("rounds", 3) {
+        for (k, r) in runners.iter_mut().enumerate() {
+            best[k] = best[k].min(r.render(spp, 77).1);
+        }
+    }
+    let dir = out.join(name);
+    for (v, t) in variants.iter().zip(&best) {
+        let path = dir.join(format!("irys_{v}.json"));
+        let mut j = read_json(&path);
+        let rows = j["rows"].as_array_mut().unwrap();
+        let at = rows.iter().find(|r| r["spp"].as_u64() == Some(spp as u64)).expect("spp level")["seconds"]
+            .as_f64()
+            .unwrap();
+        let f = t / at;
+        for r in rows.iter_mut() {
+            let s = r["seconds"].as_f64().unwrap();
+            r["seconds"] = json!(s * f);
+        }
+        j["retimed"] = json!({"spp": spp, "clean_seconds": t, "factor": f});
+        write_json(&path, &j);
+        println!("{name} {v}: {spp} spp clean {t:.4} s, sweep had {at:.4} s, x{f:.3}");
+    }
+}
+
+/// Render `name` with irys: the reference (cached) and the sweep.
+fn irys(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
+    let ctx = context();
+    let dir = out.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let variant = a.get("variant", "base");
+    let mut runner = Runner::new(ctx, name, w, h, &variant, a.0.get("call-spp").map(|v| v.parse().unwrap()));
+    let mut render = |spp: usize, seed0: u64| runner.render(spp, seed0);
     let ref_path = dir.join("irys_ref.f32");
     let ref_spp = a.num("ref-spp", 8192);
     if !ref_path.exists() {
@@ -162,7 +232,12 @@ fn irys(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
     let mut rows = Vec::new();
     let mut spp = 1;
     while spp <= max_spp {
-        let (img, secs) = render(spp, 1000 + spp as u64 * 7919);
+        // The machine is shared: time each level `reps` times (same seed,
+        // same image) and keep the fastest.
+        let (img, mut secs) = render(spp, 1000 + spp as u64 * 7919);
+        for _ in 1..a.num("reps", 2) {
+            secs = secs.min(render(spp, 1000 + spp as u64 * 7919).1);
+        }
         let e = relmse(&img, &reference);
         println!("{name} irys {variant}: {spp:5} spp  {secs:8.4} s  relMSE {e:.5}");
         write_f32(&dir.join(format!("irys_{variant}_{spp}.f32")), &img);
@@ -285,7 +360,14 @@ fn report(a: &Args, out: &Path) {
             read_f32(&dir.join(format!("cycles_{}.f32", cr.2))),
             format!("CYCLES {} SPP {:.2}S RELMSE {:.4}", cr.2, cr.0, cr.1),
         ));
+        let shown: Vec<String> = match a.0.get("image-variants") {
+            Some(v) => v.split(',').map(str::to_string).collect(),
+            None => vec![variants[0].clone(), variants[variants.len() - 1].clone()],
+        };
         for (v, c) in variants.iter().zip(&icurves) {
+            if !shown.contains(v) {
+                continue;
+            }
             let r = nearest(c, t16);
             panels.push((
                 read_f32(&dir.join(format!("irys_{v}_{}.f32", r.2))),
