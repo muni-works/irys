@@ -67,12 +67,18 @@ fn wavefront_src(hw: bool, rest: &str) -> String {
     }
 }
 
-/// `qmc::sobol_matrices` dimensions 1–3 as a WGSL module constant, so the
-/// device's direction numbers are the CPU's by construction.
+/// `qmc::byte_tables` (dimensions 1–3, four byte tables each) and
+/// `qmc::value_keys` as WGSL module constants, so the device's direction
+/// numbers and scramble keys are the CPU's by construction.
 fn sobol_const() -> String {
-    let m = crate::qmc::sobol_matrices();
-    let words: Vec<String> = m[1..].iter().flatten().map(|w| format!("{w}u")).collect();
-    format!("const SOBOL = array<u32, 96>({});\n", words.join(", "))
+    let words: Vec<String> = crate::qmc::byte_tables().iter().map(|w| format!("{w}u")).collect();
+    let keys: Vec<String> = crate::qmc::value_keys().iter().map(|w| format!("{w}u")).collect();
+    format!(
+        "const SOBOL_T = array<u32, {}>({});\nconst QKEY = array<u32, 4>({});\n",
+        words.len(),
+        words.join(", "),
+        keys.join(", ")
+    )
 }
 const PATH_BYTES: u64 = 128;
 const WG: u32 = 64;

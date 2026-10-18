@@ -69,8 +69,34 @@ pub fn sobol_matrices() -> [[u32; BITS]; DIMS] {
 static MATRICES: std::sync::LazyLock<[[u32; BITS]; DIMS]> =
     std::sync::LazyLock::new(sobol_matrices);
 
-/// Sobol dimension `d` of index `i`.
-pub fn sobol(i: u32, d: usize) -> u32 {
+/// Bytes of an index, and so byte tables per dimension.
+pub const BYTES: usize = BITS / 8;
+
+/// The direction matrices of dimensions 1–3 cut into byte tables (Burley
+/// 2020, §4): `tables()[((d − 1) · BYTES + k) · 256 + v]` is the XOR of
+/// dimension `d`'s columns `8k … 8k + 7` selected by the bits of `v`, so
+/// `sobol(i, d)` is four lookups XORed. XOR is exact, so the tables give
+/// the column walk's integers bit for bit, here and on the device (which
+/// gets this same array as a module constant). Dimension 0 is van der
+/// Corput, the index's bits reversed, and needs no table.
+pub fn byte_tables() -> Vec<u32> {
+    let m = sobol_matrices();
+    let mut t = Vec::with_capacity((DIMS - 1) * BYTES * 256);
+    for col in &m[1..] {
+        for k in 0..BYTES {
+            for v in 0..256usize {
+                t.push((0..8).filter(|b| (v >> b) & 1 == 1).fold(0u32, |x, b| x ^ col[8 * k + b]));
+            }
+        }
+    }
+    t
+}
+
+static TABLES: std::sync::LazyLock<Vec<u32>> = std::sync::LazyLock::new(byte_tables);
+
+/// Sobol dimension `d` of index `i`, by the column walk (the reference the
+/// byte tables are tested against).
+pub fn sobol_walk(i: u32, d: usize) -> u32 {
     let m = &MATRICES[d];
     let (mut x, mut b, mut k) = (0u32, i, 0usize);
     while b != 0 {
@@ -81,6 +107,19 @@ pub fn sobol(i: u32, d: usize) -> u32 {
         k += 1;
     }
     x
+}
+
+/// Sobol dimension `d` of index `i`: van der Corput for `d = 0`, four
+/// byte-table lookups otherwise.
+pub fn sobol(i: u32, d: usize) -> u32 {
+    if d == 0 {
+        return i.reverse_bits();
+    }
+    let t = &TABLES[(d - 1) * BYTES * 256..];
+    t[(i & 255) as usize]
+        ^ t[256 + ((i >> 8) & 255) as usize]
+        ^ t[512 + ((i >> 16) & 255) as usize]
+        ^ t[768 + (i >> 24) as usize]
 }
 
 /// Chris Wellons' `lowbias32`.
@@ -117,6 +156,13 @@ pub fn owen(x: u32, seed: u32) -> u32 {
 pub fn draw(i: u32, t: u32, d: u32, pixel: u32) -> u32 {
     let seed = hash2(pixel, t);
     owen(sobol(owen(i, seed), d as usize), hash2(seed, d + 1))
+}
+
+/// `hash(d + 1) + 0x9e3779b9` for each dimension: the half of
+/// `hash2(seed, d + 1)` that does not depend on the seed, so a value
+/// scramble costs one hash (`hash(seed ^ VALUE_KEYS[d])`).
+pub fn value_keys() -> [u32; DIMS] {
+    std::array::from_fn(|d| hash(d as u32 + 1).wrapping_add(0x9e37_79b9))
 }
 
 /// A path's generator: SplitMix64 ([`crate::prb::Rng`]) or the scrambled
@@ -252,6 +298,30 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The byte tables are the column walk, bit for bit, and the hoisted
+    /// value key is `hash2`'s.
+    #[test]
+    fn byte_tables_are_the_walk() {
+        let mut x = 0x1234_5678u32;
+        let mut idx: Vec<u32> = (0..4096).collect();
+        idx.extend([u32::MAX, 1 << 31, 0xdead_beef]);
+        for _ in 0..200_000 {
+            x = hash(x);
+            idx.push(x);
+        }
+        for &i in &idx {
+            for d in 0..DIMS {
+                assert_eq!(sobol(i, d), sobol_walk(i, d), "i {i} d {d}");
+            }
+        }
+        let k = value_keys();
+        for seed in [0u32, 1, 0x9e37_79b9, 0xffff_ffff, 123_456] {
+            for d in 0..DIMS as u32 {
+                assert_eq!(hash(seed ^ k[d as usize]), hash2(seed, d + 1));
             }
         }
     }
