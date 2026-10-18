@@ -228,7 +228,7 @@ fn energy_per_lobe_never_exceeds_one() {
     }
     // The tables themselves: every entry in [0, 1].
     let mx = |v: &[f64]| v.iter().cloned().fold(0.0, f64::max);
-    println!("table maxima: diel {:.4} fuzz {:.4} metal {:.4}", mx(&t.diel), mx(&t.fuzz), mx(&t.metal[0]));
+    println!("table maxima: diel {:.4} metal {:.4}", mx(&t.diel), mx(&t.metal[0]));
     assert!(t.diel.iter().all(|&e| (0.0..=1.0 + 1e-9).contains(&e)));
     for k in 0..=20 {
         for j in 0..=20 {

@@ -448,8 +448,6 @@ pub struct Tables {
     pub diel: Vec<f64>,
     /// Metal: `∫ G2/G1`, `∫ (1 − o·h)⁵ G2/G1`, `∫ w(o·h) G2/G1`, `[μ][r]`.
     pub metal: [Vec<f64>; 3],
-    /// The fuzz lobe's own albedo, `[μ][r_f]`.
-    pub fuzz: Vec<f64>,
 }
 
 /// The F82 weight `μ (1 − μ)⁶ / (μ̄ (1 − μ̄)⁶)`.
@@ -499,21 +497,7 @@ impl Tables {
             })
         };
         let metal = [metal_k(0), metal_k(1), metal_k(2)];
-        let fuzz = par(TN * TN, |k| {
-                let (m, r) = (k / TN, k % TN);
-                let mu = mu_node(m);
-                let wo = [(1.0 - mu * mu).max(0.0).sqrt(), 0.0, mu];
-                let n = 48;
-                let mut s = 0.0;
-                for i in 0..n {
-                    for j in 0..n {
-                        let wi = cosine([(i as f64 + 0.5) / n as f64, (j as f64 + 0.5) / n as f64]);
-                        s += charlie(r_node(r), wo, wi) * PI;
-                    }
-                }
-                s / (n * n) as f64
-            });
-        Self { diel, metal, fuzz }
+        Self { diel, metal }
     }
 
     fn lerp2(t: &[f64], mu: f64, r: f64) -> (f64, f64) {
@@ -549,37 +533,11 @@ impl Tables {
         std::array::from_fn(|k| Self::lerp2(&self.metal[k], mu, r))
     }
 
-    /// The fuzz lobe's albedo, normalised so that its largest value over
-    /// `μ` is at most 1 (Charlie with Neubelt–Pettineo's visibility
-    /// reflects up to 1.4× what it receives at grazing view; the lobe is
-    /// scaled down by [`Self::fuzz_norm`] wherever it does).
+    /// The fuzz layer's albedo `R(μ_o, r_f)`: Zeltner+ 2022's fit
+    /// ([`super::sheen`]), which is ≤ 1 and needs no normaliser.
     pub fn fuzz(&self, mu: f64, rf: f64) -> f64 {
-        Self::lerp2(&self.fuzz, mu, rf).0 / self.fuzz_norm(rf)
+        super::sheen::albedo(mu, rf)
     }
-
-    /// `max(1, max_μ E(μ, r_f))`: the fuzz lobe's normaliser.
-    pub fn fuzz_norm(&self, rf: f64) -> f64 {
-        (0..TN)
-            .map(|k| Self::lerp2(&self.fuzz, k as f64 / (TN - 1) as f64, rf).0)
-            .fold(1.0, f64::max)
-    }
-}
-
-/// The fuzz lobe: Estevez & Kulla's "Charlie" sheen distribution with
-/// Neubelt & Pettineo's visibility, `D(h) V / 1` (a BRDF, colour 1). The
-/// spec recommends Zeltner+ 2022's LTC fit of an SGGX fibre layer; this is
-/// the analytic stand-in (design.md, Phase 4 deviations).
-pub fn charlie(rf: f64, wo: [f64; 3], wi: [f64; 3]) -> f64 {
-    let (ci, co) = (wi[2], wo[2]);
-    if ci <= 0.0 || co <= 0.0 {
-        return 0.0;
-    }
-    let a = (rf * rf).max(0.07);
-    let h = norm([wi[0] + wo[0], wi[1] + wo[1], wi[2] + wo[2]]);
-    let s2 = (1.0 - h[2] * h[2]).max(0.0);
-    let inv = 1.0 / a;
-    let d = (2.0 + inv) * s2.powf(0.5 * inv) / (2.0 * PI);
-    d / (4.0 * (ci + co - ci * co))
 }
 
 // ─── a material at one wavelength ────────────────────────────────────────
@@ -858,7 +816,7 @@ impl At {
         c[XI_S] = m.specular_weight;
         // The fuzz.
         c[F_FUZZ] = if kind == Kind::Reflect {
-            self.fc * charlie(m.fuzz_roughness, wo, wi) / t.fuzz_norm(m.fuzz_roughness)
+            self.fc * super::sheen::brdf(m.fuzz_roughness, wo, wi)
         } else {
             0.0
         };
