@@ -73,6 +73,8 @@ pub struct Voice {
     /// A body resonance under the struck object (Hz, decay 1/s, level), 0 = none.
     pub body: (f64, f64, f64),
     pub level: f64,
+    /// (old fundamental Hz, old length m) when retuned to the key.
+    pub retuned: Option<(f64, f64)>,
 }
 
 impl Voice {
@@ -88,7 +90,27 @@ impl Voice {
             })
             .filter(|m| m.hz < 20_000.0)
             .collect();
-        Voice { label, sub, len, thk, at, modes, contact: 0.0, chirp: (1.0, 0.0), body: (0.0, 0.0, 0.0), level: 1.0 }
+        Voice { label, sub, len, thk, at, modes, contact: 0.0, chirp: (1.0, 0.0), body: (0.0, 0.0, 0.0), level: 1.0, retuned: None }
+    }
+
+    /// Rebuild at the length that puts the fundamental on the nearest tone of
+    /// `scale` in `key`, and record the change in the label.
+    pub fn retune(&mut self, key: usize, scale: &[usize]) {
+        let f = self.fundamental();
+        let m = 69.0 + 12.0 * (f / 440.0).log2();
+        let target = (m.floor() as i64 - 3..=m.ceil() as i64 + 3)
+            .filter(|&n| scale.contains(&(((n - key as i64).rem_euclid(12)) as usize)))
+            .min_by(|a, b| (*a as f64 - m).abs().partial_cmp(&(*b as f64 - m).abs()).unwrap())
+            .unwrap() as f64;
+        let ft = 440.0 * 2f64.powf((target - 69.0) / 12.0);
+        let len = self.len * (f / ft).sqrt();
+        let mut v = Voice::bar(self.label, self.sub, len, self.thk, self.at, self.modes.len());
+        v.contact = self.contact;
+        v.chirp = self.chirp;
+        v.body = self.body;
+        v.level = self.level;
+        v.retuned = Some((f, self.len));
+        *self = v;
     }
 
     pub fn fundamental(&self) -> f64 {
@@ -146,7 +168,18 @@ pub struct Kit {
 }
 
 impl Kit {
-    pub fn new() -> Kit {
+    /// The kit, with its tuned voices (ping and both bells) retuned to the key:
+    /// each bar's length is scaled so its fundamental lands on the nearest
+    /// scale tone. f ∝ 1/L², so L' = L·√(f/f'); material and thickness stay.
+    pub fn new(key: usize, scale: &[usize]) -> Kit {
+        let mut k = Kit::raw();
+        for v in [&mut k.alu, &mut k.brass, &mut k.gold] {
+            v.retune(key, scale);
+        }
+        k
+    }
+
+    fn raw() -> Kit {
         // Skin: a 70 × 20 mm pad of dermis. Its own loss (η = 0.3) kills it in
         // a cycle, which is the thud; the body under it is the kick's cavity,
         // tuned to the pad's fundamental, and the onset chirp is the pad

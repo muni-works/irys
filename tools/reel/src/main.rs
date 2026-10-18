@@ -79,6 +79,7 @@ struct SeqSpan {
 #[derive(Serialize)]
 struct ChordOut {
     t: f64,
+    chord: String,
     sequence: String,
     frame: usize,
     chroma: Vec<f64>,
@@ -88,6 +89,7 @@ struct ChordOut {
 #[derive(Serialize)]
 struct Beats {
     bpm: f64,
+    key: String,
     beat_s: f64,
     duration: f64,
     stub_manifest: bool,
@@ -106,26 +108,72 @@ fn note_name(m: f64) -> String {
     format!("{}{}", NAMES[m.rem_euclid(12) as usize], m.div_euclid(12) - 1)
 }
 
-/// Pick chord tones from a chroma. The root is the strongest pitch class; the
-/// other three are chosen greedily by chroma weight plus a consonance bonus for
-/// their interval to the root (fifths, fourths and thirds favoured, semitones and
-/// the tritone penalised), never a semitone from a tone already chosen. The
-/// spectrum decides; the bonus only breaks the near-ties a broad spectrum makes.
-fn chord_tones(c: &[f64; 12]) -> Vec<usize> {
-    const BONUS: [f64; 12] = [0.0, -0.5, 0.1, 0.3, 0.3, 0.25, -0.4, 0.35, 0.1, 0.15, 0.15, -0.5];
-    let root = (0..12).fold(0, |b, p| if c[p] > c[b] { p } else { b });
-    let mut out = vec![root];
-    while out.len() < 4 {
-        let next = (0..12)
-            .filter(|p| out.iter().all(|&q| { let d = (*p as i32 - q as i32).rem_euclid(12); d.min(12 - d) >= 2 }))
-            .map(|p| (p, c[p] + BONUS[(p + 12 - root) % 12]))
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap().then(b.0.cmp(&a.0)));
-        match next {
-            Some((p, _)) => out.push(p),
-            None => break,
-        }
-    }
-    out
+/// Major-scale degrees (semitones above the tonic).
+const MAJOR: [usize; 7] = [0, 2, 4, 5, 7, 9, 11];
+/// Krumhansl–Kessler major profile, for choosing the key from the mean chroma.
+const KK_MAJOR: [f64; 12] = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+
+/// The tonal centre: the major key whose profile best correlates with the
+/// piece's mean chroma.
+fn choose_key(mean: &[f64; 12]) -> usize {
+    let m = mean.iter().sum::<f64>() / 12.0;
+    let pm = KK_MAJOR.iter().sum::<f64>() / 12.0;
+    (0..12)
+        .map(|k| (k, (0..12).map(|i| (mean[(i + k) % 12] - m) * (KK_MAJOR[i] - pm)).sum::<f64>()))
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap().then(b.0.cmp(&a.0)))
+        .unwrap()
+        .0
+}
+
+/// A diatonic chord of the key: its roman numeral, triad, and the two colour
+/// tones the spectrum may choose between (all inside the mode).
+struct Diatonic {
+    name: &'static str,
+    /// Degree index of the root (0 = I).
+    degree: usize,
+    /// Prior: ii is used sparingly.
+    prior: f64,
+    /// Colour tones as scale-degree offsets from the root: (label, offset).
+    colours: [(&'static str, usize); 2],
+}
+
+const CHORDS: [Diatonic; 5] = [
+    Diatonic { name: "I", degree: 0, prior: 1.0, colours: [("add9", 1), ("maj7", 6)] },
+    Diatonic { name: "IV", degree: 3, prior: 1.0, colours: [("add9", 1), ("maj7", 6)] },
+    Diatonic { name: "V", degree: 4, prior: 0.97, colours: [("sus2", 1), ("add9", 1)] },
+    Diatonic { name: "vi", degree: 5, prior: 0.9, colours: [("add9", 1), ("7", 6)] },
+    Diatonic { name: "ii", degree: 1, prior: 0.72, colours: [("add9", 1), ("7", 6)] },
+];
+
+/// Pitch class of the scale degree `root_deg + off` in `key`.
+fn deg_pc(key: usize, root_deg: usize, off: usize) -> usize {
+    (key + MAJOR[(root_deg + off) % 7]) % 12
+}
+
+/// The diatonic chord a chroma votes for: mean chroma over the triad, times the
+/// chord's prior.
+fn score(c: &[f64; 12], key: usize, d: &Diatonic) -> f64 {
+    let t: f64 = [0, 2, 4].iter().map(|&o| c[deg_pc(key, d.degree, o)]).sum();
+    d.prior * (t / 3.0 + 0.15 * c[deg_pc(key, d.degree, 0)])
+}
+
+/// Voice one diatonic chord: triad plus the colour tone the spectrum prefers
+/// (sus2 replaces the third), bass on whichever triad tone is brightest (root
+/// favoured), so the spectrum picks the inversion.
+fn voicing(c: &[f64; 12], key: usize, d: &Diatonic) -> (Vec<usize>, usize, String) {
+    let (lab, off) = if c[deg_pc(key, d.degree, d.colours[0].1)] >= c[deg_pc(key, d.degree, d.colours[1].1)] { d.colours[0] } else { d.colours[1] };
+    let col = deg_pc(key, d.degree, off);
+    let root = deg_pc(key, d.degree, 0);
+    let third = deg_pc(key, d.degree, 2);
+    let fifth = deg_pc(key, d.degree, 4);
+    let tones = if lab == "sus2" { vec![root, col, fifth, root] } else { vec![root, third, fifth, col] };
+    let sus = lab == "sus2";
+    let bass = [(root, c[root] + 0.25), (third, if sus { f64::MIN } else { c[third] }), (fifth, c[fifth])]
+        .iter()
+        .fold((root, f64::MIN), |b, &(p, w)| if w > b.1 { (p, w) } else { b })
+        .0;
+    let inv = if bass == root { "" } else if bass == third { "/3" } else { "/5" };
+    (tones, bass, format!("{}{}{}", d.name, lab, inv))
 }
 
 /// Voice-lead `pcs` onto the previous chord. Every assignment of pitch classes
@@ -138,7 +186,7 @@ fn voice_lead(prev: &[f64], pcs: &[usize]) -> Vec<f64> {
     while targets.len() < n {
         targets.push(pcs[targets.len() % pcs.len()]);
     }
-    let octaves = |pc: usize| -> Vec<f64> { (3..7).map(|o| (pc + 12 * o) as f64).filter(|&m| (50.0..=76.0).contains(&m)).collect() };
+    let octaves = |pc: usize| -> Vec<f64> { (3..7).map(|o| (pc + 12 * o) as f64).filter(|&m| (55.0..=81.0).contains(&m)).collect() };
     let mut best = (f64::INFINITY, prev.to_vec());
     let mut idx: Vec<usize> = (0..n).collect();
     permute(&mut idx, 0, &mut |perm: &[usize]| {
@@ -155,7 +203,7 @@ fn voice_lead(prev: &[f64], pcs: &[usize]) -> Vec<f64> {
                     }
                 }
             }
-            let centre = (v.iter().sum::<f64>() / n as f64 - 63.0).abs();
+            let centre = (v.iter().sum::<f64>() / n as f64 - 67.0).abs();
             let cost = motion + 20.0 * unison + 1.5 * centre;
             if cost < best.0 {
                 best = (cost, v);
@@ -290,12 +338,12 @@ fn pattern(kind: &str, bar: usize, bars: usize, step: usize, rng: &mut Rng) -> V
 /// Per-section mix: pad level, pad brightness (Hz), bass, arp.
 fn mix(s: &Section) -> (f64, f64, f64, f64) {
     match s.drums.as_str() {
-        "sparse" => (0.8, 1400.0, 0.0, 0.0),
-        "build" => (0.75, 1800.0, 0.25, 0.0),
-        "full" => (0.6, 3800.0, 1.0, 0.45),
-        "full_plus" => (0.6, 4800.0, 1.0, 0.7),
-        "none" => (0.95, 900.0, 0.0, 0.15),
-        "outro" => (0.8, 2200.0, 0.4, 0.0),
+        "sparse" => (0.8, 2000.0, 0.0, 0.0),
+        "build" => (0.75, 2600.0, 0.25, 0.0),
+        "full" => (0.6, 5000.0, 1.0, 0.45),
+        "full_plus" => (0.6, 6000.0, 1.0, 0.7),
+        "none" => (0.95, 1500.0, 0.0, 0.15),
+        "outro" => (0.8, 3000.0, 0.4, 0.0),
         _ => (0.7, 2000.0, 0.0, 0.0),
     }
 }
@@ -367,12 +415,12 @@ fn render(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let step_s = beat * arr.chord_every_beats as f64;
     let steps = (music_end / step_s).round() as usize;
     let mut smooth = [0.0f64; 12];
-    let mut voices = vec![55.0, 60.0, 64.0, 69.0];
+    let mut voices = vec![60.0, 64.0, 67.0, 71.0];
     let mut chords: Vec<(f64, Vec<f64>, f64)> = Vec::new(); // (t, voices, bass)
     let mut chord_log = Vec::new();
+    let mut per_step: Vec<([f64; 12], String, usize)> = Vec::new();
     for k in 0..steps {
         let t0 = k as f64 * step_s;
-        // Average the frames that fall in this step.
         let mut acc = [0.0; 12];
         let samples = 6;
         let (mut sid, mut sframe) = (String::new(), 0);
@@ -392,15 +440,70 @@ fn render(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         for i in 0..12 {
             smooth[i] = a * smooth[i] + (1.0 - a) * acc[i];
         }
-        let pcs = chord_tones(&smooth);
+        per_step.push((smooth, sid, sframe));
+    }
+    let mut mean = [0.0; 12];
+    for (c, _, _) in &per_step {
+        for i in 0..12 {
+            mean[i] += c[i] / per_step.len() as f64;
+        }
+    }
+    let key = choose_key(&mean);
+    eprintln!("key: {} major", NAMES[key]);
+    // Steps that resolve: the downbeat of every drop and of the outro.
+    let resolves: Vec<usize> = arr
+        .sections
+        .iter()
+        .zip(&starts)
+        .filter(|(s, _)| s.drop || s.drums == "outro")
+        .map(|(_, &t)| (t / step_s).round() as usize)
+        .collect();
+    // Score each chord against its own piece-wide baseline: broad spectra all
+    // lean on the tonic, so what the frame says is how it departs from the mean.
+    let base: Vec<f64> = CHORDS.iter().map(|d| score(&mean, key, d)).collect();
+    let rel = |c: &[f64; 12], i: usize| score(c, key, &CHORDS[i]) - base[i] + 0.08 * (CHORDS[i].prior - 1.0);
+    let mut prev: Option<usize> = None;
+    let mut ii_run = 0;
+    let mut ii_cool = 0usize;
+    for (k, (smooth, sid, sframe)) in per_step.into_iter().enumerate() {
+        let t0 = k as f64 * step_s;
+        // ii sparingly: two beats at most, then six without it.
+        let pool: Vec<usize> = if resolves.contains(&k) {
+            vec![0, 1]
+        } else {
+            (0..CHORDS.len()).filter(|&i| !(CHORDS[i].name == "ii" && (ii_run >= 2 || ii_cool > 0))).collect()
+        };
+        let mut pick = *pool
+            .iter()
+            .max_by(|&&a, &&b| rel(&smooth, a).partial_cmp(&rel(&smooth, b)).unwrap().then(b.cmp(&a)))
+            .unwrap();
+        // Hysteresis: hold the last chord unless the new one wins clearly.
+        if let Some(p) = prev {
+            if pool.contains(&p) && rel(&smooth, pick) < rel(&smooth, p) + 0.006 {
+                pick = p;
+            }
+        }
+        prev = Some(pick);
+        if CHORDS[pick].name == "ii" {
+            ii_run += 1;
+        } else {
+            if ii_run > 0 {
+                ii_cool = 6;
+            }
+            ii_run = 0;
+            ii_cool = ii_cool.saturating_sub(1);
+        }
+        let (pcs, bass_pc, label) = voicing(&smooth, key, &CHORDS[pick]);
         voices = voice_lead(&voices, &pcs);
-        let root = pcs[0] as f64;
+        let root = bass_pc as f64;
         let bass = root + 12.0 * ((36.0 - root) / 12.0).ceil();
+        let _ = &label;
         chord_log.push(ChordOut {
             t: t0,
             sequence: sid,
             frame: sframe,
             chroma: smooth.iter().map(|v| (v * 1000.0).round() / 1000.0).collect(),
+            chord: label,
             notes: voices.iter().map(|&m| note_name(m)).chain([note_name(bass)]).collect(),
         });
         chords.push((t0, voices.clone(), bass));
@@ -418,6 +521,7 @@ fn render(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let mut ph = vec![[0.0f64; 2]; freq.len()];
         let mut lp = [OnePole::default(), OnePole::default()];
         let mut lp2 = [OnePole::default(), OnePole::default()];
+        let mut hp = [OnePole::default(), OnePole::default()];
         let mut level = 0.0;
         let mut cutoff = 1000.0;
         let glide = 1.0 - (-1.0 / (0.09 * sr)).exp();
@@ -446,17 +550,19 @@ fn render(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     let det = if side == 0 { 0.997 } else { 1.003 };
                     ph[v][side] = (ph[v][side] + freq[v] * det / sr) % 1.0;
                     let mut y = 0.0;
-                    for h in 1..=9 {
-                        if freq[v] * h as f64 > 9000.0 {
+                    for h in 1..=14 {
+                        if freq[v] * h as f64 > 12000.0 {
                             break;
                         }
-                        y += (2.0 * PI * ph[v][side] * h as f64).sin() / h as f64;
+                        y += (2.0 * PI * ph[v][side] * h as f64).sin() / (h as f64).powf(0.85);
                     }
                     s[side] += y * 0.08;
                 }
             }
             for side in 0..2 {
-                let y = lp2[side].tick(lp[side].tick(s[side], cutoff, sr), cutoff * 1.5, sr) * level * breathe;
+                let y = lp2[side].tick(lp[side].tick(s[side], cutoff, sr), cutoff * 1.5, sr);
+                // Thin the low mids: the bass owns that range.
+                let y = (y - hp[side].tick(y, 220.0, sr)) * level * breathe;
                 music[i][side] += y;
                 send[i] += y * 0.35;
             }
@@ -512,7 +618,7 @@ fn render(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── drums ────────────────────────────────────────────────────────────────
-    let kit = modal::Kit::new();
+    let kit = modal::Kit::new(key, &MAJOR);
     let vs = kit.voices();
     let sixteenth = beat / 4.0;
     for (si, s) in arr.sections.iter().enumerate() {
@@ -599,6 +705,7 @@ fn render(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let beats_out = Beats {
         bpm: arr.bpm,
+        key: format!("{} major", NAMES[key]),
         beat_s: beat,
         duration: r3(dur),
         stub_manifest: man.stub,
@@ -613,7 +720,8 @@ fn render(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     for v in kit.voices() {
         let f: Vec<String> = v.modes.iter().take(4).map(|m| format!("{:.0}", m.hz)).collect();
-        println!("{:<38} {:>18}  modes {} Hz", v.label, v.sub.name, f.join(", "));
+        let rt = v.retuned.map_or(String::new(), |(f0, l0)| format!("  (retuned from {f0:.0} Hz, L {:.0} -> {:.1} mm)", l0 * 1e3, v.len * 1e3));
+        println!("{:<38} {:>18}  modes {} Hz{rt}", v.label, v.sub.name, f.join(", "));
     }
     println!("{} ({:.1} s), preview {:.1}–{:.1} s", wav_path.display(), dur, preview.0, preview.1);
     Ok(())
