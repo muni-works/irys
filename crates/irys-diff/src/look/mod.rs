@@ -5,6 +5,8 @@
 //!   the albedo tables, a material at one wavelength.
 //! - [`graph`]: the albedo-scaled OpenPBR stack as one tang IR graph.
 //! - [`swatch`]: the CPU f64 swatch integrator with path replay.
+//! - `scene`, `scene_gpu` (phase 5b, features `assets` + `gpu`): full scenes
+//!   with OpenPBR materials on the device.
 
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -16,3 +18,7 @@ pub mod volume;
 pub mod hair;
 #[cfg(feature = "gpu")]
 pub mod hair_gpu;
+#[cfg(feature = "assets")]
+pub mod scene;
+#[cfg(all(feature = "gpu", feature = "assets"))]
+pub mod scene_gpu;

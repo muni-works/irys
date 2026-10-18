@@ -2033,6 +2033,252 @@ references, labelled.)
 6. Not verified: other demo files, mirrored instances' emitter sidedness,
    and timings were taken on a shared GPU (fastest of two per level).
 
+## Phase 5b: the demo scenes with their own materials (2026-10-18)
+
+Phase 5a rendered Blender's classroom and Barcelona Pavilion with irys's
+phase-2 BSDFs (grey Lambertian, one conductor, one emitter radiance) and
+so compared different pictures with Cycles. 5b renders them with OpenPBR
+on the GPU, from each file's own camera, and redoes the true-material bench.
+
+### 1. The exporter speaks OpenPBR (`scripts/blend_openpbr.py`)
+
+`blend_export.py` (default `--look 1`) adds to each material record an
+`openpbr` block, baked textures and what was approximated
+(`dropped.openpbr` in the sidecar, with counts). Blender 4.4's Principled
+BSDF maps 1:1 (base, metalness, roughness, specular IOR level and tint,
+coat with tint/roughness/IOR and darkening 0 as Cycles has it, sheen →
+fuzz, subsurface in Cycles mode, transmission, thin film, emission, alpha).
+The older graphs the two files are built from map to the closest OpenPBR
+material:
+
+| Blender | OpenPBR |
+|---|---|
+| Diffuse(c) | base c, specular weight 0 (Blender's Diffuse has no specular) |
+| Mix(k, Diffuse c, Glossy/Anisotropic g) | base c, metalness k, **metal colour g** |
+| Mix(Fresnel / Layer Weight, D, G) | dielectric specular layer: colour g, IOR from the factor (Layer Weight blend b: 1/(1 − b)) |
+| Glass / Refraction | transmission 1, colour, roughness, IOR |
+| Add/Mix(Glossy, Transparent) | thin-walled glass: straight-through transmission, shadow rays pass |
+| Mix(image alpha, Transparent, X) | a cut-out (alpha-tested at 0.5 by camera, bounce and shadow rays) |
+| Translucent(c), Add(Diffuse, Translucent) | thin diffuse translucency; an Add keeps both albedos whole |
+| Emission(c, s), Blackbody | emission colour × strength (radiance), blackbody RGB at luminance 1 (Cycles normalises the same way) |
+
+Three things OpenPBR does not name are added: a **metal colour** (OpenPBR
+ties the metal's F0 to the base colour; a Blender Diffuse+Glossy mix is
+exactly OpenPBR's metalness mix with the two slabs' colours apart),
+**translucency** (thin diffuse transmission), and the **cut-out**.
+
+Colours are evaluated as fields over the UVs, not averaged: an image
+through Mix (all blend modes), RGB Curves, Hue/Saturation/Value,
+Bright/Contrast, Gamma, Invert, Color Ramp, Math and Mapping (scale,
+location) is baked into a PNG (≤ 1024², sRGB) the kernel samples on the
+mesh's UVs (glTF `baseColorTexture` + `KHR_texture_transform`; the metal
+colour and the cut-out are named in the sidecar). Inputs that do not
+depend on the UVs become constants: an object-random colour ramp its mean
+over [0, 1], an Attribute 0.5, a Noise/Wave texture 0.5. Where such a
+constant decided a camera-visible diffuse colour, Cycles' Diffuse Color
+pass (5a's measurement) rescales it (factor clamped to [1/3, 3]).
+
+Lights keep their colour (blackbody tints included) and their camera
+visibility, spots their cone. Portals are kept as geometry that only
+bounce rays see and shadow rays pass, emitting their own Sky Texture
+(baked equirect, looked up at the reflected direction as Blender's
+Texture Coordinate › Reflection does) through the material's RGB Curves
+and HSV. The world is baked to a 1024 × 512 equirect. `--frames a:b` and
+`--reel fps:a:b` write the file's camera per frame (the second resampled
+with subframes).
+
+One 5a bug surfaced: the exporter used the viewport depsgraph, which shows
+a particle emitter whose render hides it. The pavilion's lotus emitter, a
+plane over the whole pool with the lotus-leaf material, was exported (and
+rendered by 5a's irys); `show_instancer_for_render` is now copied before
+the depsgraph is built.
+
+Coverage (counts of materials; the sidecar lists them):
+
+| still dropped | classroom (79) | pavilion (21) |
+|---|---|---|
+| bump / normal maps | 37 | 4 |
+| displacement | 7 | 2 |
+| UV-free inputs as constants (Attribute, Object Info, Noise, Wave, group inputs) | 35 | 6 |
+| roughness textures (their mean) | 9 | 0 |
+| Layer Weight Facing read as Fresnel | 0 | 8 |
+| volume outputs | 0 | 1 (lotus leaves) |
+| ray visibility flags other than portals and lights | 13 objects | 0 |
+| depth of field | 1 | 0 |
+
+### 2. Full scenes on the GPU (`look::scene`, `look::scene_gpu`, `scene.wgsl`)
+
+`look::scene::load` reads the export into plain data: a mesh per (glTF
+mesh, primitive) with normals and UVs, instances, materials, 8-bit sRGB
+textures, the world equirect, the sun, and every other light as emitter
+geometry of its own material (quad, 48-gon disc, UV sphere, a spot's
+cone). `look::scene_gpu::GpuLook` uploads it and `scene.wgsl` renders it:
+
+- **Geometry**: one triangle BLAS per mesh, one TLAS instance per
+  placement (the instance's custom data indexes its record: first
+  triangle, material, first emitter). Instance masks are per-ray
+  visibility: geometry `0x1`, portals `0x2` (bounce rays only), lights the
+  camera does not see `0x4`, lights it does `0x8`; shadow rays see geometry
+  only (Cycles' lights do not occlude). Cut-outs, thin glass and constant
+  opacity are non-opaque triangles: the traversal alpha-tests a candidate
+  against its texture, and a shadow ray multiplies thin glass's
+  straight-through transmission and `1 − opacity` instead of stopping.
+- **Materials**: one record of 20 vec4 per material (OpenPBR's parameters
+  with colours on the hats, flags, texture ids, UV transform, portal sky,
+  spot cone), the albedo tables (`E_d(μ, r, η)` 32×32×33, metal ×3, the
+  sheen LTC) in one buffer, textures in another, sampled bilinearly with
+  wrap. The material code is look::openpbr's `At::new` + `columns` +
+  `graph::stack`, `lobe_weights`, `pdf` and `sample`, written out in WGSL
+  with irys's three additions; subsurface is a Lambertian of the
+  subsurface colour (no random walk in full scenes: neither file uses it).
+- **Wavelengths**: four hero wavelengths per path. Lobes are picked by
+  weights averaged over the four (the hero's alone gave a green leaf at a
+  blue hero `f/p` without bound), and every contribution is divided by the
+  mean of the four wavelengths' path densities (spectral MIS over whole
+  paths, Wilkie+ 2014), so a dispersive near-delta refraction carries the
+  hero ×4 and the rest ~0, unbiased. Where the index does not depend on
+  the wavelength (no dispersion, no film: every material in both files)
+  the four lanes share one evaluation with the colours as vec4.
+- **Lights**: NEE picks the sun (uniform cone), the world (equirect
+  importance sampling, marginal × conditional CDF), an emitter triangle
+  (CDF by area × luminance, each with its own RGB radiance) or a portal
+  triangle, by shares estimated from their irradiance at a reference
+  distance (floor 5 %); MIS against the BSDF everywhere. A thin-glass or
+  portal pass is not a vertex: the light sample through it was the
+  previous vertex's.
+- **Shading normals** that leave the viewer at a grazing angle are bent
+  toward the geometric normal until it is ≥ 0.1 above them (Cycles'
+  `ensure_valid_specular_reflection` has the same aim). Without it the
+  pavilion's trees, whose normals are bent outward for foliage shading,
+  made fireflies of 4·10³ through the leaves' Fresnel layer.
+- **Determinism**: one dispatch per sample, chunks of 2¹⁶ pixels, each
+  thread owning its pixel's accumulator; the frame's mean spectrum (40
+  bins) is summed per workgroup in lane order into the workgroup's own
+  slots, no float atomics. Two runs are bit-identical.
+
+It is a megakernel like `skin.wgsl`, not the phase-2 PRB wavefront with
+material binning: the kernel is forward only, there is no `θ` to replay,
+and a wavefront would carry four 25-float material states per lane
+through memory between stages. The conductor wavefront, its replay and
+`gpu.rs` are untouched, and every existing test passes
+(`cargo test --release -p irys-diff --features gpu,assets`). Volumes are
+not on this path (the lotus leaves' volume output is dropped).
+
+| Gate (`tests/look_scene.rs`) | Result |
+|---|---|
+| device material vs look::openpbr's f64 `At` (4000 lanes, 24 random materials: coat, fuzz, film, transmission, dispersion, inside/outside) | `f` 8.7e-5, pdf 8.7e-5 rel; lobe weights ≤ 2.7e-3 abs; 8 lanes over tolerance |
+| white furnaces under a world of 1: diffuse, smooth white metal, smooth glass, dispersive glass (V 20), thin glass, half opacity, diffuse + separate metal colour, diffuse + translucency | 0.9985 … 1.0005 (± ≤ 0.0012) |
+| four-lane path vs per-lane path, random materials | mean \|Δ\| / mean 4e-9 |
+| a frame twice / another seed | bit-identical / different |
+
+### 3. Beauty renders (`examples/blend_look`, `scripts/cycles_look.py`)
+
+1920 × 1080 from each file's own camera, max_bounces 7, 4096 spp, **no
+denoising** (irys has no denoiser on this path), Standard view. Cycles
+renders the .blend itself with Metal, the export's camera and size, a box
+filter, no adaptive sampling or clamping, once with OIDN off and once on.
+Shared machine (another agent's GPU work alongside), single runs.
+
+| scene | irys 4096 spp | Cycles 4096, OIDN off | Cycles 4096, OIDN on | frame mean irys / Cycles |
+|---|---|---|---|---|
+| classroom | 663 s (12.8 Mpaths/s) | 340 s | 379 s | 0.355 / 0.332 (+7 %) |
+| pavilion | 834 s (10.2 Mpaths/s) | 266 s | 267 s | 0.334 / 0.346 (−3 %; OIDN 0.301) |
+
+![classroom](demos-classroom.png)
+![classroom vs Cycles](demos-classroom-vs-cycles.png)
+![pavilion](demos-pavilion.png)
+![pavilion vs Cycles](demos-pavilion-vs-cycles.png)
+
+Cycles is 2–3× faster per sample here. What still differs, by eye: the
+pool has no ripples and so no sky in it (the water's bump map is dropped;
+Cycles' wavy normals put sky reflections across it), irys's pebbles are
+lighter (their per-object random colour is a ramp mean), the trees are a
+little yellower (the same), and the classroom's bump-mapped wood and paint
+are flatter. The first pavilion render had one pixel of 3·10²³ (one path
+through a vanishing f32 pdf); the kernel now drops any path whose radiance
+exceeds 10⁹, and the frame above is the re-render.
+
+### 4. True-material bench (`scripts/demos_bench.sh`, `examples/look_bench`)
+
+Phase 3's protocol (480 × 270, max_bounces 7, 32768-spp references for
+both, sweeps to 1024 spp, fastest of two, each against its own reference,
+budgets at Cycles' 64/256/1024-spp times). First the sanity check, which
+5a failed (cross relMSE 26 and 8.7):
+
+| scene | reference mean RGB, Cycles | irys | cross relMSE (irys ref vs Cycles ref) |
+|---|---|---|---|
+| classroom | 0.401 0.322 0.276 | 0.441 0.343 0.282 | **0.70** (5a: 26) |
+| pavilion | 0.300 0.352 0.381 | 0.290 0.346 0.366 | **0.28** (5a: 8.7) |
+| pavilion, indirect clamp 10 | 0.240 0.299 0.342 | 0.248 0.309 0.342 | **0.066** |
+
+The pictures now largely match: the means agree to 1–10 %, and the cross
+relMSE fell 37× and 31×. They are not yet the same picture, so the
+equal-time numbers below are still partly a model comparison. The
+remaining causes: bump and normal maps (37 of the classroom's 79
+materials, the pavilion's water), UV-free inputs as constants (35 in the
+classroom; the Cycles colour-pass rescale fixes only the camera-visible
+means), the red-heavy excess in the classroom (+10 % red: the wood and
+leather textures after their colour chains and the blackbody lamps), and
+the pavilion's water ripples. The unclamped pavilion's Cycles reference
+and sweep are dominated by caustic fireflies through the water (Cycles
+relMSE up to 2·10⁵ against its own reference), so only the clamped row is
+a speed result there.
+
+| scene | budget | Cycles relMSE | irys relMSE | ratio |
+|---|---|---|---|---|
+| classroom | 0.41 s | 0.160 | 0.358 | 2.24 |
+| classroom | 1.24 s | 0.113 | 0.392 | 3.46 |
+| classroom | 6.22 s | 0.021 | 0.036 | 1.71 |
+| pavilion | 0.38 / 1.26 / 5.70 s | 2.3·10⁵ / 31 / 2013 | 1.65 / 0.63 / 0.31 | — (fireflies) |
+| pavilion, clamp 10 | 0.37 s | 0.0104 | 0.207 | 20 |
+| pavilion, clamp 10 | 1.10 s | 0.0025 | 0.077 | 30 |
+| pavilion, clamp 10 | 4.32 s | 0.0006 | 0.019 | 31 |
+
+**irys loses at equal time on true materials**, 1.7–3.5× on the classroom
+and ~30× on the clamped pavilion. At 1024 spp irys takes 8.6 s / 17–19 s
+where Cycles takes 6.2 s / 4.3–5.7 s, and per sample it is noisier: this
+kernel has none of phase 3's machinery (Sobol, spectral importance,
+ReSTIR, guiding), uniform random numbers, and a light pick by fixed group
+shares rather than a light tree; the pavilion adds 54.9 M instanced
+triangles and cut-out foliage, whose alpha test runs in the traversal for
+every candidate. The grey bench of 5a (irys 0.16–0.59 of Cycles' error)
+measured the phase-2 wavefront, which those samplers sit in; moving them
+into the OpenPBR kernel is the next step.
+
+![bench classroom](demos-bench-classroom.png)
+![bench pavilion clamp](demos-bench-pavilion-clamp.png)
+
+### 5. Reel sequences (`scripts/reel.sh`, `scripts/reel_cameras.py`, `examples/reel`)
+
+1920 × 1080, 30 fps, JPEG q92, outside the repo in
+`irys-assets/reel/frames/<sequence>/`, with `frames.json` per sequence and
+`reel/manifest.json` (path, frames, fps, caption, credit, and per frame the
+mean spectral radiance in 40 bins over 380–780 nm: for the OpenPBR scenes
+the kernel's per-workgroup spectrum over every pixel and sample; for the
+prb and skin sequences the device's per-lane `L` at the lanes' own
+wavelengths, from a 240 × 135 pass of the same frame).
+
+Planned: `classroom-keyframed` (the file's animated renderCam, frames
+1–145 at 25 fps resampled to 174 frames at 30 fps), `pavilion-dolly` and
+`pavilion-orbit` (the midday camera does not move: authored 5 s moves),
+`fit` (phase 2b's trajectory), `rose` (phase 2f's 600-step run), `head`
+(a 50° orbit with hair), `swatch` (five OpenPBR parameters swept under the
+pavilion's sky). **Written: classroom-keyframed only** (174 frames, 64 spp,
+8.4 s a frame, 347 MB). The run stopped itself before the next sequence:
+the shared disk fell to 13 GB free, under the 15 GB floor. `scripts/reel.sh
+pavilion-dolly,pavilion-orbit,fit,rose,head,swatch` resumes it.
+
+### Phase 5b risks and next
+
+1. Bump/normal maps are the largest remaining look gap; a height-field
+   bake to a tangent-space normal map is the obvious next exporter piece.
+2. The OpenPBR kernel needs the phase-3 samplers (Sobol + spectral IS) and a
+   light tree before the true-material bench is a fair speed comparison.
+3. The kernel is a megakernel; material binning was not built, so
+   divergence costs are unmeasured.
+4. SSS in full scenes is Lambertian; volumes are not on this path.
+5. Timings are single runs on a GPU shared with another agent's work.
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.
