@@ -2248,6 +2248,26 @@ into the OpenPBR kernel is the next step.
 ![bench classroom](demos-bench-classroom.png)
 ![bench pavilion clamp](demos-bench-pavilion-clamp.png)
 
+### 5. Reel sequences (`scripts/reel.sh`, `scripts/reel_cameras.py`, `examples/reel`)
+
+1920 × 1080, 30 fps, JPEG q92, outside the repo in
+`irys-assets/reel/frames/<sequence>/`, with `frames.json` per sequence and
+`reel/manifest.json` (path, frames, fps, caption, credit, and per frame the
+mean spectral radiance in 40 bins over 380–780 nm: for the OpenPBR scenes
+the kernel's per-workgroup spectrum over every pixel and sample; for the
+prb and skin sequences the device's per-lane `L` at the lanes' own
+wavelengths, from a 240 × 135 pass of the same frame).
+
+Planned: `classroom-keyframed` (the file's animated renderCam, frames
+1–145 at 25 fps resampled to 174 frames at 30 fps), `pavilion-dolly` and
+`pavilion-orbit` (the midday camera does not move: authored 5 s moves),
+`fit` (phase 2b's trajectory), `rose` (phase 2f's 600-step run), `head`
+(a 50° orbit with hair), `swatch` (five OpenPBR parameters swept under the
+pavilion's sky). **Written: classroom-keyframed only** (174 frames, 64 spp,
+8.4 s a frame, 347 MB). The run stopped itself before the next sequence:
+the shared disk fell to 13 GB free, under the 15 GB floor. `scripts/reel.sh
+pavilion-dolly,pavilion-orbit,fit,rose,head,swatch` resumes it.
+
 ### Phase 5b risks and next
 
 1. Bump/normal maps are the largest remaining look gap; a height-field
