@@ -1,0 +1,15 @@
+[package]
+name = "irys-reel"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "The irys hype reel's soundtrack: spectral chords, modal hits, fit-loss risers."
+
+# Not a member of the irys workspace: a tool, built on its own, so the library
+# crates never see its dependencies.
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+png = "0.17"
