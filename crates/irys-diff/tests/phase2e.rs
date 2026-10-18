@@ -363,14 +363,27 @@ fn gate(floor: bool) {
 
 /// `Σ g I` with every pixel integrated over `k²` fixed R2 points.
 fn grid_loss(scene: &mut Scene, k: usize, g: &Weighted, seed: u64, kern: &mut Kernels) -> f64 {
+    grid_loss_at(scene, k, g, seed, kern, [0.5, 0.5])
+}
+
+/// [`grid_loss`] with the R2 points' start at `o` (a Cranley–Patterson
+/// shift of the whole grid; `[0.5, 0.5]` is [`grid_loss`]).
+fn grid_loss_at(
+    scene: &mut Scene,
+    k: usize,
+    g: &Weighted,
+    seed: u64,
+    kern: &mut Kernels,
+    o: [f64; 2],
+) -> f64 {
     let (w, h) = scene.size;
     let mut pts = Vec::with_capacity(w * h * k * k);
     for py in 0..h {
         for px in 0..w {
             for j in 0..k * k {
                 let (a1, a2) = (0.754_877_666_246_692_8, 0.569_840_290_998_053_2);
-                let u = (0.5 + a1 * j as f64).fract();
-                let v = (0.5 + a2 * j as f64).fract();
+                let u = (o[0] + a1 * j as f64).fract();
+                let v = (o[1] + a2 * j as f64).fract();
                 pts.push(scene.screen(px as f64 + u, py as f64 + v));
             }
         }
@@ -445,20 +458,33 @@ fn plate_arm(w: usize, h: usize, depth: usize) -> Scene {
 
 /// Piece 2: the ID-buffer importance is unbiased (same mean as 2d's
 /// importance and as central differences) and cheaper: the variance ratio
-/// at equal sample count is printed and must beat 3.
+/// at equal sample count is printed and must beat 1.5 (mask) and 1.3
+/// (shaded). Phase 5a: over 64 seeds per importance, not 24. A ratio of
+/// two variances from 24 seeds each is good to about ±25 % (geometric
+/// mean of three parameters), and at the by-peak sun share the 24-seed
+/// shaded ratio drew 1.28 against its 1.3 floor; `visibility_ratio_study`
+/// over 96 seeds measures 1.50 there (1.95 at the fixed ½ share), with the
+/// two importances' means within |z| < 1.2.
 #[test]
 fn visibility_importance_cuts_variance_without_bias() {
-    let mask = cut(1);
-    let shaded = cut(2);
+    let mask = cut_with(1, 64);
+    let shaded = cut_with(2, 64);
     assert!(mask > 1.5 && shaded > 1.3, "{mask} {shaded}");
 }
 
 /// The geometric-mean variance ratio (2d importance / 2e) at depth `depth`.
 fn cut(depth: usize) -> f64 {
+    cut_with(depth, 24)
+}
+
+fn cut_with(depth: usize, seeds: u64) -> f64 {
     let (w, h) = (48, 36);
     let rig = arm_rig();
     let g = Weighted::new(w, h);
     let mut s = plate_arm(w, h, depth);
+    if std::env::var("PICK").as_deref() == Ok("half") {
+        s.env = s.env.with_pick(prb::SUN_PICK);
+    }
     rig.pose(&mut s, &PHI);
     let edges = Edges::new(&s);
     let t = std::time::Instant::now();
@@ -469,11 +495,11 @@ fn cut(depth: usize) -> f64 {
     let run = |s: &mut Scene, v: Option<&vis::Visibility>, ke: &mut Kernels| {
         let mut out = Vec::new();
         let mut vis_frac = 0.0;
-        for sd in 0..24u64 {
+        for sd in 0..seeds {
             let (ge, es) = vis::boundary_with(s, &edges, &rig, &PHI, &g.0, n, 300 + sd, v, |sc| {
                 prb::forward(sc, &THETA, 300 + sd, ke).0
             });
-            vis_frac += es.visible as f64 / es.len() as f64 / 24.0;
+            vis_frac += es.visible as f64 / es.len() as f64 / seeds as f64;
             out.push(ge);
         }
         (stats(&out), vis_frac)
@@ -641,22 +667,32 @@ fn camera_gate(mut s: Scene, zmax: f64) {
     );
     // Steps that move edges ≥ ~½ px: smaller ones flip too few of the
     // fixed points for the reference to be good to a few per cent.
-    // Rotations: 0.004 rad (~½ px at the frame's edge). The reference moves
-    // by a few per cent with this step on the arm mask (c4: 6.5, 5.3, 4.3
-    // at 0.01, 0.004, 0.025), which is the size of what is left.
+    // Phase 5a: every CD seed shifts the 16² grid by its own
+    // Cranley–Patterson offset. Before, the four seeds shared one grid, so
+    // the reference's error bar left out where that grid cuts the moving
+    // edges — the "reference moves by a few per cent with the step" of 2e
+    // (c4: 6.5, 5.3, 4.3 on the arm mask; 7.4, 11.6, 14.1 on the boxes at
+    // the by-peak sun share) was that missing term, and it is what tripped
+    // c4 at z −3.1 when the share became the default
+    // (`camera_gate_reference_study`: 16 shifted grids give c4 9.0 ± 2.0 at
+    // 0.004 rad, 10.4 ± 1.1 at 0.008, against the estimate's 10.6 ± 0.3).
+    // Rotations: 0.008 rad, where the shifted reference is half as noisy
+    // and its Richardson extrapolation agrees with it.
     let rs: f64 = std::env::var("ROT")
         .map(|v| v.parse().unwrap())
-        .unwrap_or(0.004);
+        .unwrap_or(0.008);
     let steps = [0.05, 0.05, 0.05, rs, rs, rs, 0.01];
     let mut cdr = Vec::new();
-    for sd in 0..4 {
+    for sd in 0..8 {
         let mut r = Vec::new();
+        let mut rng = prb::Rng::new(77, sd);
+        let o = [rng.uniform(), rng.uniform()];
         for j in 0..7 {
             let mut side = |d: f64| {
                 let mut p = c.to_vec();
                 p[j] += d;
                 cam.pose(&mut s, &p);
-                grid_loss(&mut s, k, &g, 8000 + sd, &mut kf)
+                grid_loss_at(&mut s, k, &g, 8000 + sd, &mut kf, o)
             };
             let (a, b) = (side(steps[j]), side(-steps[j]));
             r.push((a - b) / (2.0 * steps[j]));
@@ -882,5 +918,99 @@ mod gpu_tier {
             ms(fwd2),
             ms(sum2)
         );
+    }
+}
+
+/// Phase 5a: is the camera gate's c4 miss under the by-peak sun share a
+/// bias or the reference? Measured, not gated (`--ignored`); `PICK=half`
+/// runs it at phases 1–3's fixed share. The estimator over `EST` seeds
+/// (default 96); central differences over `CDS` seeds (default 16), each
+/// with its own Cranley–Patterson shift of the 16² grid (the gate's four
+/// CD seeds share one grid, so its CD error bar leaves out where that grid
+/// cuts the edges), at the gate's steps × 0.5, 1, 2, 4, and a Richardson
+/// extrapolation `(4 CD(h) − CD(2h)) / 3` from each adjacent pair.
+#[test]
+#[ignore]
+fn camera_gate_reference_study() {
+    let mut s = two_boxes(48, 36);
+    if std::env::var("PICK").as_deref() == Ok("half") {
+        s.env = s.env.with_pick(prb::SUN_PICK);
+    }
+    let env_n = |k: &str, d: u64| std::env::var(k).map_or(d, |v| v.parse().unwrap());
+    let (n_est, n_cd) = (env_n("EST", 96), env_n("CDS", 16));
+    eprintln!("sun share {:.4}", s.env.sun_pick());
+    let (w, h) = s.size;
+    let g = Weighted::new(w, h);
+    let cam = vis::CameraRig::new(&s);
+    let c = [0.0; 7];
+    let edges = Edges::new(&s);
+    let tan = Tangents::camera(&s, &cam, &c);
+    let n = 8192;
+    let mut ke = Kernels::new(4 * n * s.wavelengths, true);
+    let mut tot = Vec::new();
+    for sd in 0..n_est {
+        let es = vis::EdgeSamples::for_camera(&s, &edges, &cam, &c, n, 600 + sd);
+        s.set_points(Some(es.points().to_vec()));
+        let l = prb::forward(&s, &THETA, 600 + sd, &mut ke).0;
+        s.set_points(None);
+        let ge = es.gradient(&s, 600 + sd, &l, &g.0);
+        let gi = interior::interior(&s, &tan, &THETA, 1600 + sd, &g.0);
+        tot.push(ge.iter().zip(&gi).map(|(a, b)| a + b).collect::<Vec<_>>());
+    }
+    let t = stats(&tot);
+    let k = 16;
+    let mut kf = Kernels::new(w * h * k * k * s.wavelengths * 2, true);
+    let base = [0.05, 0.05, 0.05, 0.004, 0.004, 0.004, 0.01];
+    let mults = [0.5, 1.0, 2.0, 4.0];
+    // cd[m][seed][j]
+    let mut cd = vec![Vec::new(); mults.len()];
+    for sd in 0..n_cd {
+        let mut r = prb::Rng::new(77, sd);
+        let o = [r.uniform(), r.uniform()];
+        for (mi, m) in mults.iter().enumerate() {
+            let mut row = Vec::new();
+            for j in 0..7 {
+                let hh = base[j] * m;
+                let mut side = |d: f64| {
+                    let mut p = c.to_vec();
+                    p[j] += d;
+                    cam.pose(&mut s, &p);
+                    grid_loss_at(&mut s, k, &g, 8000 + sd, &mut kf, o)
+                };
+                let (a, b) = (side(hh), side(-hh));
+                row.push((a - b) / (2.0 * hh));
+            }
+            cd[mi].push(row);
+        }
+    }
+    cam.pose(&mut s, &c);
+    for j in 0..7 {
+        let mut line = format!("c{j}: est {:+.2} ± {:.2} |", t.mean[j], t.stderr[j]);
+        for (mi, m) in mults.iter().enumerate() {
+            let e = stats(&cd[mi]);
+            let z = (t.mean[j] - e.mean[j]) / (t.stderr[j].powi(2) + e.stderr[j].powi(2)).sqrt();
+            line += &format!(" h×{m}: {:+.2} ± {:.2} (z {z:+.1})", e.mean[j], e.stderr[j]);
+        }
+        for mi in 0..mults.len() - 1 {
+            let rich: Vec<Vec<f64>> = (0..n_cd as usize)
+                .map(|i| vec![(4.0 * cd[mi][i][j] - cd[mi + 1][i][j]) / 3.0])
+                .collect();
+            let e = stats(&rich);
+            let z = (t.mean[j] - e.mean[0]) / (t.stderr[j].powi(2) + e.stderr[0].powi(2)).sqrt();
+            line += &format!(" | R(×{}): {:+.2} ± {:.2} (z {z:+.1})", mults[mi], e.mean[0], e.stderr[0]);
+        }
+        eprintln!("{line}");
+    }
+}
+
+/// Phase 5a: the ID-buffer variance ratio with `SEEDS` (default 96) seeds
+/// per importance instead of the gate's 24, at the current sun share
+/// (`PICK=half` for the fixed one). Measured (`--ignored`).
+#[test]
+#[ignore]
+fn visibility_ratio_study() {
+    let seeds = std::env::var("SEEDS").map_or(96, |v| v.parse().unwrap());
+    for depth in [1, 2] {
+        cut_with(depth, seeds);
     }
 }

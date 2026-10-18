@@ -17,7 +17,7 @@ use std::{
 };
 
 use irys_bench::{
-    error_at, export, font, mean_rgb, read_f32, read_json, relmse, scenes, to_srgb8, write_f32,
+    error_at, export, export_instanced, font, mean_rgb, read_f32, read_json, relmse, scenes, to_srgb8, write_f32,
     write_json, write_png,
 };
 use irys_diff::gpu::{self, GpuPrb};
@@ -54,7 +54,12 @@ fn main() {
                 let b = scenes::build(name, w, h, 1);
                 let dir = out.join(name);
                 std::fs::create_dir_all(&dir).unwrap();
-                write_json(&dir.join("scene.json"), &export(&b.scene, &b.theta, name));
+                let v = if scenes::imported(name).is_some() {
+                    export_instanced(&b.scene, &b.theta, name, &dir)
+                } else {
+                    export(&b.scene, &b.theta, name)
+                };
+                write_json(&dir.join("scene.json"), &v);
                 println!("{name}: wrote {}", dir.join("scene.json").display());
             }
         }
@@ -114,6 +119,27 @@ fn main() {
         "retime" => {
             for name in a.get("scene", "pair,room").split(',') {
                 retime(&a, &out, name, w, h);
+            }
+        }
+        "import" => {
+            // Phase 5a: load an export and print what came through.
+            for name in a.get("scene", "classroom").split(',') {
+                let (base, grey) = scenes::imported(name).expect("an imported scene");
+                let t = Instant::now();
+                let im = irys_diff::blend::load(
+                    &scenes::scenes_dir().join(base),
+                    &irys_diff::blend::Options { width: Some(w), spp: 1, depth: 8, grey: grey.then_some(scenes::GREY) },
+                )
+                .unwrap();
+                let r = &im.report;
+                println!(
+                    "{name}: {} trees, {} placements, {} unique / {} placed triangles, {} emitter triangles, emission {:.3}, min shrink {:.3}, conductor {:?} θ {:?}, sun share {:.3}, sky {:.3}, size {:?}, {:.2?}",
+                    r.trees, r.placements, r.triangles_unique, r.triangles_placed, r.emitter_triangles, r.emission, r.min_shrink,
+                    r.conductor, im.theta, im.scene.env.sun_pick(), im.scene.env.sky, im.scene.size, t.elapsed()
+                );
+                for d in &r.dropped {
+                    println!("  dropped {d}");
+                }
             }
         }
         "png" => {

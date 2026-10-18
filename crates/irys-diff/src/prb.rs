@@ -255,12 +255,15 @@ pub struct Env {
     /// Scale of the gradient.
     pub sky: f64,
     /// Share of light samples [`Env::sample`] sends at the sun lobe, the
-    /// rest uniform over the sphere for the gradient: [`SUN_PICK`] by
-    /// default, [`Env::pick_by_peak`] for speed round 3's choice.
-    pub pick: f64,
+    /// rest uniform over the sphere for the gradient. `None` (the default
+    /// since phase 5a) is speed round 3's share by peak radiance
+    /// ([`Env::pick_by_peak`]), recomputed from the current radiances;
+    /// `Some(p)` fixes it ([`Env::with_pick`]; phases 1–3 used
+    /// [`SUN_PICK`]).
+    pub pick: Option<f64>,
 }
 
-/// [`Env::pick`]'s default share.
+/// The fixed share every phase before 5a rendered with.
 pub const SUN_PICK: f64 = 0.5;
 
 impl Default for Env {
@@ -270,7 +273,7 @@ impl Default for Env {
             kappa: 40.0,
             sun_radiance: 6.0,
             sky: 1.0,
-            pick: SUN_PICK,
+            pick: None,
         }
     }
 }
@@ -283,20 +286,29 @@ impl Env {
             + self.sun_radiance * (self.kappa * (d.dot(&self.sun) - 1.0)).exp()
     }
 
-    /// The share [`Env::sample`] sends at the sun lobe.
+    /// The share [`Env::sample`] sends at the sun lobe: the fixed one, or
+    /// by peak radiance, sun against the gradient's peak (speed round 3):
+    /// the sun lobe is what a BSDF sample cannot find, the smooth gradient
+    /// is what it can, so NEE spends little there. Unbiased for any share:
+    /// the pdf MIS and the estimator divide by is the mixture's.
     pub fn sun_pick(&self) -> f64 {
-        self.pick
-    }
-
-    /// The same environment with [`Env::pick`] by peak radiance, sun against
-    /// the gradient's peak (speed round 3): the sun lobe is what a BSDF
-    /// sample cannot find, the smooth gradient is what it can, so NEE spends
-    /// little there. Unbiased for any share: the pdf MIS and the estimator
-    /// divide by is the mixture's.
-    pub fn pick_by_peak(mut self) -> Self {
+        if let Some(p) = self.pick {
+            return p;
+        }
         let sun = self.sun_radiance.max(0.0);
         let sky = self.sky.max(0.0) * 0.4;
-        self.pick = if sun + sky > 0.0 { sun / (sun + sky) } else { SUN_PICK };
+        if sun + sky > 0.0 { sun / (sun + sky) } else { SUN_PICK }
+    }
+
+    /// The same environment with the share by peak radiance (the default).
+    pub fn pick_by_peak(mut self) -> Self {
+        self.pick = None;
+        self
+    }
+
+    /// The same environment with a fixed sun share `p`.
+    pub fn with_pick(mut self, p: f64) -> Self {
+        self.pick = Some(p);
         self
     }
 

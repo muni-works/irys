@@ -27,11 +27,13 @@ pollster = { version = "0.4", optional = true }
 # the kernel crates never decode an asset.
 gltf = { version = "1.4", default-features = false, features = ["utils"], optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+# Phase 5a: the Blender export's sidecar (`blend::load`).
+serde_json = { version = "1", optional = true }
 rayon = { workspace = true }
 
 [features]
 gpu = ["dep:irys-gpu", "dep:bytemuck", "dep:pollster"]
-assets = ["dep:gltf", "dep:image"]
+assets = ["dep:gltf", "dep:image", "dep:serde_json"]
 
 [[example]]
 name = "fit_gpu"

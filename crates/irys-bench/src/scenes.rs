@@ -35,8 +35,49 @@ pub struct Bench {
     pub theta: [f64; PARAMS],
 }
 
+/// Phase 5a's real scenes: Blender demo files through
+/// `scripts/blend_export.py`, in `$IRYS_SCENES/<name>` (default
+/// `../irys-assets/blender-demos/export`). `<name>-grey` is the same scene
+/// with every non-emitter a grey Lambertian (albedo [`GREY`]).
+pub const IMPORTED: [&str; 2] = ["classroom", "pavilion"];
+
+/// The grey benchmark's albedo.
+pub const GREY: f64 = 0.8;
+
+/// Where the exports live.
+pub fn scenes_dir() -> std::path::PathBuf {
+    std::env::var("IRYS_SCENES")
+        .unwrap_or_else(|_| "../irys-assets/blender-demos/export".into())
+        .into()
+}
+
+/// `(export name, grey)` when `name` is an imported scene.
+pub fn imported(name: &str) -> Option<(&str, bool)> {
+    let (base, grey) = match name.strip_suffix("-grey") {
+        Some(b) => (b, true),
+        None => (name, false),
+    };
+    IMPORTED.contains(&base).then_some((base, grey))
+}
+
 /// Scene `name` at `w × h`, `spp` paths per pixel per call.
 pub fn build(name: &str, w: usize, h: usize, spp: usize) -> Bench {
+    if let Some((base, grey)) = imported(name) {
+        let opts = irys_diff::blend::Options {
+            width: Some(w),
+            spp,
+            depth: 8,
+            grey: grey.then_some(GREY),
+        };
+        let im = irys_diff::blend::load(&scenes_dir().join(base), &opts)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(im.scene.size, (w, h), "{name}: --w/--h must keep the export's aspect");
+        return Bench {
+            name: Box::leak(name.to_string().into_boxed_str()),
+            scene: im.scene,
+            theta: im.theta,
+        };
+    }
     match name {
         "pair" => pair(w, h, spp),
         "room" => room(w, h, spp),
@@ -147,6 +188,8 @@ pub fn apply(scene: &mut Scene, features: &[&str]) {
             "spectral" => scene.spectral_is = true,
             "rr" => scene.roulette = Some(irys_diff::prb::Roulette::default()),
             "sun" => scene.env = scene.env.pick_by_peak(),
+            // phases 1–3's fixed half share (by peak is the default since 5a)
+            "half" => scene.env = scene.env.with_pick(irys_diff::prb::SUN_PICK),
             other => panic!("unknown sampler {other}"),
         }
     }

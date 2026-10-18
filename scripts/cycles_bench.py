@@ -108,7 +108,100 @@ def material(spec, name):
     return m
 
 
-for ob in cfg["objects"]:
+def mesh_from_corners(name, corners):
+    """A mesh of independent triangles from f32 xyz per corner."""
+    me = bpy.data.meshes.new(name)
+    n = corners.shape[0]
+    me.vertices.add(n)
+    me.vertices.foreach_set("co", corners.reshape(-1))
+    me.loops.add(n)
+    me.loops.foreach_set("vertex_index", np.arange(n, dtype=np.int32))
+    me.polygons.add(n // 3)
+    me.polygons.foreach_set("loop_start", np.arange(0, n, 3, dtype=np.int32))
+    me.polygons.foreach_set("loop_total", np.full(n // 3, 3, dtype=np.int32))
+    me.update()
+    return me
+
+
+if "meshes" in cfg:
+    # Phase 5a's instanced export: each irys tree once, placed per object,
+    # the material on the object so instances can differ.
+    blob = np.fromfile(os.path.join(root, "meshes.f32"), dtype="<f4").reshape(-1, 3)
+    data = []
+    for k, m in enumerate(cfg["meshes"]):
+        me = mesh_from_corners(f"tree{k}", blob[m["offset"] : m["offset"] + m["corners"]])
+        me.materials.append(None)
+        data.append(me)
+    cache = {}
+    from mathutils import Matrix as _M
+
+    def instancer(mesh_k, mat, mats):
+        """Many placements of one tree as one object: geometry nodes'
+        Instance on Points from a point cloud carrying each placement's
+        rotation and scale. Linked duplicates are re-synced on every render
+        (seconds for the pavilion's 20 000 pebbles), these are not."""
+        src = bpy.data.objects.new(f"src{mesh_k}_{len(cache)}", data[mesh_k].copy())
+        src.data.materials[0] = mat
+        sc.collection.objects.link(src)
+        src.hide_render = True
+        n = len(mats)
+        pts = bpy.data.meshes.new(f"pts{mesh_k}")
+        pts.vertices.add(n)
+        loc, rot, scl = [], [], []
+        for m in mats:
+            M = _M((m[0:4], m[4:8], m[8:12], (0, 0, 0, 1)))
+            l, q, s3 = M.decompose()
+            loc += list(l)
+            rot += list(q.to_euler())
+            scl += list(s3)
+        pts.vertices.foreach_set("co", loc)
+        for name, vals in (("irys_rot", rot), ("irys_scl", scl)):
+            a = pts.attributes.new(name, "FLOAT_VECTOR", "POINT")
+            a.data.foreach_set("vector", vals)
+        o = bpy.data.objects.new(f"inst{mesh_k}_{len(cache)}", pts)
+        sc.collection.objects.link(o)
+        g = bpy.data.node_groups.new("irys_inst", "GeometryNodeTree")
+        g.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+        g.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+        gi, go = g.nodes.new("NodeGroupInput"), g.nodes.new("NodeGroupOutput")
+        ip = g.nodes.new("GeometryNodeInstanceOnPoints")
+        oi = g.nodes.new("GeometryNodeObjectInfo")
+        oi.inputs["Object"].default_value = src
+        oi.transform_space = "ORIGINAL"
+        ra, sa = g.nodes.new("GeometryNodeInputNamedAttribute"), g.nodes.new("GeometryNodeInputNamedAttribute")
+        for na, nm in ((ra, "irys_rot"), (sa, "irys_scl")):
+            na.data_type = "FLOAT_VECTOR"
+            na.inputs["Name"].default_value = nm
+        g.links.new(gi.outputs[0], ip.inputs["Points"])
+        g.links.new(oi.outputs["Geometry"], ip.inputs["Instance"])
+        g.links.new(ra.outputs["Attribute"], ip.inputs["Rotation"])
+        g.links.new(sa.outputs["Attribute"], ip.inputs["Scale"])
+        g.links.new(ip.outputs["Instances"], go.inputs[0])
+        mod = o.modifiers.new("irys_inst", "NODES")
+        mod.node_group = g
+
+    groups = {}
+    for ob in cfg["objects"]:
+        key = json.dumps(ob["material"], sort_keys=True)
+        if key not in cache:
+            cache[key] = material(ob["material"], f"m{len(cache)}")
+        groups.setdefault((ob["mesh"], key), []).append(ob["matrix"])
+    n_obj = 0
+    for (mk, key), mats in groups.items():
+        # Shear-free placements (all of an import's) instance exactly as TRS.
+        if len(mats) >= 2:
+            instancer(mk, cache[key], mats)
+            continue
+        for m in mats:
+            o = bpy.data.objects.new(f"o{n_obj}", data[mk])
+            n_obj += 1
+            o.material_slots[0].link = "OBJECT"
+            o.material_slots[0].material = cache[key]
+            o.matrix_world = _M((m[0:4], m[4:8], m[8:12], (0, 0, 0, 1)))
+            sc.collection.objects.link(o)
+    print(f"cycles: {len(data)} meshes, {len(cfg['objects'])} objects, {len(cache)} materials", flush=True)
+
+for ob in cfg.get("objects", []) if "meshes" not in cfg else []:
     me = bpy.data.meshes.new(ob["name"])
     v = np.array(ob["verts"], dtype=np.float64).reshape(-1, 3)
     t = np.array(ob["tris"], dtype=np.int64).reshape(-1, 3)
@@ -139,8 +232,18 @@ lobe = node_math(
     nt,
     "MULTIPLY",
     node_math(nt, "EXPONENT", node_math(nt, "MULTIPLY", node_math(nt, "SUBTRACT", dot.outputs["Value"], 1.0), env["kappa"])),
-    env["sun_radiance"],
+    0.0 if "sun_lamp" in cfg else env["sun_radiance"],
 )
+if "sun_lamp" in cfg:
+    # Phase 5a: the lobe as a sun lamp of the same irradiance and solid angle.
+    from mathutils import Vector as _V
+
+    sl = bpy.data.lights.new("irys_sun", "SUN")
+    sl.energy = cfg["sun_lamp"]["irradiance"]
+    sl.angle = 2.0 * cfg["sun_lamp"]["radius"]
+    so = bpy.data.objects.new("irys_sun", sl)
+    so.rotation_euler = _V(env["sun"]).to_track_quat("Z", "Y").to_euler()
+    sc.collection.objects.link(so)
 sep = nt.nodes.new("ShaderNodeSeparateXYZ")
 nt.links.new(dirn.outputs[0], sep.inputs[0])
 grad = node_math(nt, "MULTIPLY_ADD", node_math(nt, "MAXIMUM", sep.outputs[2], 0.0), 0.25)

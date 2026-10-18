@@ -14,6 +14,8 @@
 //! publishable from crates.io. When the IR ships, this folds into
 //! irys-light.
 
+#[cfg(feature = "assets")]
+pub mod blend;
 pub mod ggx;
 #[cfg(feature = "gpu")]
 pub mod gpu;

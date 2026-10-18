@@ -222,10 +222,11 @@ fn sun_pick_by_peak_is_unbiased() {
         s.complete = true;
         s
     };
-    let a = pair();
+    let mut a = pair();
+    a.env = a.env.with_pick(prb::SUN_PICK);
     let mut b = pair();
     b.env = b.env.pick_by_peak();
-    assert!(b.env.pick > 0.9 && b.env.pick < 1.0, "{}", b.env.pick);
+    assert!(b.env.sun_pick() > 0.9 && b.env.sun_pick() < 1.0, "{}", b.env.sun_pick());
     let mut ga = GpuPrb::new(ctx, &a);
     let mut gb = GpuPrb::new(ctx, &b);
     let (mut ma, mut mb) = (0.0, 0.0);
