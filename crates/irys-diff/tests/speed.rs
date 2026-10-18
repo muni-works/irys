@@ -1,7 +1,8 @@
-//! Speed: hardware ray queries (`gpu/rt.rs`). The hardware walk against
-//! the WGSL walk (the reference), replay bit-exactness and run-to-run
-//! equality under both, and PRB against central differences through the
-//! hardware walk. GPU tests skip without an adapter; the hardware tests
+//! Speed: hardware ray queries (`gpu/rt.rs`) and lane compaction
+//! (`gpu/compact.wgsl`). The hardware walk against the WGSL walk (the
+//! reference), replay bit-exactness and run-to-run equality under both,
+//! compaction against chunking, and PRB against central differences through
+//! the hardware walk. GPU tests skip without an adapter; the hardware tests
 //! skip without ray queries.
 
 #![cfg(feature = "gpu")]
@@ -111,6 +112,20 @@ fn replay_is_bit_exact_and_deterministic_under_both_walks() {
     }
 }
 
+/// Compaction is a function of the frame alone: the frame in chunks of 1000
+/// paths (each its own scan) renders bit for bit what one chunk does.
+#[test]
+fn compaction_is_independent_of_chunking() {
+    let ctx = device!();
+    for (name, scene) in scenes() {
+        let a = GpuPrb::new(ctx, &scene).image(&scene, &GOLD, 9);
+        let mut c = GpuPrb::chunked(ctx, &scene, 1000);
+        assert!(c.chunks() > 1);
+        let b = c.image(&scene, &GOLD, 9);
+        assert_eq!(bits(&a), bits(&b), "{name}");
+    }
+}
+
 /// Moving an instance rebuilds the TLAS: the hardware walk still renders
 /// the software walk's image.
 #[test]
@@ -134,7 +149,7 @@ fn moved_instances_rebuild_the_tlas() {
     assert!(rel(mean(&hw), mean(&sw)) < 1e-3, "{} vs {}", mean(&hw), mean(&sw));
 }
 
-/// PRB through the hardware walk against central
+/// PRB through the hardware walk and compacted lanes against central
 /// differences of the device's own loss.
 #[test]
 fn hardware_gradient_matches_central_differences() {

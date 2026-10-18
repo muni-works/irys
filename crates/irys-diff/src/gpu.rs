@@ -2,10 +2,15 @@
 //!
 //! Each bounce is five dispatches, in one compute pass per frame:
 //!
-//! 1. `bounce` (hand WGSL, `gpu/wavefront.wgsl`): intersect, sample, and
-//!    write the graph's seven input columns per lane;
+//! 1. `bounce` (hand WGSL, `gpu/wavefront.wgsl`): intersect (hardware ray
+//!    queries where the device has them, `gpu/rt.rs`), sample, and stage a
+//!    conductor vertex's lane inputs; then lane compaction
+//!    (`gpu/compact.wgsl`): a deterministic scan of which paths staged
+//!    lanes, and `scatter`, which writes the graph's seven input columns at
+//!    the compact lanes only;
 //! 2. the **eval lowering of [`ggx::Graph`], as tang-compile emits it**
-//!    ([`TensorGraph::to_wgsl`]) — `f` and `pdf` per lane;
+//!    ([`TensorGraph::to_wgsl`]) — `f` and `pdf` per lane, dispatched
+//!    indirectly over the compact lanes alone;
 //! 3. `update`: throughput `*= f cos / p`, and in replay `δf` per lane;
 //! 4. replay only: the **adjoint lowering**, the same way — `Σ_lanes δf ∂f/∂θ`
 //!    as the IR's own sum, scheduled `split = 256` (one workgroup per
@@ -45,6 +50,7 @@ const EDGES: &str = include_str!("gpu/edges.wgsl");
 const RESTIR: &str = include_str!("gpu/restir.wgsl");
 const GUIDE: &str = include_str!("gpu/guide.wgsl");
 const RT: &str = include_str!("gpu/rt.wgsl");
+const COMPACT: &str = include_str!("gpu/compact.wgsl");
 
 mod rt;
 
@@ -236,6 +242,16 @@ impl Ir {
         }
     }
 
+    /// Every kernel over the workgroups `args` holds (lane compaction):
+    /// the kernels are pointwise over lanes, so a shorter grid evaluates
+    /// the first lanes only.
+    fn dispatch_indirect(&self, pass: &mut wgpu::ComputePass, args: &wgpu::Buffer) {
+        for (pipe, bg, _) in &self.kernels {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups_indirect(args, 0);
+        }
+    }
 }
 
 /// What runs on the device after a forward pass.
@@ -293,10 +309,14 @@ pub struct GpuPrb {
     eval: Ir,
     adjoint: Ir,
     f: TensorId,
-    pipes: [wgpu::ComputePipeline; 13],
+    pipes: [wgpu::ComputePipeline; 17],
     // gen, bounce, update, finish→l, finish→l2, accumulate, score,
     // loss_sum, lane_adjoint
-    groups: [wgpu::BindGroup; 14],
+    groups: [wgpu::BindGroup; 18],
+    /// Lane compaction's indirect dispatch: (workgroups, 1, 1, lanes).
+    ind: wgpu::Buffer,
+    /// Graph lanes per chunk.
+    chunk_width: usize,
     layout: Layout,
     /// Timings of the last forward and replay.
     pub timing: Timing,
@@ -644,6 +664,22 @@ impl GpuPrb {
         let g_rec = storage("guide records", recs * 16);
         let g_nrec = storage("guide record counts", if grid.is_some() { paths as u64 * 4 } else { 0 });
         let g_cnt = storage("guide counts", cells * 4);
+        // Lane compaction (`compact.wgsl`).
+        let lane_bits = storage("lane bits", paths as u64 * 4);
+        let stage = storage("lane stage", paths as u64 * 32);
+        let lane_off = storage("lane offsets", paths as u64 * 4);
+        let lane_top = storage("lane block offsets", (paths as u64).div_ceil(256) * 4);
+        let ind = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("eval indirect"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+            mapped_at_creation: false,
+        });
+        // Lanes nothing has written are harmless (`f = 0`, finite
+        // derivatives), as `bounce` used to write them every bounce.
+        for c in &cols[..4] {
+            ctx.queue.write_buffer(c, 0, bytemuck::cast_slice(&vec![1.0f32; width]));
+        }
         let params = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
             size: std::mem::size_of::<Params>() as u64,
@@ -681,7 +717,7 @@ impl GpuPrb {
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("prb wavefront"),
             source: wgpu::ShaderSource::Wgsl(
-                wavefront_src(accel.is_some(), &format!("{RESTIR}\n{GUIDE}\n{}", sobol_const())).into(),
+                wavefront_src(accel.is_some(), &format!("{RESTIR}\n{GUIDE}\n{COMPACT}\n{}", sobol_const())).into(),
             ),
         });
         let pipe = |entry: &str| {
@@ -708,6 +744,10 @@ impl GpuPrb {
             "ris_temporal",
             "ris_spatial",
             "guide_build",
+            "cscan_block",
+            "cscan_tops",
+            "scatter",
+            "clear",
         ]
         .map(pipe);
         let bind = |p: &wgpu::ComputePipeline, e: &[(u32, &wgpu::Buffer)]| {
@@ -718,7 +758,7 @@ impl GpuPrb {
             bind_with(dev, p, e, accel.as_ref())
         };
         let f_buf = eval.buffer(g.f);
-        let mut bounce: Vec<(u32, &wgpu::Buffer)> = vec![
+        let bounce: Vec<(u32, &wgpu::Buffer)> = vec![
             (0, &params),
             (1, &path_buf),
             (23, &nodes),
@@ -730,8 +770,18 @@ impl GpuPrb {
             (52, &g_ok),
             (53, &g_rec),
             (54, &g_nrec),
+            (59, &lane_bits),
+            (60, &stage),
         ];
-        bounce.extend(cols.iter().enumerate().map(|(c, b)| (2 + c as u32, b)));
+        let mut scatter: Vec<(u32, &wgpu::Buffer)> = vec![
+            (0, &params),
+            (1, &path_buf),
+            (59, &lane_bits),
+            (60, &stage),
+            (61, &lane_off),
+            (62, &lane_top),
+        ];
+        scatter.extend(cols.iter().enumerate().map(|(c, b)| (2 + c as u32, b)));
         let groups = [
             bind(
                 &pipes[0],
@@ -753,6 +803,9 @@ impl GpuPrb {
                     (10, &l),
                     (11, &dl),
                     (12, &df),
+                    (59, &lane_bits),
+                    (61, &lane_off),
+                    (62, &lane_top),
                 ],
             ),
             bind(
@@ -830,6 +883,10 @@ impl GpuPrb {
                 &pipes[12],
                 &[(0, &params), (50, &g_hist), (51, &g_cdf), (52, &g_ok), (55, &g_cnt)],
             ),
+            bind(&pipes[13], &[(0, &params), (59, &lane_bits), (61, &lane_off), (62, &lane_top)]),
+            bind(&pipes[14], &[(0, &params), (62, &lane_top), (63, &ind)]),
+            bind(&pipes[15], &scatter),
+            bind(&pipes[16], &[(12, &df), (63, &ind)]),
         ];
         let f = g.f;
         if let Some(e) = pollster::block_on(scope.pop()) {
@@ -865,6 +922,8 @@ impl GpuPrb {
             f,
             pipes,
             groups,
+            ind,
+            chunk_width: width,
             timing: Timing::default(),
             device_points: std::cell::Cell::new(false),
             accel,
@@ -1007,7 +1066,15 @@ impl GpuPrb {
             }
             for _ in 0..scene.depth {
                 self.dispatch(&mut pass, 1, 1, groups);
-                self.eval.dispatch(&mut pass);
+                // Lane compaction: scan the lane bits, scatter the columns,
+                // evaluate only the compact lanes.
+                self.dispatch(&mut pass, 13, 14, self.paths.div_ceil(256));
+                self.dispatch(&mut pass, 14, 15, 1);
+                self.dispatch(&mut pass, 15, 16, groups);
+                if replay {
+                    self.dispatch(&mut pass, 16, 17, (self.chunk_width as u32).div_ceil(WG));
+                }
+                self.eval.dispatch_indirect(&mut pass, &self.ind);
                 self.dispatch(&mut pass, 2, 2, groups);
                 if replay {
                     self.adjoint.dispatch(&mut pass);
