@@ -43,7 +43,7 @@ struct Params {
     base: u32,            // this chunk's first path in the frame
     total: u32,           // paths in the frame
     points: u32,          // point mode: camera-plane points from `points_in`, pairs keyed together
-    _p1: u32,
+    rt: u32,              // trace through the hardware ray queries (`rt.wgsl`) when compiled in
     sun: vec4<f32>,       // unit sun direction, κ
     env: vec4<f32>,       // sun radiance, sky scale, SUN_PICK, vMF normaliser κ / (2π (1 − e^{−2κ}))
     light: vec4<f32>,     // phase 3: emitter triangles, env pick share, emitter area, emission
@@ -414,7 +414,7 @@ fn to_local(k: u32, o: vec3<f32>, d: vec3<f32>) -> array<vec3<f32>, 2> {
 // top-level tree (`irys_core::Tlas::flatten`, rooted at node 0) walked like
 // a bottom-level one, each leaf's instances in leaf order, each through its
 // own bottom-level walk.
-fn intersect(o: vec3<f32>, d: vec3<f32>, tmax: f32, any: bool) -> Hit {
+fn intersect_sw(o: vec3<f32>, d: vec3<f32>, tmax: f32, any: bool) -> Hit {
     // Origins are pushed off their surface by `offset_ray`.
     let tmin = 0.0;
     let inv = 1.0 / d;

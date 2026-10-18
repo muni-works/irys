@@ -44,6 +44,22 @@ const WAVEFRONT: &str = include_str!("gpu/wavefront.wgsl");
 const EDGES: &str = include_str!("gpu/edges.wgsl");
 const RESTIR: &str = include_str!("gpu/restir.wgsl");
 const GUIDE: &str = include_str!("gpu/guide.wgsl");
+const RT: &str = include_str!("gpu/rt.wgsl");
+
+mod rt;
+
+/// The wavefront's WGSL: with the hardware walk compiled in when the device
+/// has ray queries (`rt.wgsl`, chosen per pass by `Params::rt`), else the
+/// software walk alone.
+fn wavefront_src(hw: bool, rest: &str) -> String {
+    if hw {
+        format!("enable wgpu_ray_query;\n{WAVEFRONT}\n{RT}\n{rest}")
+    } else {
+        format!(
+            "{WAVEFRONT}\nfn intersect(o: vec3<f32>, d: vec3<f32>, tmax: f32, any: bool) -> Hit {{ return intersect_sw(o, d, tmax, any); }}\n{rest}"
+        )
+    }
+}
 
 /// `qmc::sobol_matrices` dimensions 1–3 as a WGSL module constant, so the
 /// device's direction numbers are the CPU's by construction.
@@ -84,7 +100,7 @@ struct Params {
     base: u32,
     total: u32,
     points: u32,
-    _pad: u32,
+    rt: u32,
     sun: [f32; 4],
     env: [f32; 4],
     light: [f32; 4],
@@ -219,6 +235,7 @@ impl Ir {
             pass.dispatch_workgroups(*groups, 1, 1);
         }
     }
+
 }
 
 /// What runs on the device after a forward pass.
@@ -285,6 +302,43 @@ pub struct GpuPrb {
     pub timing: Timing,
     /// The next pass's points are on the device already ([`GpuEdges`]).
     device_points: std::cell::Cell<bool>,
+    /// Speed piece 1: the hardware acceleration structures, where the
+    /// device has ray queries.
+    accel: Option<rt::Accel>,
+    /// Trace through `accel` (else the WGSL walk).
+    hw: bool,
+}
+
+/// A bind group of `e`'s buffers, plus the acceleration structure and its
+/// instance map (bindings 57, 58) when `accel` is given.
+fn bind_with(
+    dev: &wgpu::Device,
+    p: &wgpu::ComputePipeline,
+    e: &[(u32, &wgpu::Buffer)],
+    accel: Option<&rt::Accel>,
+) -> wgpu::BindGroup {
+    let mut entries: Vec<wgpu::BindGroupEntry> = e
+        .iter()
+        .map(|&(binding, b)| wgpu::BindGroupEntry {
+            binding,
+            resource: b.as_entire_binding(),
+        })
+        .collect();
+    if let Some(a) = accel {
+        entries.push(wgpu::BindGroupEntry {
+            binding: 57,
+            resource: a.tlas.as_binding(),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 58,
+            resource: a.map.as_entire_binding(),
+        });
+    }
+    dev.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &p.get_bind_group_layout(0),
+        entries: &entries,
+    })
 }
 
 /// Where the instance and splat records start in the packed scene.
@@ -548,6 +602,7 @@ impl GpuPrb {
         let loss = storage("loss", 4);
         let path_buf = storage("paths", paths as u64 * PATH_BYTES);
         let (nodes, ids, geo, layout) = pack(scene);
+        let accel = rt::Accel::new(ctx, scene);
         // Room for the top-level tree to change shape when instances move
         // (`update_geometry`): at most two nodes (four vec4s) per instance.
         let room = 8 * (scene.placements().len() as u64 + 1) * 16;
@@ -625,7 +680,9 @@ impl GpuPrb {
 
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("prb wavefront"),
-            source: wgpu::ShaderSource::Wgsl(format!("{WAVEFRONT}\n{RESTIR}\n{GUIDE}\n{}", sobol_const()).into()),
+            source: wgpu::ShaderSource::Wgsl(
+                wavefront_src(accel.is_some(), &format!("{RESTIR}\n{GUIDE}\n{}", sobol_const())).into(),
+            ),
         });
         let pipe = |entry: &str| {
             dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -654,17 +711,11 @@ impl GpuPrb {
         ]
         .map(pipe);
         let bind = |p: &wgpu::ComputePipeline, e: &[(u32, &wgpu::Buffer)]| {
-            dev.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &p.get_bind_group_layout(0),
-                entries: &e
-                    .iter()
-                    .map(|&(binding, b)| wgpu::BindGroupEntry {
-                        binding,
-                        resource: b.as_entire_binding(),
-                    })
-                    .collect::<Vec<_>>(),
-            })
+            bind_with(dev, p, e, None)
+        };
+        // The kernels that trace: with the acceleration structures as well.
+        let bind_rt = |p: &wgpu::ComputePipeline, e: &[(u32, &wgpu::Buffer)]| {
+            bind_with(dev, p, e, accel.as_ref())
         };
         let f_buf = eval.buffer(g.f);
         let mut bounce: Vec<(u32, &wgpu::Buffer)> = vec![
@@ -692,7 +743,7 @@ impl GpuPrb {
                     (56, &qtab),
                 ],
             ),
-            bind(&pipes[1], &bounce),
+            bind_rt(&pipes[1], &bounce),
             bind(
                 &pipes[2],
                 &[
@@ -746,8 +797,8 @@ impl GpuPrb {
                 &pipes[7],
                 &[(0, &params), (19, &d_img), (22, &dl), (56, &qtab)],
             ),
-            bind(&pipes[8], &bounce),
-            bind(
+            bind_rt(&pipes[8], &bounce),
+            bind_rt(
                 &pipes[9],
                 &[
                     (0, &params),
@@ -816,7 +867,21 @@ impl GpuPrb {
             groups,
             timing: Timing::default(),
             device_points: std::cell::Cell::new(false),
+            accel,
+            hw: std::env::var("IRYS_RT").map_or(true, |v| v != "sw"),
         }
+    }
+
+    /// Whether passes trace through the hardware's ray queries (the device
+    /// has them and [`set_hardware_rt`](Self::set_hardware_rt) left them on).
+    pub fn hardware_rt(&self) -> bool {
+        self.accel.is_some() && self.hw
+    }
+
+    /// Trace through the hardware (`true`, where the device has ray
+    /// queries) or the WGSL walk, the reference. Takes effect next pass.
+    pub fn set_hardware_rt(&mut self, on: bool) {
+        self.hw = on;
     }
 
     /// Lanes this wavefront was built for.
@@ -866,7 +931,7 @@ impl GpuPrb {
             base,
             total: scene.paths() as u32,
             points: scene.points().is_some() as u32,
-            _pad: 0,
+            rt: (self.accel.is_some() && self.hw) as u32,
             sun: {
                 let e = &scene.env;
                 [
@@ -1038,6 +1103,9 @@ impl GpuPrb {
         q.write_buffer(&self.geo, 0, bytemuck::cast_slice(&geo));
         q.write_buffer(&self.lights, 0, bytemuck::cast_slice(&pack_lights(scene)));
         self.layout = layout;
+        if let Some(a) = &mut self.accel {
+            a.update(self.ctx, scene);
+        }
     }
 
     /// ReSTIR DI: make the last frame's reservoirs and G-buffer the previous
@@ -1463,7 +1531,9 @@ impl GpuEdges {
         };
         let ep = uni("edge params", std::mem::size_of::<EdgeParams>() as u64);
         let params = uni("edge scene params", std::mem::size_of::<Params>() as u64);
-        let src = format!("{WAVEFRONT}\n{RESTIR}\n{GUIDE}\n{EDGES}\n{}", sobol_const());
+        // The edge sampler's visibility stays on the WGSL walk: one eye ray
+        // per edge point, not a frame's worth of bounces.
+        let src = wavefront_src(false, &format!("{RESTIR}\n{GUIDE}\n{EDGES}\n{}", sobol_const()));
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("edges"),
             source: wgpu::ShaderSource::Wgsl(src.into()),
