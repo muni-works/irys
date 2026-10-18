@@ -1,7 +1,7 @@
 # Phase 5a: a .blend as a scene irys reads.
 #
 #   blender -b -Y file.blend -P scripts/blend_export.py -- <out dir> [--scene NAME] [--width 480]
-#           [--look 1] [--frames a:b[:step]] [--env-width 1024] [--measure-width 480]
+#           [--look 1] [--frames a:b[:step]] [--reel fps:a:b] [--env-width 1024] [--measure-width 480]
 #
 # Phase 5b (--look 1, the default) adds, per material, its OpenPBR
 # parameters and baked textures (scripts/blend_openpbr.py: textures/*.png,
@@ -883,7 +883,7 @@ def main():
             L = l.energy * col / (4 * math.pi ** 2 * r * r)
             if l.type == "SPOT":
                 # a spot is a point light restricted to a cone: the same radiance, less power
-                light_drop.append(f"{name}: spot cone (emits all round)")
+                light_drop.append(f"{name}: spot cone (5a: emits all round; 5b honours it)")
             rec_lights.append({"name": name, "kind": "sphere", "center": list(mw.translation), "radius": r, "radiance": L})
             if l.type == "SPOT":
                 rec_lights[-1]["spot"] = {"axis": list((mw.to_3x3() @ Vector((0, 0, -1))).normalized()),
@@ -961,6 +961,19 @@ def main():
             c, _ = camera_record(sc, width)
             frames.append({"frame": fr, **{k: c[k] for k in ("eye", "forward", "right", "up", "tan_half")}})
         side["camera_frames"] = {"fps": sc.render.fps / sc.render.fps_base, "frames": frames}
+    if "--reel" in opts:
+        # The camera resampled to another frame rate (subframes): the reel's
+        # 30 fps from a 24/25 fps animation, frames a..b of the file.
+        rfps, a, b = (float(x) for x in opts["--reel"].split(":"))
+        sfps = sc.render.fps / sc.render.fps_base
+        n = int(round((b - a) / sfps * rfps)) + 1
+        frames = []
+        for k in range(n):
+            t = a + k * sfps / rfps
+            sc.frame_set(int(math.floor(t)), subframe=t - math.floor(t))
+            c, _ = camera_record(sc, width)
+            frames.append({"t": t, **{key: c[key] for key in ("eye", "forward", "right", "up", "tan_half")}})
+        side["reel_frames"] = {"fps": rfps, "from": a, "to": b, "scene_fps": sfps, "frames": frames}
     json.dump(side, open(os.path.join(out, "irys.json"), "w"), indent=1)
     print(f"irys export: {len(nodes) - 1} instances of {len(gl_meshes)} meshes, {tris_unique} unique / {tris_total} placed triangles, "
           f"{len(gl_mats)} materials, {len(rec_lights)} lights, sky {env['sky']:.3f} -> {out}", flush=True)

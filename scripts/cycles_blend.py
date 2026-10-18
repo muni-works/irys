@@ -1,7 +1,7 @@
 # Phase 5a: the Cycles side of the real-scene benchmark, on the .blend itself.
 #
 #   blender -b -Y file.blend -P scripts/cycles_blend.py -- <bench dir> <export dir> [--scene NAME]
-#           [--ref-spp N] [--max-spp N] [--device GPU|CPU]
+#           [--ref-spp N] [--max-spp N] [--device GPU|CPU] [--width W] [--clamp C]
 #
 # The file's own materials, lights and world, so this is what irys's import
 # is measured against for the "true materials" numbers. Matched to irys's
@@ -36,6 +36,10 @@ if "--scene" in opts:
 sc = bpy.context.scene
 side = json.load(open(os.path.join(export, "irys.json")))
 w, h = side["camera"]["size"]
+if "--width" in opts:
+    # phase 5b: the export is 1920 wide; the bench renders at --width
+    h = int(round(int(opts["--width"]) * h / w))
+    w = int(opts["--width"])
 os.makedirs(root, exist_ok=True)
 blend_export.render_settings_like_render(sc)
 
@@ -76,7 +80,7 @@ for k in ("diffuse_bounces", "glossy_bounces", "transmission_bounces", "transpar
     setattr(cy, k, depth - 1)
 cy.volume_bounces = 0
 cy.sample_clamp_direct = 0.0
-cy.sample_clamp_indirect = 0.0
+cy.sample_clamp_indirect = float(opts.get("--clamp", 0.0))
 cy.blur_glossy = 0.0
 cy.use_auto_tile = False
 # The first view layer the file renders (the exporter measured that one).

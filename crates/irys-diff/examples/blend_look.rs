@@ -16,6 +16,7 @@
 //!   --sequence CAMS  render a camera sequence (JSON list of {eye, forward,
 //!                    right, up, tan_half}) into --outdir as JPEG q92 frames,
 //!                    with frames.json: per-frame mean spectrum and time
+//!                    (--caption, --credit, --fps for the reel's manifest)
 //! ```
 
 use std::io::Write;
@@ -158,7 +159,10 @@ fn main() {
                 "spectrum": f.spectrum}));
             // keep progress on disk
             let meta = serde_json::json!({"size": [w, h], "spp": o.spp, "bounces": o.max_bounces, "bins": BINS,
-                "bins_nm": [380, 780], "frames": frames});
+                "bins_nm": [380, 780], "fps": opt("--fps").map_or(30.0, |s| s.parse::<f64>().unwrap()),
+                "caption": opt("--caption").unwrap_or_default(), "credit": opt("--credit"),
+                "spectrum_source": "look::scene_gpu per-workgroup spectrum, every pixel and sample of the frame",
+                "frames": frames});
             std::fs::write(outdir.join("frames.json"), serde_json::to_string(&meta).unwrap()).unwrap();
         }
         return;

@@ -384,7 +384,7 @@ class Evaluator:
         if t == "ShaderNodeObjectInfo":
             drop.add("object info as 0.5")
             return Field.k(0.5)
-        drop.add(f"{t[10:]} as a constant")
+        drop.add(f"{t.removeprefix('ShaderNode').removeprefix('Node')} as a constant")
         return Field.k(0.5)
 
     def mix(self, n, drop):
@@ -577,7 +577,7 @@ def lobes(ev, sock, w, out, drop, fres=None, depth=0):
             out.append(("diffuse", w, Field.k(0.8)))
             drop.add("node group shader as grey diffuse")
     else:
-        drop.add(f"{t[10:]} shader as grey diffuse")
+        drop.add(f"{t.removeprefix('ShaderNode')} shader as grey diffuse")
         out.append(("diffuse", w, Field.k(0.8)))
 
 

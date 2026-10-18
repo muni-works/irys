@@ -98,3 +98,11 @@ required-features = ["assets"]
 [[example]]
 name = "blend_look"
 required-features = ["gpu", "assets"]
+
+[[example]]
+name = "reel"
+required-features = ["gpu", "assets"]
+
+[[example]]
+name = "look_bench"
+required-features = ["gpu", "assets"]

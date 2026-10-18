@@ -1661,8 +1661,12 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
             rd = wi_w;
         }
         var rgb = vec3<f32>(0.0);
+        // A guard, not a clamp: a path whose radiance is beyond anything
+        // the scene can emit (1e9; the brightest pixel of a converged
+        // pavilion is ~170) came from a vanishing pdf in f32 and is dropped
+        // (one sample in ~10^10 on the pavilion at 1080p).
         for (var k = 0u; k < NW; k = k + 1u) {
-            if (!(rad[k] == rad[k]) || rad[k] > 3.0e38) { rad[k] = 0.0; }
+            if (!(rad[k] == rad[k]) || abs(rad[k]) > 1.0e9) { rad = vec4<f32>(0.0); }
             rgb = rgb + rad[k] * lane_rgb(lam[k]);
         }
         accum[px] = accum[px] + vec4<f32>(rgb, 0.0);
