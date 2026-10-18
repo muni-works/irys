@@ -208,3 +208,61 @@ fn hardware_gradient_matches_central_differences() {
         assert!(e < 1e-2, "θ{p}: prb {} vs fd {fd}", d[p]);
     }
 }
+
+/// Speed round 3: NEE's sun share by peak radiance (`Env::pick_by_peak`)
+/// renders the default share's image (unbiased: the mean over seeds agrees
+/// to well under the noise of one), the CPU agrees with the device under
+/// it, and PRB's gradient still matches central differences.
+#[test]
+fn sun_pick_by_peak_is_unbiased() {
+    let ctx = device!();
+    let pair = || {
+        let mut s = Scene::pair(64, 48, 64, 1.0);
+        s.depth = 6;
+        s.complete = true;
+        s
+    };
+    let a = pair();
+    let mut b = pair();
+    b.env = b.env.pick_by_peak();
+    assert!(b.env.pick > 0.9 && b.env.pick < 1.0, "{}", b.env.pick);
+    let mut ga = GpuPrb::new(ctx, &a);
+    let mut gb = GpuPrb::new(ctx, &b);
+    let (mut ma, mut mb) = (0.0, 0.0);
+    for seed in 0..4 {
+        ma += mean(&ga.image(&a, &GOLD, 100 + seed));
+        mb += mean(&gb.image(&b, &GOLD, 200 + seed));
+    }
+    eprintln!("mean: pick 0.5 {:.6}, by peak {:.6}", ma / 4.0, mb / 4.0);
+    assert!(rel(ma, mb) < 2e-3, "{ma} {mb}");
+
+    let mut small = Scene::pair(32, 24, 4, 1.0);
+    small.env = small.env.pick_by_peak();
+    let mut k = Kernels::for_scene(&small, false);
+    let cpu = prb::image(&small, 9, &prb::forward(&small, &GOLD, 9, &mut k).0);
+    let gpu = GpuPrb::new(ctx, &small).image(&small, &GOLD, 9);
+    let mc = cpu.iter().sum::<f64>() / cpu.len() as f64;
+    eprintln!("cpu {mc:.6} gpu {:.6}", mean(&gpu));
+    assert!(rel(mc, mean(&gpu)) < 1e-3);
+
+    let mut base = Scene::pair(32, 32, 4, 1.0);
+    base.env = base.env.pick_by_peak();
+    let mut scene = Scene::pair(32, 32, 4, 1.0);
+    scene.env = base.env;
+    scene.frozen_alpha = Some(0.3);
+    let mut k = Kernels::for_scene(&base, false);
+    let t = prb::image(&base, 99, &prb::forward(&base, &GOLD, 99, &mut k).0);
+    let mut g = GpuPrb::new(ctx, &scene);
+    g.set_target(&t);
+    let (_, d) = g.gradient_l2(&scene, &THETA0, (7, 7));
+    let h = 4e-3;
+    for p in 0..PARAMS {
+        let (mut lo, mut hi) = (THETA0, THETA0);
+        lo[p] -= h;
+        hi[p] += h;
+        let fd = (g.loss_l2(&scene, &hi, 7) - g.loss_l2(&scene, &lo, 7)) / (2.0 * h);
+        let e = rel(d[p], fd);
+        eprintln!("θ{p}: prb {:+.6e}  fd {fd:+.6e}  rel {e:.1e}", d[p]);
+        assert!(e < 1e-2, "θ{p}: prb {} vs fd {fd}", d[p]);
+    }
+}

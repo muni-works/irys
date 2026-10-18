@@ -1053,7 +1053,7 @@ impl GpuPrb {
                 [
                     e.sun_radiance as f32,
                     e.sky as f32,
-                    prb::SUN_PICK as f32,
+                    e.sun_pick() as f32,
                     vmf as f32,
                 ]
             },

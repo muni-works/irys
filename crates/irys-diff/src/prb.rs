@@ -239,9 +239,6 @@ impl Placement {
     }
 }
 
-/// Share of light samples [`Env::sample`] sends at the sun lobe; the rest
-/// are uniform over the sphere for the sky gradient.
-pub const SUN_PICK: f64 = 0.5;
 
 /// The environment: a dim sky gradient and a sun lobe,
 /// `L(d) = sky · tint(λ) (0.15 + 0.25 max(d_z, 0)) + sun_radiance · e^{κ (d·sun − 1)}`.
@@ -257,7 +254,14 @@ pub struct Env {
     pub sun_radiance: f64,
     /// Scale of the gradient.
     pub sky: f64,
+    /// Share of light samples [`Env::sample`] sends at the sun lobe, the
+    /// rest uniform over the sphere for the gradient: [`SUN_PICK`] by
+    /// default, [`Env::pick_by_peak`] for speed round 3's choice.
+    pub pick: f64,
 }
+
+/// [`Env::pick`]'s default share.
+pub const SUN_PICK: f64 = 0.5;
 
 impl Default for Env {
     fn default() -> Self {
@@ -266,6 +270,7 @@ impl Default for Env {
             kappa: 40.0,
             sun_radiance: 6.0,
             sky: 1.0,
+            pick: SUN_PICK,
         }
     }
 }
@@ -278,12 +283,30 @@ impl Env {
             + self.sun_radiance * (self.kappa * (d.dot(&self.sun) - 1.0)).exp()
     }
 
+    /// The share [`Env::sample`] sends at the sun lobe.
+    pub fn sun_pick(&self) -> f64 {
+        self.pick
+    }
+
+    /// The same environment with [`Env::pick`] by peak radiance, sun against
+    /// the gradient's peak (speed round 3): the sun lobe is what a BSDF
+    /// sample cannot find, the smooth gradient is what it can, so NEE spends
+    /// little there. Unbiased for any share: the pdf MIS and the estimator
+    /// divide by is the mixture's.
+    pub fn pick_by_peak(mut self) -> Self {
+        let sun = self.sun_radiance.max(0.0);
+        let sky = self.sky.max(0.0) * 0.4;
+        self.pick = if sun + sky > 0.0 { sun / (sun + sky) } else { SUN_PICK };
+        self
+    }
+
     /// A light-sampling direction from three uniforms: the first picks the
-    /// sun lobe (vMF, exactly) or the uniform sphere. Detached, like every
-    /// sampler here.
+    /// sun lobe (vMF, exactly) or the uniform sphere for the sky gradient.
+    /// Detached, like every sampler here.
     pub fn sample(&self, u: [f64; 3]) -> Vec3 {
         let phi = 2.0 * std::f64::consts::PI * u[2];
-        if u[0] < SUN_PICK {
+        let pick = self.sun_pick();
+        if u[0] < pick {
             let k = self.kappa;
             let c = (1.0 + (u[1] + (1.0 - u[1]) * (-2.0 * k).exp()).ln() / k).clamp(-1.0, 1.0);
             let r = (1.0 - c * c).max(0.0).sqrt();
@@ -296,12 +319,14 @@ impl Env {
         }
     }
 
+
     /// The density [`Env::sample`] draws from, per steradian.
     pub fn pdf(&self, d: Vec3) -> f64 {
         let k = self.kappa;
         let vmf = k / (2.0 * std::f64::consts::PI * (1.0 - (-2.0 * k).exp()))
             * (k * (d.dot(&self.sun) - 1.0)).exp();
-        SUN_PICK * vmf + (1.0 - SUN_PICK) / (4.0 * std::f64::consts::PI)
+        let pick = self.sun_pick();
+        pick * vmf + (1.0 - pick) / (4.0 * std::f64::consts::PI)
     }
 }
 

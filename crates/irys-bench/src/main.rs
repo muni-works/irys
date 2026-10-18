@@ -274,7 +274,7 @@ fn speed(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
         let mut best = f64::INFINITY;
         let mut img = Vec::new();
         for _ in 0..a.num("rounds", 3) {
-            let (i, t) = r.render(spp, 77);
+            let (i, t) = r.render(spp, a.num("seed", 77) as u64);
             best = best.min(t);
             img = i;
         }

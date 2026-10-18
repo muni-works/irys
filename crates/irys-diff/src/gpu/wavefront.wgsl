@@ -45,7 +45,7 @@ struct Params {
     points: u32,          // point mode: camera-plane points from `points_in`, pairs keyed together
     rt: u32,              // trace through the hardware ray queries (`rt.wgsl`) when compiled in
     sun: vec4<f32>,       // unit sun direction, κ
-    env: vec4<f32>,       // sun radiance, sky scale, SUN_PICK, vMF normaliser κ / (2π (1 − e^{−2κ}))
+    env: vec4<f32>,       // sun radiance, sky scale, `Env::sun_pick`, vMF normaliser κ / (2π (1 − e^{−2κ}))
     light: vec4<f32>,     // phase 3: emitter triangles, env pick share, emitter area, emission
     restir: vec4<u32>,    // phase 3 ReSTIR DI: (k << 8 | radius px, candidates M0 (0 = off), temporal, M cap)
     guide: vec4<f32>,     // phase 3 guiding: (mix c, 0, 0, 0)
@@ -206,7 +206,7 @@ fn sky(d: vec3<f32>, lambda: f32) -> f32 {
         + params.env.x * exp(params.sun.w * (dot(d, params.sun.xyz) - 1.0));
 }
 
-// `prb::Env::pdf`: SUN_PICK × vMF + the rest uniform over the sphere.
+// `prb::Env::pdf`: sun pick × vMF + the rest uniform over the sphere.
 fn light_pdf(d: vec3<f32>) -> f32 {
     let vmf = params.env.w * exp(params.sun.w * (dot(d, params.sun.xyz) - 1.0));
     return params.env.z * vmf + (1.0 - params.env.z) * (0.25 / PI);
