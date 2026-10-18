@@ -38,7 +38,20 @@ struct Params {
     sm1: [f32; 4],
     tex: [u32; 4],
     resp: [f32; 4],
+    hair0: [f32; 4],
+    hair1: [f32; 4],
     lights: [GpuLight; MAX_LIGHTS],
+}
+
+/// Fibres in a skin frame ([`GpuSkin::with_strands`]): the device strands,
+/// the fibre's shape, and the melanin `θ` (each segment's own scale on top).
+pub struct SkinHair<'a> {
+    /// The fibres.
+    pub strands: &'a crate::look::hair_gpu::GpuStrands,
+    /// Shape.
+    pub fiber: crate::look::hair::Fiber,
+    /// Eumelanin, pheomelanin.
+    pub melanin: [f64; 2],
 }
 
 /// Pixels per dispatch: keeps one command buffer well under the OS's GPU
@@ -55,6 +68,7 @@ pub struct GpuSkin {
     lanes: wgpu::Buffer,
     pixels: usize,
     paths_cap: usize,
+    hair: Option<([f32; 4], [f32; 4])>,
 }
 
 fn v4(p: irys_core::Point3, w: f32) -> [f32; 4] {
@@ -69,6 +83,19 @@ impl GpuSkin {
     /// Upload `scene`'s mesh, tree, maps and the medium table. `lanes` makes
     /// room to read back every path's `L` (small frames, for tests).
     pub fn new(ctx: &'static GpuContext, scene: &Scene, lanes: bool) -> Self {
+        Self::with_strands(ctx, scene, lanes, None)
+    }
+
+    /// [`Self::new`] with fibres traced alongside the skin: nearest of skin
+    /// and fibre per ray, Chiang's BCSDF at a fibre, fibres in every shadow
+    /// test (so hair shadows the skin, the SSS exits included); the walks
+    /// see only the skin.
+    pub fn with_strands(
+        ctx: &'static GpuContext,
+        scene: &Scene,
+        lanes: bool,
+        hair: Option<SkinHair<'_>>,
+    ) -> Self {
         let dev = &ctx.device;
         let scope = dev.push_error_scope(wgpu::ErrorFilter::Validation);
         let bvh = scene.bvh();
@@ -175,9 +202,17 @@ impl GpuSkin {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let src = match &hair {
+            Some(h) => format!("{}{SHADER}", crate::look::hair_gpu::shader_prelude(h.strands.prim)),
+            None => format!(
+                "{SHADER}\n{}\n{}",
+                include_str!("../look/strands_none.wgsl"),
+                include_str!("../look/bcsdf.wgsl")
+            ),
+        };
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("skin"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
         });
         let pipe = dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("skin trace"),
@@ -199,16 +234,34 @@ impl GpuSkin {
             (8, &accum),
             (9, &lanes),
         ];
+        let mut bind: Vec<wgpu::BindGroupEntry> = entries
+            .iter()
+            .map(|&(binding, b)| wgpu::BindGroupEntry {
+                binding,
+                resource: b.as_entire_binding(),
+            })
+            .collect();
+        if let Some(h) = &hair {
+            bind.push(wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::AccelerationStructure(&h.strands.tlas),
+            });
+            bind.push(wgpu::BindGroupEntry {
+                binding: 11,
+                resource: h.strands.segs.as_entire_binding(),
+            });
+        }
         let group = dev.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("skin"),
             layout: &pipe.get_bind_group_layout(0),
-            entries: &entries
-                .iter()
-                .map(|&(binding, b)| wgpu::BindGroupEntry {
-                    binding,
-                    resource: b.as_entire_binding(),
-                })
-                .collect::<Vec<_>>(),
+            entries: &bind,
+        });
+        let hair = hair.map(|h| {
+            let f = h.fiber;
+            (
+                [f.eta as f32, f.beta_m as f32, f.beta_n as f32, f.alpha as f32],
+                [h.melanin[0] as f32, h.melanin[1] as f32, 1.0, 0.0],
+            )
         });
         if let Some(e) = pollster::block_on(scope.pop()) {
             panic!("skin gpu: {e}");
@@ -222,6 +275,7 @@ impl GpuSkin {
             lanes,
             pixels,
             paths_cap,
+            hair,
         }
     }
 
@@ -303,6 +357,8 @@ impl GpuSkin {
                 norm[2] as f32 * per,
                 0.0,
             ],
+            hair0: self.hair.map_or([0.0; 4], |h| h.0),
+            hair1: self.hair.map_or([0.0; 4], |h| h.1),
             lights,
         }
     }

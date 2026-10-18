@@ -29,6 +29,8 @@ struct Params {
     sm1: vec4<f32>,       // sampling θ4, -, -, -
     tex: vec4<u32>,       // texture w, h, pixels in the frame, write lanes
     resp: vec4<f32>,      // RESPONSE_NORM × band / (spp × NW)
+    hair0: vec4<f32>,     // fibre: eta, beta_m, beta_n, alpha°
+    hair1: vec4<f32>,     // eumelanin, pheomelanin, strands on, -
     lights: array<Light, 4>,
 }
 
@@ -425,7 +427,9 @@ fn distance(p: vec3<f32>) -> f32 {
 }
 
 fn occluded(o: vec3<f32>, d: vec3<f32>, dist: f32) -> bool {
-    return intersect(o, d, dist * (1.0 - 1e-4), true).prim != NONE;
+    if (intersect(o, d, dist * (1.0 - 1e-4), true).prim != NONE) { return true; }
+    // Fibres shadow too (no-ops without strands: `strands_none.wgsl`).
+    return P.hair1.z != 0.0 && strand_hit(o, d, 1e-7, dist * (1.0 - 1e-4), true).seg != NONE;
 }
 
 fn offset_ray(x: vec3<f32>, n: vec3<f32>, o: vec3<f32>, t: f32) -> vec3<f32> {
@@ -541,6 +545,48 @@ fn light_probs(x: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
         sum = sum + p[i];
     }
     return p / sum;
+}
+
+// light_probs at a fibre: power × the emitter's cosine / d², no receiver
+// cosine (a fibre scatters into the whole sphere).
+fn light_probs_fibre(x: vec3<f32>) -> vec4<f32> {
+    var p = vec4<f32>(0.0);
+    var sum = 0.0;
+    for (var i = 0u; i < P.flags.y; i = i + 1u) {
+        let l = P.lights[i];
+        let to = l.c.xyz - x;
+        let d2 = max(dot(to, to), 1e-12);
+        let d = to / sqrt(d2);
+        let cl = max(-dot(d, l.n.xyz), 0.02);
+        let area = 4.0 * length(cross(l.u.xyz, l.v.xyz));
+        p[i] = l.c.w * area * cl / d2;
+        sum = sum + p[i];
+    }
+    return p / sum;
+}
+
+fn sample_light_fibre(x: vec3<f32>, u: vec3<f32>) -> LightSample {
+    var out = LightSample(false, 0u, vec3<f32>(0.0), 0.0, 0.0);
+    if (P.flags.y == 0u) { return out; }
+    let p = light_probs_fibre(x);
+    var i = P.flags.y - 1u;
+    var acc = 0.0;
+    for (var k = 0u; k < P.flags.y; k = k + 1u) {
+        acc = acc + p[k];
+        if (u.x < acc) {
+            i = k;
+            break;
+        }
+    }
+    let l = P.lights[i];
+    let y = l.c.xyz + l.u.xyz * (2.0 * u.y - 1.0) + l.v.xyz * (2.0 * u.z - 1.0);
+    let to = y - x;
+    let dist = length(to);
+    let wi = to / dist;
+    let cl = -dot(wi, l.n.xyz);
+    if (cl <= 0.0) { return out; }
+    let area = 4.0 * length(cross(l.u.xyz, l.v.xyz));
+    return LightSample(true, i, wi, dist, p[i] * dist * dist / (cl * area));
 }
 
 fn light_le(i: u32, lam: f32) -> f32 {
@@ -692,12 +738,19 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
     var prev_x = ro;
     var prev_n = vec3<f32>(0.0, 0.0, 1.0);
     var prev_pdf = 0.0;
+    var prev_fibre = false;
     let r1 = P.th0.w;
     let r2 = P.th1.x;
     let mm = P.up.w;
     for (var depth = 0u; depth < P.crop.w; depth = depth + 1u) {
         let h = intersect(ro, rd, 3.4e38, false);
-        let tmax = h.t;
+        var tmax = h.t;
+        // A fibre nearer than the skin.
+        var sh = SHit(tmax, NONE, vec3<f32>(0.0));
+        if (P.hair1.z != 0.0) {
+            sh = strand_hit(ro, rd, 1e-7, tmax, false);
+            if (sh.seg != NONE) { tmax = sh.t; }
+        }
         // Closest light before the surface.
         var li = NONE;
         var lt = tmax;
@@ -710,12 +763,75 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
         }
         if (li != NONE) {
             var wm = 1.0;
-            if (prev_pdf > 0.0) { wm = mis(prev_pdf, light_pdf(prev_x, prev_n, li, rd, lt)); }
+            if (prev_pdf > 0.0) {
+                var pl = light_pdf(prev_x, prev_n, li, rd, lt);
+                if (prev_fibre) {
+                    let l = P.lights[li];
+                    let area = 4.0 * length(cross(l.u.xyz, l.v.xyz));
+                    pl = light_probs_fibre(prev_x)[li] * lt * lt / (max(-dot(rd, l.n.xyz), 1e-12) * area);
+                }
+                wm = mis(prev_pdf, pl);
+            }
             for (var k = 0u; k < NW; k = k + 1u) {
                 rad[k] = rad[k] + tp[k] * light_le(li, lam[k]) * wm;
             }
             break;
         }
+        if (sh.seg != NONE) {
+            // A fibre: Chiang's BCSDF (bcsdf.wgsl) per hero wavelength,
+            // lobes picked by the lanes' mean A_p, NEE through skin and
+            // fibres, then a sampled direction — `hair::HairScene::trace`'s
+            // vertex with four wavelengths.
+            let x = ro + rd * sh.t;
+            let tx = strand_tangent(sh.seg);
+            var z = -(rd - tx * dot(rd, tx));
+            if (length(z) < 1e-9) { break; }
+            z = normalize(z);
+            let y = cross(z, tx);
+            let frad = strand_radius(sh.seg);
+            let mel = strand_melanin(sh.seg);
+            let hh = clamp(dot(sh.n, y), -1.0, 1.0);
+            let wo = vec3<f32>(dot(-rd, tx), dot(-rd, y), dot(-rd, z));
+            let fb = fib_new(P.hair0, hh);
+            let g = fib_geometry(fb, wo);
+            var sa = vec4<f32>(0.0);
+            var ap = vec4<f32>(0.0);
+            for (var k = 0u; k < NW; k = k + 1u) {
+                sa[k] = fib_sigma_a(P.hair1.xy * mel, lam[k]);
+                ap = ap + fib_ap(g.f, g.l, sa[k]) * (1.0 / f32(NW));
+            }
+            let off = sh.n * (2.0 * frad);
+            let u3 = vec3<f32>(rand(&rng), rand(&rng), rand(&rng));
+            let ls = sample_light_fibre(x, u3);
+            if (ls.ok) {
+                let xs = x + select(-off, off, dot(ls.wi, sh.n) > 0.0);
+                if (!occluded(xs, ls.wi, ls.dist)) {
+                    let wl = vec3<f32>(dot(ls.wi, tx), dot(ls.wi, y), dot(ls.wi, z));
+                    let mn = fib_mn(fb, g, wl);
+                    let wm = mis(ls.pdf, fib_pdf(fb, g, wl, ap));
+                    for (var k = 0u; k < NW; k = k + 1u) {
+                        rad[k] = rad[k] + tp[k] * fib_f(mn, g.f, g.l, sa[k]) * light_le(ls.i, lam[k]) * wm / ls.pdf;
+                    }
+                }
+            }
+            let u4 = vec4<f32>(rand(&rng), rand(&rng), rand(&rng), rand(&rng));
+            let wl = fib_sample(fb, g, ap, u4);
+            let pdf = fib_pdf(fb, g, wl, ap);
+            if (!(pdf > 0.0) || pdf > 3.0e38) { break; }
+            let mn = fib_mn(fb, g, wl);
+            for (var k = 0u; k < NW; k = k + 1u) {
+                tp[k] = tp[k] * fib_f(mn, g.f, g.l, sa[k]) / pdf;
+            }
+            let nd = normalize(tx * wl.x + y * wl.y + z * wl.z);
+            prev_x = x;
+            prev_n = sh.n;
+            prev_pdf = pdf;
+            prev_fibre = true;
+            ro = x + select(-off, off, dot(nd, sh.n) > 0.0);
+            rd = nd;
+            continue;
+        }
+        prev_fibre = false;
         if (h.prim == NONE) {
             let env = P.th1.y * (0.55 + 0.45 * rd.z);
             rad = rad + tp * env;

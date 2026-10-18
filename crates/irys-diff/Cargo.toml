@@ -84,5 +84,13 @@ name = "look_volume"
 required-features = ["assets"]
 
 [[example]]
+name = "look_hair_gpu"
+required-features = ["gpu", "assets"]
+
+[[example]]
+name = "look2_head"
+required-features = ["gpu", "assets"]
+
+[[example]]
 name = "look_hair"
 required-features = ["assets"]

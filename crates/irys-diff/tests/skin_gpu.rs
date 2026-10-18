@@ -128,3 +128,44 @@ fn gpu_frames_are_deterministic() {
     let (b, _) = g.render(&s, &THETA, 3, false);
     assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
 }
+
+/// Strands in the skin kernel: fibres nowhere near the frame leave every
+/// lane bit-identical to the hairless kernel (the strand test consumes no
+/// random numbers); fibres over the ball darken it (they occlude and
+/// shadow) and the frame repeats bit for bit.
+#[test]
+fn strands_coexist_with_the_skin() {
+    use irys_diff::look::hair::{Fiber, Strands};
+    use irys_diff::look::hair_gpu::{self, GpuStrands, StrandPrim};
+    use irys_diff::skin::gpu::SkinHair;
+    let Some(ctx) = ctx() else { return };
+    if !hair_gpu::available(ctx) {
+        return;
+    }
+    let s = ball(24, 4, Mode { sss: true, dual: true });
+    let bare = GpuSkin::new(ctx, &s, true).render(&s, &THETA, 3, true).1;
+    let tuft = |offset: f64| {
+        let mut st = Strands::default();
+        for i in 0..400 {
+            let a = i as f64 * 0.7;
+            let b = (i as f64 * 0.37).sin() * 1.2;
+            let root = irys_core::Vec3::new(a.cos() * b.cos(), -b.sin().abs() - 0.0, a.sin() * b.cos()).normalize();
+            let p0 = irys_core::Point3::origin() + root * (1.0 + offset);
+            let pts: Vec<_> = (0..5).map(|k| p0 + root * (0.04 * k as f64)).collect();
+            st.push(&pts, 0.004);
+        }
+        st
+    };
+    let far = GpuStrands::new(ctx, &tuft(500.0), None, StrandPrim::Cylinders).unwrap();
+    let hair = |st| SkinHair { strands: st, fiber: Fiber::default(), melanin: [3.0, 0.2] };
+    let with_far = GpuSkin::with_strands(ctx, &s, true, Some(hair(&far))).render(&s, &THETA, 3, true).1;
+    assert!(bare.iter().zip(&with_far).all(|(a, b)| a.to_bits() == b.to_bits()), "far fibres change nothing");
+    let near = GpuStrands::new(ctx, &tuft(0.0), None, StrandPrim::Cylinders).unwrap();
+    let g = GpuSkin::with_strands(ctx, &s, true, Some(hair(&near)));
+    let (i1, l1) = g.render(&s, &THETA, 3, true);
+    let (i2, _) = g.render(&s, &THETA, 3, true);
+    assert!(i1.iter().zip(&i2).all(|(a, b)| a.to_bits() == b.to_bits()), "deterministic");
+    let (sb, sh): (f64, f64) = (bare.iter().map(|&x| x as f64).sum(), l1.iter().map(|&x| x as f64).sum());
+    println!("frame with fibres / without: {:.4}", sh / sb);
+    assert!(sh < sb && sh > 0.3 * sb);
+}
