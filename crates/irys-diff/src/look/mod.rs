@@ -11,3 +11,4 @@ pub mod gpu;
 pub mod graph;
 pub mod openpbr;
 pub mod swatch;
+pub mod volume;
