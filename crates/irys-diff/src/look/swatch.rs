@@ -31,7 +31,7 @@ use irys_core::{Bvh, Point3, TriMesh, Vec3};
 use irys_light::spectrum::{hero_weight, sample_lambda_nm};
 
 use super::graph::{self, Stack};
-use super::openpbr::{At, COLUMNS, Kind, OpenPbr, PARAMS, subsurface_medium};
+use super::openpbr::{At, COLUMNS, Kind, OpenPbr, PARAMS, SubsurfaceMode, subsurface_walk_medium};
 use crate::prb::{Rng, mis};
 use crate::skin::mesh::basis;
 use crate::skin::render::{Light, walk_g};
@@ -332,9 +332,23 @@ impl Swatch {
                     }
                     beta *= f / lw[4];
                     let bvh = self.walk_mesh.as_ref().expect("walk mesh");
-                    let wd = world(super::openpbr::cosine([rng.uniform(), rng.uniform()]));
-                    let model = subsurface_medium(&mat, lambda);
-                    let samp = subsurface_medium(&smat, lambda);
+                    let ue = [rng.uniform(), rng.uniform()];
+                    // Into the medium: a cosine (the spec's diffuse
+                    // boundary), or Cycles' GGX refraction at (r², η).
+                    let wd = if smat.subsurface_mode == SubsurfaceMode::Cycles {
+                        let a = super::openpbr::alpha(smat.specular_roughness);
+                        let h = super::openpbr::vndf(a, wo, ue);
+                        let eta = smat.specular_ior.clamp(1.01, 3.8);
+                        match super::openpbr::refract(wo, h, eta) {
+                            Some(t) if t[2] < 0.0 => -world(t).normalize(),
+                            _ => break,
+                        }
+                    } else {
+                        world(super::openpbr::cosine(ue))
+                    };
+                    let (model, k) = subsurface_walk_medium(&mat, lambda);
+                    let (samp, _) = subsurface_walk_medium(&smat, lambda);
+                    beta *= k;
                     // Inside the tessellated boundary: the analytic hit is
                     // outside the inscribed faces by up to their sagitta
                     // (≈ 2e-4 at level 5), and a walk started there would

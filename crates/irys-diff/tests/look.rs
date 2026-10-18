@@ -407,6 +407,27 @@ fn replay_is_bit_exact_and_deterministic() {
 }
 
 #[test]
+fn cycles_subsurface_replays_bit_exact() {
+    let m = OpenPbr {
+        subsurface_weight: 0.8,
+        subsurface_radius: 0.3,
+        subsurface_mode: openpbr::SubsurfaceMode::Cycles,
+        ..busy()
+    };
+    let s = small(m);
+    let th = s.material.theta();
+    let fwd = s.forward(&th, 9);
+    let dl = vec![1.0; fwd.len()];
+    let mut p = Stack::new(4096).adjoint(true);
+    let (g1, l1) = s.replay(&th, 9, &dl, &mut p, 4096);
+    let (g2, _) = s.replay(&th, 9, &dl, &mut p, 4096);
+    let same = fwd.iter().zip(&l1).filter(|(a, b)| a.0.to_bits() == b.to_bits()).count();
+    assert_eq!(same, fwd.len());
+    assert_eq!(g1.map(f64::to_bits), g2.map(f64::to_bits));
+    assert!(fwd.iter().any(|x| x.0 > 0.0));
+}
+
+#[test]
 fn prb_matches_central_differences() {
     // The film on a metal is detached in the base colour (its substrate
     // index is read from F0 as a number), so the gate runs without it.
