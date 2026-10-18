@@ -46,6 +46,51 @@ pub fn alpha(r: f64) -> f64 {
     A_MIN + (1.0 - A_MIN) * r * r
 }
 
+/// The subsurface model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubsurfaceMode {
+    /// The spec: `μ_t = 1/(radius · scale)`, van de Hulst's albedo
+    /// inversion, a diffuse (cosine) entry.
+    #[default]
+    Physical,
+    /// Blender 4.4 Cycles' Principled `Random Walk`
+    /// (kernel/closure/bssrdf.h, kernel/integrator/subsurface*.h): the mean
+    /// free path is `radius · scale / 4π`, `σ_t = 1/(d (1 − g))`, the
+    /// single-scattering albedo is Chiang+ 2016's fit
+    /// (`subsurface_random_walk_remap`) with its 0.2 floor, and the entry is
+    /// a GGX refraction at `(α = r², η = specular_ior)` with no Fresnel
+    /// weight. The exit is diffuse in both modes.
+    Cycles,
+}
+
+/// Chiang, Kutz & Burley 2016's fit from a multiple-scattering albedo to
+/// the single-scattering albedo at anisotropy `g`, as Cycles has it
+/// (`subsurface_random_walk_remap`).
+pub fn chiang_alpha(albedo: f64, g: f64) -> f64 {
+    let (g2, g3, g4, g5, g6, g7) = (g * g, g.powi(3), g.powi(4), g.powi(5), g.powi(6), g.powi(7));
+    let a = 1.8260523782 - 1.28451056436 * g - 1.79904629312 * g2 + 9.19393289202 * g3
+        - 22.8215585862 * g4 + 32.0234874259 * g5 - 23.6264803333 * g6 + 7.21067002658 * g7;
+    let b = 4.98511194385
+        + 0.127355959438
+            * (31.1491581433 * g - 201.847017512 * g2 + 841.576016723 * g3 - 2018.09288505 * g4
+                + 2731.71560286 * g5 - 1935.41424244 * g6 + 559.009054474 * g7)
+                .exp();
+    let c = 1.09686102424 - 0.394704063468 * g + 1.05258115941 * g2 - 8.83963712726 * g3
+        + 28.8643230661 * g4 - 46.8802913581 * g5 + 38.5402837518 * g6 - 12.7181042538 * g7;
+    let d = 0.496310210422 + 0.360146581622 * g - 2.15139309747 * g2 + 17.8896899217 * g3
+        - 55.2984010333 * g4 + 82.065982243 * g5 - 58.5106008578 * g6 + 15.8478295021 * g7;
+    let e = 4.23190299701
+        + 0.00310603949088
+            * (76.7316253952 * g - 594.356773233 * g2 + 2448.8834203 * g3 - 5576.68528998 * g4
+                + 7116.60171912 * g5 - 4763.54467887 * g6 + 1303.5318055 * g7)
+                .exp();
+    let f = 2.40602999408 - 2.51814844609 * g + 9.18494908356 * g2 - 79.2191708682 * g3
+        + 259.082868209 * g4 - 403.613804597 * g5 + 302.85712436 * g6 - 87.4370473567 * g7;
+    let blend = albedo.powf(0.25);
+    ((1.0 - blend) * a * (b * albedo).atan().powf(c) + blend * d * (e * albedo).atan().powf(f))
+        .clamp(0.0, 0.999_999)
+}
+
 /// OpenPBR Surface's parameters, the spec's names and defaults. Colours are
 /// linear sRGB. Anisotropy, `base_diffuse_roughness`, `transmission_scatter`
 /// and thin-walled mode are not implemented (design.md, Phase 4 deviations).
@@ -69,6 +114,9 @@ pub struct OpenPbr {
     pub subsurface_radius: f64,
     pub subsurface_radius_scale: [f64; 3],
     pub subsurface_scatter_anisotropy: f64,
+    /// Which subsurface model: the spec's ([`SubsurfaceMode::Physical`]) or
+    /// Cycles' Principled random walk ([`SubsurfaceMode::Cycles`]).
+    pub subsurface_mode: SubsurfaceMode,
     pub coat_weight: f64,
     pub coat_color: [f64; 3],
     pub coat_roughness: f64,
@@ -106,6 +154,7 @@ impl Default for OpenPbr {
             subsurface_radius: 1.0,
             subsurface_radius_scale: [1.0, 0.5, 0.25],
             subsurface_scatter_anisotropy: 0.0,
+            subsurface_mode: SubsurfaceMode::Physical,
             coat_weight: 0.0,
             coat_color: [1.0; 3],
             coat_roughness: 0.0,
@@ -448,8 +497,6 @@ pub struct Tables {
     pub diel: Vec<f64>,
     /// Metal: `∫ G2/G1`, `∫ (1 − o·h)⁵ G2/G1`, `∫ w(o·h) G2/G1`, `[μ][r]`.
     pub metal: [Vec<f64>; 3],
-    /// The fuzz lobe's own albedo, `[μ][r_f]`.
-    pub fuzz: Vec<f64>,
 }
 
 /// The F82 weight `μ (1 − μ)⁶ / (μ̄ (1 − μ̄)⁶)`.
@@ -499,21 +546,7 @@ impl Tables {
             })
         };
         let metal = [metal_k(0), metal_k(1), metal_k(2)];
-        let fuzz = par(TN * TN, |k| {
-                let (m, r) = (k / TN, k % TN);
-                let mu = mu_node(m);
-                let wo = [(1.0 - mu * mu).max(0.0).sqrt(), 0.0, mu];
-                let n = 48;
-                let mut s = 0.0;
-                for i in 0..n {
-                    for j in 0..n {
-                        let wi = cosine([(i as f64 + 0.5) / n as f64, (j as f64 + 0.5) / n as f64]);
-                        s += charlie(r_node(r), wo, wi) * PI;
-                    }
-                }
-                s / (n * n) as f64
-            });
-        Self { diel, metal, fuzz }
+        Self { diel, metal }
     }
 
     fn lerp2(t: &[f64], mu: f64, r: f64) -> (f64, f64) {
@@ -549,37 +582,11 @@ impl Tables {
         std::array::from_fn(|k| Self::lerp2(&self.metal[k], mu, r))
     }
 
-    /// The fuzz lobe's albedo, normalised so that its largest value over
-    /// `μ` is at most 1 (Charlie with Neubelt–Pettineo's visibility
-    /// reflects up to 1.4× what it receives at grazing view; the lobe is
-    /// scaled down by [`Self::fuzz_norm`] wherever it does).
+    /// The fuzz layer's albedo `R(μ_o, r_f)`: Zeltner+ 2022's fit
+    /// ([`super::sheen`]), which is ≤ 1 and needs no normaliser.
     pub fn fuzz(&self, mu: f64, rf: f64) -> f64 {
-        Self::lerp2(&self.fuzz, mu, rf).0 / self.fuzz_norm(rf)
+        super::sheen::albedo(mu, rf)
     }
-
-    /// `max(1, max_μ E(μ, r_f))`: the fuzz lobe's normaliser.
-    pub fn fuzz_norm(&self, rf: f64) -> f64 {
-        (0..TN)
-            .map(|k| Self::lerp2(&self.fuzz, k as f64 / (TN - 1) as f64, rf).0)
-            .fold(1.0, f64::max)
-    }
-}
-
-/// The fuzz lobe: Estevez & Kulla's "Charlie" sheen distribution with
-/// Neubelt & Pettineo's visibility, `D(h) V / 1` (a BRDF, colour 1). The
-/// spec recommends Zeltner+ 2022's LTC fit of an SGGX fibre layer; this is
-/// the analytic stand-in (design.md, Phase 4 deviations).
-pub fn charlie(rf: f64, wo: [f64; 3], wi: [f64; 3]) -> f64 {
-    let (ci, co) = (wi[2], wo[2]);
-    if ci <= 0.0 || co <= 0.0 {
-        return 0.0;
-    }
-    let a = (rf * rf).max(0.07);
-    let h = norm([wi[0] + wo[0], wi[1] + wo[1], wi[2] + wo[2]]);
-    let s2 = (1.0 - h[2] * h[2]).max(0.0);
-    let inv = 1.0 / a;
-    let d = (2.0 + inv) * s2.powf(0.5 * inv) / (2.0 * PI);
-    d / (4.0 * (ci + co - ci * co))
 }
 
 // ─── a material at one wavelength ────────────────────────────────────────
@@ -858,7 +865,7 @@ impl At {
         c[XI_S] = m.specular_weight;
         // The fuzz.
         c[F_FUZZ] = if kind == Kind::Reflect {
-            self.fc * charlie(m.fuzz_roughness, wo, wi) / t.fuzz_norm(m.fuzz_roughness)
+            self.fc * super::sheen::brdf(m.fuzz_roughness, wo, wi)
         } else {
             0.0
         };
@@ -972,6 +979,32 @@ impl At {
 /// subsurface colour (van de Hulst's inversion, spec "Subsurface"), and
 /// `μ_t = 1 / (radius · radius_scale)`.
 pub fn subsurface_medium(m: &OpenPbr, lambda: f64) -> (f64, f64) {
+    subsurface_walk_medium(m, lambda).0
+}
+
+/// [`subsurface_medium`] and the walk's θ-free throughput factor: 1 for the
+/// spec's model; Cycles' `α < 0.2` floor (`throughput *= α / 0.2`) in
+/// [`SubsurfaceMode::Cycles`].
+pub fn subsurface_walk_medium(m: &OpenPbr, lambda: f64) -> ((f64, f64), f64) {
+    if m.subsurface_mode == SubsurfaceMode::Cycles {
+        let c = lift(m.subsurface_color, lambda).clamp(0.0, 1.0);
+        let g = m.subsurface_scatter_anisotropy.clamp(0.0, 0.9);
+        let d = (m.subsurface_radius * lift(m.subsurface_radius_scale, lambda)).max(0.0)
+            * 0.25
+            / PI;
+        let mut a = chiang_alpha(c, g);
+        let mut k = 1.0;
+        if a < 0.2 {
+            k = a / 0.2;
+            a = 0.2;
+        }
+        let st = 1.0 / (d.max(1e-16) * (1.0 - g));
+        return ((st * (1.0 - a), st * a), k);
+    }
+    (subsurface_medium_physical(m, lambda), 1.0)
+}
+
+fn subsurface_medium_physical(m: &OpenPbr, lambda: f64) -> (f64, f64) {
     let c = lift(m.subsurface_color, lambda).clamp(1e-4, 0.999);
     let g = m.subsurface_scatter_anisotropy;
     let s = 4.09712 + 4.20863 * c - (9.59217 + 41.6808 * c + 17.7126 * c * c).sqrt();

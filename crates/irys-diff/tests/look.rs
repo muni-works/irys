@@ -228,7 +228,7 @@ fn energy_per_lobe_never_exceeds_one() {
     }
     // The tables themselves: every entry in [0, 1].
     let mx = |v: &[f64]| v.iter().cloned().fold(0.0, f64::max);
-    println!("table maxima: diel {:.4} fuzz {:.4} metal {:.4}", mx(&t.diel), mx(&t.fuzz), mx(&t.metal[0]));
+    println!("table maxima: diel {:.4} metal {:.4}", mx(&t.diel), mx(&t.metal[0]));
     assert!(t.diel.iter().all(|&e| (0.0..=1.0 + 1e-9).contains(&e)));
     for k in 0..=20 {
         for j in 0..=20 {
@@ -404,6 +404,27 @@ fn replay_is_bit_exact_and_deterministic() {
     let same = fwd.iter().zip(&l1).filter(|(a, b)| a.0.to_bits() == b.to_bits()).count();
     assert_eq!(same, fwd.len(), "replay re-walks every path");
     assert_eq!(g1.map(f64::to_bits), g2.map(f64::to_bits), "δθ bit-identical");
+}
+
+#[test]
+fn cycles_subsurface_replays_bit_exact() {
+    let m = OpenPbr {
+        subsurface_weight: 0.8,
+        subsurface_radius: 0.3,
+        subsurface_mode: openpbr::SubsurfaceMode::Cycles,
+        ..busy()
+    };
+    let s = small(m);
+    let th = s.material.theta();
+    let fwd = s.forward(&th, 9);
+    let dl = vec![1.0; fwd.len()];
+    let mut p = Stack::new(4096).adjoint(true);
+    let (g1, l1) = s.replay(&th, 9, &dl, &mut p, 4096);
+    let (g2, _) = s.replay(&th, 9, &dl, &mut p, 4096);
+    let same = fwd.iter().zip(&l1).filter(|(a, b)| a.0.to_bits() == b.to_bits()).count();
+    assert_eq!(same, fwd.len());
+    assert_eq!(g1.map(f64::to_bits), g2.map(f64::to_bits));
+    assert!(fwd.iter().any(|x| x.0 > 0.0));
 }
 
 #[test]

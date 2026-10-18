@@ -17,7 +17,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use irys_diff::look::openpbr::OpenPbr;
+use irys_diff::look::openpbr::{OpenPbr, SubsurfaceMode};
 use irys_diff::look::swatch::{Swatch, studio};
 use irys_diff::skin::render::{Light, tonemap};
 
@@ -98,6 +98,8 @@ fn swatches() -> Vec<(String, String, OpenPbr)> {
         subsurface_weight: v,
         subsurface_radius: 0.3,
         specular_roughness: 0.4,
+        // Blender's walk, so the row compares like with like.
+        subsurface_mode: SubsurfaceMode::Cycles,
         ..d
     });
     out

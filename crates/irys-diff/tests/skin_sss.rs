@@ -136,3 +136,29 @@ fn similarity_for_skin_anisotropy() {
         );
     }
 }
+
+/// Cycles' subsurface mode (`look::openpbr::SubsurfaceMode::Cycles`) maps a
+/// colour to a single-scattering albedo with Chiang+ 2016's fit; the walk
+/// it drives on a half-space, entered diffusely, returns about that colour.
+#[test]
+fn chiang_fit_inverts_the_walk() {
+    use irys_diff::look::openpbr::chiang_alpha;
+    let bvh = slab();
+    assert_eq!(chiang_alpha(0.0, 0.0), 0.0);
+    let mut last = 0.0;
+    for k in 1..=20 {
+        let a = chiang_alpha(k as f64 / 20.0, 0.0);
+        assert!(a >= last && a < 1.0, "monotone in (0, 1): {k} {a} {last}");
+        last = a;
+    }
+    for c in [0.2, 0.5, 0.8, 0.95] {
+        let a = chiang_alpha(c, 0.0);
+        let (e, s) = albedo(&bvh, a, 0.0, false, 100_000, 11);
+        let (ed, _) = albedo(&bvh, a, 0.0, true, 100_000, 11);
+        println!("colour {c:.2}: α {a:.5} → walk {e:.4} ± {s:.4} diffuse {ed:.4}");
+        // The fit is for diffuse incidence; at 0.95 it saturates (α
+        // clamped to 1 − 1e-6, as in Cycles).
+        let tol = if c > 0.9 { 0.05 } else { 0.015 };
+        assert!((ed - c).abs() < tol, "colour {c}: walk {ed}");
+    }
+}

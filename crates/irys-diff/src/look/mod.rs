@@ -10,6 +10,9 @@
 pub mod gpu;
 pub mod graph;
 pub mod openpbr;
+pub mod sheen;
 pub mod swatch;
 pub mod volume;
 pub mod hair;
+#[cfg(feature = "gpu")]
+pub mod hair_gpu;

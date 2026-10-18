@@ -16,6 +16,7 @@ pub mod accel;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod graph;
+pub mod groom;
 pub mod head;
 pub mod mesh;
 pub mod optics;

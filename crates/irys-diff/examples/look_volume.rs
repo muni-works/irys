@@ -2,7 +2,7 @@
 //! warm emissive core over a grey floor, one softbox, delta tracking with
 //! ratio-tracked light samples, spectral σ (bluer light scatters more).
 //!
-//! `cargo run --release -p irys-diff --features assets --example look_volume -- [w] [h] [spp]`
+//! `cargo run --release -p irys-diff --features assets --example look_volume -- [w] [h] [spp] [grid]`
 
 use irys_core::Point3;
 use irys_diff::look::volume::{Grid, Medium, VolumeScene};
@@ -64,6 +64,7 @@ fn main() {
             sigma: [5.0, 6.0, 7.5],
             g: 0.35,
             emission: Some((emission, [30.0, 9.0, 1.5])),
+            majorant: None,
         },
         floor: Some([0.45, 0.45, 0.45]),
         lights: vec![
@@ -79,11 +80,23 @@ fn main() {
         depth: 10,
         sampler: None,
     };
+    // Majorant grid: `r³` supervoxels (0: one global majorant).
+    let r = a.get(3).copied().unwrap_or(8);
+    let mut scene = scene;
+    if r > 0 {
+        scene.medium = scene.medium.clone().with_majorant_grid(r);
+        let mg = scene.medium.majorant.as_ref().unwrap();
+        let gm = scene.medium.density.max();
+        let mean = mg.dmax.iter().sum::<f64>() / mg.dmax.len() as f64 / gm;
+        let mean_d = scene.medium.density.data.iter().sum::<f64>() / scene.medium.density.data.len() as f64 / gm;
+        let empty = mg.dmax.iter().filter(|&&d| d == 0.0).count() as f64 / mg.dmax.len() as f64;
+        eprintln!("majorant/global {mean:.3}, density/global {mean_d:.3}, empty {empty:.3}");
+    }
     let theta = [1.0, 0.9, 0.92, 0.95];
     let t0 = std::time::Instant::now();
     let img = scene.image(&scene.forward(&theta, 0x70c));
     let secs = t0.elapsed().as_secs_f64();
-    println!("{w}×{h} × {spp} spp in {secs:.1} s ({:.2} Mpaths/s)", (w * h * spp) as f64 / secs / 1e6);
+    println!("grid {r}³: {w}×{h} × {spp} spp in {secs:.1} s ({:.2} Mpaths/s)", (w * h * spp) as f64 / secs / 1e6);
     let px = tonemap(&img, 1.4);
     let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/look-volume.png");
     image::RgbImage::from_raw(w as u32, h as u32, px).unwrap().save(&out).unwrap();
