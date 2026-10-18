@@ -1265,3 +1265,197 @@ Render a few spp → film keeps mean, variance and AOVs → KPN denoises and
 predicts its residual error → the sampler puts the next spp where that error
 is → repeat until the predicted error is under target. KPN and sampler train
 together as one tang IR graph (nonlinear Noise2Noise, no clean references).
+
+## Skin (2026-10-17)
+
+A lifelike head, as a first instance of "the look" (phase 4) on the PRB
+machinery: `irys-diff::skin`, additive to everything above (no change to
+`prb`, `gpu.rs` or `wavefront.wgsl`). The subject is the Lee Perry-Smith scan
+— "Lee Perry-Smith" by Infinite-Realities (ir-ltd.net), CC BY 3.0
+(creativecommons.org/licenses/by/3.0), via the three.js examples — read from
+`$IRYS_ASSETS/lee-perry-smith` (default `/Users/cam/Developer/irys-assets`)
+and never copied into the repository. The renders below are of it.
+
+![front](skin-head-front.png)
+
+![three-quarter](skin-head-3q.png)
+
+![no SSS · SSS + one lobe · SSS + two lobes](skin-compare.png)
+
+### Method
+
+- **Mesh and maps** (`skin::mesh`). The glb's first primitive (9 279
+  vertices, 17 684 triangles, a bust) through `gltf` + `image` behind an
+  `assets` feature; per-vertex tangents by Lengyel's method; bilinear,
+  wrapped, linear-f32 textures (sRGB decoded for colour). Two facts about
+  this file, both settled by the maps rather than by convention: its UVs
+  run `v` *up* the image (read as glTF says, the lips land on the chin and
+  the eyebrows on the neck; `load` flips them, `the_eyebrows_are_above_the_eyes`
+  holds it), and its normal map is green-up (as a height gradient, the
+  green-up reading is 2.26× closer to curl-free than green-down;
+  `the_normal_map_is_opengl`). 1 unit = 50 mm (4.3 units nose to occiput).
+- **The medium** (`skin::optics`). One homogeneous layer per entry point,
+  per mm: `σa = s (m μa_mel + h μa_blood + μa_base)`, `σs = s μs'/(1 − g)`,
+  Henyey–Greenstein `g = 0.8`. Measured constituents: melanosome absorption
+  `51.9 (λ/500)^−3.5` and the average-skin reduced scattering
+  `4.60 (0.409 (λ/500)^−4 + 0.591 (λ/500)^−0.562)` (Jacques 2013), whole
+  blood from Prahl's HbO₂/Hb extinction at 75 % saturation, Jacques' bloodless
+  baseline. One 1-nm table feeds CPU and GPU. `θ = (m-scale, h-scale, s, r₁,
+  r₂)`.
+- **Albedo → chromophores.** The map's colour is inverted per texel to
+  `(m, h)`: the walk's own total albedo (below) through the similarity
+  relation, times `1 − F̄` (the entry Fresnel, cosine-averaged), integrated
+  against the sRGB response, searched on a 96² grid at the nodes of a 48³
+  `√rgb` grid and trilinearly interpolated (0.6 s for 1024²; mean RGB error
+  0.030; 0.6 % of texels at a bound — painted stubble and lips). The head
+  renders at `θ = (1, 1, 1, 0.35, 0.6)`: the inverted maps as they are.
+- **The walk** (`render::walk_g`). Analog, one wavelength per walk: distances
+  drawn at the sampler's `σt` (detached), `f = σs e^{−σt t}` per scatter and
+  `e^{−σt d}` at the boundary, HG turns. Boundaries are any triangle of the
+  closed mesh; entry and exit are diffuse transmissions (cosine in, cosine
+  out about the smooth normal), `(1 − F(cos_o))` at entry, nothing at the
+  inner boundary — Cycles' random walk. Each entry runs **four walks**, one
+  per hero wavelength, each with NEE at its own exit; the path continues
+  from one (picked uniformly, weight 4). A walk that runs out of events
+  (4096) is absorbed.
+- **The layer** (`skin::graph::Spec`). Dual-lobe GGX dielectric, Schlick at
+  `η = 1.4`, height-correlated Smith, lobes 0.85 / 0.15 at perceptual
+  roughness `r₁ = 0.35`, `r₂ = 0.6` (`α = r²`), scaled by Map-SPEC
+  normalised to a mean of 0.7. VNDF sampling of the lobe picked by its
+  weight, MIS against the lights with the mixture's pdf. Reflect-or-enter at
+  `P_r = clamp(4 F k, 0.1, 0.6)`, detached.
+- **Portrait** (`skin::head`, `render`). Three softbox quads (warm key
+  7 × 7, cool fill 10 × 10, rim strip), NEE picking a light by
+  power × the two cosines / d² (detached; the MIS pdf recomputes it at the
+  vertex the ray left), MIS with every BSDF-sampled light hit; a dark
+  studio gradient; thin lens (Shirley–Chiu); ACES (Narkowicz's fit) and
+  the sRGB curve on display only, exposure from the lit pixels' median.
+- **Differentiable** (`skin::graph`, `render::replay`). Both factors are tang
+  IR graphs. `Medium` is written in the log domain, `ℓ = s ln σs − t σt`,
+  and `ℓ` is linear in `(s, t)` for fixed coefficients, so every event of a
+  walk — which all share `W = δL (L − L_entry⁺)`, nothing being collected
+  inside — reduces exactly to one adjoint lane with `s = W · #scatters`,
+  `t = W · Σt`: the replay runs the adjoint once per walk, not once per
+  event (155 records for 43 k events in the test). Records are reduced in
+  path order through the compiled adjoints: the gradient is bit-identical
+  run to run.
+- **GPU** (`skin/gpu.rs`, `skin.wgsl`). The same path as one WGSL
+  megakernel, one thread per pixel per sample, samples as separate
+  dispatches in order (no atomics), the frame chunked at 64 k pixels per
+  command buffer. Forward only.
+- **Safe sphere** (`skin::accel`). A walk asks once how far the nearest
+  triangle is; every later step ending inside that sphere cannot reach the
+  boundary and is not traced. Outcomes are unchanged (a step is either
+  provably clear or traced as before); the GPU walk got 3.8× faster
+  (256² × 64 spp: 38 s → 9.9 s).
+
+### Validation
+
+| Gate (release, M-series) | Result |
+|---|---|
+| walk vs Chandrasekhar's `H` (semi-infinite, isotropic, index-matched), `ϖ` 0.3 … 0.999, diffuse and normal incidence, 50 k–400 k walks | every case within 1.7 σ; rel error ≤ 4.3e-3 (e.g. `ϖ = 0.99`: 0.79404 ± 0.00096 vs 0.79456 diffuse, 0.75268 ± 0.00103 vs 0.75272 normal) |
+| `g = 0.8` walk vs the similarity relation (what the inversion assumes) | absolute albedo error ≤ 0.0025 at `ϖ` 0.9 … 0.999 |
+| `∫ H dμ` vs `(2/ϖ)(1 − √(1 − ϖ))` | < 1e-10 |
+| `Spec`, `Medium` graphs vs their f64 twins (interpreter) | ≤ 1e-12; `Medium` adjoint vs analytic `∂ℓ` ≤ 1e-10 |
+| compiled C (f32) vs interpreter adjoint, full replay | rel ≤ 3.1e-6 on all five θ |
+| replay vs forward, SSS ball (16² × 2 spp × 4 λ, 1000 walks, 199 k events) and Lambert | 2048 / 2048 lanes bit-identical, both; δθ bit-identical twice |
+| PRB vs central differences, frozen sampler, CRN, f64 | mean loss: rel ≤ 6.3e-9 on all five θ; L2 to a target: ≤ 3.2e-8 |
+| live sampler (distances drawn at the current θ), melanin, 24 seeds | PRB −0.370 ± 0.011 vs CD −0.388 ± 0.041 (0.4 σ) |
+| GPU f32 vs CPU f64, per lane, ball, Lambert / SSS | median rel 8.3e-8 / 8.4e-8; > 1e-3: 0 / 8192 and 17 / 73 728 — the walks follow the same paths in f32 |
+| same, a 32² crop of the face, Lambert / SSS | median 1.3e-6 / 2.7e-6; frame sum rel 3e-7 / 2.5e-4 |
+| GPU frame twice | bit-identical |
+
+### Renders and timings
+
+`examples/skin` (GPU, release, Metal, M-series; depth 5, 4 λ per path):
+
+| Frame | Size × spp | Time |
+|---|---|---|
+| `skin-head-front.png` | 1024² × 256 | 260 s (1.03 Mpaths/s) |
+| `skin-head-3q.png` | 1024² × 256 | 252 s (1.07 Mpaths/s) |
+| `skin-compare.png`, per panel: Lambert + 1 GGX / SSS + 1 GGX / SSS + 2 GGX | 512 × 640 × 256 | 0.9 s / 98 s / ≈ 100 s |
+
+SSS costs ≈ 100× the surface model: four walks per entry, ≈ 300 events each.
+
+### The fit
+
+`examples/skin_fit` (CPU f64 forward, compiled-C adjoints): the head with
+uniform chromophores, target rendered at truth `(m, h, r₁) = (0.030, 0.012,
+0.30)` at 96² × 32 spp; start `(0.090, 0.004, 0.50)` (3× melanin, ⅓ blood,
+rougher); Adam on `(ln m, ln h, r₁)`, 96² × 16 spp per gradient with
+decorrelated primal/adjoint seeds, 300 steps, cosine decay; 340 s.
+Last-10 mean: **melanin 0.0306, blood 0.0103, r₁ 0.311** — melanin and
+roughness within 4 %, blood 14 % low (its signal is the 540–580 nm band, and
+it trades against melanin there).
+
+![fit](skin-fit.png) (`skin-fit.csv`: every iteration's loss and θ.)
+
+### Deviations
+
+1. **One layer, not two.** Donner & Jensen's epidermis (melanin) over
+   dermis (blood) is folded into one bulk medium per entry point: the
+   inversion can only identify two numbers from a colour anyway, and a
+   layered walk is the position-free machinery this section did not build.
+   The chromophores are the entry texel's for the whole walk.
+2. **Diffuse transmission at the boundary**, no inner Fresnel, no rough
+   refraction — Cycles' convention, and the reason the walk's albedo has an
+   exact reference.
+3. **One wavelength per walk.** The first version walked all four hero
+   wavelengths together with spectral MIS (one-sample balance over lanes,
+   throughput-weighted): the per-event weight's variance compounds over
+   hundreds of events and the frame was chroma noise. Four separate walks
+   cost 4× the events and keep the four-wavelength colour of the direct
+   light; the indirect continuation is one wavelength.
+4. **`f` is computed in Rust f64 on the CPU**, the graphs' twins (held equal
+   to 1e-12 against the interpreter); the IR runs the adjoints. Phase 1's
+   note 5 (one eval program for `f`) is about f32 rounding between lowerings;
+   here both passes run the same Rust, and replay is bit-exact.
+5. **The GPU is forward only** and its `f` is hand-written WGSL of the same
+   formulas, not the IR's emitted kernels. The gradients are the CPU's.
+6. **Capped walks.** 3–4 % of walks on the head reach 4096 events (deep red
+   transport through the skull's volume, which is not skin anyway) and are
+   absorbed: a small darkening bias in the reds.
+7. **No eyes.** The scan's eyelids are closed; there is no socket to put an
+   eyeball in, so no sclera or cornea. Deferred to a subject with open eyes.
+8. **The normal map** bends the specular layer and the entry Fresnel only;
+   the exit lobe uses the smooth interpolated normal (the geometric normal
+   showed the facets; a bumped exit would put back the pores the medium
+   blurs).
+
+### Gaps to MetaHuman-level realism
+
+- **Hair.** None as geometry: eyebrows, lashes and stubble are paint in a
+  1K albedo, the scalp is bald. Strand hair (Marschner/d'Eon fibres, a
+  Chiang-style BCSDF) is a phase-4 item.
+- **Eyes.** Closed in the scan; no eyeball, cornea, tear line or caruncle.
+- **Maps.** 1024² colour, specular and normal. MetaHumans carry 4–8K
+  albedo, cavity, roughness and per-region normal maps plus animated
+  wrinkle maps; here the pores are a few texels wide.
+- **No displacement.** 17.7 k triangles; silhouettes (ears, nostrils, lips)
+  are polygonal and all fine detail is the normal map.
+- **No measured SSS maps.** Chromophores come from inverting an albedo that
+  has lighting and occlusion baked in; there is no measured scatter radius,
+  no spatially varying density, no epidermis/dermis split, no
+  hemoglobin-oxygenation map, no peach fuzz / sheen.
+- **No mouth interior, teeth, or neck/shoulder cloth**, and the bust's
+  bottom is open (walks that leave through it are lost — rare).
+- **Lighting** is three analytic quads and a gradient, not a captured HDRI
+  stage; there is no denoiser, and 256 spp still shows SSS grain in the
+  shadows.
+
+### Risks and next
+
+1. **Walk cost** dominates (≈ 300 events per walk, four walks per entry). A
+   majorant/null-collision walk over a coarse density grid, or a
+   diffusion-guided exit (Křivánek & d'Eon's zero-variance walks), would
+   cut it; so would path guiding at the exit (the phase-3 branch's work).
+2. **Position-free layering** (the design's flagged risk) is now shown
+   safe for a random walk of random length: replay re-consumes the stream
+   identically. A layered OpenPBR slab is the same machinery with more than
+   one medium.
+3. **GPU gradients.** The megakernel is forward-only; the walk's adjoint
+   reduces per walk, so a device replay needs only one record per walk per
+   lane — the wavefront's reduction scheme applies directly.
+4. **Fit from a photo** needs a camera and lighting fit first (phases 2d–2f
+   have both), and the albedo's baked lighting separated from the
+   chromophores.

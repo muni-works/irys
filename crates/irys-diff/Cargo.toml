@@ -23,9 +23,15 @@ libloading = "0.8"
 irys-gpu = { workspace = true, optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 pollster = { version = "0.4", optional = true }
+# Skin: the glTF head and its JPEG maps (`skin::mesh::load`). Optional, so
+# the kernel crates never decode an asset.
+gltf = { version = "1.4", default-features = false, features = ["utils"], optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+rayon = { workspace = true }
 
 [features]
 gpu = ["dep:irys-gpu", "dep:bytemuck", "dep:pollster"]
+assets = ["dep:gltf", "dep:image"]
 
 [[example]]
 name = "fit_gpu"
@@ -58,3 +64,11 @@ required-features = ["gpu"]
 [[example]]
 name = "rose_fit"
 required-features = ["gpu"]
+
+[[example]]
+name = "skin"
+required-features = ["gpu", "assets"]
+
+[[example]]
+name = "skin_fit"
+required-features = ["assets"]
