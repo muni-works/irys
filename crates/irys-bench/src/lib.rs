@@ -147,6 +147,115 @@ pub fn export(scene: &Scene, theta: &[f64; PARAMS], name: &str) -> Value {
     })
 }
 
+/// [`export`] for a scene too large to flatten (phase 5a's imports): each
+/// bottom-level tree's triangles once, in its own frame, to
+/// `<dir>/meshes.f32` (f32 xyz per corner), and per placement its tree, its
+/// object → world matrix (row-major) and its material, so Cycles instances
+/// them as irys does. Everything else as [`export`].
+pub fn export_instanced(scene: &Scene, theta: &[f64; PARAMS], name: &str, dir: &Path) -> Value {
+    let mut bin: Vec<u8> = Vec::new();
+    let mut meshes = Vec::new();
+    for t in scene.blas() {
+        let o = t.geometry();
+        let m = o.mesh();
+        let start = bin.len() / 12;
+        for tri in m.triangles() {
+            for &k in tri {
+                let p = m.positions()[k as usize];
+                for c in [p.x, p.y, p.z] {
+                    bin.extend((c as f32).to_le_bytes());
+                }
+            }
+        }
+        meshes.push(json!({"offset": start, "corners": bin.len() / 12 - start}));
+    }
+    fs::write(dir.join("meshes.f32"), &bin).unwrap();
+    let mut objects = Vec::new();
+    for p in scene.placements() {
+        let o = scene.blas()[p.blas].geometry();
+        let material = material_of(scene, theta, p, o.surface(0));
+        let t = &p.to_world;
+        let z = t.apply_point(&irys_core::Point3::new(0.0, 0.0, 0.0));
+        let cols: Vec<irys_core::Vec3> = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+            .iter()
+            .map(|e| t.apply_point(&irys_core::Point3::new(e[0], e[1], e[2])) - z)
+            .collect();
+        let m = [
+            cols[0].x, cols[1].x, cols[2].x, z.x, cols[0].y, cols[1].y, cols[2].y, z.y, cols[0].z,
+            cols[1].z, cols[2].z, z.z,
+        ];
+        objects.push(json!({"mesh": p.blas, "matrix": m, "material": material}));
+    }
+    let mut v = export_head(scene, name);
+    // The sun as a Cycles sun lamp of the same irradiance and solid angle
+    // (irys's vMF lobe has 2π/κ sr): Cycles samples a lamp exactly, but a
+    // lobe a few texels wide in its world map poorly, and the benchmark is
+    // of the renderers, not of that map.
+    let e = scene.env;
+    if e.sun_radiance > 0.0 {
+        v["sun_lamp"] = json!({
+            "irradiance": e.sun_radiance * 2.0 * std::f64::consts::PI / e.kappa,
+            "radius": (2.0 / e.kappa).sqrt(),
+        });
+    }
+    v["meshes"] = json!(meshes);
+    v["objects"] = json!(objects);
+    v
+}
+
+fn material_of(
+    scene: &Scene,
+    theta: &[f64; PARAMS],
+    p: &irys_diff::prb::Placement,
+    surf: irys_diff::prb::Surface,
+) -> Value {
+    match surf {
+        irys_diff::prb::Surface::Conductor => json!({
+            "kind": "conductor",
+            "f0": f0_rgb(theta),
+            "roughness": theta[0].sqrt(),
+        }),
+        irys_diff::prb::Surface::Diffuse => {
+            let checker = if p.checker { scene.floor_checker } else { None };
+            json!({
+                "kind": "diffuse",
+                "albedo": scene.floor_albedo * p.albedo,
+                "checker": checker,
+                "checker_dark": CHECKER_DARK,
+            })
+        }
+        irys_diff::prb::Surface::Emitter => {
+            let e = scene.emission;
+            json!({"kind": "emitter", "radiance": [e, e, e]})
+        }
+    }
+}
+
+fn export_head(scene: &Scene, name: &str) -> Value {
+    let (eye, fwd, right, up, tan_half) = scene.camera();
+    let e = scene.env;
+    let tint = spectrum_rgb(|l| 1.0 + 0.4 * (550.0 - l) / 200.0);
+    json!({
+        "name": name,
+        "size": [scene.size.0, scene.size.1],
+        "depth": scene.depth,
+        "camera": {
+            "eye": [eye.x, eye.y, eye.z],
+            "forward": [fwd.x, fwd.y, fwd.z],
+            "right": [right.x, right.y, right.z],
+            "up": [up.x, up.y, up.z],
+            "tan_half": tan_half,
+        },
+        "env": {
+            "sun": [e.sun.x, e.sun.y, e.sun.z],
+            "kappa": e.kappa,
+            "sun_radiance": e.sun_radiance,
+            "sky": e.sky,
+            "sky_tint_rgb": tint,
+        },
+    })
+}
+
 /// Raw little-endian f32, `w·h·3`, rows top to bottom.
 pub fn write_f32(path: &Path, img: &[f32]) {
     let bytes: Vec<u8> = img.iter().flat_map(|v| v.to_le_bytes()).collect();

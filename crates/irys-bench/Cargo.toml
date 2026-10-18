@@ -14,6 +14,6 @@ irys-core.workspace = true
 irys-light.workspace = true
 irys-prims.workspace = true
 irys-gpu.workspace = true
-irys-diff = { path = "../irys-diff", features = ["gpu"] }
+irys-diff = { path = "../irys-diff", features = ["gpu", "assets"] }
 serde_json = "1"
 png = "0.18"
