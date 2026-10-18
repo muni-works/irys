@@ -322,7 +322,7 @@ fn report(a: &Args, out: &Path) {
             .map(|v| curve(&read_json(&dir.join(format!("irys_{v}.json")))))
             .collect();
         for r in &ccurve {
-            println!("{name} cycles: {:5} spp {:8.4} s relMSE {:.5}", r.2, r.0, r.1);
+            println!("{name} cycles: {:5} spp {:8.4} s relMSE {:.3e}", r.2, r.0, r.1);
         }
         let (mc, mi) = (mean_rgb(&cref), mean_rgb(&iref));
         let cross = relmse(&iref, &cref);
