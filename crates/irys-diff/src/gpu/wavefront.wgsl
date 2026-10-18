@@ -108,7 +108,8 @@ struct Path {
 // (v1, 0), (v2, 0) — the cumulative area share light sampling picks by.
 @group(0) @binding(40) var<storage, read> lights: array<vec4<f32>>;
 // Phase 3 sampler (`qmc.rs`): Sobol's four direction matrices (32 words
-// each), then the wavelength CDF's 257 f32s as bits.
+// each; the device reads dimensions 1–3 from the `SOBOL` constant instead),
+// then the wavelength CDF's 257 f32s as bits.
 @group(0) @binding(56) var<storage, read> qtab: array<u32>;
 
 const PI: f32 = 3.14159265358979;
@@ -781,14 +782,20 @@ fn owen(x0: u32, seed: u32) -> u32 {
     return reverseBits(x);
 }
 
+// Sobol dimension d of index i. Dimension 0 is van der Corput (the bits
+// reversed); the others XOR the columns of `SOBOL` (a module constant the
+// host splices in from `qmc::sobol_matrices`) for the index's set bits.
 fn sobol(i: u32, d: u32) -> u32 {
+    if (d == 0u) {
+        return reverseBits(i);
+    }
     var x = 0u;
     var b = i;
-    var k = 0u;
+    var k = (d - 1u) * 32u;
     loop {
         if (b == 0u) { break; }
         if ((b & 1u) != 0u) {
-            x = x ^ qtab[d * 32u + k];
+            x = x ^ SOBOL[k];
         }
         b = b >> 1u;
         k = k + 1u;

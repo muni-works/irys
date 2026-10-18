@@ -44,6 +44,14 @@ const WAVEFRONT: &str = include_str!("gpu/wavefront.wgsl");
 const EDGES: &str = include_str!("gpu/edges.wgsl");
 const RESTIR: &str = include_str!("gpu/restir.wgsl");
 const GUIDE: &str = include_str!("gpu/guide.wgsl");
+
+/// `qmc::sobol_matrices` dimensions 1–3 as a WGSL module constant, so the
+/// device's direction numbers are the CPU's by construction.
+fn sobol_const() -> String {
+    let m = crate::qmc::sobol_matrices();
+    let words: Vec<String> = m[1..].iter().flatten().map(|w| format!("{w}u")).collect();
+    format!("const SOBOL = array<u32, 96>({});\n", words.join(", "))
+}
 const PATH_BYTES: u64 = 128;
 const WG: u32 = 64;
 
@@ -616,7 +624,7 @@ impl GpuPrb {
 
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("prb wavefront"),
-            source: wgpu::ShaderSource::Wgsl(format!("{WAVEFRONT}\n{RESTIR}\n{GUIDE}").into()),
+            source: wgpu::ShaderSource::Wgsl(format!("{WAVEFRONT}\n{RESTIR}\n{GUIDE}\n{}", sobol_const()).into()),
         });
         let pipe = |entry: &str| {
             dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -666,7 +674,6 @@ impl GpuPrb {
             (25, &geo),
             (40, &lights),
             (43, &r_a),
-            (56, &qtab),
             (51, &g_cdf),
             (52, &g_ok),
             (53, &g_rec),
@@ -1451,7 +1458,7 @@ impl GpuEdges {
         };
         let ep = uni("edge params", std::mem::size_of::<EdgeParams>() as u64);
         let params = uni("edge scene params", std::mem::size_of::<Params>() as u64);
-        let src = format!("{WAVEFRONT}\n{RESTIR}\n{GUIDE}\n{EDGES}");
+        let src = format!("{WAVEFRONT}\n{RESTIR}\n{GUIDE}\n{EDGES}\n{}", sobol_const());
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("edges"),
             source: wgpu::ShaderSource::Wgsl(src.into()),
