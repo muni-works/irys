@@ -2495,3 +2495,138 @@ work.
   Metal.
 - **The tables are built per process (≈ 1 s) and are not shared with the
   device.** A device integrator would upload them as textures.
+
+## Phase 4b: closing the look's gaps (2026-10-18)
+
+Four pieces, each its own commit. Coat darkening stays **on** by default, as
+the spec says; Blender comparisons set `coat_darkening = 0`.
+
+![sweep](look-openpbr-sweep.png)
+
+### Match vs Cycles, before → after
+
+| Row | Phase 4 | Phase 4b |
+|---|---|---|
+| fuzz weight 0 … 1 | +1.5 … +17.1 % | **+1.5 … +2.4 %** |
+| subsurface weight 0 … 1 | +0.5 … +13.5 % | **−0.3 … +0.4 %** (Cycles mode) |
+| every other row | unchanged | unchanged (`look-openpbr-match.csv`) |
+
+- **Fuzz** (`look::sheen`): Zeltner, Burley & Chiang 2022's LTC microfibre
+  sheen, the model the spec recommends. The `(a, b, R)` fit is Cycles'
+  `table_sheen_ltc` (Blender v4.4.3, Apache-2.0), read the way Cycles reads
+  it, so the lobe is Principled sheen by construction. `R(μ_o, r)` is the
+  layer albedo used by albedo scaling, and it needs no normaliser. The
+  remaining +1.5 % is the base's own offset (it is there at weight 0).
+- **Subsurface** (`SubsurfaceMode::Cycles`, next to the default `Physical`):
+  Blender 4.4's `Random Walk`, read from `bssrdf.h`, `subsurface.h` and
+  `subsurface_random_walk.h`. The mean free path is `radius·scale/4π`,
+  `σ_t = 1/(d(1−g))`, and the albedo comes from Chiang+ 2016's fit with its
+  0.2 floor. Entry is a GGX refraction at `(r², IOR)` with no Fresnel
+  weight; the exit is diffuse. The +13.5 % in phase 4 came almost entirely
+  from the mean free path, which is 4π× shorter in Cycles. New gate: the
+  fit, walked on a half-space with diffuse entry, returns the colour
+  (±0.015; at 0.95 the fit saturates, as in Cycles). The skin's spectral
+  walk is untouched.
+
+### Volumes
+
+The phase-4 volume did run at 0.06 Mpaths/s, but the cause was not the
+majorant. `Track::new` scanned the 96³ grid for its maximum on every path.
+`Grid::max` is now computed once. On top of that, `Medium::with_majorant_grid(r)`
+tracks against per-supervoxel majorants: the maximum any trilinear lookup
+inside the supervoxel can return, with a floor where there is emission. It
+spends one Exp(1) optical depth across supervoxels. Each event lane carries
+its local majorant, so PRB is unchanged.
+
+| look-volume (M-series, loaded machine) | Mpaths/s |
+|---|---|
+| phase 4 | 0.06 |
+| max cached, global majorant | 7.3 |
+| 4³ / 8³ / 16³ majorant grid | 9.2 / 9.2 / 8.0 |
+
+On this dense smoke the grid only gains about 1.25×: the mean supervoxel
+majorant is 0.41 of the global one at 8³, and the DDA's per-cell cost eats
+the rest. A sparser medium gains more. New gates: grid frame vs global
+frame (+0.66 σ at 8³), grid PRB vs central differences (≤ 5e-9), and grid
+heterogeneous transmittance. `look-volume.png` is now 960×600 × 1024 spp in
+70 s. **Not ported to the GPU.** The CPU now meets the "clean frame under a
+minute" goal at the original 480×300 size (≈ 17 s). A device port would
+need the hat lift and `Rng` in WGSL, as hair has now.
+
+### Hair on the GPU
+
+wgpu 30's Metal ray queries are triangles only, so I measured both options
+on `look_hair`'s brown cut (126 k segments, 280×360, depth 24;
+`examples/look_hair_gpu`):
+
+| Primitive | Prims | Primary Mrays/s | Same fibre as CPU | Converged frame mean vs CPU | Paths Mpaths/s |
+|---|---|---|---|---|---|
+| **Cylinders** (AABB + exact intersection in the query) | 126 k | 71 | **1.0000** | +0.25 % (noise) | 4.8 |
+| tubes, 3 sides | 756 k | 539 | 0.944 | +2.1 % | 31.9 |
+| tubes, 4 sides | 1.0 M | 549 | 0.973 | −1.5 % | 29.8 |
+| tubes, 6 sides | 1.5 M | 472 | 0.983 | −1.4 % | 27.2 |
+| tubes, 8 sides | 2.0 M | 493 | 0.990 | −2.3 % | 25.4 |
+
+(CPU f64 reference: 0.48–0.75 Mpaths/s.) **I chose cylinders.** They are
+the CPU's round fibre exactly: same fibre on every primary ray, `|Δh|`
+1.5e-5, shadow rays 0/5536 disagree. The device kernel walks the CPU's
+paths: at depth 2, 98 % agree per path and the frame sum agrees to 5e-4;
+at depth 10, 87 % agree and the frame sum agrees to 1.1e-4. That keeps
+the GPU-vs-CPU invariant. Tubes are 5–7× faster but they are a different
+fibre: the frame is biased 1.4–2.3 % and `h` is off by 0.03–0.07, which
+moves the azimuthal lobes. They are also not needed on the head, where
+the skin's walks dominate (below). Tubes remain available as `StrandPrim::Tubes(n)`.
+
+Two f32 details: a ray leaving through its own fibre starts on that fibre's
+surface, so roots within 1e-2 r are rejected (f64 gets this right at 1e-7).
+A shadow query must return at the first generated hit, because a generated
+intersection is committed only by the next `rayQueryProceed`.
+
+### Strands on the head
+
+![front](look2-head-hair-front.png)
+
+![three-quarter](look2-head-hair-3q.png)
+
+`skin::groom` draws roots area-uniformly on the scan:
+
+- **Scalp**: above a soft, azimuth-dependent hairline, ears excluded,
+  combed away from the crown and clumped onto guides on a 0.08-unit grid.
+  191 k strands, 5 segments each, 4.5–8 mm long.
+- **Eyebrows**: where the painted brows are, from a blurred albedo map.
+  1.7 k strands.
+- **Stubble**: jaw, chin, upper lip and neck, with density from the painted
+  stubble and a floor. 50 k strands, 0.75–2 mm.
+
+That is 1.06 M segments, grown in 0.5 s, with the BLAS built in 0.05 s.
+Melanin is θ = (5, 0.4) with a scale per region. `GpuSkin::with_strands`
+takes the nearest of skin and fibre per ray, evaluates Chiang's BCSDF at a
+fibre per hero wavelength (lobes picked by the lanes' mean `A_p`), and
+includes fibres in every shadow test, the SSS exits' too. The walks see
+only the skin. Without strands the kernel is bit-identical to before. A
+test checks that far-away strands leave every lane unchanged and that near
+strands darken the frame deterministically.
+
+| 1024² × 256 spp, depth 5 | With hair | Skin only |
+|---|---|---|
+| front | 220 s (1.22 Mpaths/s) | 204 s |
+| three-quarter | 241 s (1.11 Mpaths/s) | 224 s |
+
+### Deviations and risks
+
+1. The sheen table is Cycles' copy of the paper's fit. The paper's own
+   data was not imported separately.
+2. Cycles mode is only for comparisons. The physical (spec) mode stays the
+   default, and the two differ by ≈ 13 % on the swatch.
+3. The majorant grid helps sparse media. This smoke is not sparse.
+4. Hair in the skin kernel is **forward only** and GPU only. The CPU skin
+   integrator has no strands, so the head's hair has no gradient or CPU
+   reference; only the HairScene kernel is checked per path against the
+   CPU. The four-wavelength lobe choice (mean `A_p`) is the skin kernel's
+   own convention.
+5. The groom is procedural: regions are hand-set heights and azimuths on
+   this scan, the painted brows and stubble stay in the albedo under the
+   fibres, there are no eyelashes, and fibre radii (55–65 µm) are a little
+   thick so they read at 1024².
+6. Per-path GPU/CPU agreement falls with hair depth: f32 rounding moves
+   lobe choices, while the frames still agree.
