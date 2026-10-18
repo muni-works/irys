@@ -125,7 +125,9 @@ pub fn blobs(fit: &Fit, setup: &Setup) -> Vec<Blob> {
         let rb = fit::blur(&fit.residual[vi], (w, ht), 1, 1.0);
         let mut top: Vec<Option<(f64, f64)>> = vec![None; w * ht];
         for p in 0..w * ht {
-            if rb[p].abs() < 4.0 {
+            // Blurred by σ = 1 px, the noise's std is ≈ 0.28 of the
+            // unblurred one: 2 is ≈ 7 of its σ.
+            if rb[p].abs() < 2.0 {
                 continue;
             }
             let s = sc.screen((p % w) as f64 + 0.5, (p / w) as f64 + 0.5);
@@ -160,7 +162,7 @@ pub fn blobs(fit: &Fit, setup: &Setup) -> Vec<Blob> {
                     }
                 }
             }
-            if pts.len() >= 8 {
+            if pts.len() >= 4 {
                 per_view.push((pts, vi));
             }
         }
@@ -268,7 +270,10 @@ fn near_existing(p: &Program, x: f64, y: f64) -> bool {
 impl Algorithmic {
     fn adds(&self, ctx: &Context, all: &[Blob], out: &mut Vec<Proposal>) {
         let p = &ctx.fit.prog;
-        let bl: Vec<Blob> = all.iter().filter(|b| !near_existing(p, b.x, b.y)).cloned().collect();
+        // Blobs at the outline are the corner finish or a side misfit, not a
+        // feature (features keep a margin from the edge).
+        let inside = |b: &Blob| b.x.abs() < p.w / 2.0 - 2.5 && b.y.abs() < p.d / 2.0 - 2.5;
+        let bl: Vec<Blob> = all.iter().filter(|b| !near_existing(p, b.x, b.y) && inside(b)).cloned().collect();
         if std::env::var("RECON_DEBUG").is_ok() {
             let mx: Vec<f64> = ctx.fit.residual.iter().map(|r| r.iter().fold(0.0f64, |m, x| m.max(x.abs()))).collect();
             eprintln!("blobs {:?} max|r| {mx:?}", bl);
@@ -278,7 +283,7 @@ impl Algorithmic {
             q.features.push(f);
             q
         };
-        for (bi, b) in bl.iter().take(3).enumerate() {
+        for (bi, b) in bl.iter().take(6).enumerate() {
             let (x, y, r) = (b.x, b.y, b.r.clamp(1.0, 15.0));
             out.push(Proposal { program: with(Feature::Hole { x, y, r }), why: format!("hole at blob ({x:.1}, {y:.1}) r {r:.1}"), group: Some(bi) });
             if b.half_len > 1.5 * b.r {
@@ -317,6 +322,10 @@ impl Algorithmic {
             if same.len() >= 3 {
                 if let Some(c) = force_circular(&same) {
                     out.push(Proposal { program: with(c), why: format!("circular pattern through {} blobs", same.len()), group: None });
+                }
+                for c in circular_supersets(&same) {
+                    let Feature::CircularHoles { n, .. } = c else { unreachable!() };
+                    out.push(Proposal { program: with(c), why: format!("circular ×{n} through {} blobs", same.len()), group: None });
                 }
             }
             if same.len() >= 2 {
@@ -434,6 +443,13 @@ impl Algorithmic {
             let hs: Vec<(f64, f64, f64)> = holes.iter().map(|h| h.1).collect();
             let rest = |q: &mut Program| q.features.retain(|f| !matches!(f, Feature::Hole { .. }));
             if hs.len() >= 3 {
+                for c in circular_supersets(&hs) {
+                    let Feature::CircularHoles { n, .. } = c else { unreachable!() };
+                    let mut q = p.clone();
+                    rest(&mut q);
+                    q.features.push(c);
+                    out.push(Proposal { program: q, why: format!("merge {} holes → circular ×{n}", hs.len()), group: None });
+                }
                 if let Some(c) = force_circular(&hs) {
                     let mut q = p.clone();
                     rest(&mut q);
@@ -455,6 +471,36 @@ impl Algorithmic {
             out.push(Proposal { program: canon, why: "canonical form".into(), group: None });
         }
     }
+}
+
+/// Circular patterns of `n ≥ k` holes of which `holes` (`k ≥ 3`) are
+/// members: the circle through them, every hole within 6° of a slot of
+/// `360/n`. Finds a pattern whose other holes the blobs missed.
+pub fn circular_supersets(holes: &[(f64, f64, f64)]) -> Vec<Feature> {
+    let k = holes.len();
+    if k < 3 {
+        return Vec::new();
+    }
+    let pts: Vec<(f64, f64)> = holes.iter().map(|h| (h.0, h.1)).collect();
+    let (cx, cy, rad, rms) = canon::circle(&pts);
+    if !(rms < 1.5 && rad > 2.0) {
+        return Vec::new();
+    }
+    let r = holes.iter().map(|h| h.2).sum::<f64>() / k as f64;
+    let ang: Vec<f64> = pts.iter().map(|p| (p.1 - cy).atan2(p.0 - cx).to_degrees()).collect();
+    let mut out = Vec::new();
+    for n in k + 1..=(k + 3).min(8) {
+        let step = 360.0 / n as f64;
+        let phase = ang[0].rem_euclid(step);
+        let ok = ang.iter().all(|a| {
+            let d = (a - phase).rem_euclid(step);
+            d.min(step - d) < 6.0
+        });
+        if ok {
+            out.push(Feature::CircularHoles { x: cx, y: cy, rad, phase, r, n });
+        }
+    }
+    out
 }
 
 /// A circular pattern through `holes` whatever the spacing error.
@@ -781,7 +827,7 @@ pub fn degenerate(p: &Program) -> Option<&'static str> {
         match *f {
             Feature::Slot { len, .. } if len < 1.5 => return Some("slot shorter than 1.5 mm"),
             Feature::Boss { bh, .. } if bh < 0.8 => return Some("boss under 0.8 mm"),
-            Feature::Counterbore { r, cr, cd, .. } if cr - r < 1.0 || cd < 0.8 || cd > p.h - 1.2 => {
+            Feature::Counterbore { r, cr, cd, .. } if r < 0.8 || cr - r < 0.4 || cd < 0.8 || cd > p.h - 1.2 => {
                 return Some("counterbore without a step");
             }
             _ => {}

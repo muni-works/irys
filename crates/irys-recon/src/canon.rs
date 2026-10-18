@@ -48,7 +48,7 @@ fn normalise(f: &Feature) -> Feature {
 }
 
 /// Least-squares circle through points: `(cx, cy, rad, rms)`.
-fn circle(p: &[(f64, f64)]) -> (f64, f64, f64, f64) {
+pub fn circle(p: &[(f64, f64)]) -> (f64, f64, f64, f64) {
     // Kåsa: x² + y² = 2ax + 2by + c.
     let n = p.len() as f64;
     let (mut sxx, mut sxy, mut syy, mut sx, mut sy, mut sxz, mut syz, mut sz) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);

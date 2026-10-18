@@ -45,6 +45,9 @@ pub struct Eval {
     pub tris: usize,
 }
 
+/// Step of the forward differences for occluded parameters, mm.
+pub const FD_STEP: f64 = 0.25;
+
 /// Kernel caches, one per view (each view renders on its own thread).
 pub struct Renderer {
     caches: Vec<KernelCache>,
@@ -90,6 +93,24 @@ impl Renderer {
             e.cov.push(c);
             if let (Some(v), Some(j)) = (e.jac.as_mut(), j) {
                 v.push(j);
+            }
+        }
+        // Columns the edge term cannot carry (see [`Program::occluded_params`]):
+        // forward differences of the image at the same seeds.
+        if jac {
+            for j in prog.occluded_params() {
+                let mut th = prog.params();
+                let h = FD_STEP;
+                th[j] += h;
+                let mut q = prog.clone();
+                q.set_params(&th);
+                let Ok(ep) = self.eval(&q, setup, false) else { continue };
+                let jv = e.jac.as_mut().unwrap();
+                for (v, view) in jv.iter_mut().enumerate() {
+                    for px in 0..e.img[v].len() {
+                        view.img[px * np + j] = (ep.img[v][px] - e.img[v][px]) / h;
+                    }
+                }
             }
         }
         Ok(e)

@@ -2,8 +2,8 @@
 //!
 //! ```text
 //! MDL(program, θ̂) = ½ Σ r²                         residual, nats (σ_n known; constant dropped)
-//!                 + Σ log range_i + ½ log det F − (k/2) log 2π    parameter cost (Laplace, uniform prior)
-//!                 − log p(program)                  grammar prior
+//!                 + Σ_eig max(0, ½ log(λ(R F R) / 2π))   parameter cost (Laplace, uniform prior, ranges R)
+//!                 − log p(program) + k               grammar prior, one nat per parameter
 //! ```
 //!
 //! `F = JᵀJ / σ_n²` is the Gauss–Newton Fisher information of the image
@@ -44,19 +44,31 @@ pub struct Score {
     pub total: f64,
 }
 
-/// `log det` of an SPD matrix via its eigenvalues (floored).
-fn logdet(a: &[f64], n: usize) -> f64 {
-    let (ev, _) = eigh(a, n);
-    ev.iter().map(|&e| e.max(1e-12).ln()).sum()
-}
+/// Each continuous parameter's floor in the program length: writing a
+/// number down costs something even when the photo pins it for free, and
+/// without it an extra parameter the photo cannot see is a free lunch.
+pub const NATS_PER_PARAM: f64 = 1.0;
 
 /// Score a fit.
+///
+/// The parameter cost is the Laplace term whitened by the prior ranges
+/// `R`: per eigen-direction `λ` of `R F R`, `max(0, ½ log(λ / 2π))` — the
+/// nats it takes to state that direction to the precision the photo gives,
+/// and nothing for a direction the photo does not determine (the posterior
+/// there is the prior). The bare `½ log det F` would instead *reward* an
+/// unidentifiable parameter with `−∞`.
 pub fn score(fit: &Fit) -> Score {
     let info = fit.prog.param_info();
     let k = info.len();
-    let ranges: f64 = info.iter().map(|i| i.range.ln()).sum();
-    let params = ranges + 0.5 * logdet(&fit.fisher, k) - 0.5 * k as f64 * std::f64::consts::TAU.ln();
-    let program = program_length(&fit.prog);
+    let mut w = fit.fisher.clone();
+    for i in 0..k {
+        for j in 0..k {
+            w[i * k + j] *= info[i].range * info[j].range;
+        }
+    }
+    let (ev, _) = eigh(&w, k);
+    let params: f64 = ev.iter().map(|&l| (0.5 * (l / std::f64::consts::TAU).max(1e-300).ln()).max(0.0)).sum();
+    let program = program_length(&fit.prog) + NATS_PER_PARAM * k as f64;
     Score { residual: fit.nll, params, program, total: fit.nll + params + program }
 }
 

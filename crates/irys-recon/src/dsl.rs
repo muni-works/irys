@@ -264,6 +264,25 @@ impl Program {
         }
     }
 
+    /// Parameters whose image derivative is mostly not on primary edges:
+    /// a counterbore's depth and its inner hole's radius change what the
+    /// bore's floor and the hole below it see of the sky (occlusion — the
+    /// secondary visibility and interior terms), which the primary edge
+    /// term leaves out; its column there has the wrong sign. Their columns
+    /// are forward differences instead ([`crate::model::Renderer::eval`]).
+    pub fn occluded_params(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut j = 3 + matches!(self.corner, Corner::Fillet(_) | Corner::Chamfer(_)) as usize;
+        for f in &self.features {
+            if let Feature::Counterbore { .. } = f {
+                out.push(j + 2);
+                out.push(j + 4);
+            }
+            j += f.params().len();
+        }
+        out
+    }
+
     /// Descriptions of [`Program::params`], with fit bounds that keep the
     /// program valid where that is a box constraint.
     pub fn param_info(&self) -> Vec<ParamInfo> {
@@ -327,7 +346,7 @@ impl Program {
         for f in &self.features {
             match *f {
                 Feature::Counterbore { r, cr, cd, .. } => {
-                    if !(cr > r + 0.8 && cd > 0.5 && cd < h - 1.0) {
+                    if !(cr > r + 0.3 && cd > 0.5 && cd < h - 1.0) {
                         return false;
                     }
                 }

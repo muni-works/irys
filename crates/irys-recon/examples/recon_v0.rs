@@ -10,8 +10,10 @@ use std::{fs, io::Write, path::PathBuf};
 
 use irys_recon::{canon, dsl::Program, fit::Target, generate, model::*, render, search::*};
 
-/// The gate set: seeds 1000..1020. The dev set (used while building) is 0..100.
-const GATE: std::ops::Range<u64> = 1000..1020;
+/// The gate set: seeds 2000..2020, run once the solver was frozen. The dev
+/// set used while building it is 0..100 and 1000..1003 (1000..1020 was the
+/// first gate set; two of its failures were looked at, so it became dev).
+const GATE: std::ops::Range<u64> = 2000..2020;
 const TARGET_SPP: usize = 64;
 const TOL_MM: f64 = 0.5;
 
