@@ -1,0 +1,23 @@
+[package]
+name = "irys-recon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "irys: image to CAD, v0 — recover a vcad program and its dimensions from irys renders"
+publish = false
+
+[dependencies]
+irys-core.workspace = true
+irys-prims.workspace = true
+irys-light.workspace = true
+irys-diff = { path = "../irys-diff", features = ["assets"] }
+vcad-kernel = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[example]]
+name = "recon_v0"
