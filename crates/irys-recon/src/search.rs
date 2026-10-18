@@ -58,6 +58,12 @@ pub struct Proposal {
     pub program: Program,
     /// One line.
     pub why: String,
+    /// For a proposal that adds one feature for one piece of evidence
+    /// (a residual blob): that evidence's id. The driver combines the best
+    /// interpretation of each piece of evidence into one more candidate,
+    /// so a greedy round cannot lock in a joint explanation that is wrong
+    /// for one of them.
+    pub group: Option<usize>,
 }
 
 /// Proposes program edits.
@@ -96,6 +102,9 @@ pub struct Blob {
     pub angle: f64,
     /// Pixels (summed over views).
     pub pixels: usize,
+    /// A raised feature's centre and height from the blob's parallax
+    /// across views, `(x, y, height)`, when two or more views saw it.
+    pub raised: Option<(f64, f64, f64)>,
 }
 
 /// Where the model's top face disagrees with the target: per view, pixels
@@ -108,9 +117,11 @@ pub fn blobs(fit: &Fit, setup: &Setup) -> Vec<Blob> {
     let h = fit.prog.h;
     let (w, ht) = setup.film.size;
     let mut per_view: Vec<(Vec<(f64, f64)>, usize)> = Vec::new();
+    let mut eyes = Vec::new();
     for (vi, v) in setup.views.iter().enumerate() {
         let sc = render::scene(Some(&mesh), v, setup.film);
         let (eye, f, rt, up, _) = sc.camera();
+        eyes.push(eye);
         let rb = fit::blur(&fit.residual[vi], (w, ht), 1, 1.0);
         let mut top: Vec<Option<(f64, f64)>> = vec![None; w * ht];
         for p in 0..w * ht {
@@ -155,19 +166,63 @@ pub fn blobs(fit: &Fit, setup: &Setup) -> Vec<Blob> {
         }
     }
     // One blob per component, then merge across views by centre distance.
-    let mut out: Vec<(Blob, Vec<(f64, f64)>)> = Vec::new();
-    for (pts, _) in per_view {
+    let mut out: Vec<(Blob, Vec<(f64, f64)>, Vec<(usize, f64, f64)>)> = Vec::new();
+    for (pts, vi) in per_view {
         let b = describe(&pts);
-        if let Some((m, mp)) = out.iter_mut().find(|(m, _)| (m.x - b.x).hypot(m.y - b.y) < (m.r.max(b.r) + 1.0)) {
+        let c = (vi, b.x, b.y);
+        if let Some((m, mp, cs)) = out.iter_mut().find(|(m, ..)| (m.x - b.x).hypot(m.y - b.y) < (m.r.max(b.r) + 1.0)) {
             mp.extend(pts);
+            cs.push(c);
             *m = describe(mp);
         } else {
-            out.push((b, pts));
+            out.push((b, pts, vec![c]));
         }
     }
-    let mut v: Vec<Blob> = out.into_iter().map(|(b, _)| b).collect();
+    let mut v: Vec<Blob> = out
+        .into_iter()
+        .map(|(mut b, _, cs)| {
+            b.raised = parallax(&cs, &eyes, h);
+            b
+        })
+        .collect();
     v.sort_by(|a, b| b.pixels.cmp(&a.pixels).then(a.x.total_cmp(&b.x)));
     v
+}
+
+/// A raised cylinder's footprint on `z = h`, seen from eye `e`, is the hull
+/// of its base disc at `p` and its top disc pushed by `bh · t` (`t` the
+/// view ray's horizontal run per unit drop), so its centroid is about
+/// `p + (bh/2) t`. Least squares over the views for `(p, bh)`.
+fn parallax(cs: &[(usize, f64, f64)], eyes: &[Point3], h: f64) -> Option<(f64, f64, f64)> {
+    let mut seen: Vec<usize> = cs.iter().map(|c| c.0).collect();
+    seen.dedup();
+    if seen.len() < 2 {
+        return None;
+    }
+    // Unknowns (px, py, β): c = p + β t.
+    let mut a = [[0.0; 3]; 3];
+    let mut b = [0.0; 3];
+    for &(vi, cx, cy) in cs {
+        let e = eyes[vi];
+        let d = Vec3::new(cx - e.x, cy - e.y, h - e.z);
+        if d.z >= -1e-6 {
+            continue;
+        }
+        let t = [d.x / -d.z, d.y / -d.z];
+        let rows = [([1.0, 0.0, t[0]], cx), ([0.0, 1.0, t[1]], cy)];
+        for (r, y) in rows {
+            for i in 0..3 {
+                b[i] += r[i] * y;
+                for j in 0..3 {
+                    a[i][j] += r[i] * r[j];
+                }
+            }
+        }
+    }
+    let m: Vec<f64> = a.iter().flatten().copied().collect();
+    let x = fit::solve(&m, &b, 3)?;
+    let bh = 2.0 * x[2];
+    (bh > 1.0 && bh < 40.0).then_some((x[0], x[1], bh))
 }
 
 fn describe(pts: &[(f64, f64)]) -> Blob {
@@ -198,6 +253,7 @@ fn describe(pts: &[(f64, f64)]) -> Blob {
         half_len: major.max(0.5),
         angle: th,
         pixels: pts.len(),
+        raised: None,
     }
 }
 
@@ -210,9 +266,9 @@ fn near_existing(p: &Program, x: f64, y: f64) -> bool {
 }
 
 impl Algorithmic {
-    fn adds(&self, ctx: &Context, out: &mut Vec<Proposal>) {
+    fn adds(&self, ctx: &Context, all: &[Blob], out: &mut Vec<Proposal>) {
         let p = &ctx.fit.prog;
-        let bl: Vec<Blob> = blobs(ctx.fit, ctx.setup).into_iter().filter(|b| !near_existing(p, b.x, b.y)).collect();
+        let bl: Vec<Blob> = all.iter().filter(|b| !near_existing(p, b.x, b.y)).cloned().collect();
         if std::env::var("RECON_DEBUG").is_ok() {
             let mx: Vec<f64> = ctx.fit.residual.iter().map(|r| r.iter().fold(0.0f64, |m, x| m.max(x.abs()))).collect();
             eprintln!("blobs {:?} max|r| {mx:?}", bl);
@@ -222,25 +278,35 @@ impl Algorithmic {
             q.features.push(f);
             q
         };
-        for b in bl.iter().take(3) {
+        for (bi, b) in bl.iter().take(3).enumerate() {
             let (x, y, r) = (b.x, b.y, b.r.clamp(1.0, 15.0));
-            out.push(Proposal { program: with(Feature::Hole { x, y, r }), why: format!("hole at blob ({x:.1}, {y:.1}) r {r:.1}") });
+            out.push(Proposal { program: with(Feature::Hole { x, y, r }), why: format!("hole at blob ({x:.1}, {y:.1}) r {r:.1}"), group: Some(bi) });
             if b.half_len > 1.5 * b.r {
                 let axis = if b.angle.cos().abs() > b.angle.sin().abs() { Axis::X } else { Axis::Y };
                 let len = (2.0 * (b.half_len - b.r)).max(2.0);
                 out.push(Proposal {
                     program: with(Feature::Slot { x, y, len, r, axis }),
                     why: format!("slot{axis:?} at elongated blob ({x:.1}, {y:.1}) len {len:.1}"),
+                    group: Some(bi),
                 });
             }
             out.push(Proposal {
                 program: with(Feature::Counterbore { x, y, r: (0.55 * r).max(1.0), cr: r, cd: p.h / 3.0 }),
                 why: format!("counterbore at blob ({x:.1}, {y:.1})"),
+                group: Some(bi),
             });
             out.push(Proposal {
                 program: with(Feature::Boss { x, y, r, bh: 4.0 }),
                 why: format!("boss at blob ({x:.1}, {y:.1})"),
+                group: Some(bi),
             });
+            if let Some((bx, by, bh)) = b.raised {
+                out.push(Proposal {
+                    program: with(Feature::Boss { x: bx, y: by, r: (0.8 * r).max(1.0), bh }),
+                    why: format!("boss by parallax ({bx:.1}, {by:.1}) height {bh:.1}"),
+                    group: Some(bi),
+                });
+            }
         }
         // Several blobs of one size: holes all at once, or a pattern.
         let small: Vec<&Blob> = bl.iter().filter(|b| b.half_len < 1.5 * b.r).collect();
@@ -250,24 +316,30 @@ impl Algorithmic {
                 small.iter().filter(|b| (b.r - r0).abs() < 0.35 * r0 + 0.5).map(|b| (b.x, b.y, r0)).collect();
             if same.len() >= 3 {
                 if let Some(c) = force_circular(&same) {
-                    out.push(Proposal { program: with(c), why: format!("circular pattern through {} blobs", same.len()) });
+                    out.push(Proposal { program: with(c), why: format!("circular pattern through {} blobs", same.len()), group: None });
                 }
             }
             if same.len() >= 2 {
                 if let Some(l) = force_linear(&same) {
-                    out.push(Proposal { program: with(l), why: format!("linear pattern through {} blobs", same.len()) });
+                    out.push(Proposal { program: with(l), why: format!("linear pattern through {} blobs", same.len()), group: None });
                 }
                 let mut q = p.clone();
                 for &(x, y, r) in &same {
                     q.features.push(Feature::Hole { x, y, r });
                 }
-                out.push(Proposal { program: q, why: format!("{} holes at once", same.len()) });
+                out.push(Proposal { program: q, why: format!("{} holes at once", same.len()), group: None });
             }
         }
     }
 
-    fn edits(&self, p: &Program, out: &mut Vec<Proposal>) {
+    fn edits(&self, p: &Program, all: &[Blob], out: &mut Vec<Proposal>) {
         let h = p.h;
+        let raised_near = |x: f64, y: f64| {
+            all.iter().find(|b| (b.x - x).hypot(b.y - y) < b.r + 4.0).and_then(|b| b.raised).map(|(bx, by, bh)| {
+                let r = all.iter().find(|b| (b.x - x).hypot(b.y - y) < b.r + 4.0).map_or(3.0, |b| (0.8 * b.r).max(1.0));
+                Feature::Boss { x: bx, y: by, r, bh }
+            })
+        };
         // The corner.
         let corners = match p.corner {
             Corner::Sharp => vec![Corner::Fillet(4.0), Corner::Chamfer(4.0)],
@@ -275,12 +347,12 @@ impl Algorithmic {
             Corner::Chamfer(c) => vec![Corner::Fillet(c / 0.7), Corner::Sharp],
         };
         for c in corners {
-            out.push(Proposal { program: Program { corner: c, ..p.clone() }, why: format!("corner → {c:?}") });
+            out.push(Proposal { program: Program { corner: c, ..p.clone() }, why: format!("corner → {c:?}"), group: None });
         }
         for (i, f) in p.features.iter().enumerate() {
             let mut rm = p.clone();
             rm.features.remove(i);
-            out.push(Proposal { program: rm, why: format!("remove f{i} ({})", f.kind()) });
+            out.push(Proposal { program: rm, why: format!("remove f{i} ({})", f.kind()), group: None });
             let swap = |g: Feature| {
                 let mut q = p.clone();
                 q.features[i] = g;
@@ -288,50 +360,64 @@ impl Algorithmic {
             };
             match *f {
                 Feature::Hole { x, y, r } => {
+                    if let Some(raised) = raised_near(x, y) {
+                        out.push(Proposal { program: swap(raised), why: format!("f{i} hole → boss by parallax"), group: None });
+                    }
                     out.push(Proposal {
                         program: swap(Feature::Counterbore { x, y, r, cr: r + 2.0, cd: h / 3.0 }),
-                        why: format!("f{i} hole → counterbore"),
+                        why: format!("f{i} hole → counterbore (bore outside)"),
+                        group: None,
                     });
+                    if r > 2.2 {
+                        out.push(Proposal {
+                            program: swap(Feature::Counterbore { x, y, r: 0.55 * r, cr: r, cd: h / 2.0 }),
+                            why: format!("f{i} hole → counterbore (hole inside)"),
+                            group: None,
+                        });
+                    }
                     for axis in [Axis::X, Axis::Y] {
                         out.push(Proposal {
                             program: swap(Feature::Slot { x, y, len: 3.0, r, axis }),
                             why: format!("f{i} hole → slot{axis:?}"),
+                            group: None,
                         });
                     }
-                    out.push(Proposal { program: swap(Feature::Boss { x, y, r, bh: 3.0 }), why: format!("f{i} hole → boss") });
+                    out.push(Proposal { program: swap(Feature::Boss { x, y, r, bh: 3.0 }), why: format!("f{i} hole → boss"), group: None });
                 }
                 Feature::Counterbore { x, y, r, cr, .. } => {
-                    out.push(Proposal { program: swap(Feature::Hole { x, y, r }), why: format!("f{i} counterbore → hole") });
-                    out.push(Proposal { program: swap(Feature::Hole { x, y, r: cr }), why: format!("f{i} counterbore → hole (outer)") });
+                    out.push(Proposal { program: swap(Feature::Hole { x, y, r }), why: format!("f{i} counterbore → hole"), group: None });
+                    out.push(Proposal { program: swap(Feature::Hole { x, y, r: cr }), why: format!("f{i} counterbore → hole (outer)"), group: None });
                 }
                 Feature::Slot { x, y, r, axis, .. } => {
-                    out.push(Proposal { program: swap(Feature::Hole { x, y, r }), why: format!("f{i} slot → hole") });
+                    out.push(Proposal { program: swap(Feature::Hole { x, y, r }), why: format!("f{i} slot → hole"), group: None });
                     let other = if axis == Axis::X { Axis::Y } else { Axis::X };
                     if let Feature::Slot { len, .. } = *f {
-                        out.push(Proposal { program: swap(Feature::Slot { x, y, len, r, axis: other }), why: format!("f{i} slot axis") });
+                        out.push(Proposal { program: swap(Feature::Slot { x, y, len, r, axis: other }), why: format!("f{i} slot axis"), group: None });
                     }
                 }
                 Feature::Boss { x, y, r, .. } => {
-                    out.push(Proposal { program: swap(Feature::Hole { x, y, r }), why: format!("f{i} boss → hole") });
+                    out.push(Proposal { program: swap(Feature::Hole { x, y, r }), why: format!("f{i} boss → hole"), group: None });
                 }
                 Feature::LinearHoles { x, y, dx, dy, r, n } => {
-                    out.push(Proposal { program: swap(Feature::LinearHoles { x, y, dx, dy, r, n: n + 1 }), why: format!("f{i} linear n+1 (end)") });
+                    out.push(Proposal { program: swap(Feature::LinearHoles { x, y, dx, dy, r, n: n + 1 }), why: format!("f{i} linear n+1 (end)"), group: None });
                     out.push(Proposal {
                         program: swap(Feature::LinearHoles { x: x - dx, y: y - dy, dx, dy, r, n: n + 1 }),
                         why: format!("f{i} linear n+1 (start)"),
+                        group: None,
                     });
                     if n > 2 {
-                        out.push(Proposal { program: swap(Feature::LinearHoles { x, y, dx, dy, r, n: n - 1 }), why: format!("f{i} linear n−1 (end)") });
+                        out.push(Proposal { program: swap(Feature::LinearHoles { x, y, dx, dy, r, n: n - 1 }), why: format!("f{i} linear n−1 (end)"), group: None });
                         out.push(Proposal {
                             program: swap(Feature::LinearHoles { x: x + dx, y: y + dy, dx, dy, r, n: n - 1 }),
                             why: format!("f{i} linear n−1 (start)"),
+                            group: None,
                         });
                     }
                 }
                 Feature::CircularHoles { x, y, rad, phase, r, n } => {
                     for m in [n + 1, n.saturating_sub(1)] {
                         if m >= 3 {
-                            out.push(Proposal { program: swap(Feature::CircularHoles { x, y, rad, phase, r, n: m }), why: format!("f{i} circular n → {m}") });
+                            out.push(Proposal { program: swap(Feature::CircularHoles { x, y, rad, phase, r, n: m }), why: format!("f{i} circular n → {m}"), group: None });
                         }
                     }
                 }
@@ -352,21 +438,21 @@ impl Algorithmic {
                     let mut q = p.clone();
                     rest(&mut q);
                     q.features.push(c);
-                    out.push(Proposal { program: q, why: format!("merge {} holes → circular", hs.len()) });
+                    out.push(Proposal { program: q, why: format!("merge {} holes → circular", hs.len()), group: None });
                 }
             }
             if let Some(l) = force_linear(&hs) {
                 let mut q = p.clone();
                 rest(&mut q);
                 q.features.push(l);
-                out.push(Proposal { program: q, why: format!("merge {} holes → linear", hs.len()) });
+                out.push(Proposal { program: q, why: format!("merge {} holes → linear", hs.len()), group: None });
             }
         }
         // A hole next to a pattern of its size joins it (the pattern's n+1 covers
         // the ends; this covers a hole found before its pattern was).
         let canon = canon::canonical(p);
         if canon.to_text() != p.to_text() {
-            out.push(Proposal { program: canon, why: "canonical form".into() });
+            out.push(Proposal { program: canon, why: "canonical form".into(), group: None });
         }
     }
 }
@@ -432,8 +518,9 @@ pub fn force_linear(holes: &[(f64, f64, f64)]) -> Option<Feature> {
 impl Proposer for Algorithmic {
     fn propose(&mut self, ctx: &Context) -> Vec<Proposal> {
         let mut out = Vec::new();
-        self.adds(ctx, &mut out);
-        self.edits(&ctx.fit.prog, &mut out);
+        let all = blobs(ctx.fit, ctx.setup);
+        self.adds(ctx, &all, &mut out);
+        self.edits(&ctx.fit.prog, &all, &mut out);
         out
     }
 }
@@ -555,6 +642,7 @@ pub fn recover(
     let mut setup = setup_full.clone();
     setup.film.size = target.size;
     setup.edge_samples = setup_full.edge_samples / 3;
+    setup.film.spp = (setup_full.film.spp / 2).max(4);
     let base = init_base(&target, &setup);
     let probe = Fitter::new(setup.clone(), target.clone(), target_spp, &base);
     let sigma2 = probe.sigma2;
@@ -567,12 +655,12 @@ pub fn recover(
     let mut cur_score = mdl::score(&cur);
     let mut trace = vec![Step { round: 0, why: "base box from silhouettes".into(), program: cur.prog.to_text(), score: Some(cur_score), accepted: true }];
     let mut accepted = vec![(cur.prog.to_text(), cur_score)];
-    let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
     for round in 1..=opts.rounds {
+        let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
         let ctx = Context { fit: &cur, score: cur_score, target: &target, setup: &setup, history: &trace };
         let mut props = proposer.propose(&ctx);
         // Drop invalid and already-tried structures-at-parameters.
-        props.retain(|p| p.program.valid());
+        props.retain(|p| p.program.valid() && p.program.signature() + &round_text(&p.program) != cur.prog.signature() + &round_text(&cur.prog));
         props.retain(|p| tried.insert(format!("{}|{}", p.program.signature(), round_text(&p.program))));
         if props.is_empty() {
             break;
@@ -596,6 +684,12 @@ pub fn recover(
         let first = trace.len();
         for (i, r) in results {
             match r {
+                Ok(f) if degenerate(&f.prog).is_some() => {
+                    iters += f.iters;
+                    evals += f.evals;
+                    let why = degenerate(&f.prog).unwrap();
+                    trace.push(Step { round, why: format!("{} (degenerate: {why})", props[i].why), program: f.prog.to_text(), score: Some(mdl::score(&f)), accepted: false });
+                }
                 Ok(f) => {
                     iters += f.iters;
                     evals += f.evals;
@@ -608,7 +702,39 @@ pub fn recover(
                 Err(e) => trace.push(Step { round, why: props[i].why.clone(), program: format!("error: {e}"), score: None, accepted: false }),
             }
         }
-        let _ = first;
+        // Combine: the best fitted interpretation of each piece of evidence
+        // that beats the current program on its own, all at once.
+        let mut by_group: std::collections::BTreeMap<usize, (f64, Feature)> = std::collections::BTreeMap::new();
+        for (k, step) in trace[first..].iter().enumerate() {
+            let (Some(g), Some(sc)) = (props.get(k).and_then(|p| p.group), step.score) else { continue };
+            if sc.total >= cur_score.total || step.why.contains("degenerate") {
+                continue;
+            }
+            let Ok(prog) = Program::from_text(&step.program) else { continue };
+            let Some(f) = prog.features.last().cloned() else { continue };
+            if by_group.get(&g).is_none_or(|(t, _)| sc.total < *t) {
+                by_group.insert(g, (sc.total, f));
+            }
+        }
+        if by_group.len() >= 2 {
+            let mut q = cur.prog.clone();
+            q.features.extend(by_group.values().map(|(_, f)| f.clone()));
+            let why = format!("combine the best of {} blobs", by_group.len());
+            if q.valid() {
+                match fitters[0].fit(&q, &fit::short()) {
+                    Ok(f) if degenerate(&f.prog).is_none() => {
+                        iters += f.iters;
+                        evals += f.evals;
+                        let s = mdl::score(&f);
+                        trace.push(Step { round, why, program: f.prog.to_text(), score: Some(s), accepted: false });
+                        if best.as_ref().is_none_or(|b| s.total < b.2.total) {
+                            best = Some((trace.len() - 1, f, s));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         match best {
             Some((ti, f, s)) if s.total < cur_score.total => {
                 trace[ti].accepted = true;
@@ -639,6 +765,29 @@ pub fn recover(
         evals,
         seconds: t0.elapsed().as_secs_f64(),
     }
+}
+
+/// A fitted program that collapsed onto a simpler one — a blend, slot,
+/// boss or counterbore shrunk to its limit — is that simpler program with
+/// an extra parameter the Laplace term undercharges (the optimum sits on a
+/// bound, where the Gaussian approximation does not hold). Refused; the
+/// simpler program is always on offer as an edit.
+pub fn degenerate(p: &Program) -> Option<&'static str> {
+    match p.corner {
+        Corner::Fillet(r) | Corner::Chamfer(r) if r < 0.8 => return Some("corner blend under 0.8 mm"),
+        _ => {}
+    }
+    for f in &p.features {
+        match *f {
+            Feature::Slot { len, .. } if len < 1.5 => return Some("slot shorter than 1.5 mm"),
+            Feature::Boss { bh, .. } if bh < 0.8 => return Some("boss under 0.8 mm"),
+            Feature::Counterbore { r, cr, cd, .. } if cr - r < 1.0 || cd < 0.8 || cd > p.h - 1.2 => {
+                return Some("counterbore without a step");
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn round_text(p: &Program) -> String {

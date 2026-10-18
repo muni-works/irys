@@ -308,6 +308,13 @@ pub fn edge_jacobian(
     if samples.is_empty() {
         return out;
     }
+    // Pad to a fixed 2n paths: the kernels are compiled per graph width, so
+    // a width that changed with every call would compile C every call.
+    let real = points.len();
+    while points.len() < 2 * n {
+        points.push(points[real - 2]);
+        points.push(points[real - 1]);
+    }
     scene.set_points(Some(points.clone()));
     let l = render::trace_points(scene, seed, k);
     scene.set_points(None);
