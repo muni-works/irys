@@ -52,6 +52,7 @@ struct Params {
     gmin: vec4<f32>,      // grid origin, 1 / cell size
     gres: vec4<u32>,      // grid cells per axis, flags (1 on, 2 training)
     gres2: vec4<u32>,     // records per path, cells, samples a cell needs, 0
+    qmc: vec4<u32>,       // phase 3 sampler: (Sobol on, wavelengths by importance, 0, 0)
 }
 
 const NONE: u32 = 0xffffffffu;
@@ -106,6 +107,9 @@ struct Path {
 // Phase 3: emitter triangles in world space, three vec4 each — (v0, cdf),
 // (v1, 0), (v2, 0) — the cumulative area share light sampling picks by.
 @group(0) @binding(40) var<storage, read> lights: array<vec4<f32>>;
+// Phase 3 sampler (`qmc.rs`): Sobol's four direction matrices (32 words
+// each), then the wavelength CDF's 257 f32s as bits.
+@group(0) @binding(56) var<storage, read> qtab: array<u32>;
 
 const PI: f32 = 3.14159265358979;
 
@@ -734,18 +738,128 @@ fn flat(gid: vec3<u32>, nwg: vec3<u32>) -> u32 {
 // The path's wavelengths: the first draw of its generator, as `gen` makes
 // them, so scoring can rebuild them for any path of the frame.
 fn lambdas(s: ptr<function, vec2<u32>>) -> vec4<f32> {
-    let u = rand(s);
+    let u = prand(s);
     var lam = vec4<f32>(0.0);
     for (var k = 0u; k < params.nw; k = k + 1u) {
         let v = u + f32(k) / f32(params.nw);
-        lam[k] = 380.0 + 400.0 * (v - floor(v));
+        if (params.qmc.y != 0u) {
+            lam[k] = spec_lambda(v - floor(v));
+        } else {
+            lam[k] = 380.0 + 400.0 * (v - floor(v));
+        }
     }
     return lam;
 }
 
 fn path_lambdas(path: u32) -> vec4<f32> {
-    var s = rng_new(path);
+    var s = path_rng(path);
     return lambdas(&s);
+}
+
+// ---- phase 3 sampler (`qmc.rs`, the same integers) ----
+
+fn qhash(x0: u32) -> u32 {
+    var x = x0;
+    x = x ^ (x >> 16u);
+    x = x * 0x7feb352du;
+    x = x ^ (x >> 15u);
+    x = x * 0x846ca68bu;
+    return x ^ (x >> 16u);
+}
+
+fn qhash2(a: u32, b: u32) -> u32 {
+    return qhash(a ^ (qhash(b) + 0x9e3779b9u));
+}
+
+fn owen(x0: u32, seed: u32) -> u32 {
+    var x = reverseBits(x0);
+    x = x + seed;
+    x = x ^ (x * 0x6c50b47cu);
+    x = x ^ (x * 0xb82f1e52u);
+    x = x ^ (x * 0xc7afe638u);
+    x = x ^ (x * 0x8d22f6e6u);
+    return reverseBits(x);
+}
+
+fn sobol(i: u32, d: u32) -> u32 {
+    var x = 0u;
+    var b = i;
+    var k = 0u;
+    loop {
+        if (b == 0u) { break; }
+        if ((b & 1u) != 0u) {
+            x = x ^ qtab[d * 32u + k];
+        }
+        b = b >> 1u;
+        k = k + 1u;
+    }
+    return x;
+}
+
+// A path's generator: SplitMix64, or (Sobol) the draw counter and the
+// path's frame index.
+fn path_rng(g: u32) -> vec2<u32> {
+    if (params.qmc.x != 0u && params.points == 0u) {
+        return vec2<u32>(0u, g);
+    }
+    return rng_new(select(g, g >> 1u, params.points != 0u));
+}
+
+// A path's next uniform: `PathRng::uniform`.
+fn prand(s: ptr<function, vec2<u32>>) -> f32 {
+    if (params.qmc.x == 0u || params.points != 0u) {
+        return rand(s);
+    }
+    let c = (*s).x;
+    (*s).x = c + 1u;
+    let g = (*s).y;
+    let index = params.seed.x * params.spp + g % params.spp;
+    let pixel = qhash2(g / params.spp, params.seed.y);
+    let seed = qhash2(pixel, c >> 2u);
+    let d = c & 3u;
+    let x = owen(sobol(owen(index, seed), d), qhash2(seed, d + 1u));
+    return f32(x >> 8u) * (1.0 / 16777216.0);
+}
+
+// `PathRng::align`: the next draw starts a tuple.
+fn palign(s: ptr<function, vec2<u32>>) {
+    if (params.qmc.x != 0u && params.points == 0u) {
+        (*s).x = ((*s).x + 3u) & ~3u;
+    }
+}
+
+fn spec_cdf(b: u32) -> f32 {
+    return bitcast<f32>(qtab[128u + b]);
+}
+
+// `Spectral::lambda`.
+fn spec_lambda(u: f32) -> f32 {
+    var lo = 1u;
+    var hi = 256u;
+    // the first b in [1, 256) with cdf[b] > u, so the bin is b − 1
+    loop {
+        if (lo >= hi) { break; }
+        let mid = (lo + hi) / 2u;
+        if (spec_cdf(mid) <= u) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    let b = min(lo - 1u, 255u);
+    let c0 = spec_cdf(b);
+    let c1 = spec_cdf(b + 1u);
+    let t = clamp((u - c0) / (c1 - c0), 0.0, 1.0);
+    return 380.0 + 400.0 * (f32(b) + t) / 256.0;
+}
+
+// `Spectral::pdf`, relative to uniform; 1 without importance sampling.
+fn spec_pdf(l: f32) -> f32 {
+    if (params.qmc.y == 0u) {
+        return 1.0;
+    }
+    let b = min(u32(max((l - 380.0) / 400.0 * 256.0, 0.0)), 255u);
+    return (spec_cdf(b + 1u) - spec_cdf(b)) * 256.0;
 }
 
 @compute @workgroup_size(64)
@@ -761,13 +875,13 @@ fn gen(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (guide_training()) {
         g_nrec[i] = 0u;
     }
-    var s = rng_new(select(g, g >> 1u, params.points != 0u));
+    var s = path_rng(g);
     let lam = lambdas(&s);
     let w = params.size.x;
     let h = params.size.y;
     let px = g / params.spp;
-    let x = f32(px % w) + rand(&s);
-    let y = f32(px / w) + rand(&s);
+    let x = f32(px % w) + prand(&s);
+    let y = f32(px / w) + prand(&s);
     var sx = (2.0 * x / f32(w) - 1.0) * params.tan_half * f32(w) / f32(h);
     var sy = (1.0 - 2.0 * y / f32(h)) * params.tan_half;
     if (params.points != 0u) {
@@ -896,7 +1010,10 @@ fn bounce_at(i: u32, last: bool) {
     var lw = 1.0;
     var ldiv = 1.0;
     if (params.nee != 0u) {
-        let u = vec3<f32>(rand(&s), rand(&s), rand(&s));
+        palign(&s);
+        let u0 = prand(&s);
+        let u1 = prand(&s);
+        let u = vec3<f32>(u0, u1, prand(&s));
         let dr = sample_light(origin, u);
         ld = dr.dir;
         lcos = dot(ld, n);
@@ -937,8 +1054,9 @@ fn bounce_at(i: u32, last: bool) {
                 p.rad[k] = p.rad[k] + p.tp[k] * albedo / PI * lcos * light_le(ld, lem, p.lam[k]) * w / ldiv * lw;
             }
         }
-        let u1 = rand(&s);
-        let u2 = rand(&s);
+        palign(&s);
+        let u1 = prand(&s);
+        let u2 = prand(&s);
         let r = sqrt(u1);
         let phi = 2.0 * PI * u2;
         let cz = sqrt(max(1.0 - u1, 0.0));
@@ -966,7 +1084,9 @@ fn bounce_at(i: u32, last: bool) {
         p.ldir = vec4<f32>(ld, lcos * mis(lpdf, pb) / ldiv * lw);
         p.smp.z = 1.0;
     }
-    let u = vec2<f32>(rand(&s), rand(&s));
+    palign(&s);
+    let u0 = prand(&s);
+    let u = vec2<f32>(u0, prand(&s));
     p.rng = s;
     let sm = ggx_sample(params.alpha, lo, u);
     let li = sm.xyz;
@@ -1016,9 +1136,10 @@ fn bounce_guided(
             p.rad[k] = p.rad[k] + p.tp[k] * albedo / PI * lcos * light_le(ld, lem, p.lam[k]) * w / ldiv * lw;
         }
     }
-    let us = rand(s);
-    let u1 = rand(s);
-    let u2 = rand(s);
+    palign(s);
+    let u1 = prand(s);
+    let u2 = prand(s);
+    let us = prand(s);
     var wi: vec3<f32>;
     if (us < c) {
         wi = guide_sample(cell, u1, u2);
@@ -1143,7 +1264,7 @@ fn lane_rgb(l: f32) -> vec3<f32> {
         -0.969266 * x + 1.8760108 * y + 0.041556 * z,
         0.0556434 * x - 0.2040259 * y + 1.0572252 * z,
     );
-    return rgb * params.resp.xyz;
+    return rgb * params.resp.xyz / spec_pdf(l);
 }
 
 // One thread per pixel: its `spp × nw` lanes are contiguous and summed in

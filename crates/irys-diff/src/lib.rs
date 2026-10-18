@@ -20,5 +20,6 @@ pub mod gpu;
 pub mod interior;
 pub mod ir;
 pub mod prb;
+pub mod qmc;
 pub mod secondary;
 pub mod vis;

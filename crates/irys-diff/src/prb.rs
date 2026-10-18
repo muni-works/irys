@@ -66,6 +66,7 @@ use irys_light::splats::{self, Splats};
 use irys_prims::analytic::{Analytic, Prim};
 
 use crate::ggx::{self, COLUMNS, DF, Graph, PARAMS, THETA, band_weights, normalize};
+pub use crate::qmc::PathRng;
 
 /// Most wavelengths a path carries (Wilkie et al., "Hero Wavelength Spectral
 /// Sampling", EGSR 2014).
@@ -504,6 +505,15 @@ pub struct Scene {
     /// ReSTIR DI at the first vertex (GPU only; see `gpu/restir.wgsl`).
     /// `None` is the plain NEE draw.
     pub restir: Option<Restir>,
+    /// Draw every path's uniforms from its pixel's shuffled, scrambled
+    /// Sobol sequence ([`crate::qmc`]) instead of SplitMix64. The frame
+    /// seed's low 32 bits are the frame's place in the sequence (frame `f`
+    /// is samples `f · spp …`), the high 32 bits the scramble. Not in point
+    /// mode, which keeps the random stream.
+    pub qmc: bool,
+    /// Importance-sample wavelengths by the film's response
+    /// ([`crate::qmc::Spectral`]) instead of uniformly.
+    pub spectral_is: bool,
     /// Online path guiding at diffuse vertices (GPU only; see
     /// `gpu/guide.wgsl`). `None` is cosine sampling.
     pub guide: Option<Guide>,
@@ -750,6 +760,8 @@ impl Scene {
             lights,
             complete: false,
             restir: None,
+            qmc: false,
+            spectral_is: false,
             guide: None,
             points: None,
             tan_half: half_fov_deg.to_radians().tan(),
@@ -757,6 +769,45 @@ impl Scene {
             forward,
             right,
             up,
+        }
+    }
+
+    /// Path `i`'s generator for the frame drawn with `seed`.
+    pub fn path_rng(&self, seed: u64, i: usize) -> PathRng {
+        if self.qmc && self.points.is_none() {
+            let spp = self.spp as u32;
+            PathRng::Sobol {
+                index: (seed as u32)
+                    .wrapping_mul(spp)
+                    .wrapping_add(i as u32 % spp),
+                pixel: crate::qmc::hash2(i as u32 / spp, (seed >> 32) as u32),
+                counter: 0,
+            }
+        } else {
+            PathRng::Random(Rng::new(seed, self.path_key(i)))
+        }
+    }
+
+    /// A path's wavelengths from its hero draw `u` ([`wavelengths`], or by
+    /// importance with [`Scene::spectral_is`]).
+    pub fn wavelengths_of(&self, u: f64) -> [f64; HERO] {
+        if !self.spectral_is {
+            return wavelengths(u, self.wavelengths);
+        }
+        let s = crate::qmc::Spectral::get();
+        let w = self.wavelengths;
+        std::array::from_fn(|k| {
+            let v = u + k as f64 / w as f64;
+            s.lambda(v - v.floor())
+        })
+    }
+
+    /// The density wavelengths are drawn with, relative to uniform.
+    pub fn lambda_pdf(&self, lambda_nm: f64) -> f64 {
+        if self.spectral_is {
+            crate::qmc::Spectral::get().pdf(lambda_nm)
+        } else {
+            1.0
         }
     }
 
@@ -973,7 +1024,7 @@ impl Scene {
         self.lanes() * if self.nee { 2 } else { 1 }
     }
 
-    fn camera_ray(&self, path: usize, rng: &mut Rng) -> Ray {
+    fn camera_ray(&self, path: usize, rng: &mut PathRng) -> Ray {
         let (w, h) = self.size;
         let px = path / self.spp;
         let (x, y) = (
@@ -1132,7 +1183,7 @@ struct Path {
     /// `L_j`: radiance collected so far, per wavelength.
     radiance: [f64; HERO],
     lambda: [f64; HERO],
-    rng: Rng,
+    rng: PathRng,
     /// The BSDF pdf the current ray was drawn with; 0 for the camera ray.
     prev_pdf: f64,
     alive: bool,
@@ -1288,8 +1339,8 @@ fn trace(
     let env = scene.env;
     let mut paths: Vec<Path> = (0..n)
         .map(|i| {
-            let mut rng = Rng::new(seed, scene.path_key(i));
-            let lambda = wavelengths(rng.uniform(), nw);
+            let mut rng = scene.path_rng(seed, i);
+            let lambda = scene.wavelengths_of(rng.uniform());
             let ray = scene.camera_ray(i, &mut rng);
             Path {
                 ray,
@@ -1420,6 +1471,7 @@ fn trace(
             // The light sample: drawn before the BSDF's, three uniforms
             // whether or not it lands, so the stream does not depend on it.
             let nee = scene.nee.then(|| {
+                p.rng.align();
                 let u = [p.rng.uniform(), p.rng.uniform(), p.rng.uniform()];
                 let Some(ld) = scene.sample_light(origin, u) else {
                     return (Vec3::zeros(), 0.0, 0.0, false, false);
@@ -1459,6 +1511,7 @@ fn trace(
                             / pl;
                     }
                 }
+                p.rng.align();
                 let (u1, u2) = (p.rng.uniform(), p.rng.uniform());
                 let (r, phi) = (u1.sqrt(), 2.0 * std::f64::consts::PI * u2);
                 let cz = (1.0 - u1).max(0.0).sqrt();
@@ -1492,6 +1545,7 @@ fn trace(
                 ball[i] = true;
                 any = true;
             }
+            p.rng.align();
             let u = [p.rng.uniform(), p.rng.uniform()];
             let (li, pdf) = ggx::sample(alpha, lo, u);
             if li[2] <= 0.0 || lo[2] <= 0.0 || !pdf.is_finite() || pdf <= 0.0 {
@@ -1620,9 +1674,10 @@ pub fn image(scene: &Scene, seed: u64, l: &[f64]) -> Vec<f64> {
 /// seed, because the forward pass keeps nothing per path but `L`.
 pub fn lane_weight(scene: &Scene, seed: u64, lane: usize) -> [f64; 3] {
     let nw = scene.wavelengths;
-    let u = Rng::new(seed, (lane / nw) as u64).uniform();
-    let lambda = wavelengths(u, nw)[lane % nw];
-    hero_weight(lambda).map(|w| w as f64 / (scene.spp * nw) as f64)
+    let u = scene.path_rng(seed, lane / nw).uniform();
+    let lambda = scene.wavelengths_of(u)[lane % nw];
+    let p = scene.lambda_pdf(lambda);
+    hero_weight(lambda).map(|w| w as f64 / p / (scene.spp * nw) as f64)
 }
 
 /// A loss over the image: its value and its adjoint per pixel channel.

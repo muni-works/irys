@@ -85,6 +85,7 @@ struct Params {
     gmin: [f32; 4],
     gres: [u32; 4],
     gres2: [u32; 4],
+    qmc: [u32; 4],
 }
 
 /// The splat compositor's segment start, `EPS / 10` (phase 2b's, unchanged).
@@ -453,6 +454,14 @@ impl Grid {
     }
 }
 
+/// The sampler's tables for the device: Sobol's four direction matrices,
+/// then the wavelength CDF as `f32` bits ([`crate::qmc`]).
+fn sampler_tables() -> Vec<u32> {
+    let mut t: Vec<u32> = crate::qmc::sobol_matrices().iter().flatten().copied().collect();
+    t.extend(crate::qmc::Spectral::get().cdf.iter().map(|c| c.to_bits()));
+    t
+}
+
 /// The scene's emitter triangles for `sample_light`: three `vec4`s each,
 /// `(v0, cumulative share)`, `(v1, 0)`, `(v2, 0)`. One harmless record when
 /// there are none, so the binding is never empty.
@@ -552,6 +561,7 @@ impl GpuPrb {
         let geo = init("prims", bytemuck::cast_slice(&geo), 0);
         let points = storage("points", scene.points().map_or(0, |p| p.len() as u64 * 8));
         let lights = init("lights", bytemuck::cast_slice(&pack_lights(scene)), 0);
+        let qtab = init("sampler tables", bytemuck::cast_slice(&sampler_tables()), 0);
         // ReSTIR DI: G-buffers (three vec4 per slot) and reservoirs (two),
         // this frame's and the previous one's.
         let slots = if scene.restir.is_some() { paths as u64 } else { 0 };
@@ -656,6 +666,7 @@ impl GpuPrb {
             (25, &geo),
             (40, &lights),
             (43, &r_a),
+            (56, &qtab),
             (51, &g_cdf),
             (52, &g_ok),
             (53, &g_rec),
@@ -665,7 +676,13 @@ impl GpuPrb {
         let groups = [
             bind(
                 &pipes[0],
-                &[(0, &params), (1, &path_buf), (26, &points), (54, &g_nrec)],
+                &[
+                    (0, &params),
+                    (1, &path_buf),
+                    (26, &points),
+                    (54, &g_nrec),
+                    (56, &qtab),
+                ],
             ),
             bind(&pipes[1], &bounce),
             bind(
@@ -708,6 +725,7 @@ impl GpuPrb {
                 &pipes[5],
                 &[
                     (0, &params),
+                    (56, &qtab),
                     (10, &l),
                     (17, &img),
                     (18, &target),
@@ -716,7 +734,10 @@ impl GpuPrb {
                 ],
             ),
             bind(&pipes[6], &[(0, &params), (20, &sq), (21, &loss)]),
-            bind(&pipes[7], &[(0, &params), (19, &d_img), (22, &dl)]),
+            bind(
+                &pipes[7],
+                &[(0, &params), (19, &d_img), (22, &dl), (56, &qtab)],
+            ),
             bind(&pipes[8], &bounce),
             bind(
                 &pipes[9],
@@ -878,6 +899,7 @@ impl GpuPrb {
                 scene.guide.map_or(0, |g| g.min_samples),
                 0,
             ],
+            qmc: [scene.qmc as u32, scene.spectral_is as u32, 0, 0],
             restir: match scene.restir {
                 Some(r) => [
                     (r.neighbours.min(9) << 8) | r.radius.min(255),

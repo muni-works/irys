@@ -446,3 +446,158 @@ fn guide_is_deterministic_and_replays() {
         assert!(e < 1e-2, "θ{p}: prb {} vs fd {}", d[p], fd[p]);
     }
 }
+
+// ---- the sampler: scrambled Sobol and wavelengths by importance ----
+
+fn sampled(mut s: Scene) -> Scene {
+    s.qmc = true;
+    s.spectral_is = true;
+    s
+}
+
+/// The Sobol draws and the wavelength table are the same integers on both
+/// tiers: GPU f32 against the CPU f64 reference path by path.
+#[test]
+fn sampler_gpu_matches_cpu_f64() {
+    let ctx = device!();
+    let scene = sampled(frozen(32, 32, 4));
+    let mut k = Kernels::for_scene(&scene, false);
+    let t = prb::image(&scene, 99, &prb::forward(&scene, &GOLD, 99, &mut k).0);
+    let mut g = GpuPrb::new(ctx, &scene);
+    g.set_target(&t);
+    let lg = gpu::widen(&g.forward(&scene, &THETA0, 7));
+    let lc = prb::forward(&scene, &THETA0, 7, &mut k).0;
+    let mut errs: Vec<f64> = lg.iter().zip(&lc).map(|(a, b)| rel(*a, *b)).collect();
+    errs.sort_by(f64::total_cmp);
+    let far = errs.iter().filter(|e| **e > 1e-3).count();
+    eprintln!(
+        "L gpu vs cpu: median rel {:.1e}, p99 {:.1e}, {far}/{} lanes off by > 1e-3",
+        errs[errs.len() / 2],
+        errs[errs.len() * 99 / 100],
+        errs.len()
+    );
+    assert!(far * 50 < errs.len(), "{far} lanes diverge");
+    let (vg, gg) = g.gradient_l2(&scene, &THETA0, (7, 7));
+    let (vc, gc) = prb::gradient(&scene, &THETA0, (7, 7), &mut k, &L2(&t));
+    eprintln!("loss gpu {vg:.6e} cpu {vc:.6e} rel {:.1e}", rel(vg, vc));
+    assert!(rel(vg, vc) < 1e-2);
+    for p in 0..PARAMS {
+        let e = rel(gg[p], gc[p]);
+        eprintln!("θ{p}: gpu {:+.6e}  cpu f64 {:+.6e}  rel {e:.1e}", gg[p], gc[p]);
+        assert!(e < 2e-2, "θ{p}: gpu {} vs cpu {}", gg[p], gc[p]);
+    }
+}
+
+/// PRB through the new sampler on the CPU reference: the draws are
+/// detached, so the replay formula holds as is.
+#[test]
+fn sampler_cpu_gradient_matches_central_differences() {
+    let scene = sampled(frozen(16, 16, 2));
+    let mut k = Kernels::for_scene(&scene, false);
+    let t = prb::image(&scene, 99, &prb::forward(&scene, &GOLD, 99, &mut k).0);
+    let (_, d) = prb::gradient(&scene, &THETA0, (7, 7), &mut k, &L2(&t));
+    let h = 1e-5;
+    for p in 0..PARAMS {
+        let (mut lo, mut hi) = (THETA0, THETA0);
+        lo[p] -= h;
+        hi[p] += h;
+        let fd = (prb::loss(&scene, &hi, 7, &mut k, &L2(&t))
+            - prb::loss(&scene, &lo, 7, &mut k, &L2(&t)))
+            / (2.0 * h);
+        let e = rel(d[p], fd);
+        eprintln!("θ{p}: cpu prb {:+.9e}  fd {fd:+.9e}  rel {e:.1e}", d[p]);
+        assert!(e < 1e-5, "θ{p}: prb {} vs fd {fd}", d[p]);
+    }
+}
+
+/// Replay is bit-exact and two wavefronts agree with the sampler on.
+#[test]
+fn sampler_replay_is_bit_exact() {
+    let ctx = device!();
+    let scene = sampled(Scene::cornell(64, 64, 4));
+    let run = || {
+        let mut g = GpuPrb::new(ctx, &scene);
+        let l = g.forward(&scene, &THETA0, 3);
+        let (d, l2) = g.replay(&scene, &THETA0, 3, &vec![1.0; l.len()]);
+        assert_eq!(bits(&l), bits(&l2));
+        (bits(&l), d.map(f64::to_bits))
+    };
+    assert!(run() == run());
+}
+
+/// Unbiased: the converged image is the random sampler's (frames are
+/// consecutive Sobol blocks of one scramble, so the error is measured
+/// against a long random-sampler mean), and the error at equal spp falls.
+#[test]
+fn sampler_is_unbiased_and_converges_faster() {
+    let ctx = device!();
+    for (name, base) in [
+        ("pair", {
+            let mut s = Scene::pair(48, 48, 4, 1.0);
+            s.complete = true;
+            s
+        }),
+        ("cornell", {
+            let mut s = Scene::cornell(48, 48, 4);
+            s.depth = 4;
+            s
+        }),
+    ] {
+        // reference: 512 random frames
+        let mut g = GpuPrb::new(ctx, &base);
+        let n_ref = 512;
+        let mut r = vec![0.0f64; 48 * 48 * 3];
+        for f in 0..n_ref {
+            for (a, v) in r.iter_mut().zip(g.image(&base, &GOLD, 10_000 + f)) {
+                *a += v as f64 / n_ref as f64;
+            }
+        }
+        let relmse = |img: &[f64]| {
+            img.iter()
+                .zip(&r)
+                .map(|(a, b)| (a - b).powi(2) / (b * b + 1e-2))
+                .sum::<f64>()
+                / img.len() as f64
+        };
+        let mean_of = |scene: &Scene, frames: u64, salt: u64| {
+            let mut g = GpuPrb::new(ctx, scene);
+            let mut m = vec![0.0f64; 48 * 48 * 3];
+            for f in 0..frames {
+                for (a, v) in m.iter_mut().zip(g.image(scene, &GOLD, (salt << 32) | f)) {
+                    *a += v as f64 / frames as f64;
+                }
+            }
+            m
+        };
+        let s = sampled(base_clone(&base));
+        // equal spp (64 frames × 4) against the reference, a few scrambles
+        let (mut e_rand, mut e_qmc, mut tot) = (0.0, 0.0, 0.0);
+        let reps = 4;
+        for k in 0..reps {
+            e_rand += relmse(&mean_of(&base, 64, 100 + k)) / reps as f64;
+            let q = mean_of(&s, 64, 200 + k);
+            e_qmc += relmse(&q) / reps as f64;
+            tot += q.iter().sum::<f64>() / reps as f64;
+        }
+        let bias = rel(tot, r.iter().sum::<f64>());
+        eprintln!(
+            "{name}: 256 spp relMSE vs a 2048-spp random reference: random {e_rand:.3e}, sobol+spectral {e_qmc:.3e} ({:.2}×); image totals rel {bias:.1e}",
+            e_rand / e_qmc
+        );
+        assert!(bias < 5e-3, "{name}: totals differ by {bias}");
+        assert!(e_qmc < e_rand, "{name}: the sampler does not help");
+    }
+}
+
+fn base_clone(s: &Scene) -> Scene {
+    // Scenes are not Clone (their trees are shared); rebuild by name.
+    let mut out = if s.lights().is_empty() {
+        let mut p = Scene::pair(s.size.0, s.size.1, s.spp, 1.0);
+        p.complete = s.complete;
+        p
+    } else {
+        Scene::cornell(s.size.0, s.size.1, s.spp)
+    };
+    out.depth = s.depth;
+    out
+}

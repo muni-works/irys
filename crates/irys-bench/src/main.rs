@@ -125,7 +125,14 @@ fn irys(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
             if guide {
                 g.set_guide_training(train);
             }
-            let img = g.image(&b.scene, &b.theta, seed0 + k as u64);
+            // Sobol: the low word is the frame's place in the sequence
+            // (consecutive blocks), the high word the scramble.
+            let seed = if b.scene.qmc {
+                ((seed0 & 0xffff_ffff) << 32) | k as u64
+            } else {
+                seed0 + k as u64
+            };
+            let img = g.image(&b.scene, &b.theta, seed);
             if restir {
                 g.advance();
             }
