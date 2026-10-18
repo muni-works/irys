@@ -1786,7 +1786,7 @@ was dropped; and a luminance-importance map with alias tables, Cycles'
 way, was not needed — this environment is analytic, and its lobe is
 already sampled exactly. MIS stays the power heuristic.
 
-`pick_by_peak` is **not the default**: as the default it trips two phase
+`pick_by_peak` was **not the default** here (it is since phase 5a): as the default it trips two phase
 2e gates measured at ½ — the camera gate's c4 (z −3.1; its
 central-difference reference itself moves 7.4 → 11.6 → 14.1 across
 rotation steps 0.0025 / 0.01 / 0.004 while the estimate stays at 11.0) and
@@ -1870,6 +1870,53 @@ that cannot need them) is the next thing to measure there.
    reads the wavelengths must run after `gen` of the same seed (scoring
    does). `Env::pick` is part of the estimator: CPU, device and the interior
    term must read the same share.
+
+## Phase 5a: real scenes, the sun share by default (2026-10-18)
+
+### 1. The sun share is the default
+
+`Env::pick` is now `Option<f64>`: `None`, the default, is speed round 3's
+share by peak radiance, recomputed from the current radiances
+(`Env::sun_pick`); `Env::with_pick(p)` fixes it (`SUN_PICK = 0.5` is what
+every earlier phase rendered with; the bench's `half` feature). Round 3
+left two phase 2e gates failing under it. Both are the test, not the
+estimator:
+
+**The camera gate's c4** (z −3.1). Its four central-difference seeds
+shared one 16² grid of fixed points per pixel, so their spread measured
+the path noise but not where that one grid cuts the moving edges — the
+term that made the reference "move with the step" (7.4, 11.6, 14.1 at
+0.0025, 0.01, 0.004 rad). `camera_gate_reference_study` (ignored test)
+gives every CD seed its own Cranley–Patterson shift of the grid, 16
+seeds, steps × ½, 1, 2, 4 and the Richardson extrapolation of each pair,
+against the estimate over 96 seeds:
+
+| c4 (two boxes, depth 3 + NEE) | estimate | CD h/2 | CD h | CD 2h | CD 4h | Richardson (2h, 4h) |
+|---|---|---|---|---|---|---|
+| by peak (0.94) | 10.55 ± 0.28 | 8.46 ± 2.41 | 9.00 ± 2.01 | 10.40 ± 1.09 | 10.54 ± 0.59 | 10.35 ± 1.33 |
+| ½ | 10.11 ± 0.39 | 8.83 ± 2.82 | 8.41 ± 1.99 | 9.39 ± 1.27 | 10.11 ± 0.77 | 9.15 ± 1.50 |
+
+Every c4 cell agrees to |z| ≤ 0.9: the gate's ± 0.87 was a quarter of
+the reference's real error at h = 0.004. The one parameter that leans is
+the fov, c6, and it leans **at both shares**: the estimate is 146.98 ±
+0.63 (by peak) and 147.04 ± 0.84 (½), the shifted reference 148–151, a
+≈ 2 % gap that 2e already showed (145.4 vs 150.1) and that the share
+does not move. The gate now shifts each CD seed's grid, takes 8 seeds,
+and steps rotations by 0.008 rad, where the shifted reference is half as
+noisy and its Richardson value agrees with it: c4 z +0.90, c6 −1.63, all
+seven |z| < 1.7 (arm mask: all < 1).
+
+**The ID-buffer variance ratio at depth 2** (1.28 against a 1.3 floor). A
+ratio of two variances from 24 seeds each is good to about ± 25 % as a
+geometric mean of three parameters. Over 96 seeds
+(`visibility_ratio_study`): depth 1 1.81 / 1.66, depth 2 **1.50** / 1.95
+(by peak / ½), every mean within |z| < 1.5 of the other importance. The
+shaded ratio is lower at the peak share (less NEE noise leaves the edge
+term less to win), not below the floor, and the gate draws 64 seeds now:
+2.01 and 1.37.
+
+Neither is a bias, so `pick_by_peak` is the default; the full suite passes
+under it.
 
 ## Open questions
 

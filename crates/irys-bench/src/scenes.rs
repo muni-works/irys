@@ -147,6 +147,8 @@ pub fn apply(scene: &mut Scene, features: &[&str]) {
             "spectral" => scene.spectral_is = true,
             "rr" => scene.roulette = Some(irys_diff::prb::Roulette::default()),
             "sun" => scene.env = scene.env.pick_by_peak(),
+            // phases 1–3's fixed half share (by peak is the default since 5a)
+            "half" => scene.env = scene.env.with_pick(irys_diff::prb::SUN_PICK),
             other => panic!("unknown sampler {other}"),
         }
     }
