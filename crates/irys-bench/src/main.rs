@@ -88,6 +88,24 @@ fn main() {
                 );
             }
         }
+        "score" => {
+            // Speed round 3: the scoring kernels alone, ms per spp of the frame.
+            let ctx = context();
+            for name in a.get("scene", "pair").split(',') {
+                let spp = a.num("spp", 64);
+                let mut b = scenes::build(name, w, h, spp);
+                let features: Vec<String> = a.get("variant", "sobol+spectral").split('+').map(str::to_string).collect();
+                let f: Vec<&str> = features.iter().map(String::as_str).collect();
+                scenes::apply(&mut b.scene, &f);
+                let mut g = GpuPrb::new(ctx, &b.scene);
+                let _ = g.image(&b.scene, &b.theta, 5);
+                let reps = a.num("reps", 20);
+                let best = (0..a.num("rounds", 5))
+                    .map(|_| g.time_score(&b.scene, reps).as_secs_f64())
+                    .fold(f64::INFINITY, f64::min);
+                println!("{name} score: {:.4} ms/spp ({spp} spp frame)", best / reps as f64 / spp as f64 * 1e3);
+            }
+        }
         "grad" => {
             for name in a.get("scene", "pair").split(',') {
                 grad(&a, name, w, h);

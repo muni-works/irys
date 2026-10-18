@@ -64,7 +64,6 @@ struct Path {
     d: vec4<f32>,
     tp: vec4<f32>,        // throughput per wavelength
     rad: vec4<f32>,       // L_j per wavelength
-    lam: vec4<f32>,       // wavelengths, nm
     rng: vec2<u32>,       // SplitMix64 state (lo, hi)
     alive: u32,
     pdf: f32,             // the pdf of the ray's own BSDF sample (MIS at the next hit), 0 for none
@@ -77,6 +76,11 @@ struct Path {
 // of the BSDF sample, the light sample is an emitter (1) or the environment
 // (0), 0).
 @group(0) @binding(71) var<storage, read_write> cold: array<vec4<f32>>;
+
+// Speed round 3: each path's wavelengths (nm), by frame index, as `gen`
+// drew them: `bounce` and `update` read them where a radiance is added, and
+// scoring reads them instead of rebuilding them from the generator.
+@group(0) @binding(72) var<storage, read_write> lams: array<vec4<f32>>;
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read_write> paths: array<Path>;
@@ -759,12 +763,6 @@ fn flat(gid: vec3<u32>, nwg: vec3<u32>) -> u32 {
     return gid.x + gid.y * nwg.x * 64u;
 }
 
-// The path's wavelengths: the first draw of its generator, as `gen` makes
-// them, so scoring can rebuild them for any path of the frame.
-fn lambdas(s: ptr<function, vec2<u32>>) -> vec4<f32> {
-    return lambdas_u(prand(s));
-}
-
 // The wavelengths the camera tuple's first uniform `u` picks.
 fn lambdas_u(u: f32) -> vec4<f32> {
     var lam = vec4<f32>(0.0);
@@ -777,11 +775,6 @@ fn lambdas_u(u: f32) -> vec4<f32> {
         }
     }
     return lam;
-}
-
-fn path_lambdas(path: u32) -> vec4<f32> {
-    var s = path_rng(path);
-    return lambdas(&s);
 }
 
 // ---- phase 3 sampler (`qmc.rs`, the same integers) ----
@@ -933,12 +926,12 @@ fn gen(@builtin(global_invocation_id) gid: vec3<u32>) {
         sy = points_in[g].y;
     }
     let d = normalize(params.fwd.xyz + params.right.xyz * sx + params.up.xyz * sy);
+    lams[g] = lam;
     paths[i] = Path(
         vec4<f32>(params.eye.xyz, 0.0),
         vec4<f32>(d, 1.0),   // .w: the roulette's θ-free throughput proxy
         vec4<f32>(1.0),
         vec4<f32>(0.0),
-        lam,
         s,
         select(1u, 2u, params.restir.y > 0u),   // 2: the first vertex takes the ReSTIR reservoir
         0.0,
@@ -971,6 +964,7 @@ fn bounce_at(i: u32, last: bool) {
         return;
     }
     var p = paths[i];
+    let lam = lams[params.base + i];
     let prev_pdf = p.pdf;
     p.pdf = 0.0;
     let o = p.o.xyz;
@@ -979,7 +973,7 @@ fn bounce_at(i: u32, last: bool) {
     if (params.splat_root != NONE) {
         let seg = composite(o, d, params.eps * 0.1, hit.t);
         for (var k = 0u; k < params.nw; k = k + 1u) {
-            p.rad[k] = p.rad[k] + p.tp[k] * splat_lambda(seg.rad, p.lam[k]);
+            p.rad[k] = p.rad[k] + p.tp[k] * splat_lambda(seg.rad, lam[k]);
             p.tp[k] = p.tp[k] * seg.tr;
         }
         if (seg.tr == 0.0) {
@@ -994,7 +988,7 @@ fn bounce_at(i: u32, last: bool) {
             w = mis(prev_pdf, light_pdf_env(d));
         }
         for (var k = 0u; k < params.nw; k = k + 1u) {
-            p.rad[k] = p.rad[k] + p.tp[k] * sky(d, p.lam[k]) * w;
+            p.rad[k] = p.rad[k] + p.tp[k] * sky(d, lam[k]) * w;
         }
         p.alive = 0u;
         paths[i] = p;
@@ -1080,7 +1074,7 @@ fn bounce_at(i: u32, last: bool) {
         if (lit) {
             let w = mis(lpdf, lcos / PI);
             for (var k = 0u; k < params.nw; k = k + 1u) {
-                p.rad[k] = p.rad[k] + p.tp[k] * albedo / PI * lcos * light_le(ld, lem, p.lam[k]) * w / ldiv * lw;
+                p.rad[k] = p.rad[k] + p.tp[k] * albedo / PI * lcos * light_le(ld, lem, lam[k]) * w / ldiv * lw;
             }
         }
         palign(&s);
@@ -1182,13 +1176,14 @@ fn bounce_guided(
     lw: f32,
 ) {
     var p = *pp;
+    let lam = lams[params.base + i];
     let cell = guide_cell(x, n);
     let c = guide_mix(cell);
     if (lit) {
         let pb = c * guide_pdf(cell, ld) + (1.0 - c) * lcos / PI;
         let w = mis(lpdf, pb);
         for (var k = 0u; k < params.nw; k = k + 1u) {
-            p.rad[k] = p.rad[k] + p.tp[k] * albedo / PI * lcos * light_le(ld, lem, p.lam[k]) * w / ldiv * lw;
+            p.rad[k] = p.rad[k] + p.tp[k] * albedo / PI * lcos * light_le(ld, lem, lam[k]) * w / ldiv * lw;
         }
     }
     palign(s);
@@ -1250,6 +1245,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let bits = lane_bits[i];
     if (bits == 0u) { return; }
     var p = paths[i];
+    let lam = lams[params.base + i];
     let ls = cold[2u * i];
     let bs = cold[2u * i + 1u];
     let slot = lane_slot(i) * params.nw;
@@ -1267,7 +1263,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         // NEE first: C_j joins L_j before the BSDF lane's δf reads it.
         if ((bits & 2u) != 0u && ls.w > 0.0) {
-            let g = p.tp[k] * ls.w * light_le(ls.xyz, bs.z == 1.0, p.lam[k]);
+            let g = p.tp[k] * ls.w * light_le(ls.xyz, bs.z == 1.0, lam[k]);
             if (params.replay != 0u) {
                 df_out[light_base + k] = dl_in[fj] * g;
             }
@@ -1347,7 +1343,7 @@ fn score(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
     var c = vec3<f32>(0.0);
     for (var s = 0u; s < params.spp; s = s + 1u) {
         let i = px * params.spp + s;
-        let lam = path_lambdas(i);
+        let lam = lams[i];
         for (var k = 0u; k < params.nw; k = k + 1u) {
             c = c + l_in[i * params.nw + k] * lane_rgb(lam[k]);
         }
@@ -1400,15 +1396,15 @@ fn loss_sum(@builtin(local_invocation_id) lid: vec3<u32>) {
 
 // `prb::lane_adjoint`: δL per lane from the pixel adjoint and the lane's own
 // wavelength response, over every path of the frame. The wavelengths are
-// rebuilt from the generators of `params.seed`, which is the adjoint frame's
-// when this runs.
+// the ones `gen` stored for `params.seed`'s frame, the adjoint frame's when
+// this runs.
 @compute @workgroup_size(64)
 fn lane_adjoint(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let i = flat(gid, nwg);
     if (i >= params.total) { return; }
     let px = i / params.spp;
     let g = vec3<f32>(d_img[px * 3u], d_img[px * 3u + 1u], d_img[px * 3u + 2u]);
-    let lam = path_lambdas(i);
+    let lam = lams[i];
     for (var k = 0u; k < params.nw; k = k + 1u) {
         dl_out[i * params.nw + k] = dot(g, lane_rgb(lam[k]));
     }
