@@ -580,6 +580,7 @@ dependencies = [
  "libloading",
  "pollster",
  "rayon",
+ "serde_json",
  "tang",
  "tang-compile",
  "tang-expr",
