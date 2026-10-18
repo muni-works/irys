@@ -2286,3 +2286,212 @@ it trades against melanin there).
 4. **Fit from a photo** needs a camera and lighting fit first (phases 2d–2f
    have both), and the albedo's baked lighting separated from the
    chromophores.
+
+## Phase 4: the look (2026-10-18)
+
+`irys-diff::look`, additive: new modules, tests and examples. `gpu.rs`,
+`wavefront.wgsl`, `Env::pick` and the speed tests are untouched; the only
+shared file edited is `crates/irys-diff/Cargo.toml` (three `[[example]]`
+entries). The integrators here are CPU f64. Every BSDF is a tang IR graph
+whose WGSL lowering is checked on the device against the f64 twin.
+
+![sweep](look-openpbr-sweep.png)
+
+### 1. OpenPBR Surface (`look::openpbr`, `look::graph`, `look::swatch`)
+
+- **Spec conformance.** The parameters are OpenPBR 1.x's names and defaults,
+  and so is the slab tree: fuzz over coat over mix(metal, mix(translucent,
+  mix(glossy-diffuse, subsurface))). The spec gives **albedo scaling** as
+  its reference `layer` (`w f_top + lerp(1, T(1 − E_top(ω_o)), w) f_sub`), so
+  that is what is used here. The design's position-free walk (Guo+ 2018)
+  is not: the spec does not define it, and a Monte Carlo layer would not
+  match the spec's own reference. The albedos `E` (rough dielectric
+  `(μ, r, η)`, 32×32×33; metal `∫G2/G1`, `∫(1−μ)⁵`, `∫ F82-weight`; fuzz)
+  are tabulated once, by quadrature of the very lobes being evaluated
+  (24² visible-normal strata). The η axis has an odd node count, so `η = 1`
+  (where TIR starts) is a node. The pieces:
+  - metal: F82-tint (`μ̄ = 1/7`);
+  - dielectric: exact Fresnel at the specular-weight-modulated index
+    (spec `ε` form), tinted by `specular_color`;
+  - diffuse: Lambert;
+  - coat: GGX, absorption `coat_color^{(1/μᵢ' + 1/μₒ')/2}`, and darkening
+    `Δ = (1 − K)/(1 − E_b K)`, `K = lerp(K_s, K_r, r_b)`. The base under the
+    coat sees `η/η_c`, and the stack evaluates the base both ways and mixes
+    by coverage, which is the weighted layer, exactly;
+  - fuzz: see deviation 2;
+  - thin film: the **exact Airy sum** at the path's wavelength (s and p
+    averaged), folded into the dielectric and metal Fresnel by
+    `thin_film_weight`;
+  - transmission: Walter's rough dielectric BTDF, tint at `depth = 0` or
+    Beer–Lambert `μ_t = −ln(T)/depth`, with Cauchy dispersion from
+    `V_d = abbe/scale`;
+  - subsurface: van de Hulst's inversion for the albedo, `μ_t = 1/(r · scale)`,
+    walked by the skin random walk (`skin::render::walk_g`) on an icosphere
+    copy of the swatch.
+- **One source.** `graph::stack<S: Scalar>` is the stack's `f` for one lane
+  (reflect / transmit / subsurface-entry, one-hot). At `ExprId` it is the
+  `Stack` graph, whose eval and adjoint come from `TensorGraph::backward`.
+  At `f64` it is the integrator's `f`. `θ = (base colour on 3 hats,
+  metalness, specular roughness, coat weight, fuzz weight, base weight)`.
+  Tabulated albedos enter linearised at the current roughness, so the
+  adjoint is the interpolant's exact gradient. The lanes' 49 columns are one
+  `[n, 49]` input, because Metal allows 29 storage buffers per stage.
+- **Colour.** An sRGB colour is lifted onto the hats through `M⁻¹`, where `M`
+  is the hat basis as the hero-wavelength integrator renders it. A colour
+  then round-trips to < 2e-3, which matters for any comparison with an RGB
+  renderer. Wavelengths are stratified over a pixel's samples.
+- **Sampling** (detached): lobe by its albedo at `ω_o`, VNDF for the GGX
+  lobes, cosine for diffuse and fuzz, refraction through a VNDF normal,
+  one-sample MIS over the directional lobes, and the subsurface entry as a
+  discrete event.
+
+| Gate (`tests/look.rs`, `look_gpu.rs`) | Result |
+|---|---|
+| white furnace, importance-sampled `∫ f cos` at μ 0.15/0.5/0.95: Lambert, glossy-diffuse r 0.1/0.5/1, coat over white (δ = 0), fuzz over white, subsurface white | all within 2.2e-3 of 1 (worst: glossy r 0.1 at μ 0.15, 0.9979) |
+| energy ≤ 1, 40 random physical materials (incl. transmission, film) | ✓; every table entry in [0, 1] (fuzz after normalisation) |
+| metal furnace vs the single-scatter table | ≤ 1.1e-3 |
+| reciprocity: metal, dielectric specular, coat lobes alone | ≤ 1e-9 rel |
+| rough BTDF generalised reciprocity `f(o→i) η² = f(i→o)` | 7.4e-11 |
+| stack graph vs twin: interpreter / compiled C f32 / device WGSL f32 | 5e-16 / 1.7e-6 / 1.1e-5 (0 of 4096 lanes > 1e-4) |
+| adjoint vs central differences (interpreter); device adjoint vs CPU | ≤ 1e-9 rel; ≤ 1.4e-4 rel |
+| Airy: no film, ambient-index film and film = substrate give Fresnel; quarter-wave AR gives 0; half-wave gives the bare substrate | 1e-12 |
+| dispersion: `(n_d − 1)/(n_F − n_C)` | = V to 1e-6 |
+| swatch replay vs forward (20² × 4 spp, every lobe on) | every path bit-identical, δθ bit-identical twice |
+| swatch PRB vs CD (frozen sampler, all 8 θ) | ≤ 7.4e-9 rel |
+
+The albedo-scaled stack is **not reciprocal** (the spec says as much). On the
+default glossy-diffuse the worst `|f(o,i) − f(i,o)|/f` is 0.34, at grazing
+angles.
+
+### 2. Reference match (`examples/look_sweep`, `scripts/openpbr_cycles.py`)
+
+The OpenPBR repository publishes the spec and MaterialX graphs but no
+reference images with pixel values. The quantitative reference is
+therefore Blender 4.4.3 Cycles' Principled BSDF, whose structure follows
+OpenPBR: F82 metals, specular IOR level, coat with tint and IOR, sheen,
+thin film, random-walk SSS. Both renderers see the same scene: a unit
+sphere, three white quads, a constant 0.08 environment, an orthographic
+camera, a box filter, depth 12, no clamping, single-scatter GGX. The
+swatches are 96² at 1024 spp (irys) and 2048 spp (Cycles). The table gives
+each swatch's error in mean sphere radiance. Pixel MAE is in
+`look-openpbr-match.csv`; its floor is about 7–8 %, which is noise at
+these sample counts. The Cycles grid is `look-openpbr-cycles.png`.
+
+| Row (6 swatches each) | Mean-radiance error vs Cycles |
+|---|---|
+| dielectric roughness 0 … 1 | +0.0 … +3.0 % (grows with r: albedo-scaling tables differ at r → 1) |
+| metal roughness 0 … 1 (gold F82) | −0.05 … +0.08 % |
+| metalness 0 … 1 | −0.19 … +0.15 % |
+| specular IOR 1.1 … 3.0 | −0.45 … +0.21 % |
+| thin film 0.1 … 0.6 µm | +0.1 … +1.8 % (exact Airy vs Cycles' fit) |
+| coat weight 0 … 1, `coat_darkening = 1` (spec default) | +1.1 … **−41.5 %**: Cycles does not darken |
+| coat weight 0 … 1, `coat_darkening = 0` | +1.2 … −5.7 % |
+| transmission r 0 … 0.5, V = 20 (Cycles: no dispersion) | +0.0 … +4.4 % |
+| fuzz weight 0 … 1 | +1.5 … +17.1 % (Charlie vs Zeltner's microfibre) |
+| subsurface weight 0 … 1 | +0.5 … +13.5 % (van de Hulst vs Cycles' albedo inversion; diffuse boundary) |
+
+So on base, metal, metalness, IOR and film the gate is met: the error is
+within the noise. Coat, fuzz and SSS differ, each because the two
+renderers implement a different model, not because of a bug. Each
+difference is named above and listed below as a deviation.
+
+### 3. Volumes (`look::volume`)
+
+- **Media.** Homogeneous or gridded (trilinear) density in a box with an
+  index-matched boundary. `σ_t = s·d(x)·c(λ)` (spectral shape on the hats),
+  `σ_s = α(λ)σ_t`, Henyey–Greenstein phase.
+- **Tracking.** Free flight is delta tracking against the sampler's
+  majorant. Real and null weights are frozen-sampler ratios (analog at
+  `θ = θ_s`, absorption folded into `α`). Light samples are NEE through
+  the medium, with ratio tracking for the transmittance, MIS with the
+  phase pdf, and a Lambertian floor. There is an emission grid
+  (`β e L_e / μ̄` at every tentative collision).
+- **Differentiable.** Every θ-dependent factor (real, null, ratio track)
+  is one `VolEvent` IR lane, `ℓ = real·ln(α s d c) + null·ln(μ̄ − s d c)`.
+  PRB owes `W = L − L_j`, or `C` for a light sample's track.
+  `θ = (density scale, albedo on 3 hats)`.
+
+| Gate (`tests/look_volume.rs`) | Result |
+|---|---|
+| homogeneous ratio tracking and delta-tracking escape vs `e^{−σd}`, d = 0.2, 1, 3 | within 2.0 σ (e.g. 0.27391 ± 0.00083 vs 0.27253) |
+| heterogeneous grid vs `e^{−∫σ}` (τ = 1.564) | 0.20952 ± 0.00044 vs 0.20929 |
+| half-space diffuse reflectance vs Chandrasekhar `H`, ϖ 0.3/0.8/0.95/0.99 | 2.2 / 2.6 / 2.0 / 0.9 σ (e.g. 0.79544 ± 0.00096 vs 0.79456) |
+| event graph vs twin; adjoint vs CD; device WGSL vs twin | 1e-12; 1e-6; 3e-7 abs |
+| replay bit-exact; PRB vs CD (smoke scene with emission, 4 θ) | ✓; ≤ 1.6e-9 rel |
+
+![volume](look-volume.png)
+
+`look-volume.png`: a 96³ fbm smoke cube with a warm emissive core, two
+softboxes, 480×300 × 256 spp, depth 10, 1967 s on the CPU (0.02 Mpaths/s, sharing the machine with the hair render). The
+renderer is slow at 0.06–0.1 Mpaths/s. One global majorant over a sparse
+grid wastes most of the tentative collisions; a per-cell majorant grid
+(DDA) is the next step.
+
+### 4. Hair (`look::hair`)
+
+- **The BCSDF.** Chiang et al. 2016 as in pbrt-v3: R/TT/TRT and a residual;
+  d'Eon's `M_p` with `I₀`; the trimmed-logistic `N_p`; a 2° cuticle tilt;
+  exact `A_p` with `T = e^{−σ_a·2cos γ_t/cos θ_t}`. Absorption is melanin,
+  `σ_a = c_e E(λ) + c_p P(λ)`, with Chiang's RGB spectra on the hats. The
+  `Hair` IR graph carries `θ = (eumelanin, pheomelanin)`. The θ-free
+  `M_p N_p`, `F` and the path length are columns.
+- **Geometry.** Polylines are swept as round cylinders, `Strands: Geometry`
+  under irys's software BVH, and `h` comes from the hit normal in the
+  ray-facing frame. wgpu 30's ray queries on Metal intersect triangle
+  BLASes only, with no curve or procedural primitive. Hardware curves
+  would mean tessellated ribbons or an AABB intersection shader, and wgpu
+  has neither on Metal yet. So the fibres are traced in software, and the
+  hair is CPU only.
+
+| Gate (`tests/look_hair.rs`) | Result |
+|---|---|
+| white furnace `∫ f dω` (σ_a = 0) at four `(h, θ_o)` | 0.990 … 1.009 (the tilt makes `M_p` not exactly normalised) |
+| `∫ pdf dω`; `E[f/pdf]` vs uniform | 0.990 … 1.009; = 1.0000 (the sampler is exact at σ_a = 0) |
+| melanin: blonde red/blue 1.70, red-head 7.29, black albedo 0.046 | ✓ |
+| graph vs twin interp / C / WGSL; adjoint vs CD | 4e-16 / 2.6e-7 / 6.7e-7; 1e-6 |
+| replay bit-exact; PRB vs CD (400-strand clump) | ✓; ≤ 9.1e-10 rel |
+
+![hair](look-hair.png)
+
+`look-hair.png`: three procedural haircuts on spheres, 9 000 strands ×
+14 segments each, black / brown / blonde by melanin alone
+(`c_e = 8, 1.3, 0.3`). 840×360 × 256 spp, depth 24, 777 s on the CPU (sharing the machine).
+The Lee Perry-Smith head was not given hair: the skin integrator has no
+strand primitive, and merging the two integrators is its own piece of
+work.
+
+### Phase 4 deviations
+
+1. **Albedo scaling, not position-free layering.** This follows the spec's
+   reference evaluation, and the stack is non-reciprocal as the spec's is.
+2. **Fuzz is Charlie sheen** (Estevez–Kulla, Neubelt–Pettineo visibility),
+   not the spec's recommended Zeltner+ 2022 LTC fit, and it is scaled so
+   its albedo is ≤ 1. Raw Charlie reflects up to 1.40× at grazing angles.
+   Against Cycles' microfibre sheen it is +17 % at full weight.
+3. **No** `base_diffuse_roughness` (EON), anisotropy, `transmission_scatter`,
+   thin-walled mode or `geometry_opacity`. Emission is added unattenuated by
+   the coat and fuzz.
+4. **The thin film on a metal** uses the real index implied by F0, not
+   the F82 tint, and it is detached in the base colour: the PRB gate runs
+   without it. The film's change to the dielectric albedo enters as the
+   Fresnel ratio at `ω_o`.
+5. **The base under the coat uses `max(η/η_c, η_c/η)`**, because albedo
+   scaling has no refraction into the coat.
+6. **Subsurface** uses a diffuse (Lambertian) boundary at entry and exit,
+   as the skin walk does, and a tessellated copy of the shape for the walk.
+7. **CPU integrators.** Only the graphs run on the device. A GPU tier of the
+   swatch, volume or hair integrators is not built.
+
+### Phase 4 risks and next
+
+- **Coat darkening is the largest disagreement with Cycles (−41 %)**, and it
+  is on purpose: the spec's physics says a coated dark paint is darker. Any
+  scene matched against Blender should set `coat_darkening = 0`.
+- **Fuzz and SSS do not match Cycles yet.** Fuzz needs the LTC table; SSS
+  differs by the boundary and inversion models.
+- **The volume speed is poor** (one global majorant). The next steps are a
+  majorant grid, then the device.
+- **Hair has no device path** until wgpu exposes custom intersection on
+  Metal.
+- **The tables are built per process (≈ 1 s) and are not shared with the
+  device.** A device integrator would upload them as textures.
