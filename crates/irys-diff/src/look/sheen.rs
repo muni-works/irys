@@ -406,6 +406,12 @@ static TABLE: [f32; 3072] = [
     0.39997, 0.39069, 0.38171, 0.37342, 0.36523, 0.35675, 0.34897, 0.34187,
 ];
 
+/// The raw fit table (`[a; 1024] ++ [b; 1024] ++ [R; 1024]`, each `[r][μ]`),
+/// for the device kernel (phase 5b).
+pub fn table() -> &'static [f32; 3072] {
+    &TABLE
+}
+
 fn lookup(off: usize, mu: f64, r: f64) -> f64 {
     let read1 = |row: usize, x: f64| {
         let x = x.clamp(0.0, 1.0) * 31.0;
