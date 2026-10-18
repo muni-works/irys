@@ -722,6 +722,10 @@ fn lobe_weights(m: Mat, a: At) -> Lobes {
 // Directional pdf of ω_i under the lobe mixture (the thin pass is a
 // discrete event and has no density).
 fn lobe_pdf(m: Mat, a: At, l: Lobes, wo: vec3<f32>, wi: vec3<f32>) -> f32 {
+    return lobe_pdf_e(m, a.etap, l, wo, wi);
+}
+
+fn lobe_pdf_e(m: Mat, etap: f32, l: Lobes, wo: vec3<f32>, wi: vec3<f32>) -> f32 {
     let co = wo.z;
     let lw = l.w;
     if (wi.z > 0.0) {
@@ -734,7 +738,7 @@ fn lobe_pdf(m: Mat, a: At, l: Lobes, wo: vec3<f32>, wi: vec3<f32>) -> f32 {
     }
     var p = lw[4] * (-wi.z) / PI;
     if ((m.flags & F_THIN) == 0u) {
-        let e = a.etap;
+        let e = etap;
         var h = normalize(wo + wi * e);
         if (h.z < 0.0) { h = -h; }
         let oh = dot(wo, h);
@@ -764,7 +768,7 @@ fn qbar(q: vec4<f32>) -> f32 {
 // Sample: (ω_i, lobe). Lobe 3 on a thin material is the pass (ω_i = −ω_o).
 struct Pick { wi: vec3<f32>, lobe: u32 }
 
-fn lobe_sample(m: Mat, a: At, l: Lobes, wo: vec3<f32>, u: vec3<f32>) -> Pick {
+fn lobe_sample(m: Mat, etap: f32, l: Lobes, wo: vec3<f32>, u: vec3<f32>) -> Pick {
     var acc = 0.0;
     var k = 4u;
     var lw = l.w;
@@ -785,13 +789,232 @@ fn lobe_sample(m: Mat, a: At, l: Lobes, wo: vec3<f32>, u: vec3<f32>) -> Pick {
         if ((m.flags & F_THIN) != 0u) {
             p.wi = -wo;
         } else {
-            p.wi = refract_h(wo, vndf(alpha_of(m.r), wo, uv), a.etap);
+            p.wi = refract_h(wo, vndf(alpha_of(m.r), wo, uv), etap);
         }
     } else {
         let c = cosine_dir(uv);
         p.wi = vec3<f32>(c.x, c.y, -c.z);
     }
     return p;
+}
+
+
+// ---- the four lanes at once ----
+//
+// Where the index does not depend on the wavelength (no dispersion, no thin
+// film), every geometric factor (GGX, Fresnel, the tables at μ_o) is the
+// same for the four lanes and only the colours differ: At4 / eval4 / lobes4
+// / thin4 are At / eval_dir / lobe_weights / thin_pass with the colours as
+// vec4, computed once. Same arithmetic per lane as the scalar path, which
+// stays for dispersive and filmed materials (`fast_ok`).
+
+struct At4 {
+    inside: bool, co: f32,
+    eta_f: f32, eta_c: f32, eta_raw: f32, etap: f32,
+    base: vec4<f32>, metal: vec4<f32>, sc: vec4<f32>, tc: vec4<f32>,
+    ssc: vec4<f32>, cc: vec4<f32>, fc: vec4<f32>, tlc: vec4<f32>,
+    es_u: f32, es_c: f32,
+    eb: vec4<f32>,
+    e_coat: f32, k_s: f32,
+    e_fuzz: vec4<f32>,
+    em: vec4<f32>,
+}
+
+fn fast_ok(m: Mat) -> bool {
+    return m.abbe <= 0.0 && m.filmw <= 0.0;
+}
+
+fn lift4(h: vec3<f32>, lam: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(lifth(h, lam.x), lifth(h, lam.y), lifth(h, lam.z), lifth(h, lam.w));
+}
+
+fn metal4(mu: f32, r: f32, w: u32) -> f32 {
+    return metal_tab(mu, r, w);
+}
+
+fn at4_new(m: Mat, lam: vec4<f32>, inside: bool, co0: f32) -> At4 {
+    var a: At4;
+    let co = max(co0, 1e-9);
+    a.inside = inside;
+    a.co = co;
+    let eta = m.ior;
+    let rel = max(eta / m.cior, m.cior / eta);
+    let eu = modulated_ior(eta, m.sw);
+    let ec = modulated_ior(rel, m.sw);
+    if (inside) {
+        a.eta_f = 1.0 / eu; a.eta_c = 1.0 / ec; a.etap = 1.0 / eta;
+    } else {
+        a.eta_f = eu; a.eta_c = ec; a.etap = eta;
+    }
+    a.eta_raw = eta;
+    a.base = lift4(m.base, lam);
+    a.metal = lift4(m.metal, lam);
+    a.sc = lift4(m.spec, lam);
+    a.tc = select(lift4(m.trans, lam), vec4<f32>(1.0), m.tdepth > 0.0);
+    a.ssc = lift4(m.ssc, lam);
+    a.cc = lift4(m.coat, lam);
+    a.fc = lift4(m.fuzz, lam);
+    a.tlc = lift4(m.transl, lam);
+    a.es_u = diel(co, m.r, a.eta_f);
+    a.es_c = a.es_u;
+    a.eb = vec4<f32>(0.0);
+    a.e_coat = 0.0;
+    a.k_s = 0.0;
+    if (m.cw > 0.0) {
+        a.es_c = diel(co, m.r, a.eta_c);
+        let es1 = diel(1.0, m.r, a.eta_c);
+        let f0 = m.wb * a.metal;
+        let kk = (1.0 - a.sc) * (f0 + (1.0 - f0) * pow(1.0 - MU_BAR, 5.0));
+        let e5 = metal4(1.0, m.r, 1u);
+        let em1 = xi_metal(m) * (f0 * (metal4(1.0, m.r, 0u) - e5) + e5 - kk * metal4(1.0, m.r, 2u));
+        let bd = (1.0 - m.ss) * m.wb * ((1.0 - m.tl) * a.base + m.tl * a.tlc) + m.ss * a.ssc;
+        a.eb = m.met * em1 + (1.0 - m.met) * (a.sc * es1 + (1.0 - a.sc * es1) * (1.0 - m.tw) * bd);
+        let etac_side = select(m.cior, 1.0 / m.cior, inside);
+        a.e_coat = diel(co, m.cr, etac_side);
+        a.k_s = fresnel(co, etac_side);
+    }
+    a.e_fuzz = vec4<f32>(0.0);
+    if (m.fw > 0.0) { a.e_fuzz = a.fc * sheen_ltc(co, m.fr).z; }
+    a.em = vec4<f32>(0.0);
+    if (m.met > 0.0) {
+        let f0 = m.wb * a.metal;
+        let e5 = metal4(co, m.r, 1u);
+        a.em = max(f0 * (metal4(co, m.r, 0u) - e5) + e5, vec4<f32>(0.0));
+    }
+    return a;
+}
+
+fn coat_under4(m: Mat, a: At4, path: f32) -> vec4<f32> {
+    let t_coat = pow(max(a.cc, vec4<f32>(1e-12)), vec4<f32>(0.5 * path));
+    let k_r = 1.0 - (1.0 - m.ef_coat) / (m.cior * m.cior);
+    let fs = ((1.0 - a.eta_raw) / (1.0 + a.eta_raw)) * ((1.0 - a.eta_raw) / (1.0 + a.eta_raw));
+    let xs_fs = clamp(m.sw * fs, 0.0, 1.0);
+    let rd = 1.0 + (m.r - 1.0) * xs_fs;
+    let rb = rd + (m.r - rd) * m.met;
+    let kr = a.k_s + (k_r - a.k_s) * rb;
+    let delta = (1.0 - kr) / (1.0 - a.eb * kr);
+    let dark = 1.0 + (delta - 1.0) * m.cdark;
+    return t_coat * (1.0 - a.e_coat) * dark;
+}
+
+fn eval4(m: Mat, a: At4, wo: vec3<f32>, wi: vec3<f32>) -> vec4<f32> {
+    let co = a.co;
+    let thin = (m.flags & F_THIN) != 0u;
+    let up = wi.z > 0.0;
+    if (!up && (m.tw <= 0.0 || thin) && m.tl <= 0.0) { return vec4<f32>(0.0); }
+    var h: vec3<f32>;
+    var ci: f32;
+    if (up) {
+        h = normalize(wi + wo);
+        ci = wi.z;
+    } else {
+        h = normalize(wo + wi * a.etap);
+        if (h.z < 0.0) { h = -h; }
+        ci = -wi.z;
+    }
+    let oh = max(abs(dot(wo, h)), 1e-9);
+    let ih = abs(dot(wi, h));
+    let cI = max(abs(ci), 1e-9);
+    let ch = clamp(h.z, 1e-9, 1.0);
+    let al = alpha_of(m.r);
+    let a2 = al * al;
+    let kq = ch * ch * (a2 - 1.0) + 1.0;
+    let d = a2 / (PI * kq * kq);
+    let g2 = 1.0 / (1.0 + ggx_lambda(al, cI) + ggx_lambda(al, co));
+    let dg = d * g2 / (4.0 * cI * co);
+    let bd = (1.0 - m.ss) * m.wb * (1.0 - m.tl) * a.base;
+    let coated = m.cw > 0.0;
+    var f_metal = vec4<f32>(0.0);
+    if (up && m.met > 0.0) {
+        let f0 = m.wb * a.metal;
+        let p5 = pow(1.0 - oh, 5.0);
+        let fs_oh = f0 + (1.0 - f0) * p5;
+        let fs_bar = f0 + (1.0 - f0) * pow(1.0 - MU_BAR, 5.0);
+        let kk = (1.0 - a.sc) * fs_bar;
+        let mo = 1.0 - oh;
+        let w82 = oh * mo * mo * mo * mo * mo * mo / (MU_BAR * pow(1.0 - MU_BAR, 6.0));
+        f_metal = xi_metal(m) * (fs_oh - w82 * kk);
+    }
+    var ru = vec4<f32>(0.0);
+    var rc = vec4<f32>(0.0);
+    var tu = vec4<f32>(0.0);
+    var tcv = vec4<f32>(0.0);
+    let nb = select(1u, 2u, coated);
+    for (var k = 0u; k < nb; k = k + 1u) {
+        let eta = select(a.eta_f, a.eta_c, k == 1u);
+        let es = select(a.es_u, a.es_c, k == 1u);
+        let fd = fresnel(oh, eta);
+        let kd = (1.0 - m.tw) * (1.0 - a.sc * es);
+        if (up) {
+            let diffuse = kd * (bd + m.ss * a.ssc) / PI;
+            let r = m.met * f_metal * dg + (1.0 - m.met) * (a.sc * fd * dg + diffuse);
+            if (k == 0u) { ru = r; } else { rc = r; }
+        } else {
+            var t = vec4<f32>(0.0);
+            if (!thin && m.tw > 0.0) {
+                let den = dot(wi, h) + dot(wo, h) / a.etap;
+                let denom2 = max(den * den, 1e-12);
+                let btdf = d * g2 * ih * oh / (cI * co * denom2 * a.etap * a.etap);
+                t = m.tw * a.tc * (1.0 - fd) * btdf;
+            }
+            t = t + kd * (1.0 - m.ss) * m.wb * m.tl * a.tlc / PI;
+            if (k == 0u) { tu = (1.0 - m.met) * t; } else { tcv = (1.0 - m.met) * t; }
+        }
+    }
+    var under = vec4<f32>(0.0);
+    if (coated) { under = coat_under4(m, a, 1.0 / coat_mu(m, cI) + 1.0 / coat_mu(m, co)); }
+    let fuzzmul = 1.0 - m.fw * a.e_fuzz;
+    if (up) {
+        var f_coat = 0.0;
+        if (coated) {
+            let etac_side = select(m.cior, 1.0 / m.cior, a.inside);
+            let ac = alpha_of(m.cr);
+            f_coat = fresnel(oh, etac_side) * ggx_d(ac, ch)
+                / (1.0 + ggx_lambda(ac, cI) + ggx_lambda(ac, co)) / (4.0 * cI * co);
+        }
+        var f_fuzz = vec4<f32>(0.0);
+        if (m.fw > 0.0) { f_fuzz = a.fc * sheen_brdf(m.fr, wo, wi); }
+        return m.fw * f_fuzz + fuzzmul * (m.cw * f_coat + (1.0 - m.cw) * ru + m.cw * under * rc);
+    }
+    return fuzzmul * ((1.0 - m.cw) * tu + m.cw * under * tcv);
+}
+
+fn thin4(m: Mat, a: At4) -> vec4<f32> {
+    let fd = fresnel(max(a.co, 1e-4), a.eta_f);
+    var under = vec4<f32>(0.0);
+    if (m.cw > 0.0) { under = coat_under4(m, a, 2.0 / coat_mu(m, a.co)); }
+    let base = (1.0 - m.met) * m.tw * a.tc * (1.0 - fd);
+    return (1.0 - m.fw * a.e_fuzz) * ((1.0 - m.cw) + m.cw * under) * base;
+}
+
+// lobe_weights per lane, normalised per lane, averaged over the lanes.
+fn lobes4(m: Mat, a: At4) -> Lobes {
+    let es = a.es_u;
+    let ec = a.e_coat;
+    let ef = a.e_fuzz;
+    let above = max(1.0 - m.fw * ef, vec4<f32>(0.0)) * max(1.0 - m.cw * ec, 0.0);
+    let die = 1.0 - m.met;
+    let kd = (1.0 - m.tw) * max(1.0 - a.sc * es, vec4<f32>(0.0));
+    var w0 = above * (m.met * a.em + die * a.sc * es) + 1e-3;
+    var w1 = vec4<f32>(m.cw * ec);
+    var w2 = above * die * kd * ((1.0 - m.ss) * m.wb * (1.0 - m.tl) * a.base + m.ss * a.ssc) + m.fw * ef;
+    let w3 = above * die * m.tw * (1.0 - es) * a.tc;
+    var w4 = above * die * kd * (1.0 - m.ss) * m.wb * m.tl * a.tlc;
+    if (a.inside) {
+        w0 = w0 + w2;
+        w1 = vec4<f32>(0.0);
+        w2 = vec4<f32>(0.0);
+        w4 = vec4<f32>(0.0);
+    }
+    let s = w0 + w1 + w2 + w3 + w4;
+    let q = vec4<f32>(0.25);
+    var l: Lobes;
+    l.w[0] = dot(w0 / s, q);
+    l.w[1] = dot(w1 / s, q);
+    l.w[2] = dot(w2 / s, q);
+    l.w[3] = dot(w3 / s, q);
+    l.w[4] = dot(w4 / s, q);
+    return l;
 }
 
 // ---- the world ----
@@ -923,6 +1146,26 @@ fn mat_uv(m: Mat, uv: vec2<f32>) -> vec2<f32> {
     return uv * m.xf.xy + m.xf.zw;
 }
 
+// A candidate's material, the little a traversal needs of it: flags,
+// textures, the UV transform and the constant opacity.
+struct Cand { flags: u32, alpha_tex: u32, opacity: f32, xf: vec4<f32> }
+
+fn load_cand(i: u32) -> Cand {
+    let o = i * MS;
+    var c: Cand;
+    c.flags = bitcast<u32>(mats[o + 10u].w);
+    let t = mats[o + 12u];
+    c.alpha_tex = select(bitcast<u32>(t.x), bitcast<u32>(t.z), bitcast<u32>(t.z) != NONE);
+    c.opacity = t.w;
+    c.xf = mats[o + 13u];
+    return c;
+}
+
+fn cand_alpha(c: Cand, uv: vec2<f32>) -> f32 {
+    if (c.alpha_tex == NONE) { return 1.0; }
+    return tex(c.alpha_tex, uv * c.xf.xy + c.xf.zw).w;
+}
+
 fn alpha_at(m: Mat, uv: vec2<f32>) -> f32 {
     var t = m.alpha_tex;
     if (t == NONE) { t = m.base_tex; }
@@ -939,10 +1182,10 @@ fn trace_ray(o: vec3<f32>, d: vec3<f32>, msk: u32) -> Surf {
         let c = rayQueryGetCandidateIntersection(&rq);
         if (c.kind != RAY_QUERY_INTERSECTION_TRIANGLE) { continue; }
         let ir = inst[c.instance_custom_data];
-        let m = load_mat(ir.y);
+        let m = load_cand(ir.y);
         if ((m.flags & F_CUTOUT) != 0u) {
             let uv = tri_uv(ir.x + c.primitive_index, c.barycentrics);
-            if (alpha_at(m, uv) < 0.5) { continue; }
+            if (cand_alpha(m, uv) < 0.5) { continue; }
         }
         rayQueryConfirmIntersection(&rq);
     }
@@ -988,21 +1231,26 @@ fn shadow(o: vec3<f32>, d: vec3<f32>, tmax: f32, lam: vec4<f32>) -> vec4<f32> {
         let c = rayQueryGetCandidateIntersection(&rq);
         if (c.kind != RAY_QUERY_INTERSECTION_TRIANGLE) { continue; }
         let ir = inst[c.instance_custom_data];
-        let m = load_mat(ir.y);
-        if ((m.flags & F_CUTOUT) != 0u) {
+        let mc = load_cand(ir.y);
+        if ((mc.flags & F_CUTOUT) != 0u) {
             let uv = tri_uv(ir.x + c.primitive_index, c.barycentrics);
-            if (alpha_at(m, uv) < 0.5) { continue; }
+            if (cand_alpha(mc, uv) < 0.5) { continue; }
             rayQueryConfirmIntersection(&rq);
             break;
         }
-        if ((m.flags & F_THIN) != 0u) {
+        if ((mc.flags & F_THIN) != 0u) {
+            let m = load_mat(ir.y);
             let q = (ir.x + c.primitive_index) * 7u;
             let ng = normalize(cross(tris[q + 1u].xyz - tris[q].xyz, tris[q + 2u].xyz - tris[q].xyz));
             let ow = c.object_to_world;
             let ngw = normalize((ow * vec4<f32>(ng, 0.0)).xyz);
             let cs = abs(dot(ngw, d));
-            for (var k = 0u; k < NW; k = k + 1u) {
-                tr[k] = tr[k] * thin_pass(m, at_new(m, lam[k], false, cs));
+            if (fast_ok(m)) {
+                tr = tr * thin4(m, at4_new(m, lam, false, cs));
+            } else {
+                for (var k = 0u; k < NW; k = k + 1u) {
+                    tr[k] = tr[k] * thin_pass(m, at_new(m, lam[k], false, cs));
+                }
             }
             if (max(max(tr.x, tr.y), max(tr.z, tr.w)) <= 0.0) {
                 rayQueryConfirmIntersection(&rq);
@@ -1010,8 +1258,8 @@ fn shadow(o: vec3<f32>, d: vec3<f32>, tmax: f32, lam: vec4<f32>) -> vec4<f32> {
             }
             continue;
         }
-        if (m.opacity < 1.0) {
-            tr = tr * (1.0 - m.opacity);
+        if (mc.opacity < 1.0) {
+            tr = tr * (1.0 - mc.opacity);
             continue;
         }
         rayQueryConfirmIntersection(&rq);
@@ -1290,25 +1538,38 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
                 mt.metal = hats(tex(m.metal_tex, mat_uv(m, s.uv)).xyz);
             }
             let wo = local_frame(ns, wo_w);
+            // The four-lane path where the index is the same at every
+            // wavelength; per lane otherwise (and when P.up.w forces it).
+            let fast = fast_ok(mt) && P.up.w == 0.0;
             var at: array<At, 4>;
-            for (var k = 0u; k < NW; k = k + 1u) { at[k] = at_new(mt, lam[k], inside, max(wo.z, 1e-6)); }
-            // Lobe weights averaged over the four wavelengths: the hero's
-            // alone would give a lane whose albedo the hero does not share
-            // (a green leaf at a blue hero) f / pdf without bound.
-            var lw = lobe_weights(mt, at[0]);
-            for (var k = 1u; k < NW; k = k + 1u) {
-                let lk = lobe_weights(mt, at[k]);
-                lw.w[0] = lw.w[0] + lk.w[0];
-                lw.w[1] = lw.w[1] + lk.w[1];
-                lw.w[2] = lw.w[2] + lk.w[2];
-                lw.w[3] = lw.w[3] + lk.w[3];
-                lw.w[4] = lw.w[4] + lk.w[4];
+            var a4: At4;
+            var lw: Lobes;
+            var etap0 = 1.0;
+            if (fast) {
+                a4 = at4_new(mt, lam, inside, max(wo.z, 1e-6));
+                lw = lobes4(mt, a4);
+                etap0 = a4.etap;
+            } else {
+                for (var k = 0u; k < NW; k = k + 1u) { at[k] = at_new(mt, lam[k], inside, max(wo.z, 1e-6)); }
+                // Lobe weights averaged over the four wavelengths: the hero's
+                // alone would give a lane whose albedo the hero does not share
+                // (a green leaf at a blue hero) f / pdf without bound.
+                lw = lobe_weights(mt, at[0]);
+                for (var k = 1u; k < NW; k = k + 1u) {
+                    let lk = lobe_weights(mt, at[k]);
+                    lw.w[0] = lw.w[0] + lk.w[0];
+                    lw.w[1] = lw.w[1] + lk.w[1];
+                    lw.w[2] = lw.w[2] + lk.w[2];
+                    lw.w[3] = lw.w[3] + lk.w[3];
+                    lw.w[4] = lw.w[4] + lk.w[4];
+                }
+                lw.w[0] = lw.w[0] * 0.25;
+                lw.w[1] = lw.w[1] * 0.25;
+                lw.w[2] = lw.w[2] * 0.25;
+                lw.w[3] = lw.w[3] * 0.25;
+                lw.w[4] = lw.w[4] * 0.25;
+                etap0 = at[0].etap;
             }
-            lw.w[0] = lw.w[0] * 0.25;
-            lw.w[1] = lw.w[1] * 0.25;
-            lw.w[2] = lw.w[2] * 0.25;
-            lw.w[3] = lw.w[3] * 0.25;
-            lw.w[4] = lw.w[4] * 0.25;
             let xo_up = offset_ray(s.x, ng);
             let xo_dn = offset_ray(s.x, -ng);
             // Next-event estimation.
@@ -1325,10 +1586,18 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
                         if (dist < 3e38) { dist = length(s.x + l.wi * l.dist - xo) * (1.0 - 1e-4); }
                         let tr = shadow(xo, l.wi, dist, lam);
                         if (max(max(tr.x, tr.y), max(tr.z, tr.w)) > 0.0) {
-                            let pb = spectral_pdf(mt, &at, lw, wo, wi, q);
+                            var pb: f32;
+                            var f4: vec4<f32>;
+                            if (fast) {
+                                pb = lobe_pdf_e(mt, a4.etap, lw, wo, wi);
+                                f4 = eval4(mt, a4, wo, wi);
+                            } else {
+                                pb = spectral_pdf(mt, &at, lw, wo, wi, q);
+                                for (var k = 0u; k < NW; k = k + 1u) { f4[k] = eval_dir(mt, at[k], wo, wi); }
+                            }
                             let wm = mis(l.pdf, pb);
                             for (var k = 0u; k < NW; k = k + 1u) {
-                                let fk = eval_dir(mt, at[k], wo, wi);
+                                let fk = f4[k];
                                 var c = tp[k] * fk * abs(wi.z) * lifth(l.le, lam[k]) * tr[k] * wm / (l.pdf * qbar(q));
                                 if (clampv > 0.0 && bounce > 0u) { c = min(c, clampv); }
                                 rad[k] = rad[k] + c;
@@ -1339,12 +1608,16 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
             }
             // The BSDF sample.
             let ub = vec3<f32>(rand(&rng), rand(&rng), rand(&rng));
-            let pick = lobe_sample(mt, at[0], lw, wo, ub);
+            let pick = lobe_sample(mt, etap0, lw, wo, ub);
             if (pick.lobe == 3u && thin) {
                 // The thin pass: straight on, not a vertex (shadow rays
                 // took the same pass at the previous vertex).
-                for (var k = 0u; k < NW; k = k + 1u) {
-                    tp[k] = tp[k] * thin_pass(mt, at[k]) / lw.w[3];
+                if (fast) {
+                    tp = tp * thin4(mt, a4) / lw.w[3];
+                } else {
+                    for (var k = 0u; k < NW; k = k + 1u) {
+                        tp[k] = tp[k] * thin_pass(mt, at[k]) / lw.w[3];
+                    }
                 }
                 if (passes >= 32u) { break; }
                 passes = passes + 1u;
@@ -1359,12 +1632,20 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
             // Spectral MIS (Wilkie+ 2014): every lane over the mean of the
             // four wavelengths' densities, so a dispersive near-delta
             // refraction carries its hero ×4 and the rest ~0, unbiased.
-            let pdf = spectral_pdf(mt, &at, lw, wo, wi, q);
-            let p0 = lobe_pdf(mt, at[0], lw, wo, wi);
-            if (!(pdf > 0.0) || pdf > 3.0e38 || !(p0 > 0.0)) { break; }
-            for (var k = 0u; k < NW; k = k + 1u) {
-                tp[k] = tp[k] * eval_dir(mt, at[k], wo, wi) * abs(wi.z) / p0;
-                if (k > 0u) { q[k] = q[k] * lobe_pdf(mt, at[k], lw, wo, wi) / p0; }
+            var pdf: f32;
+            if (fast) {
+                // every lane's density is the hero's: q is unchanged
+                pdf = lobe_pdf_e(mt, a4.etap, lw, wo, wi);
+                if (!(pdf > 0.0) || pdf > 3.0e38) { break; }
+                tp = tp * eval4(mt, a4, wo, wi) * (abs(wi.z) / pdf);
+            } else {
+                pdf = spectral_pdf(mt, &at, lw, wo, wi, q);
+                let p0 = lobe_pdf(mt, at[0], lw, wo, wi);
+                if (!(pdf > 0.0) || pdf > 3.0e38 || !(p0 > 0.0)) { break; }
+                for (var k = 0u; k < NW; k = k + 1u) {
+                    tp[k] = tp[k] * eval_dir(mt, at[k], wo, wi) * abs(wi.z) / p0;
+                    if (k > 0u) { q[k] = q[k] * lobe_pdf(mt, at[k], lw, wo, wi) / p0; }
+                }
             }
             bounce = bounce + 1u;
             if (bounce >= P.flags.w) {
@@ -1422,6 +1703,6 @@ fn probe(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = lobe_pdf(m, a, lw, wo, wi);
     probe_io[base + 4u] = vec4<f32>(f, p, lw.w[0], lw.w[1]);
     probe_io[base + 5u] = vec4<f32>(lw.w[2], lw.w[3], lw.w[4], thin_pass(m, a));
-    let pk = lobe_sample(m, a, lw, wo, u);
+    let pk = lobe_sample(m, a.etap, lw, wo, u);
     probe_io[base + 6u] = vec4<f32>(pk.wi, f32(pk.lobe));
 }

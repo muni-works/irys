@@ -58,11 +58,14 @@ pub struct Opts {
     pub seed: u64,
     /// Debug view (0: off; 1 material hash, 2 shading normal, 3 tw / front / t).
     pub debug: u32,
+    /// Evaluate every material per wavelength (the dispersive path) even
+    /// where the four-lane path applies: the test of one against the other.
+    pub per_lane: bool,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Self { spp: 16, max_bounces: 7, rr_from: u32::MAX, clamp: 0.0, seed: 1, debug: 0 }
+        Self { spp: 16, max_bounces: 7, rr_from: u32::MAX, clamp: 0.0, seed: 1, debug: 0, per_lane: false }
     }
 }
 
@@ -650,7 +653,7 @@ impl GpuLook {
             eye: v(cam.eye, cam.tan_half as f32),
             fwd: v(cam.forward, o.clamp),
             right: v(cam.right, 0.0),
-            up: v(cam.up, 0.0),
+            up: v(cam.up, if o.per_lane { 1.0 } else { 0.0 }),
             resp: [norm[0] as f32 * per, norm[1] as f32 * per, norm[2] as f32 * per, 0.0],
             sun_dir: self.sun.0,
             sun_l: self.sun.1,

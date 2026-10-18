@@ -203,3 +203,52 @@ fn frames_are_deterministic() {
     assert_ne!(bits(&a.rgb), bits(&c.rgb), "the seed does not reach the frame");
     assert!(a.spectrum.iter().all(|s| s.is_finite() && *s >= 0.0));
 }
+
+/// The four-lane material path (no dispersion, no film) against the
+/// per-wavelength path it replaces: the same paths (the random stream does
+/// not depend on it), the same frame to f32 rounding.
+#[test]
+fn four_lanes_are_the_per_lane_path() {
+    let Some(ctx) = gpu() else {
+        eprintln!("no device: skipped");
+        return;
+    };
+    let mut rng = Rng::new(77, 0);
+    let mats: Vec<Material> = (0..6)
+        .map(|k| {
+            let mut m = random_material(&mut rng, k);
+            m.thin_film_weight = 0.0;
+            m.transmission_dispersion_scale = 0.0;
+            let mut mm = Material::new("m", m);
+            if k == 3 {
+                mm.translucency = 0.4;
+                mm.translucent_color = [0.3, 0.8, 0.2];
+            }
+            if k == 4 {
+                mm.metal_color = Some([0.9, 0.5, 0.2]);
+            }
+            mm
+        })
+        .collect();
+    let scene = LookScene::spheres(mats, 0.8, (120, 40));
+    let Some(g) = GpuLook::new(ctx, &scene) else {
+        eprintln!("no ray queries: skipped");
+        return;
+    };
+    let o = Opts { spp: 16, max_bounces: 8, ..Opts::default() };
+    let a = g.render(&scene.camera, &o);
+    let b = g.render(&scene.camera, &Opts { per_lane: true, ..o });
+    let (mut d, mut m) = (0.0f64, 0.0f64);
+    let mut far = 0;
+    for (x, y) in a.rgb.iter().zip(&b.rgb) {
+        let e = (x - y).abs() as f64;
+        d += e;
+        m += y.abs() as f64;
+        if e > 1e-3 * (1.0 + y.abs() as f64) {
+            far += 1;
+        }
+    }
+    eprintln!("four lanes vs per lane: mean |Δ| / mean {:.2e}, {far} of {} values > 1e-3", d / m, a.rgb.len());
+    assert!(d / m < 1e-4, "four-lane path drifts: {}", d / m);
+    assert!(far <= a.rgb.len() / 1000);
+}
