@@ -2,10 +2,15 @@
 //!
 //! Each bounce is five dispatches, in one compute pass per frame:
 //!
-//! 1. `bounce` (hand WGSL, `gpu/wavefront.wgsl`): intersect, sample, and
-//!    write the graph's seven input columns per lane;
+//! 1. `bounce` (hand WGSL, `gpu/wavefront.wgsl`): intersect (hardware ray
+//!    queries where the device has them, `gpu/rt.rs`), sample, and stage a
+//!    conductor vertex's lane inputs; then lane compaction
+//!    (`gpu/compact.wgsl`): a deterministic scan of which paths staged
+//!    lanes, and `scatter`, which writes the graph's seven input columns at
+//!    the compact lanes only;
 //! 2. the **eval lowering of [`ggx::Graph`], as tang-compile emits it**
-//!    ([`TensorGraph::to_wgsl`]) — `f` and `pdf` per lane;
+//!    ([`TensorGraph::to_wgsl`]) — `f` and `pdf` per lane, dispatched
+//!    indirectly over the compact lanes alone;
 //! 3. `update`: throughput `*= f cos / p`, and in replay `δf` per lane;
 //! 4. replay only: the **adjoint lowering**, the same way — `Σ_lanes δf ∂f/∂θ`
 //!    as the IR's own sum, scheduled `split = 256` (one workgroup per
@@ -44,6 +49,23 @@ const WAVEFRONT: &str = include_str!("gpu/wavefront.wgsl");
 const EDGES: &str = include_str!("gpu/edges.wgsl");
 const RESTIR: &str = include_str!("gpu/restir.wgsl");
 const GUIDE: &str = include_str!("gpu/guide.wgsl");
+const RT: &str = include_str!("gpu/rt.wgsl");
+const COMPACT: &str = include_str!("gpu/compact.wgsl");
+
+mod rt;
+
+/// The wavefront's WGSL: with the hardware walk compiled in when the device
+/// has ray queries (`rt.wgsl`, chosen per pass by `Params::rt`), else the
+/// software walk alone.
+fn wavefront_src(hw: bool, rest: &str) -> String {
+    if hw {
+        format!("enable wgpu_ray_query;\n{WAVEFRONT}\n{RT}\n{rest}")
+    } else {
+        format!(
+            "{WAVEFRONT}\nfn intersect(o: vec3<f32>, d: vec3<f32>, tmax: f32, any: bool) -> Hit {{ return intersect_sw(o, d, tmax, any); }}\n{rest}"
+        )
+    }
+}
 
 /// `qmc::sobol_matrices` dimensions 1–3 as a WGSL module constant, so the
 /// device's direction numbers are the CPU's by construction.
@@ -84,7 +106,7 @@ struct Params {
     base: u32,
     total: u32,
     points: u32,
-    _pad: u32,
+    rt: u32,
     sun: [f32; 4],
     env: [f32; 4],
     light: [f32; 4],
@@ -219,6 +241,17 @@ impl Ir {
             pass.dispatch_workgroups(*groups, 1, 1);
         }
     }
+
+    /// Every kernel over the workgroups `args` holds (lane compaction):
+    /// the kernels are pointwise over lanes, so a shorter grid evaluates
+    /// the first lanes only.
+    fn dispatch_indirect(&self, pass: &mut wgpu::ComputePass, args: &wgpu::Buffer) {
+        for (pipe, bg, _) in &self.kernels {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups_indirect(args, 0);
+        }
+    }
 }
 
 /// What runs on the device after a forward pass.
@@ -276,15 +309,56 @@ pub struct GpuPrb {
     eval: Ir,
     adjoint: Ir,
     f: TensorId,
-    pipes: [wgpu::ComputePipeline; 13],
+    pipes: [wgpu::ComputePipeline; 17],
     // gen, bounce, update, finish→l, finish→l2, accumulate, score,
     // loss_sum, lane_adjoint
-    groups: [wgpu::BindGroup; 14],
+    groups: [wgpu::BindGroup; 18],
+    /// Lane compaction's indirect dispatch: (workgroups, 1, 1, lanes).
+    ind: wgpu::Buffer,
+    /// Graph lanes per chunk.
+    chunk_width: usize,
     layout: Layout,
     /// Timings of the last forward and replay.
     pub timing: Timing,
     /// The next pass's points are on the device already ([`GpuEdges`]).
     device_points: std::cell::Cell<bool>,
+    /// Speed piece 1: the hardware acceleration structures, where the
+    /// device has ray queries.
+    accel: Option<rt::Accel>,
+    /// Trace through `accel` (else the WGSL walk).
+    hw: bool,
+}
+
+/// A bind group of `e`'s buffers, plus the acceleration structure and its
+/// instance map (bindings 57, 58) when `accel` is given.
+fn bind_with(
+    dev: &wgpu::Device,
+    p: &wgpu::ComputePipeline,
+    e: &[(u32, &wgpu::Buffer)],
+    accel: Option<&rt::Accel>,
+) -> wgpu::BindGroup {
+    let mut entries: Vec<wgpu::BindGroupEntry> = e
+        .iter()
+        .map(|&(binding, b)| wgpu::BindGroupEntry {
+            binding,
+            resource: b.as_entire_binding(),
+        })
+        .collect();
+    if let Some(a) = accel {
+        entries.push(wgpu::BindGroupEntry {
+            binding: 57,
+            resource: a.tlas.as_binding(),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 58,
+            resource: a.map.as_entire_binding(),
+        });
+    }
+    dev.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &p.get_bind_group_layout(0),
+        entries: &entries,
+    })
 }
 
 /// Where the instance and splat records start in the packed scene.
@@ -548,6 +622,7 @@ impl GpuPrb {
         let loss = storage("loss", 4);
         let path_buf = storage("paths", paths as u64 * PATH_BYTES);
         let (nodes, ids, geo, layout) = pack(scene);
+        let accel = rt::Accel::new(ctx, scene);
         // Room for the top-level tree to change shape when instances move
         // (`update_geometry`): at most two nodes (four vec4s) per instance.
         let room = 8 * (scene.placements().len() as u64 + 1) * 16;
@@ -589,6 +664,22 @@ impl GpuPrb {
         let g_rec = storage("guide records", recs * 16);
         let g_nrec = storage("guide record counts", if grid.is_some() { paths as u64 * 4 } else { 0 });
         let g_cnt = storage("guide counts", cells * 4);
+        // Lane compaction (`compact.wgsl`).
+        let lane_bits = storage("lane bits", paths as u64 * 4);
+        let stage = storage("lane stage", paths as u64 * 32);
+        let lane_off = storage("lane offsets", paths as u64 * 4);
+        let lane_top = storage("lane block offsets", (paths as u64).div_ceil(256) * 4);
+        let ind = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("eval indirect"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+            mapped_at_creation: false,
+        });
+        // Lanes nothing has written are harmless (`f = 0`, finite
+        // derivatives), as `bounce` used to write them every bounce.
+        for c in &cols[..4] {
+            ctx.queue.write_buffer(c, 0, bytemuck::cast_slice(&vec![1.0f32; width]));
+        }
         let params = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
             size: std::mem::size_of::<Params>() as u64,
@@ -625,7 +716,9 @@ impl GpuPrb {
 
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("prb wavefront"),
-            source: wgpu::ShaderSource::Wgsl(format!("{WAVEFRONT}\n{RESTIR}\n{GUIDE}\n{}", sobol_const()).into()),
+            source: wgpu::ShaderSource::Wgsl(
+                wavefront_src(accel.is_some(), &format!("{RESTIR}\n{GUIDE}\n{COMPACT}\n{}", sobol_const())).into(),
+            ),
         });
         let pipe = |entry: &str| {
             dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -651,23 +744,21 @@ impl GpuPrb {
             "ris_temporal",
             "ris_spatial",
             "guide_build",
+            "cscan_block",
+            "cscan_tops",
+            "scatter",
+            "clear",
         ]
         .map(pipe);
         let bind = |p: &wgpu::ComputePipeline, e: &[(u32, &wgpu::Buffer)]| {
-            dev.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &p.get_bind_group_layout(0),
-                entries: &e
-                    .iter()
-                    .map(|&(binding, b)| wgpu::BindGroupEntry {
-                        binding,
-                        resource: b.as_entire_binding(),
-                    })
-                    .collect::<Vec<_>>(),
-            })
+            bind_with(dev, p, e, None)
+        };
+        // The kernels that trace: with the acceleration structures as well.
+        let bind_rt = |p: &wgpu::ComputePipeline, e: &[(u32, &wgpu::Buffer)]| {
+            bind_with(dev, p, e, accel.as_ref())
         };
         let f_buf = eval.buffer(g.f);
-        let mut bounce: Vec<(u32, &wgpu::Buffer)> = vec![
+        let bounce: Vec<(u32, &wgpu::Buffer)> = vec![
             (0, &params),
             (1, &path_buf),
             (23, &nodes),
@@ -679,8 +770,18 @@ impl GpuPrb {
             (52, &g_ok),
             (53, &g_rec),
             (54, &g_nrec),
+            (59, &lane_bits),
+            (60, &stage),
         ];
-        bounce.extend(cols.iter().enumerate().map(|(c, b)| (2 + c as u32, b)));
+        let mut scatter: Vec<(u32, &wgpu::Buffer)> = vec![
+            (0, &params),
+            (1, &path_buf),
+            (59, &lane_bits),
+            (60, &stage),
+            (61, &lane_off),
+            (62, &lane_top),
+        ];
+        scatter.extend(cols.iter().enumerate().map(|(c, b)| (2 + c as u32, b)));
         let groups = [
             bind(
                 &pipes[0],
@@ -692,7 +793,7 @@ impl GpuPrb {
                     (56, &qtab),
                 ],
             ),
-            bind(&pipes[1], &bounce),
+            bind_rt(&pipes[1], &bounce),
             bind(
                 &pipes[2],
                 &[
@@ -702,6 +803,9 @@ impl GpuPrb {
                     (10, &l),
                     (11, &dl),
                     (12, &df),
+                    (59, &lane_bits),
+                    (61, &lane_off),
+                    (62, &lane_top),
                 ],
             ),
             bind(
@@ -746,8 +850,8 @@ impl GpuPrb {
                 &pipes[7],
                 &[(0, &params), (19, &d_img), (22, &dl), (56, &qtab)],
             ),
-            bind(&pipes[8], &bounce),
-            bind(
+            bind_rt(&pipes[8], &bounce),
+            bind_rt(
                 &pipes[9],
                 &[
                     (0, &params),
@@ -779,6 +883,10 @@ impl GpuPrb {
                 &pipes[12],
                 &[(0, &params), (50, &g_hist), (51, &g_cdf), (52, &g_ok), (55, &g_cnt)],
             ),
+            bind(&pipes[13], &[(0, &params), (59, &lane_bits), (61, &lane_off), (62, &lane_top)]),
+            bind(&pipes[14], &[(0, &params), (62, &lane_top), (63, &ind)]),
+            bind(&pipes[15], &scatter),
+            bind(&pipes[16], &[(12, &df), (63, &ind)]),
         ];
         let f = g.f;
         if let Some(e) = pollster::block_on(scope.pop()) {
@@ -814,9 +922,25 @@ impl GpuPrb {
             f,
             pipes,
             groups,
+            ind,
+            chunk_width: width,
             timing: Timing::default(),
             device_points: std::cell::Cell::new(false),
+            accel,
+            hw: std::env::var("IRYS_RT").map_or(true, |v| v != "sw"),
         }
+    }
+
+    /// Whether passes trace through the hardware's ray queries (the device
+    /// has them and [`set_hardware_rt`](Self::set_hardware_rt) left them on).
+    pub fn hardware_rt(&self) -> bool {
+        self.accel.is_some() && self.hw
+    }
+
+    /// Trace through the hardware (`true`, where the device has ray
+    /// queries) or the WGSL walk, the reference. Takes effect next pass.
+    pub fn set_hardware_rt(&mut self, on: bool) {
+        self.hw = on;
     }
 
     /// Lanes this wavefront was built for.
@@ -866,7 +990,7 @@ impl GpuPrb {
             base,
             total: scene.paths() as u32,
             points: scene.points().is_some() as u32,
-            _pad: 0,
+            rt: (self.accel.is_some() && self.hw) as u32,
             sun: {
                 let e = &scene.env;
                 [
@@ -942,7 +1066,15 @@ impl GpuPrb {
             }
             for _ in 0..scene.depth {
                 self.dispatch(&mut pass, 1, 1, groups);
-                self.eval.dispatch(&mut pass);
+                // Lane compaction: scan the lane bits, scatter the columns,
+                // evaluate only the compact lanes.
+                self.dispatch(&mut pass, 13, 14, self.paths.div_ceil(256));
+                self.dispatch(&mut pass, 14, 15, 1);
+                self.dispatch(&mut pass, 15, 16, groups);
+                if replay {
+                    self.dispatch(&mut pass, 16, 17, (self.chunk_width as u32).div_ceil(WG));
+                }
+                self.eval.dispatch_indirect(&mut pass, &self.ind);
                 self.dispatch(&mut pass, 2, 2, groups);
                 if replay {
                     self.adjoint.dispatch(&mut pass);
@@ -1038,6 +1170,9 @@ impl GpuPrb {
         q.write_buffer(&self.geo, 0, bytemuck::cast_slice(&geo));
         q.write_buffer(&self.lights, 0, bytemuck::cast_slice(&pack_lights(scene)));
         self.layout = layout;
+        if let Some(a) = &mut self.accel {
+            a.update(self.ctx, scene);
+        }
     }
 
     /// ReSTIR DI: make the last frame's reservoirs and G-buffer the previous
@@ -1463,7 +1598,9 @@ impl GpuEdges {
         };
         let ep = uni("edge params", std::mem::size_of::<EdgeParams>() as u64);
         let params = uni("edge scene params", std::mem::size_of::<Params>() as u64);
-        let src = format!("{WAVEFRONT}\n{RESTIR}\n{GUIDE}\n{EDGES}\n{}", sobol_const());
+        // The edge sampler's visibility stays on the WGSL walk: one eye ray
+        // per edge point, not a frame's worth of bounces.
+        let src = wavefront_src(false, &format!("{RESTIR}\n{GUIDE}\n{EDGES}\n{}", sobol_const()));
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("edges"),
             source: wgpu::ShaderSource::Wgsl(src.into()),

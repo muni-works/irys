@@ -63,6 +63,30 @@ fn main() {
             }
         }
         "report" => report(&a, &out),
+        "speed" => {
+            for name in a.get("scene", "pair,room").split(',') {
+                speed(&a, &out, name, w, h);
+            }
+        }
+        "rtcheck" => {
+            let ctx = context();
+            for name in a.get("scene", "pair,room").split(',') {
+                let b = scenes::build(name, w, h, a.num("spp", 4));
+                let mut g = GpuPrb::new(ctx, &b.scene);
+                let mut imgs = Vec::new();
+                for hw in [false, true, true, false, true] {
+                    g.set_hardware_rt(hw);
+                    imgs.push(g.image(&b.scene, &b.theta, 5));
+                }
+                let diff = |x: &[f32], y: &[f32]| x.iter().zip(y).filter(|(p, q)| p != q).count();
+                let m = |x: &[f32]| x.iter().map(|&v| v as f64).sum::<f64>() / x.len() as f64;
+                println!(
+                    "{name}: means sw {:.5} hw {:.5} {:.5} sw {:.5} hw {:.5}; hw-hw diff {} {}, sw-sw {}, hw-sw {}",
+                    m(&imgs[0]), m(&imgs[1]), m(&imgs[2]), m(&imgs[3]), m(&imgs[4]),
+                    diff(&imgs[1], &imgs[2]), diff(&imgs[1], &imgs[4]), diff(&imgs[0], &imgs[3]), diff(&imgs[0], &imgs[1])
+                );
+            }
+        }
         "retime" => {
             for name in a.get("scene", "pair,room").split(',') {
                 retime(&a, &out, name, w, h);
@@ -197,6 +221,8 @@ fn retime(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
         let at = rows.iter().find(|r| r["spp"].as_u64() == Some(spp as u64)).expect("spp level")["seconds"]
             .as_f64()
             .unwrap();
+        // Fastest observation: a slower round never slows the sweep down.
+        let t = t.min(at);
         let f = t / at;
         for r in rows.iter_mut() {
             let s = r["seconds"].as_f64().unwrap();
@@ -205,6 +231,32 @@ fn retime(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
         j["retimed"] = json!({"spp": spp, "clean_seconds": t, "factor": f});
         write_json(&path, &j);
         println!("{name} {v}: {spp} spp clean {t:.4} s, sweep had {at:.4} s, x{f:.3}");
+    }
+}
+
+/// Time per sample, fastest of `rounds` renders of `spp`, per variant, with
+/// the relMSE against the cached irys reference (speed work; no files
+/// written).
+fn speed(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
+    let ctx = context();
+    let reference = read_f32(&out.join(name).join("irys_ref.f32"));
+    let spp = a.num("spp", 256);
+    for v in a.get("variants", "base").split(',') {
+        let mut r = Runner::new(ctx, name, w, h, v, None);
+        let mut best = f64::INFINITY;
+        let mut img = Vec::new();
+        for _ in 0..a.num("rounds", 3) {
+            let (i, t) = r.render(spp, 77);
+            best = best.min(t);
+            img = i;
+        }
+        let hw = r.wf.values().next().is_some_and(|(_, g)| g.hardware_rt());
+        println!(
+            "{name} {v}: {:.3} ms/spp ({spp} spp, {}), relMSE {:.3e}",
+            best / spp as f64 * 1e3,
+            if hw { "hw rt" } else { "sw walk" },
+            relmse(&img, &reference)
+        );
     }
 }
 
@@ -393,7 +445,7 @@ fn report(a: &Args, out: &Path) {
             font::label(&mut canvas, pw, ph, ox + 4, oy + 4, 1, text);
         }
         std::fs::create_dir_all(&docs).unwrap();
-        let p = docs.join(format!("phase3-{name}.png"));
+        let p = docs.join(format!("{}-{name}.png", a.get("prefix", "phase3")));
         write_png(&p, pw, ph, &canvas);
         println!("wrote {}", p.display());
     }

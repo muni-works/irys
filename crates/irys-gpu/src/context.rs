@@ -121,12 +121,26 @@ impl GpuContext {
         // compute stage; default wgpu limits only allow 8. Inherit the
         // adapter's full limits so this and similar pipelines validate.
         let required_limits = adapter.limits();
+        // Hardware ray queries where the adapter has them (Metal on Apple7+
+        // with macOS 15): irys-diff's wavefront traces through them and
+        // keeps its WGSL walk as the fallback and the reference.
+        // `IRYS_RT=sw` leaves the feature off.
+        let rt = wgpu::Features::EXPERIMENTAL_RAY_QUERY;
+        let want_rt = adapter.features().contains(rt)
+            && std::env::var("IRYS_RT").map_or(true, |v| v != "sw");
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("kosm-render GPU device"),
-                required_features: wgpu::Features::empty(),
+                required_features: if want_rt { rt } else { wgpu::Features::empty() },
                 required_limits,
+                // SAFETY: the only experimental feature requested is ray
+                // queries, used by irys-diff's `rt` module as wgpu documents.
+                experimental_features: if want_rt {
+                    unsafe { wgpu::ExperimentalFeatures::enabled() }
+                } else {
+                    wgpu::ExperimentalFeatures::disabled()
+                },
                 memory_hints: wgpu::MemoryHints::default(),
                 ..Default::default()
             })

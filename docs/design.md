@@ -1469,6 +1469,195 @@ evaluation, and the trade changes.
    street; an adaptive tree (SD-tree) or a neural guide when scenes grow.
 5. ReSTIR PT/GRIS and NRC were not built.
 
+## Speed: hardware ray queries, lane compaction (2026-10-17)
+
+Phase 3 left the gate on throughput: irys took a sample 2.4–3.6× slower
+than Cycles on the same M4 Max. Two commits on `claude/speed`:
+
+| piece | commit | what |
+|---|---|---|
+| 1 | hardware ray queries | BLAS per tree, TLAS of the placements, `rayQuery` for closest and shadow rays |
+| 2 | lane compaction | stage → deterministic scan → scatter → eval IR over the compact lanes only |
+
+### 1. Hardware ray tracing (`gpu/rt.rs`, `gpu/rt.wgsl`)
+
+**What wgpu 30 offers on Metal** (read in the registry source, then
+probed on the device): `wgpu-hal-30.0.1/src/metal/adapter.rs` sets
+`Features::EXPERIMENTAL_RAY_QUERY` from `supportsRaytracing` and
+`supportsRaytracingFromRender` on macOS ≥ 15; `metal/command.rs` builds
+BLASes and TLASes through `MTLAccelerationStructureCommandEncoder` (triangle
+and bounding-box geometry, indirect instance descriptors whose transform
+is the instance's row-major 3 × 4); `naga-30.0.1/src/back/msl/ray.rs`
+lowers WGSL `rayQuery*` to Metal's `intersection_query`, procedural AABB
+candidates and `rayQueryGenerateIntersection` included. The M4 Max reports
+the feature. A Metal-native backend (objc2-metal intersector, behind a
+feature) and a faster software walk (CWBVH) were therefore not needed:
+the hardware is reachable from WGSL, behind the one experimental-features
+token, and the shader stays one module.
+
+**Build.** Per bottom-level tree, up to two BLASes: its triangles (opaque,
+in mesh order, so `primitive_index` is the prim record's offset) and its
+analytic prims as AABBs (padded by a relative margin), intersected in the
+candidate loop by the software walk's own `hit_prim` in the instance space
+`to_local` gives. One TLAS instance per (placement, BLAS), its transform
+the placement's object → world, `rt_inst` mapping it back to (instance
+record, first prim record) — so a hardware hit is exactly the `Hit` the
+WGSL walk returns. `update_geometry` rebuilds the TLAS. Splats keep the
+software K-buffer (they are parked); the edge sampler keeps the WGSL walk
+(one eye ray per edge point).
+
+**Two device facts found the hard way.** The first frames after a build
+were missing a whole BLAS, a different one run to run, until the BLAS
+builds were waited on before the TLAS build and first use: Metal does not
+order an acceleration-structure build against the work that reads it
+here. The builds also go one per submit (wgpu's Metal
+`place_acceleration_structure_barrier` is empty). And naga rejects
+`rayQueryGenerateIntersection(&q, expr)` with an inline expression ("used
+before it was introduced"); a `let` first works.
+
+**Determinism.** Ray queries are a function of (structure, ray) on this
+device: replay is bit-exact and two wavefronts agree bit for bit under the
+hardware walk (`tests/speed.rs`, four scenes: instanced meshes, the
+emitter box, analytic prims alone, triangles + a sphere behind splats).
+Ties in t between two triangles are the hardware's to break, not prim
+order as in the WGSL walk; nothing in these scenes has coplanar
+overlapping triangles, and a tie would be resolved the same way every
+trace, which is what replay needs. The hardware triangle test is
+watertight where Möller–Trumbore leaves cracks: on 120 000 primary rays
+pair and cornell differ from the WGSL walk on one ray each (an edge, the
+hardware hitting what the software missed). Images agree to 1e-3 in mean
+and relMSE; on the bench the relMSE at every level is the software walk's
+to four digits. `IRYS_RT=sw` (or `GpuPrb::set_hardware_rt(false)`) keeps
+the WGSL walk as fallback and reference.
+
+Incoherent rays (8 bounces from the primary hits, a microbenchmark): the
+hardware walk traces 3.4 G rays/s in the room against 0.57 G for the WGSL
+walk (6×), 3.6 G against 0.68 G in the box, 2.4 G against 1.6 G on pair;
+shadow (terminate-on-first-hit) rays 4.5 G against 0.62 G.
+
+### 2. Lane compaction (`gpu/compact.wgsl`)
+
+`bounce` used to write seven graph columns for every lane of every path
+every bounce (harmless ones for diffuse and dead vertices), and the eval IR
+read them all: ~800 bytes per path per bounce, bandwidth-bound. Now a
+conductor vertex stages its two lane groups (BSDF sample, light sample) as
+two `vec4`s per path and sets lane bits; a fixed-shape integer scan
+(Hillis–Steele per 256 paths, then one workgroup over the block totals —
+no atomics) gives each path its compact slot; `scatter` writes the columns
+there; the eval IR (pointwise over lanes) runs by **indirect dispatch** over
+the compact lanes alone, and `update` reads `f` there and skips paths with
+no lanes without loading them. The GGX conductor is the only IR BSDF, so
+this is also the material bin: diffuse vertices never reach the graph.
+Replay compacts identically (same kernels, same bits) and additionally
+zeroes `δf` past the compact lanes, so the adjoint's full-width reduction
+sees no stale adjoint; columns start harmless so never-written lanes stay
+finite. Chunked and whole-frame renders are bit-identical.
+
+**Russian roulette, remeasured** (it was off because a dead lane still
+cost an IR evaluation, which compaction removes): room −25 % time, +56 %
+error per sample; cornell −18 %, +62 %. Error × time is worse on both, with
+and without the guide. It stays off.
+
+### Results
+
+Same protocol and references as phase 3 (each renderer against its own
+32768-spp reference; equal-time error by log–log interpolation at Cycles'
+own 64/256/1024-spp times; fastest observation per level). Cycles' times
+are the fastest of the phase 3 sweeps and three sweeps run here,
+interleaved with irys's; irys's are the fastest per level of five sweeps
+× 2 repetitions. **Raw** times are used, not phase 3's "fastest s/spp
+extrapolated linearly": on the closed scenes irys's per-sample time grows
+with the render's length (cornell 2.14 ms/spp at 64 spp, 2.88 at 1024;
+room 2.55 → 2.85), reproducibly and with the software walk too, so the GPU
+sustains less than its first second — linear extrapolation would credit
+irys with a speed it does not keep. The machine was shared (load average
+10–45 from other sessions' builds and tests during the runs).
+
+Time per sample, 400 × 300, ms (irys: fastest at ≥ 64 spp / at 1024 spp):
+
+| scene | Cycles | irys phase 3 best | irys now: Sobol + spectral | irys now: + guiding |
+|---|---|---|---|---|
+| pair | 0.71 | 2.6 | **0.88** / 0.89 | 1.03 / 1.03 |
+| room | 2.14 | 6.5 | 2.55 / 2.85 | **2.92** / 3.53 |
+| cornell | 1.44 | 4.1 | **2.14** / 2.88 | 2.77 / 3.55 |
+
+Equal-time relMSE, irys / Cycles (< 1 is the gate), the best
+configuration per scene in bold as in phase 3:
+
+| scene | budget | Cycles | Sobol + spectral | ratio | + guiding | ratio | phase 3 best ratio |
+|---|---|---|---|---|---|---|---|
+| pair | 0.089 s | 8.8e-4 | 4.1e-4 | **0.47** | 5.8e-4 | 0.66 | 1.6 |
+| pair | 0.220 s | 1.7e-4 | 1.6e-4 | **0.93** | 2.2e-4 | 1.29 | 3.0 |
+| pair | 0.729 s | 4.0e-5 | 5.1e-5 | **1.27** | 6.5e-5 | 1.64 | 3.4 |
+| room | 0.167 s | 1.6e-2 | 1.3e-2 | 0.83 | 9.8e-3 | **0.62** | 1.6 |
+| room | 0.534 s | 3.8e-3 | 4.1e-3 | 1.09 | 3.0e-3 | **0.79** | 1.7 |
+| room | 2.190 s | 9.5e-4 | 1.1e-3 | 1.12 | 7.8e-4 | **0.82** | 1.5 |
+| cornell | 0.144 s | 5.7e-3 | 3.4e-3 | **0.60** | 4.6e-3 | 0.81 | 0.9 |
+| cornell | 0.419 s | 1.3e-3 | 1.3e-3 | **0.98** | 1.5e-3 | 1.17 | 1.5 |
+| cornell | 1.474 s | 3.2e-4 | 4.0e-4 | **1.23** | 4.7e-4 | 1.45 | 1.5 |
+
+With phase 3's linear-time protocol the room ratios are 0.62 / 0.73 / 0.69
+and cornell's 0.60 / 0.81 / **0.90**; pair is unchanged (its time per
+sample does not drift).
+
+![pair](speed-pair.png)
+![room](speed-room.png)
+![cornell](speed-cornell.png)
+
+(Cycles at its 64-spp time, both irys configurations at their nearest
+level, both references. `irys-bench report --prefix speed` regenerates
+them; `irys-bench speed` prints ms/spp per variant.)
+
+**Gate verdict: met on room at every budget; not met overall.** irys is
+ahead of Cycles at every small budget (0.47–0.62) and on the room
+throughout, level at the middle budgets of pair and cornell (0.93, 0.98),
+and behind at the largest budget on pair (1.27) and cornell (1.23 raw,
+0.90 by phase 3's protocol). The time per sample came down 2.9× on pair,
+2.2× on room and 1.9× on cornell; irys is still 1.25× (pair), 1.2–1.65×
+(room, depending on configuration and length) and 1.5–2.0× (cornell)
+slower per sample than Cycles, and the largest-budget gap is that, against
+an error per sample that is level (pair) or 1.6–2× better (room, cornell).
+
+### Where a frame goes now, and the next lever
+
+Measured by removing kernels from the trace at 64 spp (room, ms/spp, the
+frame is 2.36): the pipeline floor (gen, finish, scoring, readback, the
+per-call submit) 0.21; `bounce` ≈ 2.0; scan + scatter + eval + update
+≈ 0.2. Inside `bounce`, the hardware trace of ~2 M rays/spp at the
+microbenchmark's 3.4–4.5 G rays/s is ≈ 0.5–0.6. The rest of `bounce` —
+≈ 1.4 ms/spp, more than half the frame — is shading and state, and the
+largest named part of it is the **sampler**: Sobol + spectral IS against
+plain random numbers costs 0.16 / 0.55 / 0.48 ms/spp on pair / room /
+cornell (18–23 % of the frame; phase 3 measured 0–12 % of a frame 2–3×
+longer). Each draw hashes six times, Owen-scrambles twice and walks up to
+32 Sobol columns for the scrambled index's set bits. **Next lever**: hoist
+the per-path and per-tuple hashes (four of a tuple's draws share the
+scrambled index), and replace the 32-step column walk by four byte-table
+lookups per dimension (3 × 4 × 256 words, XOR is exact, so device and CPU
+still agree bit for bit). Expected: most of the 0.5 ms/spp on the
+interiors, which is the remaining gap on cornell and pair at the largest
+budget. Then the per-call floor (0.21 ms/spp, a quarter of pair's frame):
+the bench reads the image back after every 16-spp call; accumulating on
+the device would remove most of it. Neither was started.
+
+### Speed risks
+
+1. **`EXPERIMENTAL_RAY_QUERY` is experimental** in wgpu 30 and needs the
+   `ExperimentalFeatures` token in `irys-gpu`'s device request; the
+   build/use ordering had to be enforced by hand (a wait after the BLAS
+   builds). A wgpu upgrade should rerun `tests/speed.rs` first.
+2. **Ties** between triangles at equal t resolve in the hardware's order,
+   not by prim index. Deterministic on this device and covered by the
+   replay and rerun tests; coplanar overlapping geometry would show it.
+3. **Sustained throughput** on the closed scenes is 10–35 % below the first
+   second's, on both walks; the bench reports raw times for that reason.
+   Whether it is power management under the other sessions' load or
+   intrinsic is not separated.
+4. **The replay is not compacted**: it zeroes `δf` and runs the adjoint IR
+   over every lane, so gradient passes gained the trace speed-up but not
+   the eval one.
+5. The edge sampler and splats still walk in WGSL.
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.
@@ -1489,7 +1678,7 @@ Each phase ends on a measured gate, not a demo.
 | 0 seed | split kosm-render into crates, reference CI | kosm builds on irys, snapshots byte-identical |
 | 1 differentiable core | tang IR BSDFs, path replay backprop, hero wavelength | marble gradients match central differences, O(1) memory |
 | 2 unified scene + wavefront GPU | 3DGRT splats + BRep + mesh in one BVH, vcad on wgpu 30 | CAD rover in a splat street; pose fit from a photo |
-| 3 sampling | ReSTIR PT, neural guiding, NRC | equal-time error ≤ Cycles on classroom, bistro (2026-10-17: not met; equal-spp error ≤ Cycles, throughput 2.4–3.6× short — see Phase 3) |
+| 3 sampling | ReSTIR PT, neural guiding, NRC | equal-time error ≤ Cycles on classroom, bistro (2026-10-17: not met; equal-spp error ≤ Cycles, throughput 2.4–3.6× short — see Phase 3; after Speed: met on room, ahead at small budgets everywhere, 1.23–1.27× behind at the largest budget on pair and cornell) |
 | 4 the look | OpenPBR, layering, volumes, SSS, hair | OpenPBR reference scenes match |
 | 5 product | USD + .blend import, denoiser, RL batch lane | Blender demo files render; public bench vs Cycles |
 

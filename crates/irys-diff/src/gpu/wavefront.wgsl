@@ -43,7 +43,7 @@ struct Params {
     base: u32,            // this chunk's first path in the frame
     total: u32,           // paths in the frame
     points: u32,          // point mode: camera-plane points from `points_in`, pairs keyed together
-    _p1: u32,
+    rt: u32,              // trace through the hardware ray queries (`rt.wgsl`) when compiled in
     sun: vec4<f32>,       // unit sun direction, κ
     env: vec4<f32>,       // sun radiance, sky scale, SUN_PICK, vMF normaliser κ / (2π (1 − e^{−2κ}))
     light: vec4<f32>,     // phase 3: emitter triangles, env pick share, emitter area, emission
@@ -112,6 +112,22 @@ struct Path {
 // each; the device reads dimensions 1–3 from the `SOBOL` constant instead),
 // then the wavelength CDF's 257 f32s as bits.
 @group(0) @binding(56) var<storage, read> qtab: array<u32>;
+// Speed piece 2, lane compaction (`compact.wgsl`): `bounce` stages a
+// conductor vertex's two lane groups here — (cos_i, cos_o, cos_h, o·h) for
+// the BSDF sample, then for the light sample — and says which it wrote in
+// `lane_bits` (1 BSDF, 2 light). A deterministic scan turns the bits into
+// each path's first compact lane group (`lane_off` + `lane_top`), `scatter`
+// writes the graph's columns only there, and the eval IR runs only over
+// those lanes. Diffuse and dead vertices cost the graph nothing.
+@group(0) @binding(59) var<storage, read_write> lane_bits: array<u32>;
+@group(0) @binding(60) var<storage, read_write> stage: array<vec4<f32>>;
+@group(0) @binding(61) var<storage, read_write> lane_off: array<u32>;
+@group(0) @binding(62) var<storage, read_write> lane_top: array<u32>;
+
+// Path `i`'s first compact lane group.
+fn lane_slot(i: u32) -> u32 {
+    return lane_off[i] + lane_top[i / 256u];
+}
 
 const PI: f32 = 3.14159265358979;
 
@@ -414,7 +430,7 @@ fn to_local(k: u32, o: vec3<f32>, d: vec3<f32>) -> array<vec3<f32>, 2> {
 // top-level tree (`irys_core::Tlas::flatten`, rooted at node 0) walked like
 // a bottom-level one, each leaf's instances in leaf order, each through its
 // own bottom-level walk.
-fn intersect(o: vec3<f32>, d: vec3<f32>, tmax: f32, any: bool) -> Hit {
+fn intersect_sw(o: vec3<f32>, d: vec3<f32>, tmax: f32, any: bool) -> Hit {
     // Origins are pushed off their surface by `offset_ray`.
     let tmin = 0.0;
     let inv = 1.0 / d;
@@ -931,16 +947,12 @@ fn tail(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 fn bounce_at(i: u32, last: bool) {
     if (i >= params.cap) { return; }
-    var p = paths[i];
-    let base = i * params.nw;
-    let light_base = params.cap * params.nw + base;
-    // Inactive lanes get a harmless vertex; `update` gives them no adjoint.
-    for (var k = 0u; k < params.nw; k = k + 1u) {
-        harmless(base + k);
-        if (params.nee != 0u) {
-            harmless(light_base + k);
-        }
+    // No lanes unless a conductor vertex stages some (below).
+    lane_bits[i] = 0u;
+    if (paths[i].alive == 0u) {
+        return;
     }
+    var p = paths[i];
     let prev_pdf = p.smp.w;
     p.smp = vec4<f32>(0.0, 0.0, 0.0, prev_pdf);
     p.ldir = vec4<f32>(0.0);
@@ -1092,9 +1104,8 @@ fn bounce_at(i: u32, last: bool) {
         let li = vec3<f32>(dot(ld, t), dot(ld, b), lcos);
         let hl = normalize(li + lo);
         let ohl = dot(lo, hl);
-        for (var k = 0u; k < params.nw; k = k + 1u) {
-            write_lane(light_base + k, li.z, lo.z, hl.z, ohl, band_weights(p.lam[k]));
-        }
+        stage[2u * i + 1u] = vec4<f32>(li.z, lo.z, hl.z, ohl);
+        lane_bits[i] = 2u;
         let pb = ggx_pdf(params.alpha, lo.z, hl.z);
         p.ldir = vec4<f32>(ld, lcos * mis(lpdf, pb) / ldiv * lw);
         p.smp.z = 1.0;
@@ -1115,9 +1126,8 @@ fn bounce_at(i: u32, last: bool) {
     }
     let hh = normalize(li + lo);
     let oh = dot(lo, hh);
-    for (var k = 0u; k < params.nw; k = k + 1u) {
-        write_lane(base + k, li.z, lo.z, hh.z, oh, band_weights(p.lam[k]));
-    }
+    stage[2u * i] = vec4<f32>(li.z, lo.z, hh.z, oh);
+    lane_bits[i] = lane_bits[i] | 1u;
     // The roulette's 1/q rides on the pdf `update` divides by; MIS keeps
     // the sampler's own pdf.
     p.smp = vec4<f32>(li.z, pdf * q, 1.0, pdf);
@@ -1220,30 +1230,34 @@ fn bounce_guided(
 fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.cap) { return; }
+    // The path's compact lane groups (`compact.wgsl`): its BSDF group, then
+    // its light group, from `lane_slot`. Lanes past the compact ones keep
+    // `δf = 0` (`clear`, replay only).
+    let bits = lane_bits[i];
+    if (bits == 0u) { return; }
     var p = paths[i];
-    let base = i * params.nw;
+    let slot = lane_slot(i) * params.nw;
+    let base = slot;
+    let light_base = slot + select(0u, params.nw, (bits & 1u) != 0u);
     let frame = (params.base + i) * params.nw;
-    let light_base = params.cap * params.nw + base;
-    for (var k = 0u; k < params.nw; k = k + 1u) {
-        df_out[base + k] = 0.0;
-        if (params.nee != 0u) {
-            df_out[light_base + k] = 0.0;
-        }
-    }
-    if (p.smp.z == 0.0) { return; }
     var live = false;
     for (var k = 0u; k < params.nw; k = k + 1u) {
         let j = base + k;
         let fj = frame + k;
+        // A compact lane's δf is this bounce's or 0, never a stale one.
+        if (params.replay != 0u) {
+            if ((bits & 1u) != 0u) { df_out[j] = 0.0; }
+            if ((bits & 2u) != 0u) { df_out[light_base + k] = 0.0; }
+        }
         // NEE first: C_j joins L_j before the BSDF lane's δf reads it.
-        if (p.ldir.w > 0.0) {
+        if ((bits & 2u) != 0u && p.ldir.w > 0.0) {
             let g = p.tp[k] * p.ldir.w * light_le(p.ldir.xyz, p.lkind == 1u, p.lam[k]);
             if (params.replay != 0u) {
                 df_out[light_base + k] = dl_in[fj] * g;
             }
             p.rad[k] = p.rad[k] + g * f_in[light_base + k];
         }
-        if (p.smp.y > 0.0) {
+        if ((bits & 1u) != 0u && p.smp.y > 0.0) {
             let f = f_in[j];
             if (params.replay != 0u && f > 0.0) {
                 df_out[j] = dl_in[fj] * (l_in[fj] - p.rad[k]) / f;
