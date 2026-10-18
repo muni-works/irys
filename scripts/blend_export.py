@@ -1,6 +1,19 @@
 # Phase 5a: a .blend as a scene irys reads.
 #
 #   blender -b -Y file.blend -P scripts/blend_export.py -- <out dir> [--scene NAME] [--width 480]
+#           [--look 1] [--frames a:b[:step]] [--env-width 1024] [--measure-width 480]
+#
+# Phase 5b (--look 1, the default) adds, per material, its OpenPBR
+# parameters and baked textures (scripts/blend_openpbr.py: textures/*.png,
+# glTF baseColorTexture + KHR_texture_transform, the metal colour and the
+# cut-out named in the sidecar), each light's RGB colour (blackbody tints
+# included), spot cones and camera visibility, light portals as geometry with
+# their own sky (portal_*.f32), the world as an equirect (env.f32), and with
+# --frames the file's camera frame by frame. `irys_diff::look::scene::load`
+# reads it; the phase 5a fields below are unchanged for `irys_diff::blend`.
+# 5b also stops exporting particle emitters a render hides
+# (show_instancer_for_render), which 5a did: the pavilion's lotus emitter
+# plane covered its pool.
 #
 # Writes <out dir>/scene.glb (glTF 2.0: every unique evaluated mesh once,
 # triangulated, with normals and UVs, one primitive per material, and one
@@ -63,6 +76,9 @@ import sys
 import bpy
 import numpy as np
 from mathutils import Matrix, Vector
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import blend_openpbr  # noqa: E402
 
 LUM = np.array([0.2126, 0.7152, 0.0722])
 DIFFUSE_NODES = {"ShaderNodeBsdfDiffuse", "ShaderNodeBsdfTranslucent", "ShaderNodeBsdfToon", "ShaderNodeBsdfSheen"}
@@ -325,15 +341,15 @@ class Reducer:
 _SKY = {}
 
 
-def sky_node_mean(node):
-    """A Sky Texture's mean linear RGB over the upper hemisphere, baked as a
-    world of its own."""
-    key = node.id_data.name + "/" + node.name
+def sky_node_equirect(node, w=64, h=32, spp=16):
+    """A Sky Texture baked as a world of its own: an equirect (rows from +z
+    down; column u at azimuth atan2(-x, -y) = 2 pi u, see `bake_world`)."""
+    key = (node.id_data.name + "/" + node.name, w, h)
     if key in _SKY:
         return _SKY[key]
-    w = bpy.data.worlds.new("irys_sky_probe")
-    w.use_nodes = True
-    nt = w.node_tree
+    wd = bpy.data.worlds.new("irys_sky_probe")
+    wd.use_nodes = True
+    nt = wd.node_tree
     sky = nt.nodes.new("ShaderNodeTexSky")
     for a in ("sky_type", "sun_direction", "turbidity", "ground_albedo", "sun_disc", "sun_size", "sun_intensity",
               "sun_elevation", "sun_rotation", "altitude", "air_density", "dust_density", "ozone_density"):
@@ -345,22 +361,28 @@ def sky_node_mean(node):
     bg = nt.nodes["Background"]
     nt.links.new(sky.outputs[0], bg.inputs[0])
     tmp = bpy.data.scenes.new("irys_sky_probe")
-    tmp.world = w
-    px = bake_world(tmp, 64, 32, 16)
+    tmp.world = wd
+    px = bake_world(tmp, w, h, spp)
     bpy.data.scenes.remove(tmp)
-    bpy.data.worlds.remove(w)
+    bpy.data.worlds.remove(wd)
+    _SKY[key] = px
+    return px
+
+
+def sky_node_mean(node):
+    """A Sky Texture's mean linear RGB over the upper hemisphere."""
+    px = sky_node_equirect(node)
     up = px[: px.shape[0] // 2]
     el = (0.5 - (np.arange(up.shape[0]) + 0.5) / px.shape[0]) * math.pi
     wgt = np.cos(el)[:, None, None]
-    c = (up * wgt).sum(axis=(0, 1)) / (wgt.sum() * up.shape[1])
-    _SKY[key] = c
-    return c
+    return (up * wgt).sum(axis=(0, 1)) / (wgt.sum() * up.shape[1])
 
 
-def light_node_factor(l, drop, name):
+def light_node_factor(l, drop, name, rgb_out=None):
     """What a light's node tree multiplies its power by: the Emission node's
     strength (a Light Falloff feeding it gives its own strength) times its
-    colour's luminance (a Blackbody is luminance 1)."""
+    colour's luminance (a Blackbody is luminance 1). `rgb_out` (a list)
+    receives the tint as linear RGB of luminance 1 (phase 5b)."""
     if not (l.use_nodes and l.node_tree):
         return 1.0
     em = [n for n in l.node_tree.nodes if n.bl_idname == "ShaderNodeEmission"]
@@ -381,10 +403,14 @@ def light_node_factor(l, drop, name):
         if src.bl_idname != "ShaderNodeBlackbody":
             drop.append(f"{name}: light colour node {src.bl_idname[10:]}")
         else:
-            drop.append(f"{name}: blackbody tint (luminance kept)")
+            drop.append(f"{name}: blackbody tint (luminance kept; phase 5b: its colour)")
+            if rgb_out is not None:
+                rgb_out.extend(blend_openpbr.blackbody_rgb(src.inputs["Temperature"].default_value).tolist())
         c = 1.0
     else:
         c = float(np.array(col.default_value[:3]) @ LUM)
+        if rgb_out is not None and c > 0:
+            rgb_out.extend((np.array(col.default_value[:3]) / c).tolist())
     return f * c
 
 
@@ -463,6 +489,10 @@ def render_settings_like_render(sc):
     """Make the viewport depsgraph see what a render sees."""
     for o in bpy.data.objects:
         o.hide_viewport = o.hide_render
+        if hasattr(o, "show_instancer_for_viewport"):
+            # the emitter of a particle system shows itself in a render only
+            # if it says so for renders (phase 5b; 5a missed it)
+            o.show_instancer_for_viewport = o.show_instancer_for_render
         for m in o.modifiers:
             if hasattr(m, "render_levels") and hasattr(m, "levels"):
                 m.levels = m.render_levels
@@ -579,7 +609,9 @@ def main():
     os.makedirs(out, exist_ok=True)
     render_settings_like_render(sc)
     cam0, h0 = camera_record(sc, width)
-    measured = measure_colours(sc, 2 * width, 2 * h0) if opts.get("--measure", "1") == "1" else {}
+    mw = int(opts.get("--measure-width", min(width, 480)))
+    mh = int(round(mw * h0 / width))
+    measured = measure_colours(sc, 2 * mw, 2 * mh) if opts.get("--measure", "1") == "1" else {}
     dg = bpy.context.evaluated_depsgraph_get()
     red = Reducer(measured)
 
@@ -611,8 +643,79 @@ def main():
             if rec["kind"] == "hidden":
                 g["alphaMode"] = "BLEND"
                 g["pbrMetallicRoughness"]["baseColorFactor"][3] = 0.1
+            if look:
+                look_material(m, key, rec, g, len(gl_mats))
             gl_mats.append(g)
         return mats[key][0]
+
+    # Phase 5b: each material as OpenPBR, its colour fields baked to PNGs
+    # under textures/ (glTF baseColorTexture + KHR_texture_transform; the
+    # metal colour and opacity are named in the sidecar).
+    gl_images, gl_textures = [], []
+    look = opts.get("--look", "1") == "1"
+    ev = blend_openpbr.Evaluator(env_bake=lambda n: sky_node_equirect(n, 512, 256, 16))
+    tex_dir = os.path.join(out, "textures")
+
+    def add_texture(path):
+        gl_images.append({"uri": os.path.relpath(path, out)})
+        gl_textures.append({"source": len(gl_images) - 1, "sampler": 0})
+        return len(gl_textures) - 1
+
+    def look_material(m, key, rec, g, index):
+        params, tex, em, drop = blend_openpbr.openpbr(ev, m)
+        meas = measured.get(key)
+        approx = any(("as 0.5" in d or "as a constant" in d or "non-UV" in d or "its mean" in d) for d in drop)
+        if meas is not None and meas[2] >= 16 and approx and params["base_metalness"] < 0.5 \
+                and params["transmission_weight"] < 0.5 and params["translucency"] <= 0.0:
+            # Inputs the UVs cannot carry (attributes, procedurals) were
+            # constants; Cycles' Diffuse Color pass says what the camera's
+            # pixels had. Scale the diffuse colour to that mean.
+            have = np.asarray(params["base_color"], dtype=np.float64)
+            if "base_color" in tex:
+                have = tex["base_color"].mean()
+            want = np.asarray(meas[0], dtype=np.float64) / max(1 - params["base_metalness"], 1e-3)
+            k = np.clip(want / np.maximum(have, 1e-4), 1 / 3, 3.0)
+            params["base_color"] = (np.asarray(params["base_color"]) * k).tolist()
+            if "base_color" in tex:
+                tex["base_color"] = tex["base_color"].map(lambda a, k=k: a * k)
+            drop.append(f"diffuse colour scaled to Cycles' colour pass ({k.round(2).tolist()})")
+        side = {}
+        os.makedirs(tex_dir, exist_ok=True)
+        for which in ("base_color", "metal_color"):
+            f = tex.get(which)
+            if f is None or f.img is None or f.xf == "equirect":
+                continue
+            path = os.path.join(tex_dir, f"{index:03d}_{which}.png")
+            alpha = tex.get("opacity") if which == "base_color" else None
+            blend_openpbr.save_texture(f, path, alpha)
+            t = add_texture(path)
+            side[which] = {"path": os.path.relpath(path, out), "texture": t, "xf": list(f.xf),
+                           "alpha": alpha is not None and alpha.img is not None}
+            if which == "base_color":
+                g["pbrMetallicRoughness"]["baseColorTexture"] = {
+                    "index": t, "extensions": {"KHR_texture_transform": {"scale": [f.xf[0], f.xf[1]], "offset": [f.xf[2], f.xf[3]]}}}
+        op = tex.get("opacity")
+        if op is not None and op.img is not None and "base_color" not in side:
+            # Opacity alone: a white texture carrying it in alpha.
+            white = blend_openpbr.Field(img=np.full(op.img.shape, 1.0), xf=op.xf)
+            path = os.path.join(tex_dir, f"{index:03d}_opacity.png")
+            blend_openpbr.save_texture(white, path, op)
+            t = add_texture(path)
+            side["opacity"] = {"path": os.path.relpath(path, out), "texture": t, "xf": list(op.xf), "alpha": True}
+        if "opacity" in tex and tex["opacity"].img is not None:
+            g["alphaMode"] = "MASK"
+            g["alphaCutoff"] = 0.5
+        rec["openpbr"] = params
+        rec["textures"] = side
+        rec["dropped_openpbr"] = drop
+        if em is not None:
+            rec["emission"] = {"rgb": em["rgb"], "side": em["side"]}
+            if "equirect" in em:
+                path = os.path.join(out, f"portal_{index:03d}.f32")
+                e = np.ascontiguousarray(em["equirect"]).astype("<f4")
+                e.tofile(path)
+                rec["emission"]["equirect"] = {"path": os.path.basename(path), "size": [e.shape[1], e.shape[0]],
+                                               "vector": "reflection"}
 
     # Unique meshes, keyed by evaluated data and the object's materials.
     bin_chunks = []
@@ -643,10 +746,17 @@ def main():
     zup_to_yup = Matrix(((1, 0, 0, 0), (0, 0, 1, 0), (0, -1, 0, 0), (0, 0, 0, 1)))
     lights = []
     portals = []
+    portal_recs = []
     for oi in dg.object_instances:
         ob = oi.object
+        if not oi.show_self:
+            # A particle / geometry-node emitter whose own geometry the render
+            # hides ("Show Emitter" off). Phase 5a exported these: the
+            # pavilion's pool was covered by its lotus emitter plane.
+            skipped["hidden instancers"] = skipped.get("hidden instancers", 0) + 1
+            continue
         if ob.type == "LIGHT":
-            lights.append((ob.data, oi.matrix_world.copy(), ob.name))
+            lights.append((ob.data, oi.matrix_world.copy(), ob.name, bool(ob.visible_camera)))
             continue
         if ob.type not in ("MESH", "CURVE", "SURFACE", "META", "FONT", "CURVES") or ob.type == "CURVES":
             if ob.type in ("CURVES",):
@@ -659,6 +769,16 @@ def main():
             # so a portal at a window would shadow the sun it frames; its
             # light is folded into the environment instead.
             portals.append((ob.name, max(r["radiance"] for r in recs)))
+            if look:
+                # Phase 5b keeps the portal as what it is: a window onto its
+                # emission that shadow and camera rays pass through.
+                me = ob.to_mesh()
+                me.calc_loop_triangles()
+                mw_ = oi.matrix_world
+                tri = [[list(mw_ @ me.vertices[v].co) for v in t.vertices] for t in me.loop_triangles]
+                mi_ = ob.material_slots[0].material if ob.material_slots else None
+                portal_recs.append({"name": ob.name, "material": mat_index(mi_), "triangles": tri})
+                ob.to_mesh_clear()
             continue
         if not (ob.visible_camera and ob.visible_shadow and ob.visible_diffuse and ob.visible_glossy):
             # irys has no per-ray visibility: such an object is seen by
@@ -731,8 +851,14 @@ def main():
 
     # Lights.
     rec_lights, light_drop = [], []
-    for l, mw, name in lights:
-        col = float(np.array(l.color[:3]) @ LUM) * light_node_factor(l, light_drop, name)
+    for l, mw, name, vis_cam in lights:
+        tint = []
+        col = float(np.array(l.color[:3]) @ LUM) * light_node_factor(l, light_drop, name, tint)
+        lc = np.array(l.color[:3], dtype=np.float64)
+        lc = lc / max(float(lc @ LUM), 1e-12)
+        rgb = (lc * (np.asarray(tint) if tint else 1.0))
+        rgb = (rgb / max(float(rgb @ LUM), 1e-12)).tolist()
+        n_before = len(rec_lights)
         if l.type == "SUN":
             d = (mw.to_3x3() @ Vector((0, 0, 1))).normalized()
             r = max(l.angle / 2, 1e-3)
@@ -759,9 +885,22 @@ def main():
                 # a spot is a point light restricted to a cone: the same radiance, less power
                 light_drop.append(f"{name}: spot cone (emits all round)")
             rec_lights.append({"name": name, "kind": "sphere", "center": list(mw.translation), "radius": r, "radiance": L})
+            if l.type == "SPOT":
+                rec_lights[-1]["spot"] = {"axis": list((mw.to_3x3() @ Vector((0, 0, -1))).normalized()),
+                                          "size": l.spot_size, "blend": l.spot_blend}
             if l.shadow_soft_size < 0.02:
                 light_drop.append(f"{name}: radius {l.shadow_soft_size:.3f} widened to 0.02")
+        for rl in rec_lights[n_before:]:
+            rl["rgb"] = rgb  # linear Rec.709, luminance 1 (phase 5b)
+            rl["visible_camera"] = vis_cam
     env = fit_env(sc, rec_lights)
+    if look and sc.world is not None:
+        # Phase 5b: the world itself, as an equirect irys importance-samples.
+        ew, eh = int(opts.get("--env-width", 1024)), int(opts.get("--env-width", 1024)) // 2
+        px = bake_world(sc, ew, eh, int(opts.get("--env-spp", 16)))
+        px = np.ascontiguousarray(px).astype("<f4")
+        px.tofile(os.path.join(out, "env.f32"))
+        env["equirect"] = {"path": "env.f32", "size": [ew, eh], "mean": px.reshape(-1, 3).mean(axis=0).tolist()}
     if portals:
         # The gradient seen through a window (z ~ 0 .. 0.5) is ~0.2 sky.
         lp = max(L for _, L in dict(portals).items())
@@ -772,12 +911,13 @@ def main():
 
     gltf = {
         "asset": {"version": "2.0", "generator": "irys scripts/blend_export.py"},
-        "extensionsUsed": ["KHR_materials_emissive_strength"],
+        "extensionsUsed": ["KHR_materials_emissive_strength"] + (["KHR_texture_transform"] if gl_images else []),
         "scene": 0, "scenes": [{"nodes": list(range(len(nodes)))}],
         "nodes": nodes, "meshes": gl_meshes, "materials": gl_mats,
         "cameras": [{"type": "perspective", "perspective": {
             "yfov": 2 * math.atan(cam["tan_half"]), "aspectRatio": width / h, "znear": sc.camera.data.clip_start}}],
         "accessors": accessors, "bufferViews": views,
+        **({"images": gl_images, "textures": gl_textures, "samplers": [{"wrapS": 10497, "wrapT": 10497}]} if gl_images else {}),
         "buffers": [{"byteLength": offset[0]}],
     }
     js = json.dumps(gltf, separators=(",", ":")).encode()
@@ -803,6 +943,24 @@ def main():
                               f"gradient fit rel rms {env['fit_rel_rms']:.2f}", "world colour (irys sky tint is fixed)"]},
         "cycles": {"samples": sc.cycles.samples, "max_bounces": sc.cycles.max_bounces},
     }
+    if look:
+        dl = {}
+        for _, rec in mats.values():
+            for d in rec.get("dropped_openpbr", []):
+                dl[d] = dl.get(d, 0) + 1
+        side["dropped"]["openpbr"] = dl
+        side["portals"] = portal_recs
+        side["openpbr_version"] = 1
+    if "--frames" in opts:
+        # The file's camera, frame by frame (an animated camera's keyframes,
+        # evaluated): the reel's camera moves.
+        a, b, step = (int(x) for x in (opts["--frames"].split(":") + ["1"])[:3])
+        frames = []
+        for fr in range(a, b + 1, step):
+            sc.frame_set(fr)
+            c, _ = camera_record(sc, width)
+            frames.append({"frame": fr, **{k: c[k] for k in ("eye", "forward", "right", "up", "tan_half")}})
+        side["camera_frames"] = {"fps": sc.render.fps / sc.render.fps_base, "frames": frames}
     json.dump(side, open(os.path.join(out, "irys.json"), "w"), indent=1)
     print(f"irys export: {len(nodes) - 1} instances of {len(gl_meshes)} meshes, {tris_unique} unique / {tris_total} placed triangles, "
           f"{len(gl_mats)} materials, {len(rec_lights)} lights, sky {env['sky']:.3f} -> {out}", flush=True)
