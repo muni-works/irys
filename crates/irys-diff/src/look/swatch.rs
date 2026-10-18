@@ -229,7 +229,9 @@ impl Swatch {
         mut rec: Option<&mut Vec<Lane>>,
     ) -> (f64, f64) {
         let mut rng = Rng::new(seed, path as u64);
-        let lambda = sample_lambda_nm(rng.uniform());
+        // Wavelengths stratified over a pixel's samples: the chroma noise of
+        // one wavelength per path falls as 1/spp, not 1/√spp.
+        let lambda = sample_lambda_nm(((path % self.spp) as f64 + rng.uniform()) / self.spp as f64);
         let px = path / self.spp;
         let (w, h) = self.size;
         let (ix, iy) = ((px % w) as f64, (px / w) as f64);
@@ -333,7 +335,11 @@ impl Swatch {
                     let wd = world(super::openpbr::cosine([rng.uniform(), rng.uniform()]));
                     let model = subsurface_medium(&mat, lambda);
                     let samp = subsurface_medium(&smat, lambda);
-                    let start = x - n_out * 1e-6;
+                    // Inside the tessellated boundary: the analytic hit is
+                    // outside the inscribed faces by up to their sagitta
+                    // (≈ 2e-4 at level 5), and a walk started there would
+                    // leave at once.
+                    let start = Point3::origin() + x.coords() * (1.0 - 5e-4);
                     let walk = walk_g(
                         bvh,
                         None,

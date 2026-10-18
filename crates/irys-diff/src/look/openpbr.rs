@@ -139,14 +139,14 @@ pub const PARAM_NAMES: [&str; PARAMS] = [
 ];
 
 impl OpenPbr {
-    /// `θ`: base colour on the three hats (450/550/650 nm: b, g, r),
+    /// `θ`: base colour on the three hats (450/550/650 nm, [`hats`]),
     /// metalness, specular roughness, coat weight, fuzz weight, base weight.
     pub fn theta(&self) -> [f64; PARAMS] {
-        let c = self.base_color;
+        let c = hats(self.base_color);
         [
-            c[2],
-            c[1],
             c[0],
+            c[1],
+            c[2],
             self.base_metalness,
             self.specular_roughness,
             self.coat_weight,
@@ -157,7 +157,7 @@ impl OpenPbr {
 
     /// The material with `θ` written back.
     pub fn with_theta(mut self, t: &[f64; PARAMS]) -> Self {
-        self.base_color = [t[2], t[1], t[0]];
+        self.base_color = rgb_of_hats([t[0], t[1], t[2]]);
         self.base_metalness = t[3];
         self.specular_roughness = t[4];
         self.coat_weight = t[5];
@@ -178,10 +178,66 @@ impl OpenPbr {
     }
 }
 
-/// Linear-sRGB `rgb` at `lambda` on the three hats.
+/// `M[c][k]`: linear-sRGB channel `c` of a frame whose reflectance is hat
+/// `k` (450, 550, 650 nm) under a flat illuminant, as the hero-wavelength
+/// integrator renders it (its `hero_weight` averaged over the band).
+pub fn hat_matrix() -> &'static [[f64; 3]; 3] {
+    static M: LazyLock<[[f64; 3]; 3]> = LazyLock::new(|| {
+        let n = 8000;
+        let mut m = [[0.0; 3]; 3];
+        for i in 0..n {
+            let u = (i as f64 + 0.5) / n as f64;
+            let lambda = irys_light::spectrum::sample_lambda_nm(u);
+            let w = irys_light::spectrum::hero_weight(lambda);
+            let b = band_weights(lambda);
+            for c in 0..3 {
+                for k in 0..3 {
+                    m[c][k] += w[c] as f64 * b[k] / n as f64;
+                }
+            }
+        }
+        m
+    });
+    &M
+}
+
+fn inv3(m: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let d = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    let c = |i: usize, j: usize| {
+        let (a, b) = ((i + 1) % 3, (i + 2) % 3);
+        let (p, q) = ((j + 1) % 3, (j + 2) % 3);
+        m[a][p] * m[b][q] - m[a][q] * m[b][p]
+    };
+    let mut r = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            r[j][i] = c(i, j) / d;
+        }
+    }
+    r
+}
+
+/// The hat coefficients whose spectrum renders as linear-sRGB `rgb`
+/// (`M⁻¹ rgb`): the spectral uplift every colour parameter goes through,
+/// so a swatch's colour round-trips through the spectral integrator.
+pub fn hats(rgb: [f64; 3]) -> [f64; 3] {
+    static MI: LazyLock<[[f64; 3]; 3]> = LazyLock::new(|| inv3(hat_matrix()));
+    std::array::from_fn(|k| (0..3).map(|c| MI[k][c] * rgb[c]).sum())
+}
+
+/// `M h`: the colour hats `h` render as.
+pub fn rgb_of_hats(h: [f64; 3]) -> [f64; 3] {
+    let m = hat_matrix();
+    std::array::from_fn(|c| (0..3).map(|k| m[c][k] * h[k]).sum())
+}
+
+/// Linear-sRGB `rgb` at `lambda`: [`hats`] on the three hats.
 pub fn lift(rgb: [f64; 3], lambda: f64) -> f64 {
     let w = band_weights(lambda);
-    w[0] * rgb[2] + w[1] * rgb[1] + w[2] * rgb[0]
+    let h = hats(rgb);
+    w[0] * h[0] + w[1] * h[1] + w[2] * h[2]
 }
 
 // ─── Fresnel and the film ────────────────────────────────────────────────

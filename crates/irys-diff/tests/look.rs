@@ -207,7 +207,9 @@ fn energy_per_lobe_never_exceeds_one() {
     let mut worst: f64 = 0.0;
     for k in 0..40 {
         let m = OpenPbr {
-            base_color: [rng.uniform(), rng.uniform(), rng.uniform()],
+            // A physical reflectance: hats in [0, 1] (a saturated sRGB colour
+            // can need a hat above 1).
+            base_color: openpbr::rgb_of_hats([rng.uniform(), rng.uniform(), rng.uniform()]),
             base_metalness: rng.uniform(),
             specular_roughness: rng.uniform(),
             specular_ior: 1.1 + 1.5 * rng.uniform(),
@@ -430,4 +432,28 @@ fn prb_matches_central_differences() {
         worst = worst.max(rel);
     }
     assert!(worst < 1e-5, "worst {worst}");
+}
+
+#[test]
+fn colours_round_trip_through_the_spectrum() {
+    let m = openpbr::hat_matrix();
+    println!("M = {m:?}");
+    for rgb in [[1.0, 1.0, 1.0], [0.8, 0.3, 0.2], [0.2, 0.5, 0.9], [1.0, 0.77, 0.34]] {
+        let h = openpbr::hats(rgb);
+        let back = openpbr::rgb_of_hats(h);
+        // And the integral itself, by the lifted spectrum.
+        let n = 20_000;
+        let mut r = [0.0; 3];
+        for i in 0..n {
+            let lambda = irys_light::spectrum::sample_lambda_nm((i as f64 + 0.5) / n as f64);
+            let w = irys_light::spectrum::hero_weight(lambda);
+            for c in 0..3 {
+                r[c] += openpbr::lift(rgb, lambda) * w[c] as f64 / n as f64;
+            }
+        }
+        println!("{rgb:?} → hats {h:.3?} → {r:.4?}");
+        for c in 0..3 {
+            assert!((back[c] - rgb[c]).abs() < 1e-12 && (r[c] - rgb[c]).abs() < 2e-3);
+        }
+    }
 }

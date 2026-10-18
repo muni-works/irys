@@ -72,3 +72,7 @@ required-features = ["gpu", "assets"]
 [[example]]
 name = "skin_fit"
 required-features = ["assets"]
+
+[[example]]
+name = "look_sweep"
+required-features = ["assets"]
