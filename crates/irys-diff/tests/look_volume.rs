@@ -16,6 +16,7 @@ fn homogeneous(lo: Point3, hi: Point3, sigma: f64) -> Medium {
         sigma: [sigma; 3],
         g: 0.0,
         emission: None,
+        majorant: None,
     }
 }
 
@@ -64,7 +65,9 @@ fn heterogeneous_transmittance_matches_the_integral() {
         sigma: [1.0, 0.7, 0.4],
         g: 0.0,
         emission: None,
+        majorant: None,
     };
+    for m in [m.clone(), m.with_majorant_grid(8)] {
     let th = [1.5, 0.9, 0.9, 0.9];
     let lambda = 500.0;
     let tr = Track::new(&m, th, th, lambda);
@@ -90,6 +93,7 @@ fn heterogeneous_transmittance_matches_the_integral() {
     let sd = ((s2 / n as f64 - mean * mean) / n as f64).sqrt();
     println!("τ {tau:.4}: ratio {mean:.5} ± {sd:.5} exact {exact:.5}");
     assert!((mean - exact).abs() < 4.0 * sd);
+    }
 }
 
 /// Diffuse reflectance of a half-space by delta tracking.
@@ -193,6 +197,7 @@ pub fn smoke(size: usize, spp: usize, theta_s: Option<[f64; PARAMS]>) -> VolumeS
             sigma: [3.0, 3.5, 4.0],
             g: 0.4,
             emission: Some((Grid::from_fn(lo, hi, [8, 8, 8], |u| (0.3 - u[2]).max(0.0)), [3.0, 1.2, 0.3])),
+            majorant: None,
         },
         floor: Some([0.5, 0.5, 0.5]),
         lights: vec![Light::facing(Point3::new(1.0, -1.0, 2.5), Point3::new(0.0, 0.0, 0.4), 1.0, 1.0, 8.0, [1.0; 3])],
@@ -209,8 +214,45 @@ pub fn smoke(size: usize, spp: usize, theta_s: Option<[f64; PARAMS]>) -> VolumeS
 
 #[test]
 fn replay_is_bit_exact_and_prb_matches_central_differences() {
+    prb_check(false);
+}
+
+#[test]
+fn majorant_grid_replay_is_bit_exact_and_prb_matches_central_differences() {
+    prb_check(true);
+}
+
+/// The per-supervoxel majorant is unbiased: the same scene's frame under
+/// the global majorant and under 8³ and 4³ grids agree to the noise, and
+/// a heterogeneous transmittance still matches the integral.
+#[test]
+fn majorant_grid_matches_the_global_majorant() {
     let th = [1.0, 0.8, 0.85, 0.9];
-    let s = smoke(16, 4, Some(th));
+    let mean = |s: &VolumeScene, seed: u64| {
+        let f = s.forward(&th, seed);
+        let n = f.len() as f64;
+        let m = f.iter().map(|x| x.0).sum::<f64>() / n;
+        let v = f.iter().map(|x| (x.0 - m).powi(2)).sum::<f64>() / (n - 1.0);
+        (m, (v / n).sqrt())
+    };
+    let g = smoke(48, 96, None);
+    let (mg, sg) = mean(&g, 21);
+    for r in [4, 8] {
+        let mut s = smoke(48, 96, None);
+        s.medium = s.medium.clone().with_majorant_grid(r);
+        let (m, sd) = mean(&s, 22);
+        let z = (m - mg) / (sd * sd + sg * sg).sqrt();
+        println!("global {mg:.6} ± {sg:.6}, grid {r}³ {m:.6} ± {sd:.6} ({z:+.2} σ)");
+        assert!(z.abs() < 4.0, "grid {r}: {z} σ");
+    }
+}
+
+fn prb_check(grid: bool) {
+    let th = [1.0, 0.8, 0.85, 0.9];
+    let mut s = smoke(16, 4, Some(th));
+    if grid {
+        s.medium = s.medium.clone().with_majorant_grid(4);
+    }
     let fwd = s.forward(&th, 3);
     let (_, g, ls) = s.gradient(&th, 3, &Mean, false);
     assert!(fwd.iter().zip(&ls).all(|(a, b)| a.0.to_bits() == b.to_bits()), "replay re-walks");
