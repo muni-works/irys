@@ -1206,6 +1206,269 @@ Deviations:
 5. The secondary term is CPU f64; at 4 samples per vertex it is a quarter
    of an iteration. A device port needs the dual trace first.
 
+## Phase 3: sampling (2026-10-17)
+
+The gate: equal-time error ≤ Cycles on standard scenes. **Not met.** At
+equal *samples* irys now matches or beats Cycles on all three benchmark
+scenes (relMSE at 1024 spp: pair 4.2e-5 vs 4.0e-5, room 4.8e-4 vs 9.5e-4,
+cornell 1.8e-4 vs 3.2e-4); at equal *time* it is 1.5–3.4× behind (below
+Cycles only on cornell's smallest budget), and the whole remaining gap is
+throughput — Cycles takes a sample 2.4–3.6× faster on this GPU. Before
+phase 3 the equal-time gap was 2.2–26×. Seven commits before this note:
+
+| piece | commit | what |
+|---|---|---|
+| 0 | `irys-bench` | the harness: matched scenes in Cycles, references, equal-time relMSE |
+| 1 | emitters, tail, ReSTIR DI | mesh lights + NEE, `Scene::complete`, ReSTIR DI on the wavefront |
+| 2 | path guiding | grid × histogram guiding at diffuse vertices, trained online |
+| 3 | Sobol + spectral IS | Burley's scrambled Sobol, wavelengths by the film's response |
+| 3′ | Sobol constant | direction numbers as a WGSL constant (sampler overhead halved) |
+| — | Russian roulette | detached, θ-free; measured, off (below) |
+| — | bench timing | fastest-of-repeats and interleaved re-timing on a shared GPU |
+
+### 0. The benchmark (`crates/irys-bench`, `scripts/`)
+
+**Cycles is here**: Blender 4.4.3 at `/Applications/Blender.app` (not on
+`PATH`), Cycles on Metal, the M4 Max's 40-core GPU — the same device irys
+uses. **Classroom and bistro are not**: nothing was downloaded, and irys
+cannot read a `.blend` (phase 5), so the scenes are irys's own, rebuilt
+in Cycles from exported triangles:
+
+- **pair** — phase 2c's outdoor scene: two GGX gold balls (one squashed and
+  turned) on a checker floor, sky and a soft sun (κ = 40). Direct light.
+- **room** — the classroom stand-in: a closed 6 × 5 × 3 m room lit only
+  through one window by a sharp sun (κ = 400) and the sky; a gold ball and a
+  box inside. Almost all indirect, most light samples occluded.
+- **cornell** — a grey Cornell box under one emissive quad (phase 3's mesh
+  emitter), a tall box and a gold ball. Grey because irys's diffuse albedo
+  is a scalar.
+
+`irys-bench export` writes world-space triangles per placement, materials,
+the pinhole and the sky; `scripts/cycles_bench.py` builds them in Cycles.
+Matched: geometry, camera (vertical FOV, box filter one pixel wide), the
+sky (irys's `Env::radiance` as shader nodes, the gradient's spectral tint
+projected to sRGB; Cycles importance-samples a 2048² map of it), Lambert
+diffuse and irys's checker as nodes, the conductor as Principled metallic
+with single-scatter GGX, roughness √α and base colour = irys's spectral F0
+projected to sRGB (exact for Schlick, which is linear in F0), one-sided
+emitters, depth `d` = Cycles `max_bounces = d − 1` (irys's
+`Scene::complete`, piece 1). No clamping, denoising, or adaptive sampling;
+Cycles' light tree and default (Sobol–Burley/blue-noise) sampling stay on.
+Not matched: Cycles is RGB and irys spectral; Cycles' metallic Fresnel is
+F82-tint, irys's Schlick; Cycles uses Russian roulette, irys a fixed depth.
+
+**The metric.** Each renderer is scored against **its own** 32768-spp
+reference — relMSE = mean (x − r)² / (r² + 10⁻²) over pixels and channels —
+because the models differ slightly; the references agree anyway (channel
+means equal to four digits on all three scenes, cross relMSE ≤ 1e-4), so
+neither renderer is scored on an easier picture. 400 × 300, sweeps of
+1 … 1024 spp. **Time** is wall time of the render calls on a built, warm
+scene: irys's `GpuPrb` calls (calls of 16 spp, or 4 with ReSTIR/guiding);
+Cycles' `render()` with persistent data after a warm-up, so its ~45–90 ms
+per-render overhead is in. Equal-time error is log–log interpolation of each
+curve at Cycles' own times for 64, 256 and 1024 spp. **The GPU was shared**
+with other sessions' work for most of the runs, and single sweeps scattered
+by up to 2×, so every time reported is the fastest observation of that
+level across all sweeps (2–5 per level, `--reps 2` each, plus interleaved
+`irys-bench retime` rounds), for Cycles per level and for irys as the
+fastest seconds-per-spp at ≥ 64 spp (its time is linear in spp). Both
+renderers get their best case; relMSE does not depend on any of it.
+
+### Results
+
+Equal-time relMSE (each renderer against its own reference) at Cycles'
+own times for 64, 256 and 1024 spp; *ratio* is irys / Cycles, < 1 is the
+gate. "phase 2" is the estimator this phase started from (NEE + MIS,
+random numbers, uniform wavelengths); "best" is the best phase 3
+configuration on that scene — Sobol + spectral IS on pair and cornell,
+plus guiding on room:
+
+| scene | budget | Cycles | irys phase 2 | ratio | irys best | ratio |
+|---|---|---|---|---|---|---|
+| pair | 0.089 s | 8.8e-4 | 8.6e-3 | 9.8 | 1.4e-3 | 1.6 |
+| pair | 0.220 s | 1.7e-4 | 3.5e-3 | 20.6 | 5.0e-4 | 3.0 |
+| pair | 0.744 s | 4.0e-5 | 1.0e-3 | 25.9 | 1.4e-4 | 3.4 |
+| room | 0.168 s | 1.6e-2 | 4.1e-2 | 2.6 | 2.6e-2 | 1.6 |
+| room | 0.559 s | 3.8e-3 | 1.2e-2 | 3.3 | 6.3e-3 | 1.7 |
+| room | 2.307 s | 9.5e-4 | 3.1e-3 | 3.2 | 1.4e-3 | 1.5 |
+| cornell | 0.165 s | 5.7e-3 | 1.2e-2 | 2.2 | 5.2e-3 | **0.9** |
+| cornell | 0.453 s | 1.3e-3 | 4.6e-3 | 3.5 | 2.0e-3 | 1.5 |
+| cornell | 1.766 s | 3.2e-4 | 1.2e-3 | 3.7 | 4.7e-4 | 1.5 |
+
+Each piece alone and together, as the equal-time ratio at Cycles' 256-spp
+time:
+
+| scene | phase 2 | ReSTIR DI | guiding | Sobol | spectral IS | Sobol + spectral | + guiding |
+|---|---|---|---|---|---|---|---|
+| pair | 20.6 | 15.0 | 19.9 | 4.2 | 13.6 | **3.0** | 3.7 |
+| room | 3.3 | 3.6 | 1.9 | 2.8 | 3.0 | 2.6 | **1.7** |
+| cornell | 3.5 | 4.0 | 3.2 | 1.9 | 3.0 | **1.5** | 1.8 |
+
+Time per spp at 400 × 300 (fastest observed): irys 2.6 / 5.7 / 3.9 ms
+(phase 2) and 2.6 / 6.5 / 4.1 ms (best) on pair / room / cornell; Cycles
+0.73 / 2.25 / 1.72 ms at 1024 spp, overhead included. irys is 2.4–3.6×
+slower per sample, which is the whole gap: at **equal spp** the best
+configuration is level with Cycles on pair and twice as good on room and
+cornell (relMSE × spp at 1024 spp, lower is better):
+
+| scene | Cycles | phase 2 | ReSTIR DI | guiding | Sobol | spectral IS | Sobol + spectral | + guiding |
+|---|---|---|---|---|---|---|---|---|
+| pair | 0.041 | 0.299 | 0.210 | 0.314 | 0.058 | 0.214 | **0.043** | 0.048 |
+| room | 0.973 | 1.240 | 1.250 | 0.698 | 0.933 | 1.127 | 0.834 | **0.494** |
+| cornell | 0.331 | 0.538 | 0.534 | 0.451 | 0.237 | 0.444 | 0.202 | **0.184** |
+
+![pair](phase3-pair.png)
+![room](phase3-room.png)
+![cornell](phase3-cornell.png)
+
+(Each image: Cycles at its 64-spp time; irys's phase 2 estimator and
+Sobol + spectral IS + guiding at their levels nearest that time; both
+references. Every panel is labelled with spp, seconds and relMSE.
+`scripts/bench.sh` and `irys-bench report` regenerate them.)
+
+### 1. Mesh emitters, the tail, ReSTIR DI
+
+**Emitters.** `Surface::Emitter` is a black one-sided area light of
+`Scene::emission`. NEE picks the environment or an emitter triangle
+(`Scene::lights`, a CDF by area — with one emission, area is power and a
+light tree would pick the same triangles) and MIS weighs it against BSDF
+hits on both tiers. The PRB replay is unchanged in form: emission is θ-free.
+**The tail** (`Scene::complete`): the last vertex's BSDF ray is traced for
+emission only, so a path of `d` vertices collects exactly the light of ≤ `d`
+scatterings by both strategies. Without it the last vertex had only its
+NEE share, ~3 % dark on the box — which is how this was found: NEE and
+BSDF-only images disagreed.
+
+**ReSTIR DI** (`gpu/restir.wgsl`), at the first vertex: M0 = 8 candidates
+from the base light sampler, temporal reuse of the same slot's previous
+reservoir (its own G-buffer: a different sub-pixel point), k = 3 spatial
+neighbours within 16 px, all in generalized RIS (Lin et al. 2022) with
+pairwise MIS and unshadowed targets — **unbiased** (tested block by block
+against plain NEE). A sample is an environment direction or an emitter
+point, so reuse is the identity shift. The reservoir estimates the light
+strategy's *share* of the NEE/BSDF MIS pair (`w_L` is in its integrand), so
+BSDF escapes keep their `w_B` and the rest of the estimator is untouched;
+`W` is a detached number and PRB's light lane takes `cos · w_L · W · G` in
+place of `cos · w_L / p_L`. Replay is exact because the reservoirs are a
+function of the seed and the *previous* frame's buffers, which only
+`GpuPrb::advance` changes.
+
+It buys 1.4× at equal spp on pair (direct light) and nothing on room and
+cornell (indirect-bound), for 5–16 % more time — **net loss everywhere
+once the sampler is in** (Sobol already stratifies the direct light, and
+ReSTIR's candidates use their own random stream). Unshadowed targets are
+why it cannot help the room: the sun wins every reservoir, also where it is
+occluded.
+
+### 2. Path guiding (`gpu/guide.wgsl`)
+
+**Choice.** A fixed-resolution cousin of practical path guiding (Müller et
+al. 2017), not online neural guiding (NASG, 2303.08064): the question was
+how much guiding buys on these scenes, and a grid of histograms answers it
+without a second network in the bounce loop; it also kept the invariants
+for free (integer atomics make training deterministic; the guide is a
+constant between builds, so replay is exact). A neural guide is the next
+step if the grid's resolution turns out to be the limit (it was not: 10, 16
+and 24 cells per side measured within 6 %).
+
+A uniform grid (16 cells on the scene's longest side) × 6 normal classes,
+each a 16 × 16 equal-area histogram of incident radiance. Diffuse vertices
+sample a one-sample MIS mixture `q = c g + (1 − c) cos⁺/π`, c = 0.5 once a
+cell has 64 samples; `q` is the BSDF strategy's pdf for every MIS weight.
+The cosine half keeps it unbiased whatever the histogram holds. Training
+runs in forward passes only: each diffuse vertex records `Li / q` with
+`Li = (L − L⁺) / T`; `guide_build` normalises, mixes 10 % uniform and
+prefix-sums. In the bench the first half of a render's calls train
+(rebuilding after each) and every call counts towards the image. Learning
+NEE's share as well (Müller's choice) was measured worse: 2.3e-3 against
+1.7e-3 on the box at 256 spp.
+
+Room: 1.8× lower error at equal spp, 1.7× at equal time. Cornell: 1.2×.
+Pair: nothing (direct light). Conductors are not guided.
+
+### 3. The sampler (`qmc.rs`)
+
+**Choice over ReSTIR PT and NRC**, by the benchmark: at equal spp Cycles'
+error on pair was 7× lower than irys's, and the gap was where the samples
+go — independent random numbers against Cycles' Sobol–Burley, and a film
+whose four stratified hero wavelengths leave a *white* pixel with a
+relative variance of 0.152 per path (pair's whole error at 1 spp was 0.29).
+Path reuse addresses neither; NRC would add bias for an indirect-bound gap
+the guide already halves.
+
+**Sobol, shuffled and Owen-scrambled** (Burley, JCGT 2020; Cycles'
+Sobol–Burley). A path's draws come in tuples of up to four dimensions —
+camera `(λ, x, y)`, then a light tuple and a BSDF tuple per vertex
+(`PathRng::align`) — and each draw is a pure integer function of (pixel,
+sample, dimension): `owen(sobol_d(owen(i, seed)), hash(seed, d + 1))`.
+Owen-scrambling the index maps each aligned power-of-two block of indices
+onto another, so every tuple's first 2^k samples are still a (0, k, 2)-net
+(unit test, every elementary interval) while tuples are decorrelated.
+The device and the CPU compute the same integers (GPU vs CPU f64 per lane:
+median rel 1.9e-7, no lane off by 1e-3); replay is exact by construction.
+The frame seed's low word is the frame's place in the sequence.
+
+**Wavelengths by importance**: the hero uniform through the inverse CDF of
+`p(λ) ∝ |r̄| + |ḡ| + |b̄|` (256 bins), the other three rotated by `k/4` *in
+CDF space* so each lane is marginally `p` and the set stays stratified; the
+film divides by `p`. White's per-path variance 0.152 → 0.054.
+
+Together: pair 7× lower error at equal spp, cornell 2.7×, room 1.5×, for
+0–12 % more time (after the direction numbers became a WGSL constant;
++12–20 % before).
+
+### Russian roulette (measured, off)
+
+`Scene::roulette`: from vertex 3, continue with `q = clamp(proxy, 0.1, 1)`
+and divide by `q`, the proxy being the diffuse albedos over the earlier
+survivals' `q` — θ-free, so the decision is detached and CRN differences
+see the same paths (CPU and device; tested like the rest). On the room it
+saves 28 % of the time and costs 43 % more error per sample, neutral alone
+and a loss with the guide (it cuts the guided paths that carry the light).
+With lane compaction (risk 1) a dead lane would also stop costing an IR
+evaluation, and the trade changes.
+
+### Phase 3 deviations
+
+1. **Scenes**: no classroom or bistro (no download without asking, and no
+   `.blend` import before phase 5). The stand-ins test the same things —
+   indirect light through a small opening, a small area light, direct sun —
+   but are smaller and simpler than the real ones.
+2. **The Cornell box is grey** (scalar diffuse albedo); emitters are
+   spectrally flat.
+3. **ReSTIR DI and guiding are GPU-only**; the CPU reference refuses a
+   scene that asks for them, and their tests are GPU against GPU (plain NEE
+   or cosine sampling for unbiasedness, central differences for PRB). The
+   sampler is on both tiers.
+4. **ReSTIR needs the frame in one chunk** (≤ 524 280 paths: 4 spp at
+   400 × 300), and its candidates draw from the random stream even under
+   Sobol.
+5. **No light tree**: one emission means area is power. It belongs with
+   the first scene whose emitters differ.
+6. **Timing on a shared GPU**: other sessions used the device during most
+   runs; the reported times are best observations for both renderers (see
+   the metric). An idle machine would give tighter numbers, not different
+   conclusions: the per-sample errors carry the argument.
+
+### Phase 3 risks and next
+
+1. **Throughput is the gate now.** Cycles traces 2.5–4× more paths per
+   second here. irys walks its BVH in WGSL (≈ 60 % of a frame), Cycles uses
+   Metal's ray-tracing hardware; irys also evaluates the IR's BSDF over
+   every lane every bounce, dead or diffuse (≈ 25 %, bandwidth-bound), and
+   has no Russian roulette (fixed depth). Hardware ray queries (wgpu's ray
+   tracing on Metal), lane compaction before the IR eval, and roulette are
+   the levers, roughly in that order.
+2. **ReSTIR DI is a net loss** with the sampler on. Visibility-aware reuse
+   (shadow rays in the pairwise MIS weights) is what helps interiors; it
+   costs O(k) shadow rays per pixel and was not tried.
+3. **Bind groups must list exactly the bindings each entry point uses**
+   (wgpu's derived layouts): a kernel edit that stops using a buffer fails
+   validation at `GpuPrb::new`. Explicit layouts would make it robust.
+4. **The guide's grid is uniform**: fine for these rooms, wasteful for a
+   street; an adaptive tree (SD-tree) or a neural guide when scenes grow.
+5. ReSTIR PT/GRIS and NRC were not built.
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.
@@ -1226,7 +1489,7 @@ Each phase ends on a measured gate, not a demo.
 | 0 seed | split kosm-render into crates, reference CI | kosm builds on irys, snapshots byte-identical |
 | 1 differentiable core | tang IR BSDFs, path replay backprop, hero wavelength | marble gradients match central differences, O(1) memory |
 | 2 unified scene + wavefront GPU | 3DGRT splats + BRep + mesh in one BVH, vcad on wgpu 30 | CAD rover in a splat street; pose fit from a photo |
-| 3 sampling | ReSTIR PT, neural guiding, NRC | equal-time error ≤ Cycles on classroom, bistro |
+| 3 sampling | ReSTIR PT, neural guiding, NRC | equal-time error ≤ Cycles on classroom, bistro (2026-10-17: not met; equal-spp error ≤ Cycles, throughput 2.4–3.6× short — see Phase 3) |
 | 4 the look | OpenPBR, layering, volumes, SSS, hair | OpenPBR reference scenes match |
 | 5 product | USD + .blend import, denoiser, RL batch lane | Blender demo files render; public bench vs Cycles |
 

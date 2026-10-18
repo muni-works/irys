@@ -547,6 +547,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "irys-bench"
+version = "0.1.0"
+dependencies = [
+ "irys-core",
+ "irys-diff",
+ "irys-gpu",
+ "irys-light",
+ "irys-prims",
+ "png",
+ "serde_json",
+]
+
+[[package]]
 name = "irys-core"
 version = "0.1.0"
 dependencies = [

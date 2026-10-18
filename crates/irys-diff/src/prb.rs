@@ -66,6 +66,7 @@ use irys_light::splats::{self, Splats};
 use irys_prims::analytic::{Analytic, Prim};
 
 use crate::ggx::{self, COLUMNS, DF, Graph, PARAMS, THETA, band_weights, normalize};
+pub use crate::qmc::PathRng;
 
 /// Most wavelengths a path carries (Wilkie et al., "Hero Wavelength Spectral
 /// Sampling", EGSR 2014).
@@ -115,6 +116,10 @@ pub enum Surface {
     Conductor,
     /// The grey Lambertian floor, θ-free ([`Scene::floor_albedo`]).
     Diffuse,
+    /// A black, one-sided area light of radiance [`Scene::emission`]
+    /// (spectrally flat), θ-free, emitting on the side its winding faces. Phase 3: next-event estimation samples
+    /// every emitter triangle by area ([`Scene::lights`]).
+    Emitter,
 }
 
 /// Every opaque primitive of a scene behind one [`Geometry`], so one tree
@@ -300,6 +305,182 @@ impl Env {
     }
 }
 
+/// Every emitter triangle of a scene in world space, with the cumulative
+/// area distribution light sampling picks them by. One emission for all, so
+/// area is power; a light tree buys nothing until emitters differ (phase 3
+/// notes).
+#[derive(Debug, Clone, Default)]
+pub struct Lights {
+    /// World-space vertices.
+    pub tris: Vec<[Point3; 3]>,
+    /// Cumulative area share, ending at 1.
+    pub cdf: Vec<f64>,
+    /// Total area.
+    pub area: f64,
+}
+
+impl Lights {
+    fn gather(blas: &[Arc<Bvh<Opaque>>], placements: &[Placement]) -> Self {
+        let mut tris = Vec::new();
+        for p in placements {
+            let o = blas[p.blas].geometry();
+            let m = o.mesh();
+            for (i, t) in m.triangles().iter().enumerate() {
+                if o.surface(i) != Surface::Emitter {
+                    continue;
+                }
+                tris.push(t.map(|k| p.to_world.apply_point(&m.positions()[k as usize])));
+            }
+            assert!(
+                (0..o.analytic().len()).all(|k| o.surface(m.len() + k) != Surface::Emitter),
+                "analytic emitters are not sampled"
+            );
+        }
+        let areas: Vec<f64> = tris
+            .iter()
+            .map(|t| 0.5 * (t[1] - t[0]).cross(&(t[2] - t[0])).norm())
+            .collect();
+        let area: f64 = areas.iter().sum();
+        let mut acc = 0.0;
+        let cdf = areas
+            .iter()
+            .map(|a| {
+                acc += a;
+                acc / area
+            })
+            .collect();
+        Self { tris, cdf, area }
+    }
+
+    /// No emitters.
+    pub fn is_empty(&self) -> bool {
+        self.tris.is_empty()
+    }
+
+    /// The triangle `u` picks: the first whose cumulative share exceeds it.
+    pub fn pick(&self, u: f64) -> usize {
+        self.cdf
+            .partition_point(|&c| c <= u)
+            .min(self.tris.len() - 1)
+    }
+
+    /// A point uniform over the emitters by area, and its unit normal.
+    pub fn sample(&self, u0: f64, u1: f64, u2: f64) -> (Point3, Vec3) {
+        let t = self.tris[self.pick(u0)];
+        let r = u1.sqrt();
+        let (b0, b1) = (1.0 - r, u2 * r);
+        let p = Point3::from(
+            t[0].coords() * b0 + t[1].coords() * b1 + t[2].coords() * (1.0 - b0 - b1),
+        );
+        (p, (t[1] - t[0]).cross(&(t[2] - t[0])).normalize())
+    }
+}
+
+/// ReSTIR DI's knobs (Bitterli et al. 2020, in Lin et al. 2022's
+/// generalized RIS with pairwise MIS). The device kernels are
+/// `gpu/restir.wgsl`; the CPU reference has none and refuses a scene that
+/// asks for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Restir {
+    /// Candidates per pixel from the base light sampler (M0).
+    pub candidates: u32,
+    /// Spatial neighbours per pixel (k ≤ 9).
+    pub neighbours: u32,
+    /// Spatial radius, pixels (≤ 255).
+    pub radius: u32,
+    /// Reuse the previous frame's reservoir at the same slot
+    /// ([`crate::gpu::GpuPrb::advance`] makes this frame's the previous).
+    pub temporal: bool,
+    /// Confidence cap, in frames.
+    pub cap: u32,
+}
+
+impl Default for Restir {
+    fn default() -> Self {
+        Self {
+            candidates: 8,
+            neighbours: 3,
+            radius: 16,
+            temporal: true,
+            cap: 20,
+        }
+    }
+}
+
+/// Path guiding's knobs: a grid of `res` cells along the scene's longest
+/// side (×6 normal classes), 16 × 16 directional bins each, sampled with
+/// probability `mix` against the cosine lobe once a cell has `min_samples`
+/// training samples. GPU only (`gpu/guide.wgsl`); the CPU reference refuses
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Guide {
+    /// Cells along the longest side of the scene's bounds.
+    pub res: u32,
+    /// Probability of drawing from the guide in a trained cell.
+    pub mix: f64,
+    /// Samples a cell needs before it guides.
+    pub min_samples: u32,
+}
+
+impl Default for Guide {
+    fn default() -> Self {
+        Self {
+            res: 16,
+            mix: 0.5,
+            min_samples: 64,
+        }
+    }
+}
+
+/// [`Scene::roulette`]'s knobs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Roulette {
+    /// The first vertex (0 is the camera ray's hit) that may end a path.
+    pub start: u32,
+    /// The least survival probability.
+    pub floor: f64,
+}
+
+impl Default for Roulette {
+    fn default() -> Self {
+        Self {
+            start: 3,
+            floor: 0.1,
+        }
+    }
+}
+
+impl Scene {
+    /// The roulette at a vertex with `vertex` vertices before it and
+    /// throughput proxy `proxy`: 1 when off or too early (no draw), else one
+    /// draw and the survival probability, or 0 when the path ends.
+    fn roulette_at(&self, vertex: u32, proxy: f64, rng: &mut PathRng) -> f64 {
+        match self.roulette {
+            Some(r) if vertex >= r.start => {
+                let u = rng.uniform();
+                // f32, as the device computes it
+                let q = (proxy as f32).clamp(r.floor as f32, 1.0) as f64;
+                if u < q { q } else { 0.0 }
+            }
+            _ => 1.0,
+        }
+    }
+}
+
+/// One light sample: direction, solid-angle pdf, distance to the point on
+/// an emitter (∞ for the environment), and which it is.
+#[derive(Debug, Clone, Copy)]
+pub struct LightDraw {
+    /// Unit direction.
+    pub dir: Vec3,
+    /// Solid-angle pdf, the pick included.
+    pub pdf: f64,
+    /// Distance to the emitter point; ∞ for the environment.
+    pub dist: f64,
+    /// An emitter, not the environment.
+    pub emitter: bool,
+}
+
 /// The power heuristic (β = 2): the weight of the strategy with pdf `a`
 /// against the one with pdf `b`.
 pub fn mis(a: f64, b: f64) -> f64 {
@@ -342,6 +523,42 @@ pub struct Scene {
     pub nee: bool,
     /// The sky and sun.
     pub env: Env,
+    /// Radiance of every [`Surface::Emitter`] prim (flat spectrum).
+    pub emission: f64,
+    /// With emitters and a lit sky, the share of light samples sent to the
+    /// environment; the rest pick an emitter triangle by area. See
+    /// [`Scene::env_pick`].
+    pub env_share: f64,
+    /// Emitter triangles in world space, for light sampling.
+    pub(crate) lights: Lights,
+    /// Trace the last vertex's BSDF ray too, for emission only (the sky or
+    /// an emitter, MIS-weighted, no further vertex). Then a path of `depth`
+    /// vertices collects exactly the light of up to `depth` scatterings by
+    /// both strategies, which is Cycles' `max_bounces = depth − 1`; off, the
+    /// last vertex's light is its NEE share alone (phases 1–2, bit for bit).
+    pub complete: bool,
+    /// ReSTIR DI at the first vertex (GPU only; see `gpu/restir.wgsl`).
+    /// `None` is the plain NEE draw.
+    pub restir: Option<Restir>,
+    /// Draw every path's uniforms from its pixel's shuffled, scrambled
+    /// Sobol sequence ([`crate::qmc`]) instead of SplitMix64. The frame
+    /// seed's low 32 bits are the frame's place in the sequence (frame `f`
+    /// is samples `f · spp …`), the high 32 bits the scramble. Not in point
+    /// mode, which keeps the random stream.
+    pub qmc: bool,
+    /// Importance-sample wavelengths by the film's response
+    /// ([`crate::qmc::Spectral`]) instead of uniformly.
+    pub spectral_is: bool,
+    /// Russian roulette: from this vertex on, each vertex continues with
+    /// probability `q = clamp(proxy, floor, 1)` and divides the throughput
+    /// by it. The proxy is the product of the diffuse albedos over the
+    /// earlier survivals' `q` — a throughput without the conductor's `f`, so
+    /// it is θ-free, the decision is detached, and CRN central differences
+    /// see the same paths.
+    pub roulette: Option<Roulette>,
+    /// Online path guiding at diffuse vertices (GPU only; see
+    /// `gpu/guide.wgsl`). `None` is cosine sampling.
+    pub guide: Option<Guide>,
     /// When set, the frame is these primary rays instead of the image's:
     /// path `i` leaves the camera through camera-plane point `points[i]`
     /// (`(sx, sy)`, [`Scene::screen`]) and is keyed `i / 2`, so the two rays
@@ -456,6 +673,72 @@ impl Scene {
         sc
     }
 
+    /// Phase 3's mesh-emitter scene: a grey Cornell box (interior
+    /// `[−1, 1]² × [0, 2]`, open towards the camera at `y = −1`) lit by one
+    /// emissive 0.6 × 0.5 quad just under the ceiling, facing down, a tall turned box and
+    /// a conductor ball inside, black outside. NEE on, depth 8.
+    pub fn cornell(w: usize, h: usize, spp: usize) -> Self {
+        let mesh = |m: TriMesh, s: Surface| Opaque::new(m, s, Analytic::from_prims(Vec::new()), &[]);
+        let slab = |lo: [f64; 3], hi: [f64; 3]| {
+            let c = |k: usize| 0.5 * (lo[k] + hi[k]);
+            let s = |k: usize| hi[k] - lo[k];
+            Placement::new(
+                0,
+                Transform::translation(c(0), c(1), c(2)).then(&Transform::scale(s(0), s(1), s(2))),
+            )
+            .tinted(1.0)
+        };
+        let t = 0.05;
+        let placements = vec![
+            slab([-1.0 - t, -1.0, -t], [1.0 + t, 1.0 + t, 0.0]),
+            slab([-1.0 - t, -1.0, 2.0], [1.0 + t, 1.0 + t, 2.0 + t]),
+            slab([-1.0 - t, 1.0, 0.0], [1.0 + t, 1.0 + t, 2.0]),
+            slab([-1.0 - t, -1.0, 0.0], [-1.0, 1.0, 2.0]),
+            slab([1.0, -1.0, 0.0], [1.0 + t, 1.0, 2.0]),
+            Placement::new(
+                0,
+                Transform::translation(-0.35, 0.3, 0.6)
+                    .then(&Transform::rotation_z(0.3))
+                    .then(&Transform::scale(0.6, 0.6, 1.2)),
+            )
+            .tinted(0.8),
+            Placement::new(
+                1,
+                Transform::translation(0.45, -0.35, 0.35).then(&Transform::scale(0.35, 0.35, 0.35)),
+            ),
+            Placement::new(
+                2,
+                Transform::translation(0.0, 0.1, 1.995)
+                    .then(&Transform::rotation_x(std::f64::consts::PI))
+                    .then(&Transform::scale(0.6, 0.5, 1.0)),
+            ),
+        ];
+        let mut s = Self::instanced(
+            vec![
+                mesh(cuboid(0.5, 0.5, 0.5), Surface::Diffuse),
+                mesh(uv_sphere(32, 64), Surface::Conductor),
+                mesh(grid_floor(1, 0.5), Surface::Emitter),
+            ],
+            placements,
+            None,
+            (w, h),
+            spp,
+            (Point3::new(0.0, -3.4, 1.0), Point3::new(0.0, 0.0, 1.0)),
+            19.5,
+        );
+        s.floor_albedo = 0.75;
+        s.nee = true;
+        s.complete = true;
+        s.depth = 8;
+        s.emission = 12.0;
+        s.env = Env {
+            sky: 0.0,
+            sun_radiance: 0.0,
+            ..Env::default()
+        };
+        s
+    }
+
     fn one(
         opaque: Opaque,
         splats: Option<Bvh<Splats>>,
@@ -499,6 +782,7 @@ impl Scene {
         let forward = (target - eye).normalize();
         let right = forward.cross(&Vec3::new(0.0, 0.0, 1.0)).normalize();
         let up = right.cross(&forward);
+        let lights = Lights::gather(&blas, &placements);
         Self {
             blas,
             tlas: Tlas::build(instances),
@@ -513,6 +797,15 @@ impl Scene {
             frozen_alpha: None,
             nee: false,
             env: Env::default(),
+            emission: 1.0,
+            env_share: 0.5,
+            lights,
+            complete: false,
+            restir: None,
+            qmc: false,
+            spectral_is: false,
+            roulette: None,
+            guide: None,
             points: None,
             tan_half: half_fov_deg.to_radians().tan(),
             eye,
@@ -520,6 +813,109 @@ impl Scene {
             right,
             up,
         }
+    }
+
+    /// Path `i`'s generator for the frame drawn with `seed`.
+    pub fn path_rng(&self, seed: u64, i: usize) -> PathRng {
+        if self.qmc && self.points.is_none() {
+            let spp = self.spp as u32;
+            PathRng::Sobol {
+                index: (seed as u32)
+                    .wrapping_mul(spp)
+                    .wrapping_add(i as u32 % spp),
+                pixel: crate::qmc::hash2(i as u32 / spp, (seed >> 32) as u32),
+                counter: 0,
+            }
+        } else {
+            PathRng::Random(Rng::new(seed, self.path_key(i)))
+        }
+    }
+
+    /// A path's wavelengths from its hero draw `u` ([`wavelengths`], or by
+    /// importance with [`Scene::spectral_is`]).
+    pub fn wavelengths_of(&self, u: f64) -> [f64; HERO] {
+        if !self.spectral_is {
+            return wavelengths(u, self.wavelengths);
+        }
+        let s = crate::qmc::Spectral::get();
+        let w = self.wavelengths;
+        std::array::from_fn(|k| {
+            let v = u + k as f64 / w as f64;
+            s.lambda(v - v.floor())
+        })
+    }
+
+    /// The density wavelengths are drawn with, relative to uniform.
+    pub fn lambda_pdf(&self, lambda_nm: f64) -> f64 {
+        if self.spectral_is {
+            crate::qmc::Spectral::get().pdf(lambda_nm)
+        } else {
+            1.0
+        }
+    }
+
+    /// The emitter triangles, world space.
+    pub fn lights(&self) -> &Lights {
+        &self.lights
+    }
+
+    /// The share of light samples that go to the environment: 1 with no
+    /// emitters (the phase 2 estimator, bit for bit), 0 with emitters under
+    /// a black sky, [`Scene::env_share`] otherwise.
+    pub fn env_pick(&self) -> f64 {
+        if self.lights.is_empty() {
+            1.0
+        } else if self.env.sky == 0.0 && self.env.sun_radiance == 0.0 {
+            0.0
+        } else {
+            self.env_share
+        }
+    }
+
+    /// A light sample from `x` with three uniforms: the first picks the
+    /// environment or an emitter triangle (and is reused, rescaled, by the
+    /// pick), the other two place the point. `None` when the draw is
+    /// degenerate (a grazing emitter, a point on `x`).
+    pub fn sample_light(&self, x: Point3, u: [f64; 3]) -> Option<LightDraw> {
+        let pe = self.env_pick();
+        if u[0] < pe {
+            let dir = self.env.sample([u[0] / pe, u[1], u[2]]);
+            return Some(LightDraw {
+                dir,
+                pdf: pe * self.env.pdf(dir),
+                dist: f64::INFINITY,
+                emitter: false,
+            });
+        }
+        let (p, n) = self.lights.sample((u[0] - pe) / (1.0 - pe), u[1], u[2]);
+        let v = p - x;
+        let d2 = v.norm_squared();
+        let dist = d2.sqrt();
+        if dist <= 0.0 {
+            return None;
+        }
+        let dir = v / dist;
+        // One-sided: only a point whose front faces `x` sends light.
+        let cos_l = -n.dot(&dir);
+        let pdf = (1.0 - pe) * d2 / (self.lights.area * cos_l);
+        (cos_l > 0.0 && pdf.is_finite()).then_some(LightDraw {
+            dir,
+            pdf,
+            dist,
+            emitter: true,
+        })
+    }
+
+    /// The light-sampling pdf (solid angle) of a ray that escaped along `d`.
+    pub fn light_pdf_env(&self, d: Vec3) -> f64 {
+        let pe = self.env_pick();
+        if pe == 0.0 { 0.0 } else { pe * self.env.pdf(d) }
+    }
+
+    /// The light-sampling pdf (solid angle) of a ray that hit an emitter at
+    /// distance `t`, at cosine `cos_l` to its normal.
+    pub fn light_pdf_emitter(&self, t: f64, cos_l: f64) -> f64 {
+        (1.0 - self.env_pick()) * t * t / (self.lights.area * cos_l.abs())
     }
 
     /// The top-level tree.
@@ -611,6 +1007,7 @@ impl Scene {
             })
             .collect();
         self.tlas = Tlas::build(instances);
+        self.lights = Lights::gather(&self.blas, &self.placements);
     }
 
     /// Pixel coordinates (`x` right, `y` down, `[0, w) × [0, h)`) to the
@@ -670,7 +1067,7 @@ impl Scene {
         self.lanes() * if self.nee { 2 } else { 1 }
     }
 
-    fn camera_ray(&self, path: usize, rng: &mut Rng) -> Ray {
+    fn camera_ray(&self, path: usize, rng: &mut PathRng) -> Ray {
         let (w, h) = self.size;
         let px = path / self.spp;
         let (x, y) = (
@@ -829,10 +1226,13 @@ struct Path {
     /// `L_j`: radiance collected so far, per wavelength.
     radiance: [f64; HERO],
     lambda: [f64; HERO],
-    rng: Rng,
+    rng: PathRng,
     /// The BSDF pdf the current ray was drawn with; 0 for the camera ray.
     prev_pdf: f64,
     alive: bool,
+    /// Vertices so far, and the roulette's θ-free throughput proxy.
+    vertex: u32,
+    proxy: f64,
 }
 
 /// What a pass measured.
@@ -908,7 +1308,12 @@ pub fn offset(x: Point3, n: Vec3, o: Point3, t: f64) -> Point3 {
 struct LightSample {
     dir: Vec3,
     s: f64,
+    emitter: bool,
 }
+
+/// A shadow ray to an emitter point stops this fraction short of it, so
+/// the emitter does not occlude itself (both tiers).
+pub const SHADOW_SHORT: f64 = 1e-4;
 
 /// Trace every path once. `replay = None` is the forward pass and returns
 /// each path's `L`; `Some((l, dl))` replays against the forward pass's `L`
@@ -966,14 +1371,22 @@ fn trace(
         !(scene.nee && scene.splats.is_some()),
         "NEE with splats: shadow rays do not composite them"
     );
+    assert!(
+        scene.restir.is_none(),
+        "ReSTIR DI is GPU-only: the CPU reference has no reservoirs"
+    );
+    assert!(
+        scene.guide.is_none(),
+        "path guiding is GPU-only: the CPU reference has no guide"
+    );
     let lanes = scene.lanes();
     let width = scene.graph_width();
     assert_eq!(k.width, width, "kernels built for another graph width");
     let env = scene.env;
     let mut paths: Vec<Path> = (0..n)
         .map(|i| {
-            let mut rng = Rng::new(seed, scene.path_key(i));
-            let lambda = wavelengths(rng.uniform(), nw);
+            let mut rng = scene.path_rng(seed, i);
+            let lambda = scene.wavelengths_of(rng.uniform());
             let ray = scene.camera_ray(i, &mut rng);
             Path {
                 ray,
@@ -983,6 +1396,8 @@ fn trace(
                 rng,
                 prev_pdf: 0.0,
                 alive: true,
+                vertex: 0,
+                proxy: 1.0,
             }
         })
         .collect();
@@ -1023,7 +1438,9 @@ fn trace(
         h
     };
 
-    for _ in 0..scene.depth {
+    let tail = scene.complete as usize;
+    for it in 0..scene.depth + tail {
+        let last = it == scene.depth;
         let mut any = false;
         for (i, p) in paths.iter_mut().enumerate() {
             // Inactive slots get a harmless vertex and no adjoint.
@@ -1060,7 +1477,7 @@ fn trace(
             let d: Vec3 = *p.ray.direction.as_ref();
             let Some(ih) = hit else {
                 let w = if scene.nee && p.prev_pdf > 0.0 {
-                    mis(p.prev_pdf, env.pdf(d))
+                    mis(p.prev_pdf, scene.light_pdf_env(d))
                 } else {
                     1.0
                 };
@@ -1071,6 +1488,28 @@ fn trace(
                 continue;
             };
             let mut nrm: Vec3 = *ih.hit.normal.as_ref();
+            if scene.surface(&ih) == Surface::Emitter {
+                // A black, one-sided emitter: collect Le from its front and
+                // stop. Against NEE, the light strategy's pdf of this hit is
+                // the area pick's, in solid angle.
+                if nrm.dot(&d) < 0.0 {
+                    let w = if scene.nee && p.prev_pdf > 0.0 {
+                        mis(p.prev_pdf, scene.light_pdf_emitter(ih.hit.t, nrm.dot(&d)))
+                    } else {
+                        1.0
+                    };
+                    for k in 0..nw {
+                        p.radiance[k] += p.throughput[k] * scene.emission * w;
+                    }
+                }
+                p.alive = false;
+                continue;
+            }
+            if last {
+                // The tail ([`Scene::complete`]): emission only, no vertex.
+                p.alive = false;
+                continue;
+            }
             if nrm.dot(&d) > 0.0 {
                 nrm = -nrm; // two-sided: shade the side the ray came from
             }
@@ -1080,14 +1519,27 @@ fn trace(
             // The light sample: drawn before the BSDF's, three uniforms
             // whether or not it lands, so the stream does not depend on it.
             let nee = scene.nee.then(|| {
-                let dir = env.sample([p.rng.uniform(), p.rng.uniform(), p.rng.uniform()]);
-                let cos = dir.dot(&nrm);
+                p.rng.align();
+                let u = [p.rng.uniform(), p.rng.uniform(), p.rng.uniform()];
+                let Some(ld) = scene.sample_light(origin, u) else {
+                    return (Vec3::zeros(), 0.0, 0.0, false, false);
+                };
+                let cos = ld.dir.dot(&nrm);
                 let lit = cos > 0.0
-                    && !scene
-                        .tlas
-                        .occluded_range(&Ray::new(origin, dir), 0.0, f64::INFINITY);
-                (dir, cos, env.pdf(dir), lit)
+                    && !scene.tlas.occluded_range(
+                        &Ray::new(origin, ld.dir),
+                        0.0,
+                        ld.dist * (1.0 - SHADOW_SHORT),
+                    );
+                (ld.dir, cos, ld.pdf, lit, ld.emitter)
             });
+            let le = |dir: Vec3, emitter: bool, lambda: f64| {
+                if emitter {
+                    scene.emission
+                } else {
+                    env.radiance(dir, lambda)
+                }
+            };
             if scene.surface(&ih) == Surface::Diffuse {
                 // Lambertian: cosine sampling, weight = albedo. θ-free.
                 let place = &scene.placements[ih.payload];
@@ -1097,25 +1549,34 @@ fn trace(
                     } else {
                         scene.floor_albedo
                     };
-                if let Some((dir, cos, pl, true)) = nee {
+                if let Some((dir, cos, pl, true, emitter)) = nee {
                     let w = mis(pl, cos / std::f64::consts::PI);
                     for k in 0..nw {
                         p.radiance[k] += p.throughput[k] * albedo / std::f64::consts::PI
                             * cos
-                            * env.radiance(dir, p.lambda[k])
+                            * le(dir, emitter, p.lambda[k])
                             * w
                             / pl;
                     }
                 }
+                p.rng.align();
                 let (u1, u2) = (p.rng.uniform(), p.rng.uniform());
+                let proxy = ((p.proxy as f32) * (albedo as f32)) as f64;
+                let q = scene.roulette_at(p.vertex, proxy, &mut p.rng);
+                if q == 0.0 {
+                    p.alive = false;
+                    continue;
+                }
                 let (r, phi) = (u1.sqrt(), 2.0 * std::f64::consts::PI * u2);
                 let cz = (1.0 - u1).max(0.0).sqrt();
                 let wi = t * (r * phi.cos()) + b * (r * phi.sin()) + nrm * cz;
                 for tp in &mut p.throughput[..nw] {
-                    *tp *= albedo;
+                    *tp *= albedo / q;
                 }
                 p.prev_pdf = cz / std::f64::consts::PI;
                 p.ray = Ray::new(origin, wi);
+                p.vertex += 1;
+                p.proxy = ((proxy as f32) / (q as f32)) as f64;
                 continue;
             }
             // The hero alone picks the direction. GGX's sampling does not
@@ -1123,7 +1584,7 @@ fn trace(
             // hero-wavelength MIS weight reduces to `f_k cos / p`.
             let lo = [wo.dot(&t), wo.dot(&b), wo.dot(&nrm)];
             let alpha = scene.frozen_alpha.unwrap_or(theta[0]);
-            if let Some((dir, cos, pl, true)) = nee
+            if let Some((dir, cos, pl, true, emitter)) = nee
                 && lo[2] > 0.0
             {
                 let li = [dir.dot(&t), dir.dot(&b), cos];
@@ -1135,13 +1596,16 @@ fn trace(
                 light[i] = Some(LightSample {
                     dir,
                     s: cos * mis(pl, pb) / pl,
+                    emitter,
                 });
                 ball[i] = true;
                 any = true;
             }
+            p.rng.align();
             let u = [p.rng.uniform(), p.rng.uniform()];
+            let q = scene.roulette_at(p.vertex, p.proxy, &mut p.rng);
             let (li, pdf) = ggx::sample(alpha, lo, u);
-            if li[2] <= 0.0 || lo[2] <= 0.0 || !pdf.is_finite() || pdf <= 0.0 {
+            if q == 0.0 || li[2] <= 0.0 || lo[2] <= 0.0 || !pdf.is_finite() || pdf <= 0.0 {
                 // Dead after this vertex; its light sample still counts.
                 sampled[i] = (Vec3::zeros(), 0.0, 0.0);
                 p.alive = false;
@@ -1150,8 +1614,11 @@ fn trace(
             for w in 0..nw {
                 lane(&mut cols, i * nw + w, li, lo, p.lambda[w]);
             }
-            sampled[i] = (t * li[0] + b * li[1] + nrm * li[2], li[2], pdf);
+            // the roulette's 1/q rides on the pdf the throughput divides by
+            sampled[i] = (t * li[0] + b * li[1] + nrm * li[2], li[2], pdf * q);
             p.prev_pdf = pdf;
+            p.vertex += 1;
+            p.proxy = ((p.proxy as f32) / (q as f32)) as f64;
             p.ray = Ray::new(origin, sampled[i].0);
             ball[i] = true;
             any = true;
@@ -1174,7 +1641,11 @@ fn trace(
             for w in 0..nw {
                 let j = i * nw + w;
                 if let Some(ls) = light[i] {
-                    let le = env.radiance(ls.dir, p.lambda[w]);
+                    let le = if ls.emitter {
+                        scene.emission
+                    } else {
+                        env.radiance(ls.dir, p.lambda[w])
+                    };
                     let g = p.throughput[w] * ls.s * le;
                     if let Some((_, dl)) = replay {
                         df[lanes + j] = dl[j] * g;
@@ -1263,9 +1734,10 @@ pub fn image(scene: &Scene, seed: u64, l: &[f64]) -> Vec<f64> {
 /// seed, because the forward pass keeps nothing per path but `L`.
 pub fn lane_weight(scene: &Scene, seed: u64, lane: usize) -> [f64; 3] {
     let nw = scene.wavelengths;
-    let u = Rng::new(seed, (lane / nw) as u64).uniform();
-    let lambda = wavelengths(u, nw)[lane % nw];
-    hero_weight(lambda).map(|w| w as f64 / (scene.spp * nw) as f64)
+    let u = scene.path_rng(seed, lane / nw).uniform();
+    let lambda = scene.wavelengths_of(u)[lane % nw];
+    let p = scene.lambda_pdf(lambda);
+    hero_weight(lambda).map(|w| w as f64 / p / (scene.spp * nw) as f64)
 }
 
 /// A loss over the image: its value and its adjoint per pixel channel.

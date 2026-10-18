@@ -42,6 +42,16 @@ use crate::prb::{self, Loss, Scene};
 
 const WAVEFRONT: &str = include_str!("gpu/wavefront.wgsl");
 const EDGES: &str = include_str!("gpu/edges.wgsl");
+const RESTIR: &str = include_str!("gpu/restir.wgsl");
+const GUIDE: &str = include_str!("gpu/guide.wgsl");
+
+/// `qmc::sobol_matrices` dimensions 1–3 as a WGSL module constant, so the
+/// device's direction numbers are the CPU's by construction.
+fn sobol_const() -> String {
+    let m = crate::qmc::sobol_matrices();
+    let words: Vec<String> = m[1..].iter().flatten().map(|w| format!("{w}u")).collect();
+    format!("const SOBOL = array<u32, 96>({});\n", words.join(", "))
+}
 const PATH_BYTES: u64 = 128;
 const WG: u32 = 64;
 
@@ -77,6 +87,14 @@ struct Params {
     _pad: u32,
     sun: [f32; 4],
     env: [f32; 4],
+    light: [f32; 4],
+    restir: [u32; 4],
+    guide: [f32; 4],
+    gmin: [f32; 4],
+    gres: [u32; 4],
+    gres2: [u32; 4],
+    qmc: [u32; 4],
+    rr: [f32; 4],
 }
 
 /// The splat compositor's segment start, `EPS / 10` (phase 2b's, unchanged).
@@ -245,13 +263,23 @@ pub struct GpuPrb {
     ids: wgpu::Buffer,
     geo: wgpu::Buffer,
     points: wgpu::Buffer,
+    /// Phase 3: emitter triangles (`pack_lights`).
+    lights: wgpu::Buffer,
+    /// ReSTIR DI: this frame's G-buffer, the previous one's, this frame's
+    /// final reservoirs, the previous one's.
+    restir: [wgpu::Buffer; 4],
+    /// Path guiding: histograms, CDFs, trained flags, sample counts.
+    guide: [wgpu::Buffer; 4],
+    grid: Option<Grid>,
+    /// The next forward passes record guiding samples.
+    training: bool,
     eval: Ir,
     adjoint: Ir,
     f: TensorId,
-    pipes: [wgpu::ComputePipeline; 8],
+    pipes: [wgpu::ComputePipeline; 13],
     // gen, bounce, update, finish→l, finish→l2, accumulate, score,
     // loss_sum, lane_adjoint
-    groups: [wgpu::BindGroup; 9],
+    groups: [wgpu::BindGroup; 14],
     layout: Layout,
     /// Timings of the last forward and replay.
     pub timing: Timing,
@@ -319,6 +347,7 @@ fn pack(scene: &Scene) -> (Vec<[f32; 4]>, Vec<u32>, Vec<[f32; 4]>, Layout) {
         let surf = |i: usize| match o.surface(i) {
             prb::Surface::Conductor => 0.0,
             prb::Surface::Diffuse => 1.0,
+            prb::Surface::Emitter => 2.0,
         };
         for (i, t) in mesh.triangles().iter().enumerate() {
             let p = |k: usize| mesh.positions()[t[k] as usize];
@@ -407,6 +436,59 @@ fn pack(scene: &Scene) -> (Vec<[f32; 4]>, Vec<u32>, Vec<[f32; 4]>, Layout) {
     (nodes, ids, geo, layout)
 }
 
+/// Path guiding's spatial grid: cubic cells over the scene's bounds, `res`
+/// along the longest side, ×6 normal classes.
+#[derive(Debug, Clone)]
+struct Grid {
+    /// Origin and 1 / cell size.
+    min: [f32; 4],
+    res: [u32; 3],
+}
+
+impl Grid {
+    fn new(scene: &Scene, g: prb::Guide) -> Self {
+        let b = scene.tlas().bounds().expect("a scene with geometry");
+        let ext = b.max - b.min;
+        let long = ext.x.max(ext.y).max(ext.z) * 1.0001;
+        let cell = long / g.res.max(1) as f64;
+        let n = |e: f64| ((e * 1.0001 / cell).ceil() as u32).max(1);
+        Self {
+            min: [b.min.x as f32, b.min.y as f32, b.min.z as f32, (1.0 / cell) as f32],
+            res: [n(ext.x), n(ext.y), n(ext.z)],
+        }
+    }
+
+    fn cells(&self) -> u32 {
+        self.res[0] * self.res[1] * self.res[2] * 6
+    }
+}
+
+/// The sampler's tables for the device: Sobol's four direction matrices,
+/// then the wavelength CDF as `f32` bits ([`crate::qmc`]).
+fn sampler_tables() -> Vec<u32> {
+    let mut t: Vec<u32> = crate::qmc::sobol_matrices().iter().flatten().copied().collect();
+    t.extend(crate::qmc::Spectral::get().cdf.iter().map(|c| c.to_bits()));
+    t
+}
+
+/// The scene's emitter triangles for `sample_light`: three `vec4`s each,
+/// `(v0, cumulative share)`, `(v1, 0)`, `(v2, 0)`. One harmless record when
+/// there are none, so the binding is never empty.
+fn pack_lights(scene: &Scene) -> Vec<[f32; 4]> {
+    let l = scene.lights();
+    let v = |p: irys_core::Point3, w: f64| [p.x as f32, p.y as f32, p.z as f32, w as f32];
+    let mut out: Vec<[f32; 4]> = l
+        .tris
+        .iter()
+        .zip(&l.cdf)
+        .flat_map(|(t, &c)| [v(t[0], c), v(t[1], 0.0), v(t[2], 0.0)])
+        .collect();
+    if out.is_empty() {
+        out = vec![[0.0; 4]; 3];
+    }
+    out
+}
+
 /// The device, or why there is none. Tests skip on `Err`.
 pub fn context() -> Result<&'static GpuContext, GpuError> {
     GpuContext::init_blocking()
@@ -431,6 +513,11 @@ impl GpuPrb {
         let fit = 65535 * WG as usize / per_path.max(1);
         let paths = scene.paths().min(fit).min(max_paths).max(1) as u32;
         let chunks = scene.paths().div_ceil(paths as usize) as u32;
+        assert!(
+            scene.restir.is_none() || chunks == 1,
+            "ReSTIR DI reuses across the frame: it must fit one chunk ({} paths > {paths})",
+            scene.paths()
+        );
         let storage = |label: &str, bytes: u64| {
             dev.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -482,6 +569,26 @@ impl GpuPrb {
         let ids = init("prim ids", bytemuck::cast_slice(&ids), room / 4);
         let geo = init("prims", bytemuck::cast_slice(&geo), 0);
         let points = storage("points", scene.points().map_or(0, |p| p.len() as u64 * 8));
+        let lights = init("lights", bytemuck::cast_slice(&pack_lights(scene)), 0);
+        let qtab = init("sampler tables", bytemuck::cast_slice(&sampler_tables()), 0);
+        // ReSTIR DI: G-buffers (three vec4 per slot) and reservoirs (two),
+        // this frame's and the previous one's.
+        let slots = if scene.restir.is_some() { paths as u64 } else { 0 };
+        let g_cur = storage("restir g", slots * 48);
+        let g_prev = storage("restir g prev", slots * 48);
+        let r_a = storage("restir a", slots * 32);
+        let r_b = storage("restir b", slots * 32);
+        let r_prev = storage("restir prev", slots * 32);
+        // Path guiding: the grid, its histograms and CDFs, the records.
+        let grid = scene.guide.map(|gd| Grid::new(scene, gd));
+        let cells = grid.as_ref().map_or(0, |g| g.cells() as u64);
+        let recs = if grid.is_some() { paths as u64 * scene.depth as u64 } else { 0 };
+        let g_hist = storage("guide hist", cells * 256 * 8);
+        let g_cdf = storage("guide cdf", cells * 256 * 4);
+        let g_ok = storage("guide ok", cells * 4);
+        let g_rec = storage("guide records", recs * 16);
+        let g_nrec = storage("guide record counts", if grid.is_some() { paths as u64 * 4 } else { 0 });
+        let g_cnt = storage("guide counts", cells * 4);
         let params = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
             size: std::mem::size_of::<Params>() as u64,
@@ -518,7 +625,7 @@ impl GpuPrb {
 
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("prb wavefront"),
-            source: wgpu::ShaderSource::Wgsl(WAVEFRONT.into()),
+            source: wgpu::ShaderSource::Wgsl(format!("{WAVEFRONT}\n{RESTIR}\n{GUIDE}\n{}", sobol_const()).into()),
         });
         let pipe = |entry: &str| {
             dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -539,6 +646,11 @@ impl GpuPrb {
             "score",
             "loss_sum",
             "lane_adjoint",
+            "tail",
+            "ris_init",
+            "ris_temporal",
+            "ris_spatial",
+            "guide_build",
         ]
         .map(pipe);
         let bind = |p: &wgpu::ComputePipeline, e: &[(u32, &wgpu::Buffer)]| {
@@ -561,10 +673,25 @@ impl GpuPrb {
             (23, &nodes),
             (24, &ids),
             (25, &geo),
+            (40, &lights),
+            (43, &r_a),
+            (51, &g_cdf),
+            (52, &g_ok),
+            (53, &g_rec),
+            (54, &g_nrec),
         ];
         bounce.extend(cols.iter().enumerate().map(|(c, b)| (2 + c as u32, b)));
         let groups = [
-            bind(&pipes[0], &[(0, &params), (1, &path_buf), (26, &points)]),
+            bind(
+                &pipes[0],
+                &[
+                    (0, &params),
+                    (1, &path_buf),
+                    (26, &points),
+                    (54, &g_nrec),
+                    (56, &qtab),
+                ],
+            ),
             bind(&pipes[1], &bounce),
             bind(
                 &pipes[2],
@@ -577,13 +704,36 @@ impl GpuPrb {
                     (12, &df),
                 ],
             ),
-            bind(&pipes[3], &[(0, &params), (1, &path_buf), (13, &l)]),
-            bind(&pipes[3], &[(0, &params), (1, &path_buf), (13, &l2)]),
+            bind(
+                &pipes[3],
+                &[
+                    (0, &params),
+                    (1, &path_buf),
+                    (13, &l),
+                    (50, &g_hist),
+                    (53, &g_rec),
+                    (54, &g_nrec),
+                    (55, &g_cnt),
+                ],
+            ),
+            bind(
+                &pipes[3],
+                &[
+                    (0, &params),
+                    (1, &path_buf),
+                    (13, &l2),
+                    (50, &g_hist),
+                    (53, &g_rec),
+                    (54, &g_nrec),
+                    (55, &g_cnt),
+                ],
+            ),
             bind(&pipes[4], &[(14, &grad), (15, adjoint.buffer(g.dtheta))]),
             bind(
                 &pipes[5],
                 &[
                     (0, &params),
+                    (56, &qtab),
                     (10, &l),
                     (17, &img),
                     (18, &target),
@@ -592,7 +742,43 @@ impl GpuPrb {
                 ],
             ),
             bind(&pipes[6], &[(0, &params), (20, &sq), (21, &loss)]),
-            bind(&pipes[7], &[(0, &params), (19, &d_img), (22, &dl)]),
+            bind(
+                &pipes[7],
+                &[(0, &params), (19, &d_img), (22, &dl), (56, &qtab)],
+            ),
+            bind(&pipes[8], &bounce),
+            bind(
+                &pipes[9],
+                &[
+                    (0, &params),
+                    (1, &path_buf),
+                    (23, &nodes),
+                    (24, &ids),
+                    (25, &geo),
+                    (40, &lights),
+                    (41, &g_cur),
+                    (43, &r_a),
+                ],
+            ),
+            bind(
+                &pipes[10],
+                &[
+                    (0, &params),
+                    (41, &g_cur),
+                    (42, &g_prev),
+                    (43, &r_a),
+                    (44, &r_b),
+                    (45, &r_prev),
+                ],
+            ),
+            bind(
+                &pipes[11],
+                &[(0, &params), (41, &g_cur), (43, &r_a), (44, &r_b)],
+            ),
+            bind(
+                &pipes[12],
+                &[(0, &params), (50, &g_hist), (51, &g_cdf), (52, &g_ok), (55, &g_cnt)],
+            ),
         ];
         let f = g.f;
         if let Some(e) = pollster::block_on(scope.pop()) {
@@ -617,6 +803,11 @@ impl GpuPrb {
             ids,
             geo,
             points,
+            lights,
+            restir: [g_cur, g_prev, r_a, r_prev],
+            guide: [g_hist, g_cdf, g_ok, g_cnt],
+            grid,
+            training: false,
             layout,
             eval,
             adjoint,
@@ -696,6 +887,40 @@ impl GpuPrb {
                     vmf as f32,
                 ]
             },
+            light: [
+                scene.lights().tris.len() as f32,
+                scene.env_pick() as f32,
+                scene.lights().area as f32,
+                scene.emission as f32,
+            ],
+            guide: [scene.guide.map_or(0.0, |g| g.mix as f32), 0.0, 0.0, 0.0],
+            gmin: self.grid.as_ref().map_or([0.0; 4], |g| g.min),
+            gres: {
+                let r = self.grid.as_ref().map_or([0; 3], |g| g.res);
+                let flags = self.grid.is_some() as u32
+                    | ((self.grid.is_some() && self.training && !replay) as u32) << 1;
+                [r[0], r[1], r[2], flags]
+            },
+            gres2: [
+                scene.depth as u32,
+                self.grid.as_ref().map_or(0, |g| g.cells()),
+                scene.guide.map_or(0, |g| g.min_samples),
+                0,
+            ],
+            qmc: [scene.qmc as u32, scene.spectral_is as u32, 0, 0],
+            rr: match scene.roulette {
+                Some(r) => [1.0, r.start as f32, r.floor as f32, 0.0],
+                None => [0.0; 4],
+            },
+            restir: match scene.restir {
+                Some(r) => [
+                    (r.neighbours.min(9) << 8) | r.radius.min(255),
+                    r.candidates.max(1),
+                    r.temporal as u32,
+                    r.cap,
+                ],
+                None => [0; 4],
+            },
         }
     }
 
@@ -710,6 +935,11 @@ impl GpuPrb {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             let groups = self.paths.div_ceil(WG);
             self.dispatch(&mut pass, 0, 0, groups);
+            if scene.restir.is_some() {
+                self.dispatch(&mut pass, 9, 10, groups);
+                self.dispatch(&mut pass, 10, 11, groups);
+                self.dispatch(&mut pass, 11, 12, groups);
+            }
             for _ in 0..scene.depth {
                 self.dispatch(&mut pass, 1, 1, groups);
                 self.eval.dispatch(&mut pass);
@@ -718,6 +948,9 @@ impl GpuPrb {
                     self.adjoint.dispatch(&mut pass);
                     self.dispatch(&mut pass, 4, 5, 1);
                 }
+            }
+            if scene.complete {
+                self.dispatch(&mut pass, 8, 9, groups);
             }
             self.dispatch(&mut pass, 3, if replay { 4 } else { 3 }, groups);
         }
@@ -803,7 +1036,78 @@ impl GpuPrb {
         q.write_buffer(&self.nodes, 0, bytemuck::cast_slice(&nodes));
         q.write_buffer(&self.ids, 0, bytemuck::cast_slice(&ids));
         q.write_buffer(&self.geo, 0, bytemuck::cast_slice(&geo));
+        q.write_buffer(&self.lights, 0, bytemuck::cast_slice(&pack_lights(scene)));
         self.layout = layout;
+    }
+
+    /// ReSTIR DI: make the last frame's reservoirs and G-buffer the previous
+    /// frame's, for the next frame's temporal reuse. Explicit, so a replay
+    /// at the same seed sees exactly what its forward pass saw.
+    pub fn advance(&mut self) {
+        let [g_cur, g_prev, r_a, r_prev] = &self.restir;
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(g_cur, 0, g_prev, 0, g_cur.size());
+        enc.copy_buffer_to_buffer(r_a, 0, r_prev, 0, r_a.size());
+        self.ctx.queue.submit([enc.finish()]);
+    }
+
+    /// Path guiding: whether the next forward passes record training
+    /// samples into the histograms (replays never do).
+    pub fn set_guide_training(&mut self, on: bool) {
+        assert!(self.grid.is_some(), "no guide: Scene::guide is None");
+        self.training = on;
+    }
+
+    /// Path guiding: rebuild every cell's CDF from its histogram. Until the
+    /// next build, the guide is a constant.
+    pub fn guide_build(&mut self, scene: &Scene) {
+        let cells = self.grid.as_ref().expect("no guide").cells();
+        let q = &self.ctx.queue;
+        q.write_buffer(
+            &self.params,
+            0,
+            bytemuck::bytes_of(&self.params(scene, &[0.0; PARAMS], 0, true, 0)),
+        );
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.pipes[12]);
+            pass.set_bind_group(0, &self.groups[13], &[]);
+            let x = cells.min(65535);
+            pass.dispatch_workgroups(x, cells.div_ceil(x), 1);
+        }
+        q.submit([enc.finish()]);
+    }
+
+    /// Forget all history: ReSTIR's previous frame and everything the
+    /// guide learned. A new render starts here.
+    pub fn reset_history(&mut self) {
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        for b in self.restir.iter().chain(&self.guide) {
+            enc.clear_buffer(b, 0, None);
+        }
+        self.ctx.queue.submit([enc.finish()]);
+    }
+
+    /// Path guiding: forget everything learned.
+    pub fn guide_reset(&mut self) {
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        for b in &self.guide {
+            enc.clear_buffer(b, 0, None);
+        }
+        self.ctx.queue.submit([enc.finish()]);
     }
 
     /// Chunks a frame is traced in.
@@ -1159,7 +1463,7 @@ impl GpuEdges {
         };
         let ep = uni("edge params", std::mem::size_of::<EdgeParams>() as u64);
         let params = uni("edge scene params", std::mem::size_of::<Params>() as u64);
-        let src = format!("{WAVEFRONT}\n{EDGES}");
+        let src = format!("{WAVEFRONT}\n{RESTIR}\n{GUIDE}\n{EDGES}\n{}", sobol_const());
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("edges"),
             source: wgpu::ShaderSource::Wgsl(src.into()),
