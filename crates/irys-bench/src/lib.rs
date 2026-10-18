@@ -110,6 +110,10 @@ pub fn export(scene: &Scene, theta: &[f64; PARAMS], name: &str) -> Value {
                     "checker_dark": CHECKER_DARK,
                 })
             }
+            irys_diff::prb::Surface::Emitter => {
+                let e = scene.emission;
+                json!({"kind": "emitter", "radiance": [e, e, e]})
+            }
         };
         objects.push(json!({
             "name": format!("{name}_{k}"),

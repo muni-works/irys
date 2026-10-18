@@ -46,6 +46,8 @@ struct Params {
     _p1: u32,
     sun: vec4<f32>,       // unit sun direction, κ
     env: vec4<f32>,       // sun radiance, sky scale, SUN_PICK, vMF normaliser κ / (2π (1 − e^{−2κ}))
+    light: vec4<f32>,     // phase 3: emitter triangles, env pick share, emitter area, emission
+    restir: vec4<u32>,    // phase 3 ReSTIR DI: (k << 8 | radius px, candidates M0 (0 = off), temporal, M cap)
 }
 
 const NONE: u32 = 0xffffffffu;
@@ -61,7 +63,7 @@ struct Path {
     ldir: vec4<f32>,      // light sample at this conductor vertex: (ω_L, s = cos w_L / p_L), s = 0 for none
     rng: vec2<u32>,       // SplitMix64 state (lo, hi)
     alive: u32,
-    _pad: u32,
+    lkind: u32,           // the light sample in `ldir` is an emitter (1) or the environment (0)
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -97,6 +99,9 @@ struct Path {
 @group(0) @binding(25) var<storage, read> geo: array<vec4<f32>>;
 // Phase 2d: the camera-plane points of a point-mode frame (`Scene::set_points`).
 @group(0) @binding(26) var<storage, read> points_in: array<vec2<f32>>;
+// Phase 3: emitter triangles in world space, three vec4 each — (v0, cdf),
+// (v1, 0), (v2, 0) — the cumulative area share light sampling picks by.
+@group(0) @binding(40) var<storage, read> lights: array<vec4<f32>>;
 
 const PI: f32 = 3.14159265358979;
 
@@ -184,6 +189,72 @@ fn light_sample(u: vec3<f32>) -> vec3<f32> {
     let z = 1.0 - 2.0 * u.y;
     let r = sqrt(max(1.0 - z * z, 0.0));
     return vec3<f32>(r * cos(phi), r * sin(phi), z);
+}
+
+// ---- phase 3: emitters (`prb::Scene::sample_light`) ----
+
+struct LightDraw {
+    dir: vec3<f32>,
+    pdf: f32,
+    dist: f32,
+    emitter: bool,
+    ok: bool,
+    nl: vec3<f32>,     // the emitter's normal at the point; 0 for the environment
+}
+
+fn light_le(d: vec3<f32>, emitter: bool, l: f32) -> f32 {
+    return select(sky(d, l), params.light.w, emitter);
+}
+
+fn light_pdf_env(d: vec3<f32>) -> f32 {
+    let pe = params.light.y;
+    return select(pe * light_pdf(d), 0.0, pe == 0.0);
+}
+
+fn light_pdf_emitter(t: f32, cos_l: f32) -> f32 {
+    return (1.0 - params.light.y) * t * t / (params.light.z * abs(cos_l));
+}
+
+// `Lights::pick`: the first triangle whose cumulative share exceeds `u`.
+fn pick_light(u: f32) -> u32 {
+    let n = u32(params.light.x);
+    var lo = 0u;
+    var hi = n;
+    loop {
+        if (lo >= hi) { break; }
+        let mid = (lo + hi) / 2u;
+        if (lights[3u * mid].w <= u) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    return min(lo, n - 1u);
+}
+
+fn sample_light(x: vec3<f32>, u: vec3<f32>) -> LightDraw {
+    let pe = params.light.y;
+    if (u.x < pe) {
+        let dir = light_sample(vec3<f32>(u.x / pe, u.y, u.z));
+        return LightDraw(dir, pe * light_pdf(dir), 3.4e38, false, true, vec3<f32>(0.0));
+    }
+    let k = pick_light((u.x - pe) / (1.0 - pe));
+    let a = lights[3u * k].xyz;
+    let b = lights[3u * k + 1u].xyz;
+    let c = lights[3u * k + 2u].xyz;
+    let r = sqrt(u.y);
+    let b0 = 1.0 - r;
+    let b1 = u.z * r;
+    let q = a * b0 + b * b1 + c * (1.0 - b0 - b1);
+    let v = q - x;
+    let d2 = dot(v, v);
+    let dist = sqrt(d2);
+    let dir = v / dist;
+    let nl = normalize(cross(b - a, c - a));
+    let cos_l = -dot(nl, dir);
+    let pdf = (1.0 - pe) * d2 / (params.light.z * cos_l);
+    let ok = dist > 0.0 && cos_l > 0.0 && pdf < 3.4e38;
+    return LightDraw(dir, pdf, dist, true, ok, nl);
 }
 
 // The power heuristic.
@@ -429,6 +500,10 @@ fn prim_normal(i: u32, x: vec3<f32>) -> vec3<f32> {
 
 fn prim_conductor(i: u32) -> bool {
     return geo[3u * i + 1u].w == 0.0;
+}
+
+fn prim_emitter(i: u32) -> bool {
+    return geo[3u * i + 1u].w == 2.0;
 }
 
 fn albedo_at(x: vec3<f32>, checker: bool) -> f32 {
@@ -702,7 +777,7 @@ fn gen(@builtin(global_invocation_id) gid: vec3<u32>) {
         vec4<f32>(0.0),
         vec4<f32>(0.0),
         s,
-        1u,
+        select(1u, 2u, params.restir.y > 0u),   // 2: the first vertex takes the ReSTIR reservoir
         0u,
     );
 }
@@ -716,7 +791,16 @@ fn harmless(j: u32) {
 // replay owes each vertex; this is that, step for step.
 @compute @workgroup_size(64)
 fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    bounce_at(gid.x, false);
+}
+
+// `Scene::complete`'s tail: the last vertex's BSDF ray, for emission only.
+@compute @workgroup_size(64)
+fn tail(@builtin(global_invocation_id) gid: vec3<u32>) {
+    bounce_at(gid.x, true);
+}
+
+fn bounce_at(i: u32, last: bool) {
     if (i >= params.cap) { return; }
     var p = paths[i];
     let base = i * params.nw;
@@ -753,7 +837,7 @@ fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (hit.prim == NONE) {
         var w = 1.0;
         if (params.nee != 0u && prev_pdf > 0.0) {
-            w = mis(prev_pdf, light_pdf(d));
+            w = mis(prev_pdf, light_pdf_env(d));
         }
         for (var k = 0u; k < params.nw; k = k + 1u) {
             p.rad[k] = p.rad[k] + p.tp[k] * sky(d, p.lam[k]) * w;
@@ -764,6 +848,26 @@ fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let x = o + d * hit.t;
     var n = hit_normal(hit, o, d);
+    if (prim_emitter(hit.prim)) {
+        // One-sided: the winding's front emits.
+        if (dot(n, d) < 0.0) {
+            var w = 1.0;
+            if (params.nee != 0u && prev_pdf > 0.0) {
+                w = mis(prev_pdf, light_pdf_emitter(hit.t, dot(n, d)));
+            }
+            for (var k = 0u; k < params.nw; k = k + 1u) {
+                p.rad[k] = p.rad[k] + p.tp[k] * params.light.w * w;
+            }
+        }
+        p.alive = 0u;
+        paths[i] = p;
+        return;
+    }
+    if (last) {
+        p.alive = 0u;
+        paths[i] = p;
+        return;
+    }
     if (dot(n, d) > 0.0) {
         n = -n;
     }
@@ -778,20 +882,48 @@ fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
     var ld = vec3<f32>(0.0);
     var lcos = 0.0;
     var lpdf = 0.0;
+    var lem = false;
+    // The light sample's weight beyond f cos Le w_L: `/ ldiv * lw` is
+    // `/ p_L` (bit for bit the phase 2 expression), or ReSTIR's `W G` at the
+    // first vertex.
+    var lw = 1.0;
+    var ldiv = 1.0;
     if (params.nee != 0u) {
         let u = vec3<f32>(rand(&s), rand(&s), rand(&s));
-        ld = light_sample(u);
+        let dr = sample_light(origin, u);
+        ld = dr.dir;
         lcos = dot(ld, n);
-        lpdf = light_pdf(ld);
-        lit = lcos > 0.0 && !occluded(origin, ld);
+        lpdf = dr.pdf;
+        lem = dr.emitter;
+        ldiv = dr.pdf;
+        var tmax = select(3.4e38, dr.dist * (1.0 - 1e-4), dr.emitter);
+        var ok = dr.ok;
+        if (p.alive == 2u) {
+            // ReSTIR DI (`restir.wgsl`): the reservoir's sample replaces the
+            // base draw (whose uniforms were still drawn, above).
+            p.alive = 1u;
+            let r = res_a(i);
+            let sn = seen(origin, r.y, r.nl);
+            ld = sn.dir;
+            lcos = dot(ld, n);
+            lpdf = sn.pl;
+            lem = !all(r.nl == vec3<f32>(0.0));
+            lw = r.w * sn.geom;
+            ldiv = 1.0;
+            tmax = select(3.4e38, sn.dist * (1.0 - 1e-4), lem);
+            ok = r.w > 0.0 && sn.geom > 0.0 && sn.pl > 0.0;
+        }
+        lit = ok && lcos > 0.0 && intersect(origin, ld, tmax, true).prim == NONE;
     }
+    // Radiance of the light sample at the path's wavelength `l`.
+    p.lkind = select(0u, 1u, lem);
     if (!conductor) {
         let info = geo[params.inst_base + 4u * hit.inst + 3u];
         let albedo = albedo_at(x, info.w != 0.0) * info.z;
         if (lit) {
             let w = mis(lpdf, lcos / PI);
             for (var k = 0u; k < params.nw; k = k + 1u) {
-                p.rad[k] = p.rad[k] + p.tp[k] * albedo / PI * lcos * sky(ld, p.lam[k]) * w / lpdf;
+                p.rad[k] = p.rad[k] + p.tp[k] * albedo / PI * lcos * light_le(ld, lem, p.lam[k]) * w / ldiv * lw;
             }
         }
         let u1 = rand(&s);
@@ -820,7 +952,7 @@ fn bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
             write_lane(light_base + k, li.z, lo.z, hl.z, ohl, band_weights(p.lam[k]));
         }
         let pb = ggx_pdf(params.alpha, lo.z, hl.z);
-        p.ldir = vec4<f32>(ld, lcos * mis(lpdf, pb) / lpdf);
+        p.ldir = vec4<f32>(ld, lcos * mis(lpdf, pb) / ldiv * lw);
         p.smp.z = 1.0;
     }
     let u = vec2<f32>(rand(&s), rand(&s));
@@ -866,7 +998,7 @@ fn update(@builtin(global_invocation_id) gid: vec3<u32>) {
         let fj = frame + k;
         // NEE first: C_j joins L_j before the BSDF lane's δf reads it.
         if (p.ldir.w > 0.0) {
-            let g = p.tp[k] * p.ldir.w * sky(p.ldir.xyz, p.lam[k]);
+            let g = p.tp[k] * p.ldir.w * light_le(p.ldir.xyz, p.lkind == 1u, p.lam[k]);
             if (params.replay != 0u) {
                 df_out[light_base + k] = dl_in[fj] * g;
             }

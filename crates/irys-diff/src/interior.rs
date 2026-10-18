@@ -654,6 +654,10 @@ fn walk(
 ) -> [D; 4] {
     let nw = scene.wavelengths;
     let env = scene.env;
+    assert!(
+        scene.lights().is_empty(),
+        "the interior term does not handle emitters yet"
+    );
     let Start {
         mut o,
         mut o_trace,

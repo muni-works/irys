@@ -92,7 +92,10 @@ fn irys(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
     let dir = out.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     let variant = a.get("variant", "base");
-    let call_max = a.num("call-spp", 16);
+    let features: Vec<&str> = variant.split('+').collect();
+    let restir = features.contains(&"restir");
+    // ReSTIR reuses across the frame, which must fit one chunk.
+    let call_max = a.num("call-spp", if restir { 4 } else { 16 });
     let mut wf: HashMap<usize, (scenes::Bench, GpuPrb)> = HashMap::new();
     // One frame of `spp` paths per pixel: `spp / call` calls of `call` spp
     // each, seeds `seed0 + k`, averaged. Returns the image and the seconds
@@ -101,17 +104,24 @@ fn irys(a: &Args, out: &Path, name: &str, w: usize, h: usize) {
         let call = spp.min(call_max);
         assert!(spp % call == 0, "spp {spp} is not a multiple of {call}");
         let (b, g) = wf.entry(call).or_insert_with(|| {
-            let b = scenes::build(name, w, h, call);
+            let mut b = scenes::build(name, w, h, call);
+            scenes::apply(&mut b.scene, &features);
             let g = GpuPrb::new(ctx, &b.scene);
             (b, g)
         });
         // warm: pipelines compiled, buffers touched
         let _ = g.image(&b.scene, &b.theta, u64::MAX);
+        if restir {
+            g.advance();
+        }
         let n = spp / call;
         let t = Instant::now();
         let mut acc = vec![0.0f64; w * h * 3];
         for k in 0..n {
             let img = g.image(&b.scene, &b.theta, seed0 + k as u64);
+            if restir {
+                g.advance();
+            }
             for (a, v) in acc.iter_mut().zip(img) {
                 *a += v as f64;
             }

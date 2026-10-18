@@ -79,7 +79,9 @@ def material(spec, name):
         e = nt.nodes.new("ShaderNodeEmission")
         r = spec["radiance"]
         e.inputs["Color"].default_value = (r[0], r[1], r[2], 1.0)
-        e.inputs["Strength"].default_value = 1.0
+        # one-sided, as irys's: the back face is black
+        geo = nt.nodes.new("ShaderNodeNewGeometry")
+        nt.links.new(node_math(nt, "SUBTRACT", 1.0, geo.outputs["Backfacing"]), e.inputs["Strength"])
         nt.links.new(e.outputs[0], out.inputs["Surface"])
         return m
     d = nt.nodes.new("ShaderNodeBsdfDiffuse")

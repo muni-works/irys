@@ -9,6 +9,9 @@
 //!   inside. Nearly all of the image is indirect light, and most light
 //!   samples from inside are occluded: the case path guiding and reservoir
 //!   reuse exist for.
+//! - `cornell`: a grey Cornell box (irys's diffuse albedo is a scalar, so
+//!   no red and green walls) lit by one emissive quad under the ceiling, a
+//!   tall box and a conductor ball, black outside. The mesh-emitter case.
 
 use irys_core::{Point3, Transform, Vec3};
 use irys_diff::ggx::PARAMS;
@@ -16,7 +19,7 @@ use irys_diff::prb::{Env, Opaque, Placement, Scene, Surface, cuboid, uv_sphere};
 use irys_prims::analytic::Analytic;
 
 /// The scenes, by name.
-pub const NAMES: [&str; 2] = ["pair", "room"];
+pub const NAMES: [&str; 3] = ["pair", "room", "cornell"];
 
 /// The conductor every scene uses: phase 2c's gold, `(α, F0 at 450, 550,
 /// 650 nm)`.
@@ -37,6 +40,7 @@ pub fn build(name: &str, w: usize, h: usize, spp: usize) -> Bench {
     match name {
         "pair" => pair(w, h, spp),
         "room" => room(w, h, spp),
+        "cornell" => cornell(w, h, spp),
         _ => panic!("unknown scene {name}: one of {NAMES:?}"),
     }
 }
@@ -44,6 +48,7 @@ pub fn build(name: &str, w: usize, h: usize, spp: usize) -> Bench {
 fn pair(w: usize, h: usize, spp: usize) -> Bench {
     let mut scene = Scene::pair(w, h, spp, 1.0);
     scene.depth = 6;
+    scene.complete = true;
     Bench {
         name: "pair",
         scene,
@@ -107,6 +112,7 @@ fn room(w: usize, h: usize, spp: usize) -> Bench {
     scene.floor_checker = None;
     scene.nee = true;
     scene.depth = 8;
+    scene.complete = true;
     scene.env = Env {
         sun: Vec3::new(0.25, 1.0, 0.75).normalize(),
         kappa: 400.0,
@@ -117,5 +123,24 @@ fn room(w: usize, h: usize, spp: usize) -> Bench {
         name: "room",
         scene,
         theta: GOLD,
+    }
+}
+
+fn cornell(w: usize, h: usize, spp: usize) -> Bench {
+    Bench {
+        name: "cornell",
+        scene: Scene::cornell(w, h, spp),
+        theta: GOLD,
+    }
+}
+
+/// Turn on the samplers a variant names (`base`, `restir`, joined by `+`).
+pub fn apply(scene: &mut Scene, features: &[&str]) {
+    for f in features {
+        match *f {
+            "base" => {}
+            "restir" => scene.restir = Some(irys_diff::prb::Restir::default()),
+            other => panic!("unknown sampler {other}"),
+        }
     }
 }

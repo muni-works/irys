@@ -115,6 +115,10 @@ pub enum Surface {
     Conductor,
     /// The grey Lambertian floor, θ-free ([`Scene::floor_albedo`]).
     Diffuse,
+    /// A black, one-sided area light of radiance [`Scene::emission`]
+    /// (spectrally flat), θ-free, emitting on the side its winding faces. Phase 3: next-event estimation samples
+    /// every emitter triangle by area ([`Scene::lights`]).
+    Emitter,
 }
 
 /// Every opaque primitive of a scene behind one [`Geometry`], so one tree
@@ -300,6 +304,122 @@ impl Env {
     }
 }
 
+/// Every emitter triangle of a scene in world space, with the cumulative
+/// area distribution light sampling picks them by. One emission for all, so
+/// area is power; a light tree buys nothing until emitters differ (phase 3
+/// notes).
+#[derive(Debug, Clone, Default)]
+pub struct Lights {
+    /// World-space vertices.
+    pub tris: Vec<[Point3; 3]>,
+    /// Cumulative area share, ending at 1.
+    pub cdf: Vec<f64>,
+    /// Total area.
+    pub area: f64,
+}
+
+impl Lights {
+    fn gather(blas: &[Arc<Bvh<Opaque>>], placements: &[Placement]) -> Self {
+        let mut tris = Vec::new();
+        for p in placements {
+            let o = blas[p.blas].geometry();
+            let m = o.mesh();
+            for (i, t) in m.triangles().iter().enumerate() {
+                if o.surface(i) != Surface::Emitter {
+                    continue;
+                }
+                tris.push(t.map(|k| p.to_world.apply_point(&m.positions()[k as usize])));
+            }
+            assert!(
+                (0..o.analytic().len()).all(|k| o.surface(m.len() + k) != Surface::Emitter),
+                "analytic emitters are not sampled"
+            );
+        }
+        let areas: Vec<f64> = tris
+            .iter()
+            .map(|t| 0.5 * (t[1] - t[0]).cross(&(t[2] - t[0])).norm())
+            .collect();
+        let area: f64 = areas.iter().sum();
+        let mut acc = 0.0;
+        let cdf = areas
+            .iter()
+            .map(|a| {
+                acc += a;
+                acc / area
+            })
+            .collect();
+        Self { tris, cdf, area }
+    }
+
+    /// No emitters.
+    pub fn is_empty(&self) -> bool {
+        self.tris.is_empty()
+    }
+
+    /// The triangle `u` picks: the first whose cumulative share exceeds it.
+    pub fn pick(&self, u: f64) -> usize {
+        self.cdf
+            .partition_point(|&c| c <= u)
+            .min(self.tris.len() - 1)
+    }
+
+    /// A point uniform over the emitters by area, and its unit normal.
+    pub fn sample(&self, u0: f64, u1: f64, u2: f64) -> (Point3, Vec3) {
+        let t = self.tris[self.pick(u0)];
+        let r = u1.sqrt();
+        let (b0, b1) = (1.0 - r, u2 * r);
+        let p = Point3::from(
+            t[0].coords() * b0 + t[1].coords() * b1 + t[2].coords() * (1.0 - b0 - b1),
+        );
+        (p, (t[1] - t[0]).cross(&(t[2] - t[0])).normalize())
+    }
+}
+
+/// ReSTIR DI's knobs (Bitterli et al. 2020, in Lin et al. 2022's
+/// generalized RIS with pairwise MIS). The device kernels are
+/// `gpu/restir.wgsl`; the CPU reference has none and refuses a scene that
+/// asks for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Restir {
+    /// Candidates per pixel from the base light sampler (M0).
+    pub candidates: u32,
+    /// Spatial neighbours per pixel (k ≤ 9).
+    pub neighbours: u32,
+    /// Spatial radius, pixels (≤ 255).
+    pub radius: u32,
+    /// Reuse the previous frame's reservoir at the same slot
+    /// ([`crate::gpu::GpuPrb::advance`] makes this frame's the previous).
+    pub temporal: bool,
+    /// Confidence cap, in frames.
+    pub cap: u32,
+}
+
+impl Default for Restir {
+    fn default() -> Self {
+        Self {
+            candidates: 8,
+            neighbours: 3,
+            radius: 16,
+            temporal: true,
+            cap: 20,
+        }
+    }
+}
+
+/// One light sample: direction, solid-angle pdf, distance to the point on
+/// an emitter (∞ for the environment), and which it is.
+#[derive(Debug, Clone, Copy)]
+pub struct LightDraw {
+    /// Unit direction.
+    pub dir: Vec3,
+    /// Solid-angle pdf, the pick included.
+    pub pdf: f64,
+    /// Distance to the emitter point; ∞ for the environment.
+    pub dist: f64,
+    /// An emitter, not the environment.
+    pub emitter: bool,
+}
+
 /// The power heuristic (β = 2): the weight of the strategy with pdf `a`
 /// against the one with pdf `b`.
 pub fn mis(a: f64, b: f64) -> f64 {
@@ -342,6 +462,23 @@ pub struct Scene {
     pub nee: bool,
     /// The sky and sun.
     pub env: Env,
+    /// Radiance of every [`Surface::Emitter`] prim (flat spectrum).
+    pub emission: f64,
+    /// With emitters and a lit sky, the share of light samples sent to the
+    /// environment; the rest pick an emitter triangle by area. See
+    /// [`Scene::env_pick`].
+    pub env_share: f64,
+    /// Emitter triangles in world space, for light sampling.
+    pub(crate) lights: Lights,
+    /// Trace the last vertex's BSDF ray too, for emission only (the sky or
+    /// an emitter, MIS-weighted, no further vertex). Then a path of `depth`
+    /// vertices collects exactly the light of up to `depth` scatterings by
+    /// both strategies, which is Cycles' `max_bounces = depth − 1`; off, the
+    /// last vertex's light is its NEE share alone (phases 1–2, bit for bit).
+    pub complete: bool,
+    /// ReSTIR DI at the first vertex (GPU only; see `gpu/restir.wgsl`).
+    /// `None` is the plain NEE draw.
+    pub restir: Option<Restir>,
     /// When set, the frame is these primary rays instead of the image's:
     /// path `i` leaves the camera through camera-plane point `points[i]`
     /// (`(sx, sy)`, [`Scene::screen`]) and is keyed `i / 2`, so the two rays
@@ -456,6 +593,72 @@ impl Scene {
         sc
     }
 
+    /// Phase 3's mesh-emitter scene: a grey Cornell box (interior
+    /// `[−1, 1]² × [0, 2]`, open towards the camera at `y = −1`) lit by one
+    /// emissive 0.6 × 0.5 quad just under the ceiling, facing down, a tall turned box and
+    /// a conductor ball inside, black outside. NEE on, depth 8.
+    pub fn cornell(w: usize, h: usize, spp: usize) -> Self {
+        let mesh = |m: TriMesh, s: Surface| Opaque::new(m, s, Analytic::from_prims(Vec::new()), &[]);
+        let slab = |lo: [f64; 3], hi: [f64; 3]| {
+            let c = |k: usize| 0.5 * (lo[k] + hi[k]);
+            let s = |k: usize| hi[k] - lo[k];
+            Placement::new(
+                0,
+                Transform::translation(c(0), c(1), c(2)).then(&Transform::scale(s(0), s(1), s(2))),
+            )
+            .tinted(1.0)
+        };
+        let t = 0.05;
+        let placements = vec![
+            slab([-1.0 - t, -1.0, -t], [1.0 + t, 1.0 + t, 0.0]),
+            slab([-1.0 - t, -1.0, 2.0], [1.0 + t, 1.0 + t, 2.0 + t]),
+            slab([-1.0 - t, 1.0, 0.0], [1.0 + t, 1.0 + t, 2.0]),
+            slab([-1.0 - t, -1.0, 0.0], [-1.0, 1.0, 2.0]),
+            slab([1.0, -1.0, 0.0], [1.0 + t, 1.0, 2.0]),
+            Placement::new(
+                0,
+                Transform::translation(-0.35, 0.3, 0.6)
+                    .then(&Transform::rotation_z(0.3))
+                    .then(&Transform::scale(0.6, 0.6, 1.2)),
+            )
+            .tinted(0.8),
+            Placement::new(
+                1,
+                Transform::translation(0.45, -0.35, 0.35).then(&Transform::scale(0.35, 0.35, 0.35)),
+            ),
+            Placement::new(
+                2,
+                Transform::translation(0.0, 0.1, 1.995)
+                    .then(&Transform::rotation_x(std::f64::consts::PI))
+                    .then(&Transform::scale(0.6, 0.5, 1.0)),
+            ),
+        ];
+        let mut s = Self::instanced(
+            vec![
+                mesh(cuboid(0.5, 0.5, 0.5), Surface::Diffuse),
+                mesh(uv_sphere(32, 64), Surface::Conductor),
+                mesh(grid_floor(1, 0.5), Surface::Emitter),
+            ],
+            placements,
+            None,
+            (w, h),
+            spp,
+            (Point3::new(0.0, -3.4, 1.0), Point3::new(0.0, 0.0, 1.0)),
+            19.5,
+        );
+        s.floor_albedo = 0.75;
+        s.nee = true;
+        s.complete = true;
+        s.depth = 8;
+        s.emission = 12.0;
+        s.env = Env {
+            sky: 0.0,
+            sun_radiance: 0.0,
+            ..Env::default()
+        };
+        s
+    }
+
     fn one(
         opaque: Opaque,
         splats: Option<Bvh<Splats>>,
@@ -499,6 +702,7 @@ impl Scene {
         let forward = (target - eye).normalize();
         let right = forward.cross(&Vec3::new(0.0, 0.0, 1.0)).normalize();
         let up = right.cross(&forward);
+        let lights = Lights::gather(&blas, &placements);
         Self {
             blas,
             tlas: Tlas::build(instances),
@@ -513,6 +717,11 @@ impl Scene {
             frozen_alpha: None,
             nee: false,
             env: Env::default(),
+            emission: 1.0,
+            env_share: 0.5,
+            lights,
+            complete: false,
+            restir: None,
             points: None,
             tan_half: half_fov_deg.to_radians().tan(),
             eye,
@@ -520,6 +729,70 @@ impl Scene {
             right,
             up,
         }
+    }
+
+    /// The emitter triangles, world space.
+    pub fn lights(&self) -> &Lights {
+        &self.lights
+    }
+
+    /// The share of light samples that go to the environment: 1 with no
+    /// emitters (the phase 2 estimator, bit for bit), 0 with emitters under
+    /// a black sky, [`Scene::env_share`] otherwise.
+    pub fn env_pick(&self) -> f64 {
+        if self.lights.is_empty() {
+            1.0
+        } else if self.env.sky == 0.0 && self.env.sun_radiance == 0.0 {
+            0.0
+        } else {
+            self.env_share
+        }
+    }
+
+    /// A light sample from `x` with three uniforms: the first picks the
+    /// environment or an emitter triangle (and is reused, rescaled, by the
+    /// pick), the other two place the point. `None` when the draw is
+    /// degenerate (a grazing emitter, a point on `x`).
+    pub fn sample_light(&self, x: Point3, u: [f64; 3]) -> Option<LightDraw> {
+        let pe = self.env_pick();
+        if u[0] < pe {
+            let dir = self.env.sample([u[0] / pe, u[1], u[2]]);
+            return Some(LightDraw {
+                dir,
+                pdf: pe * self.env.pdf(dir),
+                dist: f64::INFINITY,
+                emitter: false,
+            });
+        }
+        let (p, n) = self.lights.sample((u[0] - pe) / (1.0 - pe), u[1], u[2]);
+        let v = p - x;
+        let d2 = v.norm_squared();
+        let dist = d2.sqrt();
+        if dist <= 0.0 {
+            return None;
+        }
+        let dir = v / dist;
+        // One-sided: only a point whose front faces `x` sends light.
+        let cos_l = -n.dot(&dir);
+        let pdf = (1.0 - pe) * d2 / (self.lights.area * cos_l);
+        (cos_l > 0.0 && pdf.is_finite()).then_some(LightDraw {
+            dir,
+            pdf,
+            dist,
+            emitter: true,
+        })
+    }
+
+    /// The light-sampling pdf (solid angle) of a ray that escaped along `d`.
+    pub fn light_pdf_env(&self, d: Vec3) -> f64 {
+        let pe = self.env_pick();
+        if pe == 0.0 { 0.0 } else { pe * self.env.pdf(d) }
+    }
+
+    /// The light-sampling pdf (solid angle) of a ray that hit an emitter at
+    /// distance `t`, at cosine `cos_l` to its normal.
+    pub fn light_pdf_emitter(&self, t: f64, cos_l: f64) -> f64 {
+        (1.0 - self.env_pick()) * t * t / (self.lights.area * cos_l.abs())
     }
 
     /// The top-level tree.
@@ -611,6 +884,7 @@ impl Scene {
             })
             .collect();
         self.tlas = Tlas::build(instances);
+        self.lights = Lights::gather(&self.blas, &self.placements);
     }
 
     /// Pixel coordinates (`x` right, `y` down, `[0, w) × [0, h)`) to the
@@ -908,7 +1182,12 @@ pub fn offset(x: Point3, n: Vec3, o: Point3, t: f64) -> Point3 {
 struct LightSample {
     dir: Vec3,
     s: f64,
+    emitter: bool,
 }
+
+/// A shadow ray to an emitter point stops this fraction short of it, so
+/// the emitter does not occlude itself (both tiers).
+pub const SHADOW_SHORT: f64 = 1e-4;
 
 /// Trace every path once. `replay = None` is the forward pass and returns
 /// each path's `L`; `Some((l, dl))` replays against the forward pass's `L`
@@ -965,6 +1244,10 @@ fn trace(
     assert!(
         !(scene.nee && scene.splats.is_some()),
         "NEE with splats: shadow rays do not composite them"
+    );
+    assert!(
+        scene.restir.is_none(),
+        "ReSTIR DI is GPU-only: the CPU reference has no reservoirs"
     );
     let lanes = scene.lanes();
     let width = scene.graph_width();
@@ -1023,7 +1306,9 @@ fn trace(
         h
     };
 
-    for _ in 0..scene.depth {
+    let tail = scene.complete as usize;
+    for it in 0..scene.depth + tail {
+        let last = it == scene.depth;
         let mut any = false;
         for (i, p) in paths.iter_mut().enumerate() {
             // Inactive slots get a harmless vertex and no adjoint.
@@ -1060,7 +1345,7 @@ fn trace(
             let d: Vec3 = *p.ray.direction.as_ref();
             let Some(ih) = hit else {
                 let w = if scene.nee && p.prev_pdf > 0.0 {
-                    mis(p.prev_pdf, env.pdf(d))
+                    mis(p.prev_pdf, scene.light_pdf_env(d))
                 } else {
                     1.0
                 };
@@ -1071,6 +1356,28 @@ fn trace(
                 continue;
             };
             let mut nrm: Vec3 = *ih.hit.normal.as_ref();
+            if scene.surface(&ih) == Surface::Emitter {
+                // A black, one-sided emitter: collect Le from its front and
+                // stop. Against NEE, the light strategy's pdf of this hit is
+                // the area pick's, in solid angle.
+                if nrm.dot(&d) < 0.0 {
+                    let w = if scene.nee && p.prev_pdf > 0.0 {
+                        mis(p.prev_pdf, scene.light_pdf_emitter(ih.hit.t, nrm.dot(&d)))
+                    } else {
+                        1.0
+                    };
+                    for k in 0..nw {
+                        p.radiance[k] += p.throughput[k] * scene.emission * w;
+                    }
+                }
+                p.alive = false;
+                continue;
+            }
+            if last {
+                // The tail ([`Scene::complete`]): emission only, no vertex.
+                p.alive = false;
+                continue;
+            }
             if nrm.dot(&d) > 0.0 {
                 nrm = -nrm; // two-sided: shade the side the ray came from
             }
@@ -1080,14 +1387,26 @@ fn trace(
             // The light sample: drawn before the BSDF's, three uniforms
             // whether or not it lands, so the stream does not depend on it.
             let nee = scene.nee.then(|| {
-                let dir = env.sample([p.rng.uniform(), p.rng.uniform(), p.rng.uniform()]);
-                let cos = dir.dot(&nrm);
+                let u = [p.rng.uniform(), p.rng.uniform(), p.rng.uniform()];
+                let Some(ld) = scene.sample_light(origin, u) else {
+                    return (Vec3::zeros(), 0.0, 0.0, false, false);
+                };
+                let cos = ld.dir.dot(&nrm);
                 let lit = cos > 0.0
-                    && !scene
-                        .tlas
-                        .occluded_range(&Ray::new(origin, dir), 0.0, f64::INFINITY);
-                (dir, cos, env.pdf(dir), lit)
+                    && !scene.tlas.occluded_range(
+                        &Ray::new(origin, ld.dir),
+                        0.0,
+                        ld.dist * (1.0 - SHADOW_SHORT),
+                    );
+                (ld.dir, cos, ld.pdf, lit, ld.emitter)
             });
+            let le = |dir: Vec3, emitter: bool, lambda: f64| {
+                if emitter {
+                    scene.emission
+                } else {
+                    env.radiance(dir, lambda)
+                }
+            };
             if scene.surface(&ih) == Surface::Diffuse {
                 // Lambertian: cosine sampling, weight = albedo. θ-free.
                 let place = &scene.placements[ih.payload];
@@ -1097,12 +1416,12 @@ fn trace(
                     } else {
                         scene.floor_albedo
                     };
-                if let Some((dir, cos, pl, true)) = nee {
+                if let Some((dir, cos, pl, true, emitter)) = nee {
                     let w = mis(pl, cos / std::f64::consts::PI);
                     for k in 0..nw {
                         p.radiance[k] += p.throughput[k] * albedo / std::f64::consts::PI
                             * cos
-                            * env.radiance(dir, p.lambda[k])
+                            * le(dir, emitter, p.lambda[k])
                             * w
                             / pl;
                     }
@@ -1123,7 +1442,7 @@ fn trace(
             // hero-wavelength MIS weight reduces to `f_k cos / p`.
             let lo = [wo.dot(&t), wo.dot(&b), wo.dot(&nrm)];
             let alpha = scene.frozen_alpha.unwrap_or(theta[0]);
-            if let Some((dir, cos, pl, true)) = nee
+            if let Some((dir, cos, pl, true, emitter)) = nee
                 && lo[2] > 0.0
             {
                 let li = [dir.dot(&t), dir.dot(&b), cos];
@@ -1135,6 +1454,7 @@ fn trace(
                 light[i] = Some(LightSample {
                     dir,
                     s: cos * mis(pl, pb) / pl,
+                    emitter,
                 });
                 ball[i] = true;
                 any = true;
@@ -1174,7 +1494,11 @@ fn trace(
             for w in 0..nw {
                 let j = i * nw + w;
                 if let Some(ls) = light[i] {
-                    let le = env.radiance(ls.dir, p.lambda[w]);
+                    let le = if ls.emitter {
+                        scene.emission
+                    } else {
+                        env.radiance(ls.dir, p.lambda[w])
+                    };
                     let g = p.throughput[w] * ls.s * le;
                     if let Some((_, dl)) = replay {
                         df[lanes + j] = dl[j] * g;
