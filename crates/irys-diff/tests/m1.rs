@@ -256,6 +256,40 @@ fn the_pinhole_is_opencv() {
 }
 
 #[test]
+fn set_instances_matches_a_fresh_build() {
+    let Some(ctx) = gpu() else { return };
+    let size = (40, 32);
+    let first: Vec<Instance> = (0..30).map(|i| place(-1.5 + 0.1 * i as f32, 0.0, -0.05 * i as f32, 0.2)).collect();
+    let moved: Vec<Instance> = (0..30).map(|i| place(0.07 * (i as f32).sin(), -1.2 + 0.08 * i as f32, 0.02 * i as f32, 0.25)).collect();
+    let mut g = GpuLook::new(ctx, &scene(first.clone(), size)).unwrap();
+    let fresh = GpuLook::new(ctx, &scene(moved.clone(), size)).unwrap();
+    let cam = down(size, 18.0, 19.5, 15.5).camera();
+    let before = Sensor::new(&g, size, 1).render(&[cam], aov::DIST | aov::INST);
+    let mut times = Vec::new();
+    for _ in 0..20 {
+        times.push(g.set_instances(&moved).unwrap());
+    }
+    times.sort_by(f64::total_cmp);
+    eprintln!("set_instances, 30 instances: median {:.3} ms, min {:.3} ms", 1e3 * times[10], 1e3 * times[0]);
+    let mut s1 = Sensor::new(&g, size, 1);
+    let mut s2 = Sensor::new(&fresh, size, 1);
+    let a = s1.render(&[cam], aov::DIST | aov::INST | aov::NORMAL);
+    let b = s2.render(&[cam], aov::DIST | aov::INST | aov::NORMAL);
+    assert_eq!(a.dist, b.dist);
+    assert_eq!(a.inst, b.inst);
+    assert_ne!(a.dist, before.dist);
+    let o = Opts { spp: 2, max_bounces: 2, ..Opts::default() };
+    assert_eq!(g.render(&cam, &o).rgb, fresh.render(&cam, &o).rgb);
+    // fewer placements, then back
+    g.set_instances(&moved[..10]).unwrap();
+    let c = s1.render(&[cam], aov::INST);
+    assert!(c.inst.unwrap().iter().all(|&i| i == MISS || i < 10));
+    g.set_instances(&first).unwrap();
+    assert_eq!(s1.render(&[cam], aov::DIST).dist, before.dist);
+    assert!(g.set_instances(&vec![first[0].clone(); 31]).is_err());
+}
+
+#[test]
 fn sigma_follows_what_the_pixel_sees() {
     let Some(ctx) = gpu() else { return };
     let size = (32, 32);
