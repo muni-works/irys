@@ -26,3 +26,7 @@ pub mod scene_gpu;
 // (AOVs, batched cameras, pinholes, TLAS-only rebuilds).
 #[cfg(feature = "assets")]
 pub mod pinhole;
+#[cfg(all(feature = "gpu", feature = "assets"))]
+pub mod sensor;
+#[cfg(all(feature = "gpu", feature = "assets"))]
+pub mod splat_gpu;

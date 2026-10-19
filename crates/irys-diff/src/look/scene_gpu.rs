@@ -14,12 +14,16 @@ use super::openpbr::{NE, OpenPbr, TN, Tables, fresnel_average, hats};
 use super::scene::{Camera, LookScene, Material, hat_inverse};
 
 const SHADER: &str = include_str!("scene.wgsl");
+/// M1: splats in the TLAS (`splat.wgsl`), appended to the module.
+pub(super) const SPLAT: &str = include_str!("splat.wgsl");
 /// Spectrum bins across 380–780 nm.
 pub const BINS: usize = 40;
 const MS: usize = 20;
 const NONE: u32 = u32::MAX;
 /// Pixels per dispatch.
 const CHUNK: usize = 1 << 16;
+/// M1: the TLAS instance mask of the splat proxies (`splat.wgsl`).
+pub const SPLAT_MASK: u8 = 0x10;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -100,6 +104,8 @@ pub struct GpuLook {
     _keep: Vec<wgpu::Buffer>,
     _blas: Vec<wgpu::Blas>,
     _tlas: wgpu::Tlas,
+    /// M1: what the sensor kernel, the batch and `set_instances` share.
+    pub(super) m1: super::sensor::Shared,
     /// Placed emitter triangles (lights and emissive meshes), portal triangles.
     pub emitters: (usize, usize),
     /// Light-group shares: sun, world, emitters, portals.
@@ -204,6 +210,12 @@ impl GpuLook {
     /// Upload `scene` and build its acceleration structures. `None` when the
     /// device has no ray queries.
     pub fn new(ctx: &'static GpuContext, scene: &LookScene) -> Option<Self> {
+        Self::with_splats(ctx, scene, None)
+    }
+
+    /// [`GpuLook::new`] with a 3DGS cloud in the same TLAS (M1): splats are
+    /// composited on camera rays up to the first opaque hit (`splat.wgsl`).
+    pub fn with_splats(ctx: &'static GpuContext, scene: &LookScene, splats: Option<&super::splat_gpu::PlyCloud>) -> Option<Self> {
         let dev = &ctx.device;
         if !dev.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
             return None;
@@ -475,7 +487,7 @@ impl GpuLook {
             keep.push(e.0);
             keep.push(e.1);
         }
-        let n_inst = scene.instances.len().max(1) as u32;
+        let n_inst = scene.instances.len().max(1) as u32 + 1; // M1: + the splat proxies
         assert!(n_inst < (1 << 24), "instance custom data is 24 bits");
         let mut tlas = dev.create_tlas(&wgpu::CreateTlasDescriptor {
             label: Some("look tlas"),
@@ -492,6 +504,11 @@ impl GpuLook {
                 ];
                 tlas[k] = Some(wgpu::TlasInstance::new(b, xf, k as u32, i.mask as u8));
             }
+        }
+        let gsplats = super::splat_gpu::GpuSplats::new(ctx, splats);
+        if let Some(b) = &gsplats.blas {
+            let id = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+            tlas[n_inst as usize - 1] = Some(wgpu::TlasInstance::new(b, id, n_inst - 1, SPLAT_MASK));
         }
         let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         enc.build_acceleration_structures(std::iter::empty(), [&tlas]);
@@ -541,16 +558,17 @@ impl GpuLook {
         });
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("look scene"),
-            source: wgpu::ShaderSource::Wgsl(format!("enable wgpu_ray_query;\n{SHADER}").into()),
+            source: wgpu::ShaderSource::Wgsl(format!("enable wgpu_ray_query;\n{SHADER}\n{SPLAT}").into()),
         });
         let layout = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("look"),
             entries: &(0..13u32)
+                .chain(60..63)
                 .map(|b| wgpu::BindGroupLayoutEntry {
                     binding: b,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: match b {
-                        0 => wgpu::BindingType::Buffer {
+                        0 | 62 => wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
                             min_binding_size: None,
@@ -606,11 +624,30 @@ impl GpuLook {
             .iter()
             .map(|&(binding, b)| wgpu::BindGroupEntry { binding, resource: b.as_entire_binding() })
             .collect();
+        for (binding, b) in [(60, &gsplats.rec), (61, &gsplats.sh), (62, &gsplats.params)] {
+            ents.push(wgpu::BindGroupEntry { binding, resource: b.as_entire_binding() });
+        }
         ents.push(wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::AccelerationStructure(&tlas) });
         let group = dev.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("look"), layout: &layout, entries: &ents });
         if let Some(e) = pollster::block_on(scope.pop()) {
             panic!("look gpu: {e}");
         }
+        let m1 = super::sensor::Shared {
+            ctx,
+            tris: b_tris.clone(),
+            inst: b_inst.clone(),
+            mats: b_mats.clone(),
+            texels: b_texels.clone(),
+            textab: b_textab.clone(),
+            tlas: tlas.clone(),
+            blas: blas.clone(),
+            splats: gsplats,
+            instances: scene.instances.clone(),
+            first_tri: first_tri.clone(),
+            mesh_mat: scene.meshes.iter().map(|m| m.material as u32).collect(),
+            emit_base: emit_base.clone(),
+            cap: n_inst as usize - 1,
+        };
         Some(Self {
             ctx,
             pipe,
@@ -633,6 +670,7 @@ impl GpuLook {
                 .collect(),
             _blas: blas.into_iter().flatten().collect(),
             _tlas: tlas,
+            m1,
             emitters: (n_emit, n_portal),
             shares,
         })

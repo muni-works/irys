@@ -1443,8 +1443,19 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
         var bounce = 0u;
         var passes = 0u;
         let clampv = P.fwd.w;
+        var cam_seg = SP.info.x > 0u;   // M1: splats on the camera segment
         loop {
             let s = trace_ray(ro, rd, msk);
+            if (cam_seg) {
+                cam_seg = false;
+                let g = splat_segment(ro, rd, P.eye.w * length(P.right.xyz) * 2.0 / (fh * length(P.fwd.xyz)), 0.0, select(3.4e38, s.t, s.ok));
+                let lh = hats(splat_linear(g));
+                for (var k = 0u; k < NW; k = k + 1u) {
+                    rad[k] = rad[k] + tp[k] * lifth(lh, lam[k]) / qbar(q);
+                }
+                tp = tp * g.trans;
+                if (g.trans <= 0.0) { break; }
+            }
             if (!s.ok) {
                 let e = sky(rd);
                 var wm = 1.0;
