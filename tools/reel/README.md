@@ -41,14 +41,15 @@ reach the irys library crates).
   | low knock | limestone | 1200 × 80 mm slab | 250, 690, 1353, 2237 |
   | clap | oak | 250 × 20 mm plank | 1260, 3472, 6807 |
   | hat | glass | 50 × 4 mm rod | 8703 |
-  | ping | anodised Al (CRC, η est.) | 122.1 × 3 mm strip | 1047, 2885, 5655 |
+  | ping | anodised Al (CRC, η est.) | 118.6 × 3 mm strip | 1109, 3056, 5991 |
   | crash-bell | brass | 300 × 10 mm bar | 392, 1081, 2118, 3502 |
   | bell | gold | 194.5 × 8 mm bar | 440, 1213, 2378, 3930 |
 
   The tuned voices (ping, both bells) are retuned to the key by bar length
   alone: f ∝ 1/L², so L' = L·√(f/f'), with the material and thickness kept.
-  In F major the aluminium strip goes from 120 to 122.1 mm (1083 → 1047 Hz,
-  C6), and the gold bar from 200 to 194.5 mm (416 → 440 Hz, A4). The brass bar
+  In D major (the real frames) the aluminium strip goes from 120 to 118.6 mm
+  (1083 → 1109 Hz, C#6), and the gold bar from 200 to 194.5 mm (416 → 440 Hz, A4).
+  The stub lands in F major, where the strip is 122.1 mm (1047 Hz, C6). The brass bar
   is already on G4. The skin, stone, oak and glass voices are unpitched and
   stay as they were.
 
@@ -68,23 +69,23 @@ cd tools/reel
 export CARGO_TARGET_DIR=../../target
 cargo build --release
 BIN=$CARGO_TARGET_DIR/release/irys-reel
+A=/Users/cam/Developer/irys-assets/reel        # manifest.json + frames/<name>/NNNN.jpg
 
-# 1. manifest: the real one, or the committed stub (regenerate with `$BIN stub stub-manifest.json`)
-M=/Users/cam/Developer/irys-assets/reel/manifest.json
-[ -e "$M" ] || M=stub-manifest.json
+# 1. render: out/soundtrack.wav (48 kHz, 24-bit stereo), out/preview.wav
+#    (build + drop 1), out/spectrogram.png, out/beats.json (beats, drops,
+#    sections, every shot with its speed and hold). Seeded: same inputs, same bytes.
+$BIN render --manifest $A/manifest.json --arrangement arrangement.json --docs ../../docs --out out
 
-# 2. render: out/soundtrack.wav (48 kHz, 24-bit stereo), out/preview.wav
-#    (build + drop 1), out/spectrogram.png, out/beats.json. Seeded: same inputs, same bytes.
-$BIN render --manifest "$M" --arrangement arrangement.json --docs ../../docs --out out
+# 2. frames: one 30 fps frame per output time, captions and title cards drawn
+#    by ImageMagick in SF Pro (about 30 s)
+python3 assemble.py $A out/beats.json out/reel-frames
 
-# 3. frames: cut to out/beats.json (beats, downbeats, drops, sections, and which
-#    sequence plays when). Test frames for the mux:
-mkdir -p out/stub-frames/reel
-ffmpeg -v error -y -f lavfi -i testsrc2=size=480x270:rate=30 -t 20 -start_number 0 out/stub-frames/reel/%05d.png
-
-# 4. mux: frames (%05d.png or .jpg from 0, FPS=30) + soundtrack -> out/irys-reel.mp4
-./mux.sh out/stub-frames/reel
+# 3. mux: h264 crf 18, AAC 192k, faststart
+./mux.sh out/reel-frames out/soundtrack.wav $A/irys-reel.mp4
 ```
+
+Without the real assets: `$BIN stub stub-manifest.json` and render with
+`--manifest stub-manifest.json --arrangement arrangement.stub.json`.
 
 ## Manifest
 
@@ -100,15 +101,25 @@ section a sequence's frame is `t · fps`, looping. `stub-manifest.json` is a
 **stub**: illuminant × reflectance for gold, sky, skin, a thinning soap film,
 the classroom and the pavilion, not irys renders.
 
-## Timeline (124 BPM, bar = 1.935 s)
+## Timeline (124 BPM, bar = 1.935 s, D major on the real frames)
 
-| bars | section | seconds | sequences | drums |
-|---|---|---|---|---|
-| 0–4 | intro | 0.00–7.74 | sky, pavilion | stone, glass ticks, gold |
-| 4–8 | build | 7.74–15.48 | classroom, skin | kick, oak roll; phase 2d riser |
-| 8–16 | drop 1 | 15.48–30.97 | gold, thin film | four on the floor, arp |
-| 16–20 | break | 30.97–38.71 | sky, thin film | gold bells; skin-fit riser (bars 18–20) |
-| 20–26 | drop 2 | 38.71–50.32 | skin, gold, pavilion | full, more arp |
-| 26–28 | outro | 50.32–54.19 (+2.5 s ring) | gold | one last strike |
+Shots are listed in `arrangement.json`. A shot's speed fits its footage to its
+bars, clamped to 0.5–2×, and when the footage runs out it holds the last frame.
 
-Edit `arrangement.json` to change any of it; `beats.json` follows.
+| bars | section | seconds | shot | speed | caption |
+|---|---|---|---|---|---|
+| 0–1 | intro | 0.00–1.94 | title card "irys" (spectrum: pavilion-dolly frame 0) | — | |
+| 1–4 | intro | 1.94–7.74 | pavilion-dolly | 0.87× | spectral path tracing |
+| 4–8 | build | 7.74–15.48 | classroom-keyframed; phase 2b (gold ball) riser, converged at it. 32 → drop | 0.75× | openpbr on the gpu |
+| 8–11 | drop 1 | 15.48–21.29 | fit | 0.86× | every pixel differentiable |
+| 11–14 | drop 1 | 21.29–27.10 | swatch | 0.86× | coat, fuzz, thin film, dispersion |
+| 14–17 | break | 27.10–32.90 | pavilion-orbit; phase 2f rose riser (600-step run, converged at it. 256) over bars 15–17 | 0.87× | 0.16–0.59× cycles' error at equal time · grey bench |
+| 17–19 | drop 2 | 32.90–36.77 | rose | 1.55× | pose from pixels |
+| 19–21 | drop 2 | 36.77–40.65 | head | 0.5× | spectral skin, 243k hair strands |
+| 21–22 | outro | 40.65–42.58 | head, held on its last frame | hold | |
+| 22–23 | outro | 42.58–47.02 | closing card "irys" + asset credits (bell tail) | — | |
+
+The Cycles caption is the equal-material grey bench of phase 5a (design.md:
+irys 0.16–0.59 of Cycles' equal-time error on classroom-grey and
+pavilion-grey). With the true materials irys is slower, so the caption claims
+the grey bench only.

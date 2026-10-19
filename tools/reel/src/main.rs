@@ -26,6 +26,9 @@ use std::path::{Path, PathBuf};
 struct RiserSpec {
     csv: String,
     column: String,
+    /// For multi-run CSVs: keep rows whose `run` column equals this.
+    #[serde(default)]
+    run: Option<String>,
     #[serde(default = "one")]
     level: f64,
     /// The riser starts this many bars into its section (default 0).
@@ -37,11 +40,74 @@ fn one() -> f64 {
     1.0
 }
 
+/// One shot in a section: a sequence (by id) for some bars, optionally sped
+/// up or down, held on a frame, replaced by a title card, or captioned.
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum SegSpec {
+    Id(String),
+    Full(Shot),
+}
+
+#[derive(Deserialize, Serialize, Clone, Default)]
+struct Shot {
+    id: String,
+    /// Bars of the section this shot fills; shots without it share the rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bars: Option<f64>,
+    /// Playback speed; default fits the footage to the shot, clamped to 0.5–2×.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speed: Option<f64>,
+    /// First source frame.
+    #[serde(default)]
+    from: usize,
+    /// "first" or "last": hold one frame for the whole shot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hold: Option<String>,
+    /// Title card text (lines split on '\n'); the card replaces the picture,
+    /// the sequence still supplies the spectrum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    card: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caption: Option<String>,
+}
+
+impl SegSpec {
+    fn shot(&self) -> Shot {
+        match self {
+            SegSpec::Id(id) => Shot { id: id.clone(), ..Shot::default() },
+            SegSpec::Full(s) => s.clone(),
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct Seg {
+    #[serde(flatten)]
+    shot: Shot,
+    start: f64,
+    end: f64,
+    speed: f64,
+    fps: f64,
+    frames: usize,
+}
+
+impl Seg {
+    fn frame(&self, t: f64) -> usize {
+        let last = self.frames.saturating_sub(1);
+        match self.shot.hold.as_deref() {
+            Some("last") => last,
+            Some("first") => self.shot.from.min(last),
+            _ => (self.shot.from + ((t - self.start).max(0.0) * self.fps * self.speed) as usize).min(last),
+        }
+    }
+}
+
 #[derive(Deserialize, Clone)]
 struct Section {
     name: String,
     bars: usize,
-    sequences: Vec<String>,
+    sequences: Vec<SegSpec>,
     drums: String,
     #[serde(default)]
     drop: bool,
@@ -66,14 +132,7 @@ struct SectionOut {
     start: f64,
     end: f64,
     bars: usize,
-    sequences: Vec<SeqSpan>,
-}
-
-#[derive(Serialize)]
-struct SeqSpan {
-    id: String,
-    start: f64,
-    end: f64,
+    shots: Vec<Seg>,
 }
 
 #[derive(Serialize)]
@@ -88,6 +147,7 @@ struct ChordOut {
 
 #[derive(Serialize)]
 struct Beats {
+    fps: f64,
     bpm: f64,
     key: String,
     beat_s: f64,
@@ -375,7 +435,7 @@ fn render(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let docs = PathBuf::from(arg(args, "--docs", "../../docs"));
     let out_dir = PathBuf::from(arg(args, "--out", "out"));
     std::fs::create_dir_all(&out_dir)?;
-    let man: Manifest = serde_json::from_str(&std::fs::read_to_string(&man_path)?)?;
+    let man: Manifest = serde_json::from_str::<Manifest>(&std::fs::read_to_string(&man_path)?)?.normalise();
     if man.stub {
         eprintln!("note: {man_path} is a STUB manifest");
     }
@@ -398,17 +458,29 @@ fn render(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let music_end = t;
     let section_at = |t: f64| -> usize { starts.iter().rposition(|&s| t >= s - 1e-9).unwrap_or(0) };
-    // Which sequence and frame plays at time t.
+    // The shots, laid out.
+    let mut segs: Vec<Seg> = Vec::new();
+    let mut seg_sec: Vec<usize> = Vec::new();
+    for (si, sec) in arr.sections.iter().enumerate() {
+        let shots: Vec<Shot> = sec.sequences.iter().map(SegSpec::shot).collect();
+        let fixed: f64 = shots.iter().filter_map(|s| s.bars).sum();
+        let free = shots.iter().filter(|s| s.bars.is_none()).count().max(1) as f64;
+        let mut t = starts[si];
+        for sh in shots {
+            let bars = sh.bars.unwrap_or((sec.bars as f64 - fixed) / free);
+            let len = bars * bar;
+            let seq = man.get(&sh.id).unwrap_or_else(|| panic!("sequence {} not in manifest", sh.id));
+            let avail = (seq.frames - sh.from.min(seq.frames)) as f64 / seq.fps;
+            let speed = sh.speed.unwrap_or((avail / len).clamp(0.5, 2.0));
+            segs.push(Seg { start: t, end: t + len, speed, fps: seq.fps, frames: seq.frames, shot: sh });
+            seg_sec.push(si);
+            t += len;
+        }
+    }
     let seq_at = |t: f64| -> (String, usize) {
-        let si = section_at(t.min(music_end - 1e-6));
-        let s = &arr.sections[si];
-        let len = s.bars as f64 * bar / s.sequences.len() as f64;
-        let local = t - starts[si];
-        let k = ((local / len) as usize).min(s.sequences.len() - 1);
-        let id = &s.sequences[k];
-        let seq = man.get(id).unwrap_or_else(|| panic!("sequence {id} not in manifest"));
-        let frame = (((local - k as f64 * len) * seq.fps) as usize).min(seq.frames.max(1) * 1000) % seq.frames.max(1);
-        (id.clone(), frame)
+        let t = t.min(music_end - 1e-6);
+        let g = segs.iter().rposition(|g| t >= g.start - 1e-9).unwrap_or(0);
+        (segs[g].shot.id.clone(), segs[g].frame(t))
     };
 
     // ── harmony: one chord per step, from the mean spectrum under it ─────────
@@ -653,7 +725,7 @@ fn render(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut fx = vec![[0.0f64; 2]; n];
     for (si, s) in arr.sections.iter().enumerate() {
         let Some(r) = &s.riser else { continue };
-        let curve = riser::Curve::load(&docs.join(Path::new(&r.csv).strip_prefix("docs").unwrap_or(Path::new(&r.csv))), &r.column)?;
+        let curve = riser::Curve::load(&docs.join(Path::new(&r.csv).strip_prefix("docs").unwrap_or(Path::new(&r.csv))), &r.column, r.run.as_deref())?;
         let t0 = starts[si] + r.from_bar as f64 * bar;
         let t1 = starts[si] + s.bars as f64 * bar;
         riser_log.push(curve.render(&mut fx, t0, t1, r.level, sr, &mut rng, &r.csv));
@@ -687,23 +759,22 @@ fn render(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .sections
         .iter()
         .zip(&starts)
-        .map(|(s, &t)| {
-            let len = s.bars as f64 * bar / s.sequences.len() as f64;
-            SectionOut {
-                name: s.name.clone(),
-                start: r3(t),
-                end: r3(t + s.bars as f64 * bar),
-                bars: s.bars,
-                sequences: s
-                    .sequences
-                    .iter()
-                    .enumerate()
-                    .map(|(k, id)| SeqSpan { id: id.clone(), start: r3(t + k as f64 * len), end: r3(t + (k + 1) as f64 * len) })
-                    .collect(),
-            }
+        .enumerate()
+        .map(|(si, (s, &t))| SectionOut {
+            name: s.name.clone(),
+            start: r3(t),
+            end: r3(t + s.bars as f64 * bar),
+            bars: s.bars,
+            shots: segs
+                .iter()
+                .zip(&seg_sec)
+                .filter(|(_, k)| **k == si)
+                .map(|(g, _)| Seg { start: r3(g.start), end: r3(g.end), speed: r3(g.speed), ..g.clone() })
+                .collect(),
         })
         .collect();
     let beats_out = Beats {
+        fps: 30.0,
         bpm: arr.bpm,
         key: format!("{} major", NAMES[key]),
         beat_s: beat,

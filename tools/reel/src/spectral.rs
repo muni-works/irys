@@ -25,8 +25,16 @@ pub fn pitch_class(nm: f64) -> f64 {
     midi.rem_euclid(12.0)
 }
 
+/// The real manifest's per-sequence spectrum block.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SpectrumBlock {
+    pub bin_centres_nm: Vec<f64>,
+    pub per_frame: Vec<Vec<f64>>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Sequence {
+    #[serde(alias = "name")]
     pub id: String,
     pub path: String,
     #[serde(alias = "frame_count")]
@@ -38,8 +46,11 @@ pub struct Sequence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wavelengths_nm: Option<Vec<f64>>,
     /// One mean spectrum per frame, radiance per bin.
-    #[serde(alias = "mean_spectra", alias = "spectrum")]
+    #[serde(alias = "mean_spectra", default)]
     pub spectra: Vec<Vec<f64>>,
+    /// `{bin_centres_nm, per_frame}`, as `examples/reel.rs` writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spectrum: Option<SpectrumBlock>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -54,6 +65,18 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Fold the `spectrum` block form into `spectra` / `wavelengths_nm`.
+    pub fn normalise(mut self) -> Self {
+        for s in &mut self.sequences {
+            if let Some(b) = s.spectrum.take() {
+                if s.spectra.is_empty() {
+                    s.spectra = b.per_frame;
+                }
+                s.wavelengths_nm.get_or_insert(b.bin_centres_nm);
+            }
+        }
+        self
+    }
     pub fn get(&self, id: &str) -> Option<&Sequence> {
         self.sequences.iter().find(|s| s.id == id)
     }
@@ -145,6 +168,7 @@ pub fn stub() -> Manifest {
                 caption: format!("STUB: {cap}"),
                 wavelengths_nm: None,
                 spectra,
+                spectrum: None,
             }
         })
         .collect();

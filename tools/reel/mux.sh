@@ -14,6 +14,6 @@ EXT=png; [ -e "$FRAMES/00000.png" ] || EXT=jpg
 DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$AUDIO")
 ffmpeg -v error -y -framerate "$FPS" -i "$FRAMES/%05d.$EXT" -i "$AUDIO" \
   -vf "tpad=stop_mode=clone:stop_duration=$DUR" -t "$DUR" \
-  -c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p -c:a aac -b:a 256k \
+  -c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p -c:a aac -b:a ${ABR:-192k} \
   -movflags +faststart "$OUT"
 echo "$OUT"

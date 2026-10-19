@@ -32,14 +32,23 @@ pub struct RiserOut {
 }
 
 impl Curve {
-    pub fn load(path: &Path, column: &str) -> Result<Curve, Box<dyn std::error::Error>> {
+    pub fn load(path: &Path, column: &str, run: Option<&str>) -> Result<Curve, Box<dyn std::error::Error>> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut lines = text.lines();
         let head: Vec<&str> = lines.next().ok_or("empty csv")?.split(',').collect();
         let col = head.iter().position(|h| h.trim() == column).ok_or_else(|| format!("no column {column}"))?;
+        let run_col = head.iter().position(|h| h.trim() == "run");
+        // A quoted or ';'-bearing run name has no commas, so a plain split is safe.
         let loss: Vec<f64> = lines
+            .filter(|l| match (run, run_col) {
+                (Some(r), Some(c)) => l.split(',').nth(c).map(str::trim) == Some(r),
+                _ => true,
+            })
             .filter_map(|l| l.split(',').nth(col)?.trim().parse().ok())
             .collect();
+        if loss.is_empty() {
+            return Err(format!("{}: no rows for run {run:?}", path.display()).into());
+        }
         let mut best = f64::INFINITY;
         let run: Vec<f64> = loss.iter().map(|&l| { best = best.min(l); best }).collect();
         let (first, last) = (run[0], *run.last().unwrap());
