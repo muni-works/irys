@@ -67,6 +67,7 @@ fn main() {
         ("regen 4", Opts { regen: 4, ..base }),
         ("regen 8", Opts { regen: 8, ..base }),
         ("regen 32", Opts { regen: 32, ..base }),
+        ("regen 128", Opts { regen: 128, ..base }),
         ("area CDF", Opts { samp: samp::ALL & !samp::LIGHT_TREE, ..base }),
         ("CDF + tree walk", Opts { samp: samp::ALL & !samp::LIGHT_TREE, prof: 128, ..base }),
         ("hash rng", Opts { samp: samp::ALL & !samp::SOBOL, ..base }),

@@ -369,9 +369,9 @@ fn guiding_is_unbiased() {
         eprintln!("no ray queries: skipped");
         return;
     };
-    let o = Opts { spp: 128, max_bounces: 6, ..Opts::default() };
-    let (m0, e0) = frame_mean(&g, &s, o, 24);
-    let (m, e) = frame_mean(&g, &s, Opts { guide: 0.5, ..o }, 24);
+    let o = Opts { spp: irys_diff::look::scene_gpu::GUIDE_MIN_SPP, max_bounces: 6, ..Opts::default() };
+    let (m0, e0) = frame_mean(&g, &s, o, 16);
+    let (m, e) = frame_mean(&g, &s, Opts { guide: 0.5, ..o }, 16);
     let z = (m - m0) / (e * e + e0 * e0).sqrt();
     eprintln!("guided {m:.5} ± {e:.5} vs {m0:.5} ± {e0:.5}: z {z:+.2}");
     assert!(z.abs() < 4.0, "z {z}");

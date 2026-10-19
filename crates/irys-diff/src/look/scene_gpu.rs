@@ -120,8 +120,13 @@ pub struct Opts {
     /// Path guiding at mostly-diffuse opaque vertices (phase 3's grid ×
     /// histogram, `gpu/guide.wgsl`), trained during the frame's first
     /// quarter of samples; the mix with the BSDF's own sampling (0: off).
+    /// Off for frames under [`GUIDE_MIN_SPP`]: a guide trained on fewer
+    /// than 64 samples a pixel made more fireflies than it removed.
     pub guide: f32,
 }
+
+/// The fewest samples per pixel a frame needs for [`Opts::guide`] to act.
+pub const GUIDE_MIN_SPP: u32 = 256;
 
 /// Sampler switches for [`Opts::samp`] (speed round 4: phase 3's samplers).
 pub mod samp {
@@ -835,6 +840,7 @@ impl GpuLook {
 
     /// Render one frame from `cam`.
     pub fn render(&self, cam: &Camera, o: &Opts) -> Frame {
+        let o = &Opts { guide: if o.spp >= GUIDE_MIN_SPP { o.guide } else { 0.0 }, ..*o };
         let (dev, queue) = (&self.ctx.device, &self.ctx.queue);
         let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         enc.clear_buffer(&self.accum, 0, None);
