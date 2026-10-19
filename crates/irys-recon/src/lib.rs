@@ -13,12 +13,17 @@
 
 pub mod canon;
 pub mod dsl;
+pub mod export;
 pub mod fit;
 pub mod generate;
 pub mod geom;
 pub mod jac;
+pub mod look;
 pub mod mdl;
 pub mod model;
+pub mod photo;
 pub mod render;
 pub mod search;
+pub mod segment;
 pub mod tag;
+pub mod v1;

@@ -1115,6 +1115,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "vcad-ir",
  "vcad-kernel",
  "vcad-kernel-export",
 ]

@@ -24,6 +24,7 @@ kornia-apriltag = "0.2"
 kornia-image = "0.2"
 kamadak-exif = "0.6"
 vcad-kernel-export = "0.10"
+vcad-ir = "0.10"
 rayon.workspace = true
 
 [features]
@@ -34,3 +35,7 @@ gpu = ["irys-diff/gpu"]
 [[example]]
 name = "recon_v0"
 
+
+[[example]]
+name = "recon_v1"
+required-features = ["gpu"]
