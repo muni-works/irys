@@ -31,6 +31,8 @@ pub mod instances;
 #[cfg(feature = "assets")]
 pub mod pinhole;
 #[cfg(all(feature = "gpu", feature = "assets"))]
+pub mod present;
+#[cfg(all(feature = "gpu", feature = "assets"))]
 pub mod residual;
 #[cfg(all(feature = "gpu", feature = "assets"))]
 pub mod sensor;

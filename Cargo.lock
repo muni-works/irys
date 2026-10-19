@@ -589,6 +589,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "irys-ffi"
+version = "0.1.0"
+dependencies = [
+ "irys-diff",
+ "irys-gpu",
+ "irys-light",
+ "objc2",
+ "objc2-io-surface",
+ "objc2-metal",
+]
+
+[[package]]
 name = "irys-gpu"
 version = "0.1.0"
 dependencies = [
@@ -934,6 +946,7 @@ dependencies = [
  "block2",
  "objc2",
  "objc2-foundation",
+ "objc2-io-surface",
 ]
 
 [[package]]
