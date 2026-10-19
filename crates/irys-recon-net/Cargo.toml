@@ -1,0 +1,38 @@
+[package]
+name = "irys-recon-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "irys: image to CAD, v2 — a learned scene proposer (a tang tensor-IR graph) seeding the MDL search"
+publish = false
+
+[dependencies]
+irys-core.workspace = true
+irys-prims.workspace = true
+irys-recon = { path = "../irys-recon" }
+irys-diff = { path = "../irys-diff", features = ["assets"] }
+tang.workspace = true
+tang-compile.workspace = true
+tang-expr.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+kamadak-exif = "0.6"
+rayon.workspace = true
+irys-gpu = { workspace = true, optional = true }
+
+[features]
+# The synthetic photos are path traced with irys's OpenPBR scene kernel on
+# the device (`look::scene_gpu`).
+gpu = ["irys-diff/gpu", "irys-recon/gpu", "dep:irys-gpu"]
+
+[[example]]
+name = "neural_data"
+required-features = ["gpu"]
+
+[[example]]
+name = "neural_desk"
+required-features = ["gpu"]

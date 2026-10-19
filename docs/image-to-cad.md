@@ -398,3 +398,203 @@ on every part whose base was right; focal from EXIF+tag within ±0.6 %.
 Multi-view on the real kit photos first; an AO derivative (secondary edges for
 the AO rays) to drop the counterbore FD columns; a two-light or
 environment-map appearance; a proposer with a prior (the v0 list stands).
+
+## v2: neural (a learned scene proposer, 2026-10-19)
+
+Built in `crates/irys-recon-net` (publish = false). The goal: one photo,
+maybe from a robot's eyes, in; a parametric inventory of everything in it
+out. The network makes the guess and the MDL search is supposed to add the
+precision. Short version: the proposer works on synthetic scenes. The search
+and the renderer-as-teacher both lower the description length, but on this
+model they do not lower the dimension error. The desk photo is mostly
+not recovered.
+
+### The scene language (`scene.rs`)
+
+A scene is many objects on a support plane. Each object has a family, four
+structure tokens, continuous parameters (mm), a pose `(x, y, yaw)` and an
+OpenPBR substance, and one line of text describes it, e.g.
+`keyboard grid rows=5 w=412.30 d=125.10 h=18.20 pitch=19.05 key_h=7.90 @ 41.0 -12.5 8.0`.
+
+| family | tokens | parameters | classes |
+|---|---|---|---|
+| plate (v0's `dsl::Program`) | grid n×m or circle of k holes | w d h r hole_r pitch | bracket, gear plate |
+| lathe (revolved Catmull–Rom profile) | — | h r0..r3 | soda can, bottle, cup, humidifier |
+| product (filleted box) | vertical / all edges, stand | w d h r lift | monitor, power strip, speaker, mouse, webcam |
+| grid (base + key caps at a pitch) | rows | w d h pitch key_h | keyboard |
+| shell (walls + floor) | open with 0–4 ribs / honeycomb lid | w d h wall cell | tray, honeycomb case |
+
+The known-size objects (scale gauges) are the 12 oz can at 122 mm and the
+key pitch at 19.05 mm. Plates mesh through vcad for the photos. The search
+uses a boolean-free mesher instead (ear clipping, holes bridged to the
+outline), which matches the program volume within 2 %.
+
+### Data engine (`data.rs`, `render.rs`, `examples/neural_data`)
+
+Each scene has 3–12 objects, placed by rejection on bounding circles (45 %
+are desk-scale, with a monitor, keyboard and power strip). The camera looks
+along +y from 28–65° above the plane with a 58–72° horizontal FOV. Lighting
+is a procedural equirect with a window and a key light; materials are
+plastic, PLA colours, aluminium and wood/grey/black tables. irys's OpenPBR
+kernel path traces each scene on the device at 256×192 and 16 spp. Then
+the camera stage runs (defocus, exposure, Poisson–Gaussian noise, tone,
+JPEG 82–95) and the frame is downsampled to 128×96. The dense labels come
+from an irys TLAS cast: instance ids, metric depth, normals, and which
+gauges are in view. The labels also hold the program text, the poses and
+the camera. Domain B is the shifted, unlabelled-use slice: lower and
+wider cameras, harder lights and stronger post.
+
+- 40 000 training scenes (301 k objects, 7.5 per scene, a gauge in 63 % of
+  scenes), 400 held-out A, 1 000 B for tuning and 300 held-out B. 4.4 GB.
+- Rate: 12–19 scenes/s on this Mac. The CPU stages (sampling, meshing,
+  labels) run in parallel and the device renders one frame at a time.
+  M1's batched sensor path was not merged when this was built, so this
+  uses the existing per-scene `GpuLook` path.
+- Deterministic: a seed fixes the whole sample (tested).
+
+![data engine: photos and instance labels](neural-recon-data.png)
+
+### The network (`net.rs`, `train.rs`)
+
+- An MLP-Mixer over 8×8 patches (192 tokens): d 128, 6 blocks, token-MLP
+  256, channel-MLP 384, **1.28 M parameters**.
+- Heads, per pixel: foreground, the offset to the instance centre, and
+  log metric depth. Per patch: CenterNet heat, class (14), structure
+  tokens (4 × 8), parameter mean and log σ (Gaussian NLL), and
+  (cos 2ψ, sin 2ψ). Per image: camera height and pitch over the plane,
+  which sets the metric scale. Instances come from heat peaks, with each
+  pixel's centre vote deciding its instance.
+- One tang tensor-IR graph holds the forward and the loss. The gradient is
+  `TensorGraph::backward`'s, and there is no hand-written backward pass.
+  The graph runs as compiled C (f32) through `irys_diff::ir::Program`,
+  with 12 workers × 4 images. `neural_check`: native agrees with the
+  interpreter to 9e-4 relative, and backward agrees with central
+  differences to 6e-7. tang has no usable GPU path here, because tang-gpu
+  is on wgpu 25 and irys is on 30. tang's `merge_reduce_dims` pass lowers
+  this graph to invalid C at bfc8003, so the pass list stops at
+  `merge_siblings`.
+- Training: 10 000 steps of 48 images (480 k images, flips and photometric
+  jitter), Adam at 1e-3 with cosine decay and weight decay 3e-4. **60 min**
+  on 12 CPU cores (~130 images/s). The first run used 20 k scenes, 12 k
+  steps and no jitter. It overfit: held-out loss fell to 2.66 at step 7.5 k
+  and then rose to 3.80, almost all of it in the parameter NLL as σ
+  collapsed. Doubling the data fixed it, with held-out loss falling to
+  1.94 at the end.
+
+![learning curves (train blue, held-out orange)](neural-recon-curves.png)
+
+### Synthetic results (`examples/neural_eval`)
+
+Held-out domain A. A detection matches when its base centre lands within
+max(4 px, 0.6 · object radius) of the truth's in the image. Dimension
+errors count only matched objects whose topology is right.
+
+| | net (200 scenes) | net (15) | net + search (15) | net + search, true camera (15) | search only, true camera (15) |
+|---|---|---|---|---|---|
+| inventory recall | 0.78 | 0.89 | 0.90 | 0.89 | 0.19 |
+| inventory precision | 0.90 | 0.98 | 0.99 | 0.98 | 0.25 |
+| class accuracy | 0.81 | 0.79 | 0.78 | 0.73 | 0.06 |
+| topology accuracy | **0.75** | 0.68 | 0.55 | 0.44 | 0.12 |
+| dims within 0.5 mm | 9 % | 9 % | 8 % | 4 % | 10 % |
+| dims within 1 mm | 17 % | 20 % | 14 % | 10 % | 10 % |
+| objects with every dim ≤ 1 mm | 0 % | 0 % | 0 % | 0 % | 0 % |
+| median dim error | 4.8 mm (11 %) | 3.9 mm (9 %) | 6.1 mm (15 %) | 5.3 mm (10 %) | 18.7 mm (31 %) |
+| median position error | 25 mm | 19 mm | 17 mm | **8.8 mm** | 12 mm |
+| median yaw error | 15° | 10° | **1.0°** | 1.7° | 1.2° |
+| mean scene MDL (nats) | 325 k | 254 k | 163 k | 161 k | 321 k |
+| wall clock per scene | 0.02 s forward, < 1 s with decoding | | 20 s | 19 s | 91 s |
+
+What this says:
+
+- **The net is the inventory.** It detects 78 % of objects (precision 0.90)
+  and gets topology right for 75 % of matches, in one 20 ms forward pass.
+  Search alone, given the true camera, finds 19 %: colour segmentation
+  merges neighbours and shadows, and its seven default structures rarely
+  match a token-level truth.
+- **The search buys pose, not shape.** Yaw goes from 15° to 1°, position
+  (true camera) from 19 to 9 mm, and the MDL falls 35 %. Topology still
+  drops from 0.68 to 0.55 and dimension error rises, even though the
+  structure prior is the net's (`−log p(structure)` is the program-length
+  term). At 128×96 (about 5 mm a pixel on a desk) with a linear appearance
+  and no shadows, a *shorter description* is often a wrong part: a wider
+  box covers a shadow, and a lathe with a flared top explains the shading.
+  The objective is misaligned with the truth here. The fix is in the model
+  image (shadows, a real BSDF, higher resolution, irys's edge-term
+  Jacobian in place of finite differences), not in more search.
+- **The 0.5 mm / 1 mm gates are out of reach** for one 128×96 view of
+  half-metre scenes; no mode passes an object on all dimensions. v0's
+  0.5 mm came from 215 mm-distance renders of a single part.
+
+### Renderer as teacher (`examples/neural_finetune`)
+
+Fine-tuning reads only the photo and its field of view, never a label.
+Each detection is cast through irys (the TLAS with the linear appearance)
+and compared with the photo.
+
+- The continuous heads (parameter means, yaw, plane) get `∂L/∂head` by
+  central differences of that render loss and feed it to the graph as
+  upstream gradients, so `backward` carries it into the weights. These
+  are not PRB edge gradients: the scene families are not v0's carrier
+  surfaces, so irys-recon's edge Jacobian does not apply.
+- The structure tokens are a policy. Six structures are sampled per
+  detection under the grammar, each object scored by its MDL, and
+  REINFORCE with a mean baseline (advantage-weighted cross-entropy in the
+  graph) pushes the shorter descriptions up.
+- An optional anchor mixes in supervised domain-A batches, which carry
+  the synthetic stream's own labels.
+
+Held-out unlabelled domain B (200 scenes; the labels are used only to
+score):
+
+| | before | tune 150 steps (teacher 1, plane on) | tune 100 steps (teacher 0.3, plane off) |
+|---|---|---|---|
+| mean scene MDL (nats) | 363 k | **316 k (−13 %)** | 350 k (−4 %) |
+| recall / precision | 0.67 / 0.78 | 0.60 / 0.71 | 0.66 / 0.78 |
+| topology accuracy | 0.67 | 0.60 | 0.66 |
+| median dim error | 6.4 mm | 10.8 mm | 8.3 mm |
+| median position error | 39 mm | 80 mm | 41 mm |
+
+The teacher does what it is told: held-out MDL falls without labels. **It
+does not lower the error**, and so fails half of its brief. The plane head
+in particular learns to trade scale for residual. This is the same
+misalignment the search shows, now amplified by a learner. The domain gap
+itself is real (A→B costs recall 0.78→0.67 and dims 4.8→6.4 mm). Closing
+it needs a model image whose minimum is the truth.
+
+### The desk photo (`examples/neural_desk`)
+
+`desk-IMG_0579.jpg`, 1600×1200 (iPhone 16 Pro, 24 mm equivalent, 71.6°).
+The net sees it at 128×96 and the search works at 256×192. The figure is
+photo | irys OpenPBR re-render of the recovered scene (colours from the
+photo) | residual against the linear-appearance model | labelled
+inventory. The inventory, with a by-eye check, is in
+[neural-recon-inventory.md](neural-recon-inventory.md).
+
+![desk: photo, re-render, residual, inventory](neural-recon-desk.png)
+
+The net found 12 instances in 29 ms and the search took 18 s. The result
+is mostly wrong. The tray at the left foreground (the black printed
+bracket) is the only good correspondence; the monitor, keyboard, mouse,
+can, controller and honeycomb case are not recovered. No gauge fired, so
+the scale is the plane head's guess. The photo breaks the training
+distribution's assumptions: the camera is low, half the frame is wall,
+and the monitor, speakers, webcams and power strip hang on that wall,
+off the support plane. Cables, the screen content, soft items and the
+pegboard are outside the language and are left unmodelled; there is no
+splat or mesh fallback yet. Tuning on the desk photo itself was not run,
+since the synthetic B result says it would lower its MDL and not its error.
+
+### Next
+
+1. A model image whose best fit is the truth: shadows and the OpenPBR
+   kernel in the compare loop (M1's batched cameras and AOVs make that
+   affordable), 2–4× resolution, and edge-term gradients. Then re-measure
+   search and teacher; they are the right shape and the wrong objective.
+2. Walls and vertical supports in the scene language (a second plane, wall
+   mounts), low cameras, clutter and cables as distractors, and a splat
+   fallback label, so the desk is in-distribution.
+3. Detection at the photo's resolution (crops from proposals at 128×96)
+   for the small objects, plus gauge-aware training (the can and the keys
+   are often in view but rarely recognised as gauges).
+4. A proper search-only baseline using v0's proposer moves per object, so
+   the comparison is with v1's search rather than with a straw man.
