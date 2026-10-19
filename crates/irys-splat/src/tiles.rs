@@ -42,12 +42,15 @@ impl Ptr {
 }
 
 /// The tile rectangle `[x0, x1) × [y0, y1)` of a splat.
-pub fn rect(p: &Proj, w: usize, h: usize) -> Option<[usize; 4]> {
-    let r = p.radius;
-    let lo_x = (p.uv[0] - r).ceil().max(0.0);
-    let hi_x = (p.uv[0] + r).floor().min(w as f64 - 1.0);
-    let lo_y = (p.uv[1] - r).ceil().max(0.0);
-    let hi_y = (p.uv[1] + r).floor().min(h as f64 - 1.0);
+pub fn rect(k: [f32; 4], w: usize, h: usize) -> Option<[usize; 4]> {
+    let (u, v, r) = (k[0] as f64, k[1] as f64, k[2] as f64);
+    if !(r > 0.0) {
+        return None;
+    }
+    let lo_x = (u - r).ceil().max(0.0);
+    let hi_x = (u + r).floor().min(w as f64 - 1.0);
+    let lo_y = (v - r).ceil().max(0.0);
+    let hi_y = (v + r).floor().min(h as f64 - 1.0);
     if !(lo_x <= hi_x && lo_y <= hi_y) {
         return None;
     }
@@ -55,13 +58,22 @@ pub fn rect(p: &Proj, w: usize, h: usize) -> Option<[usize; 4]> {
     Some([t(lo_x), t(hi_x) + 1, t(lo_y), t(hi_y) + 1])
 }
 
+/// `(u, v, radius, z)` per splat from host projections (radius 0: culled).
+pub fn keys(p: &[Option<Proj>]) -> Vec<[f32; 4]> {
+    p.iter().map(|q| q.map_or([0.0; 4], |q| [q.uv[0] as f32, q.uv[1] as f32, q.radius as f32, q.colour[3] as f32])).collect()
+}
+
 pub fn bin(p: &[Option<Proj>], w: usize, h: usize) -> Bins {
+    bin_keys(&keys(p), w, h)
+}
+
+/// Bin splats given as `(u, v, radius, z)` (the device's `project` output).
+pub fn bin_keys(k: &[[f32; 4]], w: usize, h: usize) -> Bins {
     let (tx, ty) = (w.div_ceil(TILE), h.div_ceil(TILE));
     let nt = tx * ty;
-    let n = p.len();
-    let rects: Vec<Option<[usize; 4]>> = p.par_iter().map(|q| q.as_ref().and_then(|q| rect(q, w, h))).collect();
-    let mut order: Vec<(f64, u32)> =
-        (0..n).filter(|&i| rects[i].is_some()).map(|i| (p[i].unwrap().colour[3], i as u32)).collect();
+    let n = k.len();
+    let rects: Vec<Option<[usize; 4]>> = k.par_iter().map(|q| rect(*q, w, h)).collect();
+    let mut order: Vec<(f32, u32)> = (0..n).filter(|&i| rects[i].is_some()).map(|i| (k[i][3], i as u32)).collect();
     order.par_sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     // splat-major offsets
     let mut csr_off = vec![0u32; n + 1];
@@ -72,7 +84,7 @@ pub fn bin(p: &[Option<Proj>], w: usize, h: usize) -> Bins {
     let total = csr_off[n] as usize;
     // per-chunk tile histograms
     let chunk = order.len().div_ceil(64).max(1024);
-    let chunks: Vec<&[(f64, u32)]> = order.chunks(chunk).collect();
+    let chunks: Vec<&[(f32, u32)]> = order.chunks(chunk).collect();
     let hist: Vec<Vec<u32>> = chunks
         .par_iter()
         .map(|c| {

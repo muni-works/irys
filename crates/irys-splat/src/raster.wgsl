@@ -19,19 +19,30 @@
 
 struct U {
     size: vec4<u32>,   // w, h, tiles_x, splats
-    bg: vec4<f32>,
+    bg: vec4<f32>,     // rgb, ssim weight λ
+    rot0: vec4<f32>,   // camera → world rotation rows, pos in .w
+    rot1: vec4<f32>,
+    rot2: vec4<f32>,
+    intr: vec4<f32>,   // fx fy cx cy
+    lim: vec4<f32>,    // clamp of x/z, y/z: -xn, xp, -yn, yp
+    misc: vec4<f32>,   // near, degree, depth weight / valid count, 1 / (3 N)
+    lr0: vec4<f32>,    // means, log scales, quats, opacity
+    lr1: vec4<f32>,    // sh0, shN, 1 − β1ᵗ, 1 − β2ᵗ
+    win0: vec4<f32>,   // the 11-tap window
+    win1: vec4<f32>,
+    win2: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> P: U;
-@group(0) @binding(1) var<storage, read> proj: array<vec4<f32>>;        // 3 per splat: (u, v, A, B) (C, o, r, g) (b, z, -, -)
-@group(0) @binding(2) var<storage, read> ranges: array<vec2<u32>>;
-@group(0) @binding(3) var<storage, read> ids: array<u32>;
+@group(0) @binding(1) var<storage, read_write> proj: array<vec4<f32>>;        // 3 per splat: (u, v, A, B) (C, o, r, g) (b, z, -, -)
+@group(0) @binding(2) var<storage, read_write> ranges: array<vec2<u32>>;
+@group(0) @binding(3) var<storage, read_write> ids: array<u32>;
 @group(0) @binding(4) var<storage, read_write> out_c: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> out_t: array<vec2<u32>>;  // (bits of T_N, last)
-@group(0) @binding(6) var<storage, read> dl: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> dl: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read_write> slot_g: array<vec4<f32>>; // 3 per slot
-@group(0) @binding(8) var<storage, read> csr_off: array<u32>;
-@group(0) @binding(9) var<storage, read> csr_slots: array<u32>;
+@group(0) @binding(8) var<storage, read_write> csr_off: array<u32>;
+@group(0) @binding(9) var<storage, read_write> csr_slots: array<u32>;
 @group(0) @binding(10) var<storage, read_write> g2: array<vec4<f32>>;    // 3 per splat
 
 const B: u32 = 256u;
