@@ -8,7 +8,8 @@
 //!   `transform` or `matrix` (sixteen numbers or four rows).
 //!
 //! The image is found, in order, from `image` / `file` / `jpeg` / `path`
-//! (relative to the images directory); else, when the line has `t` and a
+//! (relative to the images directory); else `<frame:06>.nv12` there (the
+//! K1's raw colour frames, BT.601 full range); else, when the line has `t` and a
 //! `jpegs.jsonl` (`{frame, t}` per image) sits beside the images directory,
 //! the image nearest in time; else `<frame:06>.jpg|.png` in the directory.
 //! Depth (optional) is `depth` (a file relative to the depth directory) or
@@ -82,11 +83,36 @@ pub fn pose_of(v: &Value) -> Result<([[f64; 3]; 3], [f64; 3]), String> {
 
 /// Decode an image file to sRGB 0..1 at `(w, h)` (refused if the size differs).
 pub fn load_rgb(path: &Path, w: usize, h: usize) -> Result<Vec<[f32; 3]>, String> {
+    if path.extension().is_some_and(|e| e == "nv12") {
+        return load_nv12(path, w, h);
+    }
     let im = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?.to_rgb8();
     if im.width() as usize != w || im.height() as usize != h {
         return Err(format!("{}: {}×{}, camera says {w}×{h}", path.display(), im.width(), im.height()));
     }
     Ok(im.pixels().map(|p| p.0.map(|c| c as f32 / 255.0)).collect())
+}
+
+/// NV12 (the K1's raw colour frames): a Y plane, then interleaved CbCr at
+/// half resolution; BT.601 full range (JFIF; the sweep's Y spans 0–255 and
+/// matches its JPEGs' mean) → sRGB.
+pub fn load_nv12(path: &Path, w: usize, h: usize) -> Result<Vec<[f32; 3]>, String> {
+    let b = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if b.len() < w * h * 3 / 2 {
+        return Err(format!("{}: {} bytes, want {}", path.display(), b.len(), w * h * 3 / 2));
+    }
+    let (y, uv) = b.split_at(w * h);
+    Ok((0..w * h)
+        .map(|p| {
+            let (x, r) = (p % w, p / w);
+            let q = (r / 2) * w + (x / 2) * 2;
+            let yy = y[p] as f32;
+            let cb = uv[q] as f32 - 128.0;
+            let cr = uv[q + 1] as f32 - 128.0;
+            let c = [yy + 1.402 * cr, yy - 0.344_136 * cb - 0.714_136 * cr, yy + 1.772 * cb];
+            c.map(|v| (v / 255.0).clamp(0.0, 1.0))
+        })
+        .collect())
 }
 
 pub fn load_depth(path: &Path, n: usize, spec: DepthSpec) -> Result<Vec<f32>, String> {
@@ -130,7 +156,10 @@ pub fn load(images: &Path, poses: &Path, camera: &Path, depth: Option<&Path>, sp
         let (rot, pos) = pose_of(&v).map_err(at)?;
         let frame = v["frame"].as_u64();
         let named = ["image", "file", "jpeg", "path"].iter().find_map(|k| v.get(*k).and_then(Value::as_str)).map(|s| images.join(s));
+        let nv12 = frame.map(|f| images.join(format!("{f:06}.nv12"))).filter(|p| p.exists());
         let img: PathBuf = if let Some(p) = named {
+            p
+        } else if let Some(p) = nv12 {
             p
         } else if let (Some(t), false) = (v["t"].as_f64(), times.is_empty()) {
             let best = times.iter().min_by(|a, b| (a.0 - t).abs().total_cmp(&(b.0 - t).abs())).unwrap();

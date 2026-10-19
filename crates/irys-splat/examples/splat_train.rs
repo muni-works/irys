@@ -6,6 +6,7 @@
 //!     [--depth DIR] [--depth-scale 0.001] [--depth-min 0.1] [--depth-max 20] [--depth-weight 0.1]
 //!     [--init points.ply | --seed-depth N | --random N] [--iters 30000] [--sh-degree 3]
 //!     [--holdout 8] [--eval-every 1000] [--report DIR] [--irys-eval] [--seed S] [--max-splats N]
+//!     [--scene-scale M] [--box M]
 //! ```
 //!
 //! Every `--holdout`-th view (0: none) is held out and scored (PSNR / SSIM)
@@ -13,7 +14,10 @@
 //! `red green blue` bytes) or a 3DGS PLY; `--seed-depth N` back-projects N
 //! random valid depth pixels of the training views ("SfM-like" sparse
 //! points); otherwise `--random N` (default 100 000) uniform in the box
-//! around the cameras. `--report DIR` writes `log.csv`, `metrics.json` and
+//! around the cameras (half-width `--box`, default 2 × the scene scale).
+//! `--scene-scale` overrides gsplat's camera-spread scale (which sets the
+//! mean learning rate and the clone / split / prune sizes) — needed when
+//! the cameras barely move, as in a turn-in-place sweep. `--report DIR` writes `log.csv`, `metrics.json` and
 //! held-out `gt / render / error` PNGs; `--irys-eval` also scores the map as
 //! irys's ray tracer draws it (`look::sensor`'s splat layer).
 
@@ -144,7 +148,7 @@ fn main() {
         (views.iter().collect(), Vec::new())
     };
     let cams: Vec<_> = train_v.iter().map(|v| v.cam).collect();
-    let scale = train::scene_scale(&cams);
+    let scale = opt("--scene-scale").map_or_else(|| train::scene_scale(&cams), |s| s.parse().unwrap());
     eprintln!("{} views ({} train, {} held out), {}×{}, scene scale {scale:.2} m, loaded in {:.1} s", views.len(), train_v.len(), test_v.len(), cams[0].width, cams[0].height, t0.elapsed().as_secs_f64());
     let g = if let Some(p) = opt("--init") {
         let c = irys_light::PlyCloud::load(Path::new(&p));
