@@ -308,3 +308,53 @@ pub fn generate(ctx: &'static irys_gpu::GpuContext, seed0: u64, n: usize, domain
     }
     out
 }
+
+/// v3: the photo at `hi ×` the net's size as well (the compare image's
+/// target), and the net's 128 × 96 input area-averaged from it. Returns the
+/// samples and their high-resolution photos.
+#[cfg(feature = "gpu")]
+pub fn generate_hi(ctx: &'static irys_gpu::GpuContext, seed0: u64, n: usize, domain: crate::scene::Domain, spp: u32, hi: usize) -> Vec<(Sample, image::RgbImage)> {
+    use crate::render::{photo, world_meshes};
+    use crate::scene::sample_scene;
+    use rayon::prelude::*;
+    let mut out = Vec::with_capacity(n);
+    for chunk in (0..n as u64).collect::<Vec<_>>().chunks(16) {
+        let built: Vec<_> = chunk
+            .par_iter()
+            .map(|&k| {
+                let scene = sample_scene(seed0 + k, domain, (W, H));
+                let meshes = world_meshes(&scene.objects);
+                (scene, meshes)
+            })
+            .collect();
+        let shot: Vec<_> = built
+            .into_iter()
+            .filter_map(|(scene, meshes)| match photo(ctx, &scene, &meshes, (W * hi, H * hi), spp) {
+                Ok(i) => Some((scene, meshes, i)),
+                Err(e) => {
+                    eprintln!("seed {}: {e}", scene.seed);
+                    None
+                }
+            })
+            .collect();
+        out.extend(
+            shot.into_par_iter()
+                .map(|(scene, meshes, img)| {
+                    let small = downsample_rgb8(&img, (W, H));
+                    (Sample::label(scene, small, &meshes), img)
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    out
+}
+
+/// Area-average an 8-bit sRGB photo to `size` (in linear light), back to 8 bits.
+pub fn downsample_rgb8(img: &image::RgbImage, size: (usize, usize)) -> Vec<u8> {
+    crate::render::resample_rgb8(img, size).iter().flat_map(|p| p.map(irys_recon::render::srgb8)).collect()
+}
+
+/// The high-resolution photo of `seed` written by `neural_data --hi`.
+pub fn hi_path(dir: &Path, prefix: &str, seed: u64) -> std::path::PathBuf {
+    dir.join(format!("{prefix}-hi")).join(format!("{seed}.png"))
+}

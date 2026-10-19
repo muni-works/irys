@@ -423,7 +423,8 @@ mod gpu {
             eprintln!("gpulook new {:.3}s render {:.3}s", (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
         }
         let mut lin: Vec<f64> = fr.rgb.iter().map(|&x| if x.is_finite() { x as f64 } else { 0.0 }).collect();
-        lin = irys_recon::fit::blur(&lin, big, 3, s.post[0] * 2.0);
+        // Defocus is a property of the lens: the same angular blur at any size.
+        lin = irys_recon::fit::blur(&lin, big, 3, s.post[0] * 2.0 * out.0 as f64 / 128.0);
         let px: Vec<[f64; 3]> = lin.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
         let small = downsample(&px, big, 2);
         let mut lum: Vec<f64> = small.iter().map(|c| (c[0] + c[1] + c[2]) / 3.0).collect();

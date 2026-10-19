@@ -11,7 +11,7 @@ use irys_gpu::GpuContext;
 use irys_gpu::wgpu::{self, util::DeviceExt};
 
 use super::openpbr::{NE, OpenPbr, TN, Tables, fresnel_average, hats};
-use super::scene::{Camera, LookScene, Material, hat_inverse};
+use super::scene::{Camera, Equirect, LookScene, Material, hat_inverse};
 
 const SHADER: &str = include_str!("scene.wgsl");
 /// M1: splats in the TLAS (`splat.wgsl`), appended to the module.
@@ -185,7 +185,9 @@ pub struct GpuLook {
     pixels: usize,
     size: (usize, usize),
     flags: [u32; 4],
-    sun: ([f32; 4], [f32; 4]),
+    pub(super) sun: ([f32; 4], [f32; 4]),
+    /// The world's texels (binding 8), for `set_env`.
+    pub(super) b_env: wgpu::Buffer,
     picks: [f32; 4],
     picks_peak: [f32; 4],
     env: [u32; 4],
@@ -211,7 +213,7 @@ fn h4(c: [f64; 3], w: f64) -> [f32; 4] {
 }
 
 /// One material's [`MS`] vec4 (scene.wgsl's `load_mat`).
-fn pack_material(m: &Material, portal_off: Option<u32>) -> [[f32; 4]; MS] {
+pub(super) fn pack_material(m: &Material, portal_off: Option<u32>) -> [[f32; 4]; MS] {
     let p: &OpenPbr = &m.pbr;
     let mut flags = 0u32;
     if m.thin_walled {
@@ -302,6 +304,36 @@ fn apply(xf: &[[f32; 4]; 3], p: [f32; 3]) -> [f64; 3] {
 }
 
 /// Normalised inclusive CDF of `w` (all zero: uniform).
+/// An equirect's texels with its row CDFs and the marginal (what binding 8
+/// holds ahead of any portal sky), and the `env` parameter word.
+pub(super) fn pack_env(e: &Equirect) -> (Vec<[f32; 4]>, [u32; 4]) {
+    let mut envt: Vec<[f32; 4]> = Vec::new();
+    let (w, h) = (e.size.0 as usize, e.size.1 as usize);
+    let mut rows = Vec::with_capacity(h);
+    for j in 0..h {
+        let th = std::f64::consts::PI * (j as f64 + 0.5) / h as f64;
+        let row: Vec<f64> = (0..w)
+            .map(|i| {
+                let c = e.rgb[j * w + i];
+                lum([c[0] as f64, c[1] as f64, c[2] as f64]).max(0.0) * th.sin()
+            })
+            .collect();
+        let c = cdf(&row);
+        for i in 0..w {
+            let t = e.rgb[j * w + i];
+            envt.push([t[0], t[1], t[2], c[i]]);
+        }
+        rows.push(row.iter().sum::<f64>());
+    }
+    let mc = cdf(&rows);
+    let tot: f64 = rows.iter().sum();
+    for j in 0..h {
+        envt.push([mc[j], (rows[j] / tot.max(1e-30)) as f32, 0.0, 0.0]);
+    }
+    let env = [w as u32, h as u32, 1, (w * h) as u32];
+    (envt, env)
+}
+
 fn cdf(w: &[f64]) -> Vec<f32> {
     let s: f64 = w.iter().sum();
     let mut acc = 0.0;
@@ -355,33 +387,10 @@ impl GpuLook {
             }
         }
         // Materials, portal skies after the world in one buffer.
-        let mut envt: Vec<[f32; 4]> = Vec::new();
-        let mut env = [0u32; 4];
-        if let Some(e) = &scene.env {
-            let (w, h) = (e.size.0 as usize, e.size.1 as usize);
-            let mut rows = Vec::with_capacity(h);
-            for j in 0..h {
-                let th = std::f64::consts::PI * (j as f64 + 0.5) / h as f64;
-                let row: Vec<f64> = (0..w)
-                    .map(|i| {
-                        let c = e.rgb[j * w + i];
-                        lum([c[0] as f64, c[1] as f64, c[2] as f64]).max(0.0) * th.sin()
-                    })
-                    .collect();
-                let c = cdf(&row);
-                for i in 0..w {
-                    let t = e.rgb[j * w + i];
-                    envt.push([t[0], t[1], t[2], c[i]]);
-                }
-                rows.push(row.iter().sum::<f64>());
-            }
-            let mc = cdf(&rows);
-            let tot: f64 = rows.iter().sum();
-            for j in 0..h {
-                envt.push([mc[j], (rows[j] / tot.max(1e-30)) as f32, 0.0, 0.0]);
-            }
-            env = [w as u32, h as u32, 1, (w * h) as u32];
-        }
+        let (mut envt, env) = match &scene.env {
+            Some(e) => pack_env(e),
+            None => (Vec::new(), [0u32; 4]),
+        };
         let mut sky_off = Vec::new();
         for q in &scene.portal_skies {
             sky_off.push(envt.len() as u32);
@@ -840,6 +849,7 @@ impl GpuLook {
             size: scene.size,
             flags: [pixels as u32, n_emit as u32, n_portal as u32, 0],
             sun,
+            b_env: b_env.clone(),
             picks,
             picks_peak,
             env,
@@ -889,6 +899,11 @@ impl GpuLook {
             gres: [self.grid.1[0], self.grid.1[1], self.grid.1[2], gflags],
             gres2: [GDEPTH, self.grid.2, 64, 0],
         }
+    }
+
+    /// The `env` parameter word (texel size, presence).
+    pub(super) fn env_word(&self) -> [u32; 4] {
+        self.env
     }
 
     // M1 accessors for `sensor::render_batch`.

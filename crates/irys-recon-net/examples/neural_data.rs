@@ -24,6 +24,8 @@ fn main() {
     let spp: u32 = arg(&a, "--spp", 32);
     let preview: usize = arg(&a, "--preview", 0);
     let domain = if arg(&a, "--domain", "a".to_string()) == "b" { Domain::B } else { Domain::A };
+    // v3: also keep the photo at `hi ×` (the compare image's target).
+    let hi: usize = arg(&a, "--hi", 0);
     std::fs::create_dir_all(&out).unwrap();
     let ctx = irys_diff::gpu::context().expect("gpu");
     let t0 = std::time::Instant::now();
@@ -33,7 +35,17 @@ fn main() {
     while done < n {
         let m = shard.min(n - done);
         let s0 = seed0 + done as u64;
-        let samples = generate(ctx, s0, m, domain, spp);
+        let samples = if hi > 0 {
+            let both = irys_recon_net::data::generate_hi(ctx, s0, m, domain, spp, hi);
+            let dir = out.join(format!("{prefix}-hi"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for (s, img) in &both {
+                img.save(dir.join(format!("{}.png", s.scene.seed))).unwrap();
+            }
+            both.into_iter().map(|x| x.0).collect()
+        } else {
+            generate(ctx, s0, m, domain, spp)
+        };
         objects += samples.iter().map(|s| s.scene.objects.len()).sum::<usize>();
         if k == 0 {
             for s in samples.iter().take(preview) {
