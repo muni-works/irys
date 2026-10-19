@@ -278,3 +278,19 @@ fn sigma_follows_what_the_pixel_sees() {
     assert!(seen.iter().all(|&n| n > 20), "{seen:?}");
 }
 
+#[test]
+fn render_batch_matches_render() {
+    let Some(ctx) = gpu() else { return };
+    let (g, cams) = five_cameras(ctx, (40, 30));
+    // the path tracer: batch = singles, bit for bit; spectrum optional
+    let o = Opts { spp: 3, max_bounces: 3, ..Opts::default() };
+    let fb = g.render_batch(&cams, &o, true);
+    let fb2 = g.render_batch(&cams, &o, false);
+    for (i, cam) in cams.iter().enumerate() {
+        let f = g.render(cam, &o);
+        assert_eq!(f.rgb, fb[i].rgb, "camera {i}");
+        assert_eq!(f.spectrum, fb[i].spectrum);
+        assert_eq!(f.rgb, fb2[i].rgb);
+        assert!(fb2[i].spectrum.is_empty());
+    }
+}

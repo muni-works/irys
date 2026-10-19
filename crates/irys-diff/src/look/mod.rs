@@ -24,6 +24,8 @@ pub mod scene;
 pub mod scene_gpu;
 // M1 (docs/belief-codec.md): splats in the scene kernel, the sensor kernel
 // (AOVs, batched cameras, pinholes, TLAS-only rebuilds).
+#[cfg(all(feature = "gpu", feature = "assets"))]
+pub mod batch;
 #[cfg(feature = "assets")]
 pub mod pinhole;
 #[cfg(all(feature = "gpu", feature = "assets"))]
