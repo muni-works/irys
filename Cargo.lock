@@ -1121,6 +1121,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "irys-recon-net"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "irys-core",
+ "irys-diff",
+ "irys-gpu",
+ "irys-prims",
+ "irys-recon",
+ "kamadak-exif",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tang",
+ "tang-compile",
+ "tang-expr",
+]
+
+[[package]]
 name = "itertools"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
