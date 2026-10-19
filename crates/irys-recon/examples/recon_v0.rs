@@ -1,6 +1,6 @@
 //! The v0 gate: 20 random parts, recovered from irys renders.
 //!
-//! `cargo run --release -p irys-recon --example recon_v0 -- [--seeds A..B] [--views N] [--out DIR] [--single]`
+//! `cargo run --release -p irys-recon --example recon_v0 -- [--seeds A..B] [--views N] [--out DIR] [--v0-search]`
 //!
 //! Writes `DIR/report.json` and `DIR/report.md` (per part: pass/fail,
 //! topology, dimension errors, iterations, renders, time), and with
@@ -44,6 +44,9 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let (mut seeds, mut views, mut out) = (GATE, 3usize, PathBuf::from("out/recon_v0"));
     let mut rescore = false;
+    // v1's search (a beam of 2, four finalists at full resolution) unless
+    // `--v0-search` asks for v0's (one state, the winner alone).
+    let mut opts = Options::default();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--seeds" => {
@@ -54,6 +57,7 @@ fn main() {
             "--views" => views = args.next().unwrap().parse().unwrap(),
             "--out" => out = args.next().unwrap().into(),
             "--rescore" => rescore = true,
+            "--v0-search" => opts = Options::v0(),
             _ => panic!("unknown argument {a}"),
         }
     }
@@ -81,7 +85,7 @@ fn main() {
         let truth = generate::program(seed);
         let t = target(&truth, &setup, TARGET_SPP, 1_000_003 * seed + 11).unwrap();
         let tg = Target::new(t.clone(), &bg, setup.film.size);
-        let r = recover(&tg, &bg, &setup, TARGET_SPP, &mut Algorithmic, &Options::default());
+        let r = recover(&tg, &bg, &setup, TARGET_SPP, &mut Algorithmic, &opts);
         let topology_ok = canon::same_topology(&truth, &r.program);
         let errors = canon::errors(&truth, &r.program).unwrap_or_default();
         let max_error_mm = topology_ok.then(|| errors.iter().fold(0.0f64, |m, e| m.max(e.1)));

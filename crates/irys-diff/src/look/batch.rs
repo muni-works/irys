@@ -16,13 +16,17 @@ impl GpuLook {
     pub(crate) fn encode_frame(&self, enc: &mut wgpu::CommandEncoder, cam: &Camera, o: &Opts, slot: &mut usize) {
         let pixels = self.pixels();
         let chunk = super::scene_gpu::CHUNK;
-        assert!(*slot + o.spp as usize * pixels.div_ceil(chunk) <= RING, "more dispatches than the ring holds");
+        let k = o.regen.max(1);
+        assert!(*slot + o.spp.div_ceil(k) as usize * pixels.div_ceil(chunk) <= RING, "more dispatches than the ring holds");
         enc.clear_buffer(self.accum_buf(), 0, None);
         enc.clear_buffer(self.spec_buf(), 0, None);
-        for s in 0..o.spp {
+        // render()'s schedule (k samples per dispatch, path regeneration),
+        // without guiding: a guide is rebuilt between dispatches.
+        for s in (0..o.spp).step_by(k as usize) {
+            let ns = k.min(o.spp - s);
             for first in (0..pixels).step_by(chunk) {
                 let n = (pixels - first).min(chunk);
-                let p = self.params_bytes(cam, o, s, first as u32);
+                let p = self.params_bytes(cam, o, s, ns, first as u32);
                 let at = (*slot * self.slot_bytes()) as u64;
                 self.ctx().queue.write_buffer(self.params_buf(), at, &p);
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
@@ -35,14 +39,14 @@ impl GpuLook {
         }
     }
 
-    /// [`GpuLook::render`] for every camera in `cams`: every sample of every
+    /// [`GpuLook::render`] (guiding off) for every camera in `cams`: every sample of every
     /// camera encoded in one submit (at most [`RING`] dispatches each), one
     /// wait, one readback. The spectrum is read back only when `spectrum`.
     pub fn render_batch(&self, cams: &[Camera], o: &Opts, spectrum: bool) -> Vec<Frame> {
         let (dev, queue) = (&self.ctx().device, &self.ctx().queue);
         let pixels = self.pixels();
         let chunk = super::scene_gpu::CHUNK;
-        let per_cam = o.spp as usize * pixels.div_ceil(chunk);
+        let per_cam = o.spp.div_ceil(o.regen.max(1)) as usize * pixels.div_ceil(chunk);
         assert!(per_cam <= RING, "one camera needs more dispatches than the ring holds");
         let groups = pixels.div_ceil(64);
         let bins = super::scene_gpu::BINS;
@@ -89,7 +93,7 @@ impl GpuLook {
                 } else {
                     Vec::new()
                 };
-                Frame { rgb, spectrum, seconds: seconds / cams.len() as f64 }
+                Frame { rgb, spectrum, seconds: seconds / cams.len() as f64, stats: None }
             })
             .collect()
     }

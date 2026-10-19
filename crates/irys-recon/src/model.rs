@@ -18,6 +18,11 @@ pub struct Setup {
     pub seed: u64,
     /// Coverage supersampling per axis.
     pub coverage_sub: usize,
+    /// v1: the photo model. When set, `views`, `film.spp` and
+    /// `coverage_sub` are unused and every render is
+    /// [`crate::photo::eval`]'s.
+    #[serde(skip)]
+    pub photo: Option<std::sync::Arc<crate::photo::Rig>>,
 }
 
 impl Setup {
@@ -29,7 +34,36 @@ impl Setup {
             edge_samples: 40_000,
             seed: 7,
             coverage_sub: 3,
+            photo: None,
         }
+    }
+
+    /// v1: the photo model's setup for `rig` (film from its first view).
+    pub fn photo(rig: crate::photo::Rig, edge_samples: usize) -> Self {
+        let size = rig.views[0].cam.size;
+        Self {
+            views: Vec::new(),
+            film: Film { size, spp: 1 },
+            edge_samples,
+            seed: 7,
+            coverage_sub: rig.ss,
+            photo: Some(std::sync::Arc::new(rig)),
+        }
+    }
+
+    /// Number of views (photos, in v1).
+    pub fn n_views(&self) -> usize {
+        self.photo.as_ref().map_or(self.views.len(), |r| r.views.len())
+    }
+
+    /// The same setup on a film `s` times the size.
+    pub fn scaled(&self, s: f64) -> Self {
+        let mut o = self.clone();
+        o.film.size = ((self.film.size.0 as f64 * s).round() as usize, (self.film.size.1 as f64 * s).round() as usize);
+        if let Some(r) = &self.photo {
+            o.photo = Some(std::sync::Arc::new(r.scaled(s)));
+        }
+        o
     }
 }
 
@@ -61,6 +95,9 @@ impl Renderer {
 
     /// Render `prog` in every view of `setup`; with `jac`, its Jacobian.
     pub fn eval(&mut self, prog: &Program, setup: &Setup, jac: bool) -> Result<Eval, String> {
+        if let Some(rig) = &setup.photo {
+            return crate::photo::eval(prog, rig, setup.edge_samples, setup.seed, jac);
+        }
         let solid = prog.build()?;
         let mesh = geom::mesh(&solid);
         let np = prog.params().len();

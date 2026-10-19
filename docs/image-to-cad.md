@@ -293,3 +293,108 @@ thinner.
   covers. Blind holes and pockets need views into them (identifiability: from
   58° elevation no view reaches the floor of a 3.6 mm hole in a 16 mm plate),
   which is v2's multi-view gate.
+
+## v1 (one photo + an AprilTag, synthetic photos, 2026-10-19)
+
+Built in `crates/irys-recon` (new: `tag`, `photo`, `look`, `segment`,
+`export`, `v1`; examples `recon_v1`, `recon_photo`, `recon_kit`,
+`recon_jaccheck`). No real photo exists yet; v1 is validated on synthetic
+phone photos. Per-part tables: `docs/recon-v1-report.md` (`.json`).
+
+**Synthetic gate (seeds 3000–3019, v0's gate parts, one photo each): 2/20
+pass at 0.5 mm, 6/20 at 1 mm; topology right on 11/20.** Pose on the tag
+plane is the strong part: median |Δx|, |Δy| ≈ 0.25 mm, yaw within 0.15°
+on every part whose base was right; focal from EXIF+tag within ±0.6 %.
+
+### Method
+
+- **Tag** (`tag.rs`): `kornia-apriltag` (pure Rust, Apache-2.0; the tag36h11
+  table is AprilRobotics', BSD-2) finds the quad (tried at decimation 2, 3, 4,
+  1: at full resolution it misses large tags); corners are matched to the tag
+  frame by decoding all eight assignments, refined by line fits to the
+  gradient maximum along each side **on linear light** (on sRGB values the
+  edge shifts to the dark side: the camera came out 0.6 % far), and the camera
+  (pose + focal, principal point at the centre) is solved by LM with the EXIF
+  35 mm-equivalent focal as a 2 % prior (one tag trades focal against
+  distance; free, it drifted 1.4 %).
+- **Pose** (`photo.rs`, `Program::pose`): `(x, y, yaw)` on the tag plane,
+  last in the parameter vector. The model renderer is deterministic: G-buffer
+  (`ss²` rays/pixel), AO from 16 fixed rays, a soft key from 8 shadow rays,
+  closed-form shading. Jacobian: v0's primary edge term on world vertex
+  velocities (pose columns are rigid velocities), the **key's shadow edges on
+  the same velocities** (2f's secondary term: `dS = v − (m·v / m·l) l`), and a
+  yaw interior term. `recon_jaccheck` vs central differences: with the shadow
+  term the base and pose columns go from ratio 0.42–0.58 to 0.85–0.90
+  (cosines 0.65–0.76 → 0.92–0.95); boss columns from 0.33–0.55 to 0.71–0.84.
+  The counterbore depth stays wrong-signed (its signal is AO, not
+  differentiated), so **the forward-difference columns stay** for
+  counterbores and bosses (cheap now: a render is 0.25 s).
+- **Appearance** (`look.rs`): OpenPBR glossy-diffuse at `base_color`,
+  `specular_roughness`, `specular_ior` (Lambert under a GGX dielectric,
+  single scatter); L2 SH irradiance × AO plus one key; table albedo as unit;
+  sRGB then a fitted power. Robust IRLS linear solve for SH/key/albedo (ridge
+  on SH orders > 0), grid + coordinate search for key direction, key radius,
+  roughness, gamma; per-channel colour with the grey light's shape. Colour
+  recovered well (seed 3001: 0.81, 0.60, 0.02 vs 0.80, 0.62, 0.04 after the
+  backdrop's albedo).
+- **Noise**: Huber (1.5σ), σ by MAD of the base fit's residual, scaled by the
+  residual's integrated autocorrelation area on the table (the appearance
+  model's misses are smooth, so pixels are not independent).
+- **Segmentation** (`segment.rs`): backdrop = median chromaticity + robust
+  quadratic luminance over table points (the tag plane gives every pixel's
+  table point; the tag's 100 mm square excluded); part = far chromaticity or
+  out-of-range luminance, edges joined, majority filter. Holes kept. Plus a
+  **chromatic coverage term** in the fit: chromaticity projected on
+  backdrop→part is an observed coverage, independent of shading, residual
+  `cov − cov_obs` against the edge term's `∂cov/∂θ`.
+- **Base**: one silhouette trades plate depth against height (and reads a
+  boss as a taller plate), so `init_bases` gives the best box per height band
+  and each is lit and fitted on the image; the lowest robust cost wins
+  (a silhouette-only settle collapses all starts to the tall one).
+- **Search fixes**: beam of 2, the best 4 distinct programs refitted at full
+  resolution (degenerate refits refused), one-view boss proposals at three
+  heights with the centre moved back along the view. `Options::v0()` keeps v0's.
+- **Synthetic photos** (`recon_v1 render`): `look::scene_gpu`, PLA OpenPBR in
+  six saturated colours (roughness 0.35–0.6), a 90 mm tag sheet (textured) on
+  a grey paper backdrop, the pavilion world turned at random or a synthetic
+  room (window + ceiling panel), a key disc 3–10°, phone camera (26 mm eq.,
+  2016×1512), defocus σ 0.7 px, Poisson–Gaussian noise, sRGB × extra power
+  0.9–1.1, JPEG 85–92, EXIF focal. 320 spp; some fireflies survive on faces
+  lit by the room's window.
+
+### Where it fails
+
+- **Search/topology (9/20)**: counterbores read as plain holes (3011, 3017,
+  3018: the step's AO shading is what the model gets least right), features
+  never proposed (3005, 3013, 3019 recover the bare base: residual blobs from
+  lighting mismatch outrank them), hallucinated bosses from highlights
+  (3002, 3003).
+- **Boss height / plate height trade (4/20 with right topology but > 1 mm)**:
+  3006, 3008, 3010 pick a too-tall plate (by 5–13 mm); 3007's boss 6 mm short.
+  One view cannot separate them except through shading, and the shading
+  model is where the bias is.
+- **Bias floor**: on passing parts errors are 0.3–0.9 mm, mostly heights and
+  depths. Self-consistency (target rendered by the model itself) recovers h to
+  0.04 mm, so the floor is appearance mismatch (interreflection, the window's
+  sharp reflection, contact shading), not the solver.
+- Fisher σ remain optimistic even after the correlation scaling.
+
+### What the real photo will test, and risks
+
+- EXIF/phone processing (HDR tone curves, sharpening, lens distortion:
+  none modelled; principal point assumed centred).
+- Real light: several sources, a coloured room; the SH+key model is the
+  weakest link already in synthetic.
+- Print reality: layer lines, elephant's foot (bottom edge +0.2–0.4 mm),
+  translucency of thin PLA (no subsurface in the model).
+- Segmentation needs colour contrast: white/grey/black parts on white paper
+  will not segment.
+- Single view: plate height vs boss/plate-depth ambiguity; three photos
+  (supported: shared pose, one look per photo) are the recommended capture.
+- Runtime 30 s–20 min per part under load (CPU only).
+
+### Next
+
+Multi-view on the real kit photos first; an AO derivative (secondary edges for
+the AO rays) to drop the counterbore FD columns; a two-light or
+environment-map appearance; a proposer with a prior (the v0 list stands).

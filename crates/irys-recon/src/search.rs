@@ -112,11 +112,14 @@ pub struct Blob {
 /// normal) and whose blurred residual exceeds 4σ, grouped into connected
 /// components, back-projected to the top face and merged across views.
 pub fn blobs(fit: &Fit, setup: &Setup) -> Vec<Blob> {
+    if let Some(rig) = &setup.photo {
+        return crate::photo::blobs(fit, rig);
+    }
     let Ok(solid) = fit.prog.build() else { return Vec::new() };
     let mesh = crate::geom::mesh(&solid);
     let h = fit.prog.h;
     let (w, ht) = setup.film.size;
-    let mut per_view: Vec<(Vec<(f64, f64)>, usize)> = Vec::new();
+    let mut tops = Vec::new();
     let mut eyes = Vec::new();
     for (vi, v) in setup.views.iter().enumerate() {
         let sc = render::scene(Some(&mesh), v, setup.film);
@@ -138,6 +141,16 @@ pub fn blobs(fit: &Fit, setup: &Setup) -> Vec<Blob> {
                 }
             }
         }
+        tops.push(top);
+    }
+    blobs_from(&tops, (w, ht), &eyes, h)
+}
+
+/// Blobs from per-view maps of residual pixels on the top face (their
+/// part-frame `(x, y)`), the eyes in the part frame, the top's height.
+pub fn blobs_from(tops: &[Vec<Option<(f64, f64)>>], (w, ht): (usize, usize), eyes: &[Point3], h: f64) -> Vec<Blob> {
+    let mut per_view: Vec<(Vec<(f64, f64)>, usize)> = Vec::new();
+    for (vi, top) in tops.iter().enumerate() {
         // Connected components (4-neighbour).
         let mut seen = vec![false; w * ht];
         for p in 0..w * ht {
@@ -183,12 +196,23 @@ pub fn blobs(fit: &Fit, setup: &Setup) -> Vec<Blob> {
     let mut v: Vec<Blob> = out
         .into_iter()
         .map(|(mut b, _, cs)| {
-            b.raised = parallax(&cs, &eyes, h);
+            b.raised = parallax(&cs, eyes, h);
             b
         })
         .collect();
     v.sort_by(|a, b| b.pixels.cmp(&a.pixels).then(a.x.total_cmp(&b.x)));
     v
+}
+
+/// The eyes in the part frame, per view.
+pub fn eyes(fit: &Fit, setup: &Setup) -> Vec<Point3> {
+    match &setup.photo {
+        Some(rig) => {
+            let pose = fit.prog.pose.unwrap_or([0.0; 3]);
+            rig.views.iter().map(|v| crate::photo::unplace(pose, v.cam.eye())).collect()
+        }
+        None => setup.views.iter().map(|v| Point3::new(v.eye[0], v.eye[1], v.eye[2])).collect(),
+    }
 }
 
 /// A raised cylinder's footprint on `z = h`, seen from eye `e`, is the hull
@@ -311,6 +335,23 @@ impl Algorithmic {
                     why: format!("boss by parallax ({bx:.1}, {by:.1}) height {bh:.1}"),
                     group: Some(bi),
                 });
+            } else if let Some(e) = eyes(ctx.fit, ctx.setup).first() {
+                // One view (v1): no parallax, so a boss of each of a few
+                // heights, its centre moved back along the view by half its
+                // height (the blob is its base and its top disc, the top
+                // pushed away from the eye by `bh · t`).
+                let drop = e.z - p.h;
+                if drop > 1.0 {
+                    let t = ((x - e.x) / drop, (y - e.y) / drop);
+                    for bh in [3.0, 6.0, 10.0] {
+                        let (bx, by) = (x - 0.5 * bh * t.0, y - 0.5 * bh * t.1);
+                        out.push(Proposal {
+                            program: with(Feature::Boss { x: bx, y: by, r: (0.8 * r).max(1.0), bh }),
+                            why: format!("boss of height {bh} at blob ({bx:.1}, {by:.1})"),
+                            group: Some(bi),
+                        });
+                    }
+                }
             }
         }
         // Several blobs of one size: holes all at once, or a pattern.
@@ -561,7 +602,7 @@ pub fn force_linear(holes: &[(f64, f64, f64)]) -> Option<Feature> {
             *dy = 0.0;
         }
     }
-    let p = Program { w: 1.0, d: 1.0, h: 1.0, corner: Corner::Sharp, features: vec![f] };
+    let p = Program { w: 1.0, d: 1.0, h: 1.0, corner: Corner::Sharp, features: vec![f], pose: None };
     canon::canonical(&p).features.into_iter().next().or(Some(Feature::LinearHoles { x: x0, y: y0, dx, dy, r, n }))
 }
 
@@ -604,11 +645,34 @@ pub struct Options {
     pub workers: usize,
     /// Most rounds.
     pub rounds: usize,
+    /// States kept per round (v1: 2; v0 was 1).
+    pub beam: usize,
+    /// Distinct programs refitted at full resolution before the verdict
+    /// (v1: 4; v0 refitted the search's winner alone).
+    pub finalists: usize,
+    /// The noise variance at (search, full) resolution, when known (the
+    /// photo model is deterministic, so it cannot be measured from two
+    /// seeds of itself; [`crate::v1`] measures it from the residual).
+    pub sigma2: Option<(f64, f64)>,
+    /// Huber threshold in σ (v1), or Gaussian (`None`, v0).
+    pub huber: Option<f64>,
+    /// The photo model's linear appearance (SH, key, albedo) is refitted
+    /// on the leading state after every round.
+    pub refit_look: bool,
+    /// Start from this program instead of the silhouettes' box.
+    pub base: Option<Program>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { workers: 8, rounds: 8 }
+        Self { workers: 8, rounds: 8, beam: 2, finalists: 4, sigma2: None, huber: None, refit_look: true, base: None }
+    }
+}
+
+impl Options {
+    /// v0's search: one state, the winner alone refitted.
+    pub fn v0() -> Self {
+        Self { beam: 1, finalists: 1, ..Self::default() }
     }
 }
 
@@ -673,12 +737,14 @@ fn init_base(target: &Target, setup: &Setup) -> Program {
             best = (iou, bw, bd, bh);
         }
     }
-    Program { w: best.1, d: best.2, h: best.3, corner: Corner::Sharp, features: Vec::new() }
+    Program { w: best.1, d: best.2, h: best.3, corner: Corner::Sharp, features: Vec::new(), pose: None }
 }
 
 /// Recover a program from a full-resolution target. The search runs at
-/// half resolution (`setup_full` halved, the target box-downsampled); the
-/// winner is refitted and scored at full resolution.
+/// half resolution (`setup_full` halved, the target box-downsampled) with
+/// a beam of [`Options::beam`] states; the best [`Options::finalists`]
+/// distinct programs it saw are refitted and scored at full resolution,
+/// and the lowest description wins.
 pub fn recover(
     target_full: &Target,
     background_full: &[Vec<f64>],
@@ -688,29 +754,58 @@ pub fn recover(
     opts: &Options,
 ) -> Recovery {
     let t0 = Instant::now();
-    let target = target_full.half(background_full);
-    let mut setup = setup_full.clone();
-    setup.film.size = target.size;
-    setup.edge_samples = setup_full.edge_samples / 3;
-    setup.film.spp = (setup_full.film.spp / 2).max(4);
-    let base = init_base(&target, &setup);
-    let probe = Fitter::new(setup.clone(), target.clone(), target_spp, &base);
-    let sigma2 = probe.sigma2;
-    let mut fitters: Vec<Fitter> =
-        (0..opts.workers).map(|_| Fitter::with_sigma2(setup.clone(), target.clone(), sigma2)).collect();
+    let photo = setup_full.photo.is_some();
+    let (target, mut setup) = if photo {
+        let mut s = setup_full.scaled(0.5);
+        s.edge_samples = setup_full.edge_samples / 3;
+        (target_full.half_masks(), s)
+    } else {
+        let target = target_full.half(background_full);
+        let mut setup = setup_full.clone();
+        setup.film.size = target.size;
+        setup.edge_samples = setup_full.edge_samples / 3;
+        setup.film.spp = (setup_full.film.spp / 2).max(4);
+        (target, setup)
+    };
+    let base = match (&opts.base, &setup.photo) {
+        (Some(b), _) => b.clone(),
+        (None, Some(rig)) => crate::photo::init_base(&target, rig),
+        (None, None) => init_base(&target, &setup),
+    };
+    let (sigma2, sigma2_full) = match opts.sigma2 {
+        Some(s) => s,
+        None => (Fitter::new(setup.clone(), target.clone(), target_spp, &base).sigma2, f64::NAN),
+    };
+    let make = |setup: &Setup| -> Vec<Fitter> {
+        (0..opts.workers).map(|_| Fitter::with_sigma2(setup.clone(), target.clone(), sigma2).robust(opts.huber)).collect()
+    };
+    let mut fitters = make(&setup);
     let (mut iters, mut evals) = (0usize, 2usize);
     let mut cur = fitters[0].fit(&base, &fit::schedule()).expect("the base box fits");
     iters += cur.iters;
     evals += cur.evals;
-    let mut cur_score = mdl::score(&cur);
+    if photo && opts.refit_look {
+        setup = refit_looks(&cur.prog, &setup, &target);
+        fitters = make(&setup);
+        cur = fitters[0].fit(&cur.prog, &fit::short()).unwrap_or(cur);
+    }
+    let cur_score = mdl::score(&cur);
     let mut trace = vec![Step { round: 0, why: "base box from silhouettes".into(), program: cur.prog.to_text(), score: Some(cur_score), accepted: true }];
     let mut accepted = vec![(cur.prog.to_text(), cur_score)];
+    let key = |p: &Program| format!("{}|{}", canon::canonical(p).signature(), round_text(&canon::canonical(p)));
+    let mut beam: Vec<(Fit, Score)> = vec![(cur, cur_score)];
+    // Every fitted candidate, for the finalists: (score, round, fit).
+    let mut pool: Vec<(Score, usize, Fit)> = Vec::new();
+    let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
     for round in 1..=opts.rounds {
-        let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let ctx = Context { fit: &cur, score: cur_score, target: &target, setup: &setup, history: &trace };
-        let mut props = proposer.propose(&ctx);
-        // Drop invalid and already-tried structures-at-parameters.
-        props.retain(|p| p.program.valid() && p.program.signature() + &round_text(&p.program) != cur.prog.signature() + &round_text(&cur.prog));
+        let mut props: Vec<Proposal> = Vec::new();
+        for (bf, bs) in &beam {
+            let ctx = Context { fit: bf, score: *bs, target: &target, setup: &setup, history: &trace };
+            let mut ps = proposer.propose(&ctx);
+            ps.retain(|p| p.program.valid() && p.program.signature() + &round_text(&p.program) != bf.prog.signature() + &round_text(&bf.prog));
+            props.extend(ps);
+        }
+        // Drop already-tried structures-at-parameters (this round and before).
         props.retain(|p| tried.insert(format!("{}|{}", p.program.signature(), round_text(&p.program))));
         if props.is_empty() {
             break;
@@ -730,8 +825,8 @@ pub fn recover(
                 all
             })
         };
-        let mut best: Option<(usize, Fit, Score)> = None;
         let first = trace.len();
+        let mut fresh: Vec<(Fit, Score, usize)> = Vec::new();
         for (i, r) in results {
             match r {
                 Ok(f) if degenerate(&f.prog).is_some() => {
@@ -745,19 +840,18 @@ pub fn recover(
                     evals += f.evals;
                     let s = mdl::score(&f);
                     trace.push(Step { round, why: props[i].why.clone(), program: f.prog.to_text(), score: Some(s), accepted: false });
-                    if best.as_ref().is_none_or(|b| s.total < b.2.total) {
-                        best = Some((trace.len() - 1, f, s));
-                    }
+                    fresh.push((f, s, trace.len() - 1));
                 }
                 Err(e) => trace.push(Step { round, why: props[i].why.clone(), program: format!("error: {e}"), score: None, accepted: false }),
             }
         }
         // Combine: the best fitted interpretation of each piece of evidence
-        // that beats the current program on its own, all at once.
+        // that beats the leading state on its own, all at once.
+        let lead = beam[0].1.total;
         let mut by_group: std::collections::BTreeMap<usize, (f64, Feature)> = std::collections::BTreeMap::new();
         for (k, step) in trace[first..].iter().enumerate() {
             let (Some(g), Some(sc)) = (props.get(k).and_then(|p| p.group), step.score) else { continue };
-            if sc.total >= cur_score.total || step.why.contains("degenerate") {
+            if sc.total >= lead || step.why.contains("degenerate") {
                 continue;
             }
             let Ok(prog) = Program::from_text(&step.program) else { continue };
@@ -767,42 +861,120 @@ pub fn recover(
             }
         }
         if by_group.len() >= 2 {
-            let mut q = cur.prog.clone();
+            let mut q = beam[0].0.prog.clone();
             q.features.extend(by_group.values().map(|(_, f)| f.clone()));
             let why = format!("combine the best of {} blobs", by_group.len());
             if q.valid() {
-                match fitters[0].fit(&q, &fit::short()) {
-                    Ok(f) if degenerate(&f.prog).is_none() => {
+                if let Ok(f) = fitters[0].fit(&q, &fit::short()) {
+                    if degenerate(&f.prog).is_none() {
                         iters += f.iters;
                         evals += f.evals;
                         let s = mdl::score(&f);
                         trace.push(Step { round, why, program: f.prog.to_text(), score: Some(s), accepted: false });
-                        if best.as_ref().is_none_or(|b| s.total < b.2.total) {
-                            best = Some((trace.len() - 1, f, s));
-                        }
+                        fresh.push((f, s, trace.len() - 1));
                     }
-                    _ => {}
                 }
             }
         }
-        match best {
-            Some((ti, f, s)) if s.total < cur_score.total => {
-                trace[ti].accepted = true;
-                cur = f;
-                cur_score = s;
-                accepted.push((cur.prog.to_text(), cur_score));
+        for (f, s, _) in &fresh {
+            pool.push((*s, round, f.clone()));
+        }
+        // The new beam: the best distinct programs of the old beam and the
+        // fresh fits.
+        let old: Vec<String> = beam.iter().map(|(f, _)| key(&f.prog)).collect();
+        let mut all: Vec<(Fit, Score, Option<usize>)> = beam.drain(..).map(|(f, s)| (f, s, None)).collect();
+        all.extend(fresh.into_iter().map(|(f, s, ti)| (f, s, Some(ti))));
+        all.sort_by(|a, b| a.1.total.total_cmp(&b.1.total));
+        let mut seen = std::collections::HashSet::new();
+        for (f, s, ti) in all {
+            if beam.len() == opts.beam.max(1) {
+                break;
             }
-            _ => break,
+            if !seen.insert(key(&f.prog)) {
+                continue;
+            }
+            if let Some(ti) = ti {
+                if beam.is_empty() {
+                    trace[ti].accepted = true;
+                }
+            }
+            beam.push((f, s));
+        }
+        let new: Vec<String> = beam.iter().map(|(f, _)| key(&f.prog)).collect();
+        if new[0] != old[0] {
+            accepted.push((beam[0].0.prog.to_text(), beam[0].1));
+            if photo && opts.refit_look {
+                setup = refit_looks(&beam[0].0.prog, &setup, &target);
+                fitters = make(&setup);
+                for b in beam.iter_mut() {
+                    if let Ok(f) = fitters[0].fit(&b.0.prog, &[Level { sigma: 0.0, lambda: 0.0, iters: 0 }]) {
+                        evals += 1;
+                        b.1 = mdl::score(&f);
+                        b.0 = f;
+                    }
+                }
+                beam.sort_by(|a, b| a.1.total.total_cmp(&b.1.total));
+            }
+        }
+        if new == old {
+            break;
         }
     }
-    // Full resolution: canonicalise, refit, score, judge.
-    let prog = canon::canonical(&cur.prog);
-    let mut full = Fitter::new(setup_full.clone(), target_full.clone(), target_spp, &prog);
+    // Finalists: the beam, then the best of the pool, distinct after the
+    // normal form.
+    let mut finalists: Vec<Program> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut ranked: Vec<(f64, Program)> = beam.iter().map(|(f, s)| (s.total - 1e-9, f.prog.clone())).collect();
+    pool.sort_by(|a, b| a.0.total.total_cmp(&b.0.total));
+    ranked.extend(pool.iter().map(|(s, _, f)| (s.total, f.prog.clone())));
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (_, p) in ranked {
+        if finalists.len() == opts.finalists.max(1) {
+            break;
+        }
+        let c = canon::canonical(&p);
+        if seen.insert(c.signature()) {
+            finalists.push(c);
+        }
+    }
+    // Full resolution: refit and score each; the photo model takes the
+    // search's appearance with it.
+    let mut setup_full = setup_full.clone();
+    if let (Some(full), Some(half)) = (&setup_full.photo, &setup.photo) {
+        let mut r = (**full).clone();
+        for (a, b) in r.views.iter_mut().zip(&half.views) {
+            a.look = b.look;
+        }
+        setup_full.photo = Some(std::sync::Arc::new(r));
+    }
     let levels = [Level { sigma: 1.0, lambda: 0.0, iters: 3 }, Level { sigma: 0.0, lambda: 0.0, iters: 8 }];
-    let fit = full.fit(&prog, &levels).unwrap_or_else(|_| full.fit(&cur.prog, &levels).expect("the search's winner refits"));
-    iters += fit.iters;
-    evals += fit.evals + 2;
-    let score = mdl::score(&fit);
+    let mut best: Option<(Fit, Score)> = None;
+    let mut finals = Vec::new();
+    for prog in &finalists {
+        let mut full = if photo {
+            Fitter::with_sigma2(setup_full.clone(), target_full.clone(), sigma2_full).robust(opts.huber)
+        } else {
+            Fitter::new(setup_full.clone(), target_full.clone(), target_spp, prog)
+        };
+        let Ok(f) = full.fit(prog, &levels) else { continue };
+        iters += f.iters;
+        evals += f.evals + 2;
+        if degenerate(&f.prog).is_some() {
+            continue;
+        }
+        let s = mdl::score(&f);
+        finals.push((f.prog.to_text(), s));
+        if best.as_ref().is_none_or(|b| s.total < b.1.total) {
+            best = Some((f, s));
+        }
+    }
+    trace.push(Step { round: usize::MAX, why: format!("finalists at full resolution: {:?}", finals.iter().map(|(p, s)| (p.lines().count(), s.total.round())).collect::<Vec<_>>()), program: String::new(), score: None, accepted: false });
+    let (fit, score) = best.unwrap_or_else(|| {
+        let mut full = Fitter::with_sigma2(setup_full.clone(), target_full.clone(), if photo { sigma2_full } else { sigma2 }).robust(opts.huber);
+        let f = full.fit(&beam[0].0.prog, &levels).expect("the search's winner refits");
+        let s = mdl::score(&f);
+        (f, s)
+    });
     let judge = mdl::judge(&fit);
     Recovery {
         program: canon::canonical(&fit.prog),
@@ -815,6 +987,19 @@ pub fn recover(
         evals,
         seconds: t0.elapsed().as_secs_f64(),
     }
+}
+
+/// The photo model's looks refitted (the linear part) on `prog`.
+fn refit_looks(prog: &Program, setup: &Setup, target: &Target) -> Setup {
+    let Some(rig) = &setup.photo else { return setup.clone() };
+    let mut r = (**rig).clone();
+    for vi in 0..r.views.len() {
+        let w: Vec<f64> = (0..target.img[vi].len()).map(|p| target.w(vi, p)).collect();
+        crate::photo::refit_linear(prog, &mut r, vi, &target.img[vi], &w);
+    }
+    let mut s = setup.clone();
+    s.photo = Some(std::sync::Arc::new(r));
+    s
 }
 
 /// A fitted program that collapsed onto a simpler one — a blend, slot,

@@ -17,6 +17,7 @@ fn sample() -> Program {
             Feature::Slot { x: -15.0, y: -12.0, len: 10.0, r: 2.5, axis: Axis::X },
             Feature::Boss { x: 14.0, y: -10.0, r: 5.0, bh: 6.0 },
         ],
+        pose: None,
     }
 }
 
@@ -44,7 +45,7 @@ fn dsl_round_trips() {
 fn canonical_merges_equivalent_holes() {
     // Three loose holes on a circle at 120° are a circular pattern, and two
     // equal holes a linear one; listing order does not matter.
-    let mut p = Program { w: 80.0, d: 60.0, h: 10.0, corner: Corner::Sharp, features: Vec::new() };
+    let mut p = Program { w: 80.0, d: 60.0, h: 10.0, corner: Corner::Sharp, features: Vec::new(), pose: None };
     for k in [2, 0, 1] {
         let a = (30.0f64 + 120.0 * k as f64).to_radians();
         p.features.push(Feature::Hole { x: 10.0 + 12.0 * a.cos(), y: 5.0 + 12.0 * a.sin(), r: 2.0 });

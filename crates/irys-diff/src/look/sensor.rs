@@ -12,10 +12,9 @@ use irys_gpu::GpuContext;
 use irys_gpu::wgpu;
 
 use super::scene::{Camera, Instance};
-use super::scene_gpu::{GpuLook, SPLAT};
+use super::scene_gpu::{GpuLook, module_source};
 use super::splat_gpu::GpuSplats;
 
-const SCENE: &str = include_str!("scene.wgsl");
 const SENSOR: &str = include_str!("sensor.wgsl");
 
 /// What `GpuLook` keeps for the sensor kernel, the batch and `set_instances`.
@@ -152,6 +151,7 @@ pub struct Sensor {
     cams: wgpu::Buffer,
     out: [wgpu::Buffer; 6],
     sigma_in: wgpu::Buffer,
+    _scene_p: wgpu::Buffer,
     size: (usize, usize),
     max: usize,
     cap: usize,
@@ -173,11 +173,13 @@ impl Sensor {
             // the sensor's splat walk keeps 64 per round (one round per ray
             // on the garage, against 3–4 at 16); the scene kernel keeps 16
             source: wgpu::ShaderSource::Wgsl(
-                format!("enable wgpu_ray_query;\n{SCENE}\n{}\n{SENSOR}", SPLAT.replace("const SPLAT_K: u32 = 16u;", "const SPLAT_K: u32 = 64u;")).into(),
+                format!("{}\n{SENSOR}", module_source().replace("const SPLAT_K: u32 = 16u;", "const SPLAT_K: u32 = 64u;")).into(),
             ),
         });
         let ro = |b| matches!(b, 1..=5 | 60 | 61 | 71 | 76);
-        let bindings: Vec<u32> = (1..=5).chain([11, 60, 61, 62]).chain(70..=78).collect();
+        // 0: a zeroed `Params` of its own (trace_ray reads `P.prof`: 0, no
+        // profiling switches), so the scene's ring is never touched.
+        let bindings: Vec<u32> = (0..=5).chain([11, 60, 61, 62]).chain(70..=78).collect();
         let layout = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("look sensor"),
             entries: &bindings
@@ -187,7 +189,7 @@ impl Sensor {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: match b {
                         11 => wgpu::BindingType::AccelerationStructure { vertex_return: false },
-                        62 | 70 => wgpu::BindingType::Buffer {
+                        0 | 62 | 70 => wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
                             min_binding_size: None,
@@ -224,8 +226,10 @@ impl Sensor {
         let params = buf("look sensor params", 48, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let cams = buf("look sensor cameras", max_cameras as u64 * 64, st);
         let sigma_in = buf("look sensor sigma in", (sh.cap as u64 + 1) * 4, st);
+        let scene_p = buf("look sensor scene params", look.slot_bytes() as u64, wgpu::BufferUsages::UNIFORM);
         let mut ents: Vec<wgpu::BindGroupEntry> = Vec::new();
         for (b, r) in [
+            (0, &scene_p),
             (1, &sh.tris),
             (2, &sh.inst),
             (3, &sh.mats),
@@ -251,7 +255,7 @@ impl Sensor {
         if let Some(e) = pollster::block_on(scope.pop()) {
             panic!("look sensor: {e}");
         }
-        Self { ctx, pipe, group, params, cams, out, sigma_in, size, max: max_cameras, cap: sh.cap, miss_sigma: 0.0, last: (0, 0) }
+        Self { ctx, pipe, group, params, cams, out, sigma_in, _scene_p: scene_p, size, max: max_cameras, cap: sh.cap, miss_sigma: 0.0, last: (0, 0) }
     }
 
     /// The belief's σ per instance slot, the splat layer's, and a miss's;

@@ -16,6 +16,7 @@ pub mod sheen;
 pub mod swatch;
 pub mod volume;
 pub mod hair;
+pub mod light_tree;
 #[cfg(feature = "gpu")]
 pub mod hair_gpu;
 #[cfg(feature = "assets")]

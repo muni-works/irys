@@ -252,3 +252,127 @@ fn four_lanes_are_the_per_lane_path() {
     assert!(d / m < 1e-4, "four-lane path drifts: {}", d / m);
     assert!(far <= a.rgb.len() / 1000);
 }
+
+/// Random spheres under a coloured gradient world and a sun, with small
+/// emissive spheres (lights the camera sees), many emitter triangles: the
+/// scene the samplers, the light tree and guiding are checked on.
+fn lit_scene(size: (usize, usize)) -> LookScene {
+    use irys_diff::look::scene::{Equirect, Sun, mask};
+    let mut rng = Rng::new(31, 0);
+    let mut mats: Vec<Material> = (0..4)
+        .map(|k| {
+            let mut m = random_material(&mut rng, k);
+            m.transmission_dispersion_scale = 0.0;
+            Material::new("m", m)
+        })
+        .collect();
+    let mut lamp = Material::new("lamp", OpenPbr::default());
+    lamp.emission = [6.0, 4.0, 2.0];
+    let mut lamp2 = Material::new("lamp2", OpenPbr::default());
+    lamp2.emission = [0.5, 1.5, 4.0];
+    mats.push(lamp);
+    mats.push(lamp2);
+    let mut s = LookScene::spheres(mats, 1.0, size);
+    // the lamps: small, above the row, lights the camera sees
+    for (k, (x, z, r)) in [(4usize, (-1.5f32, 1.6f32, 0.35f32)), (5, (2.0, 1.4, 0.25))] {
+        s.instances[k].xf = [[r, 0.0, 0.0, x], [0.0, r, 0.0, -0.8], [0.0, 0.0, r, z]];
+        s.instances[k].mask = mask::LIGHT;
+    }
+    let (w, h) = (32usize, 16usize);
+    let rgb = (0..w * h)
+        .map(|i| {
+            let (x, y) = ((i % w) as f32 / w as f32, (i / w) as f32 / h as f32);
+            [0.2 + 0.6 * (1.0 - y), 0.3 + 0.3 * x, 0.6 * (1.0 - y) + 0.1]
+        })
+        .collect();
+    s.env = Some(Equirect { size: (w as u32, h as u32), rgb });
+    let d = [0.4f64, -0.6, 0.7];
+    let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    s.sun = Some(Sun { dir: d.map(|x| x / n), radius: 0.02, radiance: [2000.0, 1900.0, 1700.0] });
+    s
+}
+
+/// A frame's mean and its standard error from `seeds` independent frames.
+fn frame_mean(g: &GpuLook, s: &LookScene, o: Opts, seeds: u64) -> (f64, f64) {
+    let ms: Vec<f64> = (0..seeds)
+        .map(|k| {
+            let f = g.render(&s.camera, &Opts { seed: 1000 + 17 * k, ..o });
+            f.rgb.iter().map(|&x| x as f64).sum::<f64>() / f.rgb.len() as f64
+        })
+        .collect();
+    let m = ms.iter().sum::<f64>() / seeds as f64;
+    let v = ms.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (seeds - 1) as f64;
+    (m, (v / seeds as f64).sqrt())
+}
+
+/// Speed round 4: Sobol, film-response wavelengths and the sun share by
+/// peak keep the frame's mean (hash + uniform + share by irradiance).
+#[test]
+fn samplers_are_unbiased() {
+    use irys_diff::look::scene_gpu::samp;
+    let Some(ctx) = gpu() else {
+        eprintln!("no device: skipped");
+        return;
+    };
+    let s = lit_scene((96, 48));
+    let Some(g) = GpuLook::new(ctx, &s) else {
+        eprintln!("no ray queries: skipped");
+        return;
+    };
+    let o = Opts { spp: 64, max_bounces: 6, ..Opts::default() };
+    let (m0, e0) = frame_mean(&g, &s, Opts { samp: 0, ..o }, 24);
+    for (name, bits) in [("sobol", samp::SOBOL), ("spectral", samp::SPECTRAL), ("sun share", samp::SUN_PEAK), ("light tree", samp::LIGHT_TREE), ("all", samp::ALL)] {
+        let (m, e) = frame_mean(&g, &s, Opts { samp: bits, ..o }, 24);
+        let z = (m - m0) / (e * e + e0 * e0).sqrt();
+        eprintln!("{name:10} {m:.5} ± {e:.5} vs {m0:.5} ± {e0:.5}: z {z:+.2}");
+        assert!(z.abs() < 4.0, "{name}: z {z}");
+    }
+}
+
+/// Speed round 4: path regeneration changes the schedule, not the paths
+/// (each sample keeps its generator and Sobol index): the frame equals the
+/// one-sample-per-dispatch frame to f32 summation order.
+#[test]
+fn regeneration_is_a_schedule() {
+    let Some(ctx) = gpu() else {
+        eprintln!("no device: skipped");
+        return;
+    };
+    let s = lit_scene((64, 32));
+    let Some(g) = GpuLook::new(ctx, &s) else {
+        eprintln!("no ray queries: skipped");
+        return;
+    };
+    let o = Opts { spp: 24, max_bounces: 6, ..Opts::default() };
+    let a = g.render(&s.camera, &Opts { regen: 1, ..o });
+    let b = g.render(&s.camera, &Opts { regen: 8, ..o });
+    let c = g.render(&s.camera, &Opts { regen: 5, ..o });
+    for (n, f) in [("8", &b), ("5", &c)] {
+        let worst = a.rgb.iter().zip(&f.rgb).map(|(x, y)| ((x - y).abs() / (x.abs() + 1e-3)) as f64).fold(0.0, f64::max);
+        eprintln!("regen {n}: worst relative difference {worst:.2e}");
+        assert!(worst < 1e-4, "regen {n}: {worst}");
+        let ds = a.spectrum.iter().zip(&f.spectrum).map(|(x, y)| (x - y).abs() / (x.abs() + 1e-3)).fold(0.0, f64::max);
+        assert!(ds < 1e-6, "spectrum, regen {n}: {ds}");
+    }
+}
+
+/// Speed round 4: guiding (trained in the frame's first quarter, then
+/// fixed) keeps the frame's mean.
+#[test]
+fn guiding_is_unbiased() {
+    let Some(ctx) = gpu() else {
+        eprintln!("no device: skipped");
+        return;
+    };
+    let s = lit_scene((96, 48));
+    let Some(g) = GpuLook::new(ctx, &s) else {
+        eprintln!("no ray queries: skipped");
+        return;
+    };
+    let o = Opts { spp: irys_diff::look::scene_gpu::GUIDE_MIN_SPP, max_bounces: 6, ..Opts::default() };
+    let (m0, e0) = frame_mean(&g, &s, o, 16);
+    let (m, e) = frame_mean(&g, &s, Opts { guide: 0.5, ..o }, 16);
+    let z = (m - m0) / (e * e + e0 * e0).sqrt();
+    eprintln!("guided {m:.5} ± {e:.5} vs {m0:.5} ± {e0:.5}: z {z:+.2}");
+    assert!(z.abs() < 4.0, "z {z}");
+}

@@ -92,6 +92,9 @@ pub struct Material {
     pub emission: [f64; 3],
     /// Emits from the back of its triangles.
     pub emit_back: bool,
+    /// A Blender light, not a surface: rays collect its emission and go on
+    /// (Cycles' lights block nothing).
+    pub light: bool,
     /// Emits from both sides (spheres, point lights).
     pub emit_both: bool,
     /// Base-colour texture (alpha: the cut-out, when [`Self::cutout`]).
@@ -124,6 +127,7 @@ impl Material {
             translucent_color: [0.8; 3],
             emission: [0.0; 3],
             emit_back: false,
+            light: false,
             emit_both: false,
             base_tex: None,
             metal_tex: None,
@@ -618,7 +622,13 @@ pub fn load(dir: &Path, width: Option<usize>) -> Result<LookScene, String> {
             dropped.push(format!("lights: {name}: kind {}", l["kind"]));
             continue;
         };
-        mat.emit_both = l["kind"].as_str() == Some("sphere");
+        // A sphere light emits outward only (its winding is outward). Both
+        // sides made next-event estimation, whose shadow rays lights do not
+        // block, see the far side's inner face through the near one: twice
+        // the light a BSDF-sampled ray (which stops at the near side) sees,
+        // and the MIS mix of the two came out 2-25 % bright in the classroom.
+        mat.emit_both = false;
+        mat.light = true;
         materials.push(mat);
         meshes.push(Mesh { material: materials.len() - 1, ..mesh });
         let vis = l["visible_camera"].as_bool().unwrap_or(true);
