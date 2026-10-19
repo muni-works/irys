@@ -1,0 +1,83 @@
+{
+  "title": "irys reel",
+  "seed": 1729,
+  "bpm": 124,
+  "beats_per_bar": 4,
+  "sample_rate": 48000,
+  "chord_every_beats": 1,
+  "chroma_smoothing": 0.55,
+  "sections": [
+    {
+      "name": "intro",
+      "bars": 4,
+      "sequences": [
+        "sky",
+        "pavilion"
+      ],
+      "drums": "sparse",
+      "riser": {
+        "csv": "docs/phase2a-loss.csv",
+        "column": "loss",
+        "level": 0.25
+      }
+    },
+    {
+      "name": "build",
+      "bars": 4,
+      "sequences": [
+        "classroom",
+        "skin"
+      ],
+      "drums": "build",
+      "riser": {
+        "csv": "docs/phase2d-loss.csv",
+        "column": "loss",
+        "level": 1.0
+      }
+    },
+    {
+      "name": "drop1",
+      "bars": 8,
+      "sequences": [
+        "gold",
+        "thin_film"
+      ],
+      "drums": "full",
+      "drop": true
+    },
+    {
+      "name": "break",
+      "bars": 4,
+      "sequences": [
+        "sky",
+        "thin_film"
+      ],
+      "drums": "none",
+      "riser": {
+        "csv": "docs/skin-fit.csv",
+        "column": "loss",
+        "level": 1.0,
+        "from_bar": 2
+      }
+    },
+    {
+      "name": "drop2",
+      "bars": 6,
+      "sequences": [
+        "skin",
+        "gold",
+        "pavilion"
+      ],
+      "drums": "full_plus",
+      "drop": true
+    },
+    {
+      "name": "outro",
+      "bars": 2,
+      "sequences": [
+        "gold"
+      ],
+      "drums": "outro"
+    }
+  ]
+}

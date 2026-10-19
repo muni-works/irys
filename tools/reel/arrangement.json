@@ -1,0 +1,122 @@
+{
+  "title": "irys reel",
+  "seed": 1729,
+  "bpm": 124,
+  "beats_per_bar": 4,
+  "sample_rate": 48000,
+  "chord_every_beats": 1,
+  "chroma_smoothing": 0.55,
+  "sections": [
+    {
+      "name": "intro",
+      "bars": 4,
+      "drums": "sparse",
+      "riser": {
+        "csv": "docs/phase2a-loss.csv",
+        "column": "loss",
+        "level": 0.25
+      },
+      "sequences": [
+        {
+          "id": "pavilion-dolly",
+          "bars": 1,
+          "hold": "first",
+          "card": "irys"
+        },
+        {
+          "id": "pavilion-dolly",
+          "bars": 3,
+          "caption": "spectral path tracing"
+        }
+      ]
+    },
+    {
+      "name": "build",
+      "bars": 4,
+      "drums": "build",
+      "riser": {
+        "csv": "docs/phase2b-loss.csv",
+        "column": "loss",
+        "level": 1.0
+      },
+      "sequences": [
+        {
+          "id": "classroom-keyframed",
+          "caption": "openpbr on the gpu"
+        }
+      ]
+    },
+    {
+      "name": "drop1",
+      "bars": 6,
+      "drums": "full",
+      "drop": true,
+      "sequences": [
+        {
+          "id": "fit",
+          "bars": 3,
+          "caption": "every pixel differentiable"
+        },
+        {
+          "id": "swatch",
+          "bars": 3,
+          "caption": "coat, fuzz, thin film, dispersion"
+        }
+      ]
+    },
+    {
+      "name": "break",
+      "bars": 3,
+      "drums": "none",
+      "riser": {
+        "csv": "docs/phase2f-rose-loss.csv",
+        "column": "loss",
+        "run": "context; 2f; 600 its",
+        "level": 1.0,
+        "from_bar": 1
+      },
+      "sequences": [
+        {
+          "id": "pavilion-orbit",
+          "caption": "0.16–0.59× cycles' error at equal time · grey bench"
+        }
+      ]
+    },
+    {
+      "name": "drop2",
+      "bars": 4,
+      "drums": "full_plus",
+      "drop": true,
+      "sequences": [
+        {
+          "id": "rose",
+          "bars": 2,
+          "caption": "pose from pixels"
+        },
+        {
+          "id": "head",
+          "bars": 2,
+          "caption": "spectral skin, 243k hair strands"
+        }
+      ]
+    },
+    {
+      "name": "outro",
+      "bars": 2,
+      "drums": "outro",
+      "sequences": [
+        {
+          "id": "head",
+          "bars": 1,
+          "hold": "last"
+        },
+        {
+          "id": "head",
+          "bars": 1,
+          "hold": "last",
+          "card": "irys\nclassroom: Christophe Seux (CC0) · Barcelona Pavilion: eMirage (CC-BY) · head scan: Infinite-Realities (CC BY 3.0)"
+        }
+      ]
+    }
+  ]
+}
