@@ -3,6 +3,7 @@
 //! ```text
 //! cargo run --release -p irys-splat --example splat_train -- \
 //!     --images DIR --poses poses.jsonl --camera camera_info.json --out map.ply \
+//!     [--train <capture>.train/ (ipse CAPTURE.md export: sets --images/--poses/--camera)] [--with-depth]
 //!     [--depth DIR] [--depth-scale 0.001] [--depth-min 0.1] [--depth-max 20] [--depth-weight 0.1]
 //!     [--init points.ply | --seed-depth N | --random N] [--iters 30000] [--sh-degree 3]
 //!     [--holdout 8] [--eval-every 1000] [--report DIR] [--irys-eval] [--seed S] [--max-splats N]
@@ -123,11 +124,15 @@ fn main() {
     let opt = |k: &str| a.iter().position(|x| x == k).map(|i| a[i + 1].clone());
     let flag = |k: &str| a.iter().any(|x| x == k);
     let need = |k: &str| PathBuf::from(opt(k).unwrap_or_else(|| panic!("{k} is required (see the header of examples/splat_train.rs)")));
-    let images = need("--images");
-    let poses = need("--poses");
-    let camera = need("--camera");
+    // `--train DIR` (an ipse `<capture>.train/`) supplies the three defaults
+    let train_dir = opt("--train").map(PathBuf::from);
+    let dflt = |k: &str, f: &str| opt(k).map(PathBuf::from).or_else(|| train_dir.as_ref().map(|d| d.join(f)));
+    let images = dflt("--images", ".").unwrap_or_else(|| need("--images"));
+    let poses = dflt("--poses", "poses.jsonl").unwrap_or_else(|| need("--poses"));
+    let camera = dflt("--camera", "camera_info.json").unwrap_or_else(|| need("--camera"));
     let out = need("--out");
-    let depth = opt("--depth").map(PathBuf::from);
+    // `--depth DIR`, or `--with-depth` for the files the pose lines name
+    let depth = opt("--depth").map(PathBuf::from).or_else(|| flag("--with-depth").then(|| poses.parent().unwrap().to_path_buf()));
     let spec = DepthSpec {
         scale: opt("--depth-scale").map_or(1e-3, |s| s.parse().unwrap()),
         min: opt("--depth-min").map_or(0.1, |s| s.parse().unwrap()),

@@ -1,6 +1,12 @@
 //! Posed image sets: OpenCV pinhole intrinsics (`camera_info.json`, through
 //! `look::pinhole`) and one camera → world pose per line of `poses.jsonl`.
 //!
+//! ipse `docs/CAPTURE.md`'s export, `<capture>.train/` (`camera_info.json`,
+//! `poses.jsonl` lines `{frame, t, image: "images/N.png", depth?:
+//! "depth/N.u16", cam_pos, cam_rot}` with `cam_rot` row-major world ←
+//! optical, `images/`, `depth/`, `align.json`), is read as is: names in a
+//! line resolve against the given directory or else the poses file's own.
+//!
 //! A pose line is a JSON object with either
 //! - `cam_pos` `[x, y, z]` and `cam_rot` (3 × 3 camera → world, row-major:
 //!   nine numbers or three rows) — the K1 sweep format; or
@@ -128,6 +134,14 @@ pub fn load_depth(path: &Path, n: usize, spec: DepthSpec) -> Result<Vec<f32>, St
     Ok(raw.into_iter().map(|z| if z.is_finite() && z >= spec.min && z <= spec.max { z as f32 } else { 0.0 }).collect())
 }
 
+/// A file named in a pose line: relative to `dir` if it is there, else to
+/// the poses file's directory (ipse CAPTURE.md's `<capture>.train/` names
+/// `images/…` and `depth/…` relative to itself).
+fn resolve(s: &str, dir: &Path, root: &Path) -> PathBuf {
+    let a = dir.join(s);
+    if a.exists() { a } else { root.join(s) }
+}
+
 /// Read `poses.jsonl` against `images` (and an optional depth directory).
 pub fn load(images: &Path, poses: &Path, camera: &Path, depth: Option<&Path>, spec: DepthSpec) -> Result<Vec<View>, String> {
     let k = Pinhole::from_camera_info(&std::fs::read_to_string(camera).map_err(|e| format!("{}: {e}", camera.display()))?)?;
@@ -146,6 +160,7 @@ pub fn load(images: &Path, poses: &Path, camera: &Path, depth: Option<&Path>, sp
                 .collect()
         })
         .unwrap_or_default();
+    let root = poses.parent().unwrap_or(Path::new("."));
     let mut out = Vec::new();
     for (ln, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -155,7 +170,7 @@ pub fn load(images: &Path, poses: &Path, camera: &Path, depth: Option<&Path>, sp
         let v: Value = serde_json::from_str(line).map_err(|e| at(e.to_string()))?;
         let (rot, pos) = pose_of(&v).map_err(at)?;
         let frame = v["frame"].as_u64();
-        let named = ["image", "file", "jpeg", "path"].iter().find_map(|k| v.get(*k).and_then(Value::as_str)).map(|s| images.join(s));
+        let named = ["image", "file", "jpeg", "path"].iter().find_map(|k| v.get(*k).and_then(Value::as_str)).map(|s| resolve(s, images, root));
         let nv12 = frame.map(|f| images.join(format!("{f:06}.nv12"))).filter(|p| p.exists());
         let img: PathBuf = if let Some(p) = named {
             p
@@ -173,7 +188,7 @@ pub fn load(images: &Path, poses: &Path, camera: &Path, depth: Option<&Path>, sp
         let dep = match depth {
             None => None,
             Some(d) => {
-                let file = v.get("depth").and_then(Value::as_str).map(|s| d.join(s)).or_else(|| {
+                let file = v.get("depth").and_then(Value::as_str).map(|s| resolve(s, d, root)).or_else(|| {
                     let f = frame?;
                     [format!("{f:06}.u16"), format!("{f:06}.f32")].into_iter().map(|n| d.join(n)).find(|p| p.exists())
                 });
