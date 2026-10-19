@@ -49,17 +49,17 @@ pub struct ViewJac {
     pub np: usize,
 }
 
-struct Cand {
+pub(crate) struct Cand {
     /// Owner triangle.
-    tri: usize,
-    a: usize,
-    b: usize,
+    pub(crate) tri: usize,
+    pub(crate) a: usize,
+    pub(crate) b: usize,
     /// Third vertex of the owner, for the outward side.
-    c: usize,
-    weight: f64,
+    pub(crate) c: usize,
+    pub(crate) weight: f64,
 }
 
-fn face_normal(p: &[Point3], t: &[u32; 3]) -> Vec3 {
+pub(crate) fn face_normal(p: &[Point3], t: &[u32; 3]) -> Vec3 {
     let (a, b, c) = (p[t[0] as usize], p[t[1] as usize], p[t[2] as usize]);
     (b - a).cross(&(c - a))
 }
@@ -68,6 +68,11 @@ fn face_normal(p: &[Point3], t: &[u32; 3]) -> Vec3 {
 /// coplanar triangle, owned once (creases between two front faces by the
 /// one facing the eye more squarely).
 fn candidates(scene: &Scene, p: &[Point3], t: &[[u32; 3]]) -> Vec<Cand> {
+    candidates_from(scene.camera().0, p, t)
+}
+
+/// [`candidates`] for an eye at `eye`.
+pub(crate) fn candidates_from(eye: Point3, p: &[Point3], t: &[[u32; 3]]) -> Vec<Cand> {
     use std::collections::HashMap;
     let q = |v: Point3| ((v.x * 1e4).round() as i64, (v.y * 1e4).round() as i64, (v.z * 1e4).round() as i64);
     let mut weld: HashMap<(i64, i64, i64), usize> = HashMap::new();
@@ -95,7 +100,6 @@ fn candidates(scene: &Scene, p: &[Point3], t: &[[u32; 3]]) -> Vec<Cand> {
             edges.entry((a.min(b), a.max(b))).or_default().push((ti, k));
         }
     }
-    let (eye, ..) = scene.camera();
     let normals: Vec<Vec3> = t.iter().map(|tri| face_normal(p, tri)).collect();
     let facing = |ti: usize| {
         let n = normals[ti];
@@ -146,7 +150,7 @@ fn candidates(scene: &Scene, p: &[Point3], t: &[[u32; 3]]) -> Vec<Cand> {
 }
 
 /// Clip the screen segment `a → b` to `[0, w] × [0, h]`: the parameter range.
-fn clip(a: [f64; 2], b: [f64; 2], w: f64, h: f64) -> Option<(f64, f64)> {
+pub(crate) fn clip(a: [f64; 2], b: [f64; 2], w: f64, h: f64) -> Option<(f64, f64)> {
     let (mut t0, mut t1) = (0.0f64, 1.0f64);
     let d = [b[0] - a[0], b[1] - a[1]];
     for (p, q) in [(-d[0], a[0]), (d[0], w - a[0]), (-d[1], a[1]), (d[1], h - a[1])] {
@@ -171,7 +175,7 @@ fn ray_hit(scene: &Scene, s: [f64; 2]) -> Option<irys_core::Hit> {
     scene.tlas().trace_closest(&irys_core::Ray::new(eye, f + r * s[0] + u * s[1])).map(|h| h.hit)
 }
 
-fn key(n: &Vec3) -> (i64, i64, i64) {
+pub(crate) fn key(n: &Vec3) -> (i64, i64, i64) {
     ((n.x * 1e6) as i64, (n.y * 1e6) as i64, (n.z * 1e6) as i64)
 }
 

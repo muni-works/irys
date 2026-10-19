@@ -264,12 +264,22 @@ pub fn refine(img: &Grey, corners: &[[f64; 2]; 4], tag_mm: f64) -> [[f64; 2]; 4]
 
 /// Every tag36h11 in `img`, corners refined.
 pub fn detect(img: &Grey, tag_mm: f64) -> Vec<TagObs> {
+    detect_refined(img, img, tag_mm)
+}
+
+/// [`detect`] on `img` (display-encoded, what the detector expects), with
+/// the corners refined on `lin`, the same image in linear light: blur is
+/// linear in light, so a black-to-white edge's gradient maximum sits on the
+/// edge there; on the sRGB-encoded image it shifts towards the dark side
+/// (the tag looks smaller, the camera farther: 0.6 % in the synthetic
+/// photos).
+pub fn detect_refined(img: &Grey, lin: &Grey, tag_mm: f64) -> Vec<TagObs> {
     let (w, h) = img.size;
     let bytes: Vec<u8> = img.px.iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect();
     let fam = TagFamily::tag36_h11().expect("tag36h11");
     let mut out: Vec<TagObs> = Vec::new();
     // Large photos are decimated by 2 inside the detector; small ones not.
-    for down in [2usize, 1] {
+    for down in [2usize, 3, 4, 1] {
         let Ok(mut cfg) = DecodeTagsConfig::new(vec![TagFamilyKind::Tag36H11]) else { continue };
         cfg.downscale_factor = down;
         let Ok(im) = Image::<u8, 1>::from_size_slice(ImageSize { width: w, height: h }, &bytes) else { continue };
@@ -298,7 +308,7 @@ pub fn detect(img: &Grey, tag_mm: f64) -> Vec<TagObs> {
             if ham > 2 || out.iter().any(|o| o.id == id) {
                 continue;
             }
-            let corners = refine(img, &c, tag_mm);
+            let corners = refine(lin, &c, tag_mm);
             out.push(TagObs { id, hamming: ham, corners });
         }
         if !out.is_empty() {
