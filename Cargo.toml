@@ -9,6 +9,7 @@ members = [
     "crates/irys-diff",
     "crates/kosm-render",
     "crates/irys-bench",
+    "crates/irys-recon",
 ]
 
 [workspace.package]
