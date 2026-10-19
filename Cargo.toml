@@ -11,6 +11,7 @@ members = [
     "crates/irys-bench",
     "crates/irys-recon",
     "crates/irys-recon-net",
+    "crates/irys-ffi",
 ]
 
 [workspace.package]

@@ -16,6 +16,7 @@ pub mod env;
 pub mod neural;
 pub mod optics;
 pub mod pathtrace;
+pub mod ply;
 pub mod spectrum;
 pub mod splats;
 mod tables;
@@ -28,4 +29,5 @@ pub use pathtrace::{
     Pbr, PixelFilter, Projection, Scene, Sun, denoise, render, render_into, studio_rig,
 };
 pub use spectrum::{BK7_SELLMEIER, cauchy_index, cie_xyz, hero_weight, sellmeier_index};
+pub use ply::PlyCloud;
 pub use splats::{Splats, unpack_payload};

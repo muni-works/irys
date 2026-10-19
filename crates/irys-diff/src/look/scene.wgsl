@@ -1831,6 +1831,9 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
                 iter = 0u;
             }
             let s = trace_ray(ro, rd, msk);
+            // M1: splats on each path's camera segment (iter 0 of a path,
+            // before any bounce or pass), up to the first opaque hit.
+            let cam_seg = iter == 0u && SP.info.x > 0u;
             let it = min(iter, 7u);
             if (pstats) {
                 atomicAdd(&stats[select(1u, 0u, iter == 0u)], 1u);
@@ -1838,6 +1841,15 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
                 atomicAdd(&wg_alive[(li / 32u) * 8u + it], 1u);
             }
             iter = iter + 1u;
+            if (cam_seg) {
+                let g = splat_segment(ro, rd, P.eye.w * length(P.right.xyz) * 2.0 / (fh * length(P.fwd.xyz)), 0.0, select(3.4e38, s.t, s.ok));
+                let lh = hats(splat_linear(g));
+                for (var k = 0u; k < NW; k = k + 1u) {
+                    rad[k] = rad[k] + tp[k] * lifth(lh, lam[k]) / qbar(q);
+                }
+                tp = tp * g.trans;
+                if (g.trans <= 0.0) { alive = false; continue; }
+            }
             if (!s.ok) {
                 let e = sky(rd);
                 var wm = 1.0;

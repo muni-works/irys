@@ -14,6 +14,8 @@ use super::openpbr::{NE, OpenPbr, TN, Tables, fresnel_average, hats};
 use super::scene::{Camera, LookScene, Material, hat_inverse};
 
 const SHADER: &str = include_str!("scene.wgsl");
+/// M1: splats in the TLAS (`splat.wgsl`), appended to the module.
+pub(super) const SPLAT: &str = include_str!("splat.wgsl");
 /// Phase 3's grid × histogram guide, shared with the wavefront.
 const GUIDE: &str = include_str!("../gpu/guide.wgsl");
 /// Guide training records per path.
@@ -24,7 +26,11 @@ pub const BINS: usize = 40;
 const MS: usize = 20;
 const NONE: u32 = u32::MAX;
 /// Pixels per dispatch.
-const CHUNK: usize = 1 << 16;
+pub(super) const CHUNK: usize = 1 << 16;
+/// M1: dispatches one batched submit can carry (`Params` slots of 256 B).
+pub(super) const RING: usize = 4096;
+/// M1: the TLAS instance mask of the splat proxies (`splat.wgsl`).
+pub const SPLAT_MASK: u8 = 0x10;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -187,6 +193,8 @@ pub struct GpuLook {
     _keep: Vec<wgpu::Buffer>,
     _blas: Vec<wgpu::Blas>,
     _tlas: wgpu::Tlas,
+    /// M1: what the sensor kernel, the batch and `set_instances` share.
+    pub(super) m1: super::sensor::Shared,
     /// Placed emitter triangles (lights and emissive meshes), portal triangles.
     pub emitters: (usize, usize),
     /// Light-group shares: sun, world, emitters, portals.
@@ -270,6 +278,17 @@ fn pack_material(m: &Material, portal_off: Option<u32>) -> [[f32; 4]; MS] {
     o
 }
 
+/// The scene module: preamble, scene.wgsl, the guide, the splats (M1: the
+/// sensor kernel appends itself to the same text).
+pub(super) fn module_source() -> String {
+    format!(
+        "enable wgpu_ray_query;\n{}{}\n{SHADER}\n{}\n{SPLAT}",
+        crate::gpu::sobol_const(),
+        spec_const(),
+        GUIDE.replace("params.", "P.")
+    )
+}
+
 /// `qmc::Spectral`'s CDF as a WGSL constant.
 fn spec_const() -> String {
     let c: Vec<String> = crate::qmc::Spectral::get().cdf.iter().map(|x| format!("{x:?}")).collect();
@@ -300,6 +319,12 @@ impl GpuLook {
     /// Upload `scene` and build its acceleration structures. `None` when the
     /// device has no ray queries.
     pub fn new(ctx: &'static GpuContext, scene: &LookScene) -> Option<Self> {
+        Self::with_splats(ctx, scene, None)
+    }
+
+    /// [`GpuLook::new`] with a 3DGS cloud in the same TLAS (M1): splats are
+    /// composited on camera rays up to the first opaque hit (`splat.wgsl`).
+    pub fn with_splats(ctx: &'static GpuContext, scene: &LookScene, splats: Option<&super::splat_gpu::PlyCloud>) -> Option<Self> {
         let dev = &ctx.device;
         if !dev.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
             return None;
@@ -611,7 +636,7 @@ impl GpuLook {
             keep.push(e.0);
             keep.push(e.1);
         }
-        let n_inst = scene.instances.len().max(1) as u32;
+        let n_inst = scene.instances.len().max(1) as u32 + 1; // M1: + the splat proxies
         assert!(n_inst < (1 << 24), "instance custom data is 24 bits");
         let mut tlas = dev.create_tlas(&wgpu::CreateTlasDescriptor {
             label: Some("look tlas"),
@@ -628,6 +653,11 @@ impl GpuLook {
                 ];
                 tlas[k] = Some(wgpu::TlasInstance::new(b, xf, k as u32, i.mask as u8));
             }
+        }
+        let gsplats = super::splat_gpu::GpuSplats::new(ctx, splats);
+        if let Some(b) = &gsplats.blas {
+            let id = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+            tlas[n_inst as usize - 1] = Some(wgpu::TlasInstance::new(b, id, n_inst - 1, SPLAT_MASK));
         }
         let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         enc.build_acceleration_structures(std::iter::empty(), [&tlas]);
@@ -678,32 +708,30 @@ impl GpuLook {
         let g_rec = storage("look guide records", (CHUNK as u64) * GDEPTH as u64 * 16);
         let g_nrec = storage("look guide counts", CHUNK as u64 * 4);
         let g_cnt = storage("look guide samples", cells as u64 * 4);
+        // M1: a ring of 256-byte-aligned slots (dynamic offsets), so a batch
+        // can carry every dispatch's camera and sample in one submit.
         let params = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("look params"),
-            size: std::mem::size_of::<Params>() as u64,
+            size: (RING * std::mem::size_of::<Params>().next_multiple_of(256)) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("look scene"),
-            source: wgpu::ShaderSource::Wgsl(format!(
-                "enable wgpu_ray_query;\n{}{}\n{SHADER}\n{}",
-                crate::gpu::sobol_const(),
-                spec_const(),
-                GUIDE.replace("params.", "P.")
-            ).into()),
+            source: wgpu::ShaderSource::Wgsl(module_source().into()),
         });
         let layout = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("look"),
             entries: &(0..16u32)
                 .chain(50..56)
+                .chain(60..63)
                 .map(|b| wgpu::BindGroupLayoutEntry {
                     binding: b,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: match b {
-                        0 => wgpu::BindingType::Buffer {
+                        0 | 62 => wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
+                            has_dynamic_offset: b == 0,
                             min_binding_size: None,
                         },
                         11 => wgpu::BindingType::AccelerationStructure { vertex_return: false },
@@ -767,11 +795,35 @@ impl GpuLook {
             .iter()
             .map(|&(binding, b)| wgpu::BindGroupEntry { binding, resource: b.as_entire_binding() })
             .collect();
+        ents[0].resource = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: &params,
+            offset: 0,
+            size: std::num::NonZeroU64::new(std::mem::size_of::<Params>() as u64),
+        });
+        for (binding, b) in [(60, &gsplats.rec), (61, &gsplats.sh), (62, &gsplats.params)] {
+            ents.push(wgpu::BindGroupEntry { binding, resource: b.as_entire_binding() });
+        }
         ents.push(wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::AccelerationStructure(&tlas) });
         let group = dev.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("look"), layout: &layout, entries: &ents });
         if let Some(e) = pollster::block_on(scope.pop()) {
             panic!("look gpu: {e}");
         }
+        let m1 = super::sensor::Shared {
+            ctx,
+            tris: b_tris.clone(),
+            inst: b_inst.clone(),
+            mats: b_mats.clone(),
+            texels: b_texels.clone(),
+            textab: b_textab.clone(),
+            tlas: tlas.clone(),
+            blas: blas.clone(),
+            splats: gsplats,
+            instances: scene.instances.clone(),
+            first_tri: first_tri.clone(),
+            mesh_mat: scene.meshes.iter().map(|m| m.material as u32).collect(),
+            emit_base: emit_base.clone(),
+            cap: n_inst as usize - 1,
+        };
         Some(Self {
             ctx,
             pipe,
@@ -799,6 +851,7 @@ impl GpuLook {
                 .collect(),
             _blas: blas.into_iter().flatten().collect(),
             _tlas: tlas,
+            m1,
             emitters: (n_emit, n_portal),
             shares,
         })
@@ -836,6 +889,37 @@ impl GpuLook {
             gres: [self.grid.1[0], self.grid.1[1], self.grid.1[2], gflags],
             gres2: [GDEPTH, self.grid.2, 64, 0],
         }
+    }
+
+    // M1 accessors for `sensor::render_batch`.
+    pub(super) fn pixels(&self) -> usize {
+        self.pixels
+    }
+    /// The frame size the scene was built for.
+    pub fn size(&self) -> (usize, usize) {
+        self.size
+    }
+    pub(super) fn accum_buf(&self) -> &wgpu::Buffer {
+        &self.accum
+    }
+    pub(super) fn spec_buf(&self) -> &wgpu::Buffer {
+        &self.spec
+    }
+    pub(super) fn params_buf(&self) -> &wgpu::Buffer {
+        &self.params
+    }
+    pub(super) fn trace_pipe(&self) -> &wgpu::ComputePipeline {
+        &self.pipe
+    }
+    pub(super) fn bind_group(&self) -> &wgpu::BindGroup {
+        &self.group
+    }
+    pub(super) fn slot_bytes(&self) -> usize {
+        std::mem::size_of::<Params>().next_multiple_of(256)
+    }
+    /// One dispatch's params without guiding: `ns` samples from `sample`.
+    pub(super) fn params_bytes(&self, cam: &Camera, o: &Opts, sample: u32, ns: u32, first: u32) -> Vec<u8> {
+        bytemuck::bytes_of(&self.params(cam, o, sample, ns, first, 0, 0)).to_vec()
     }
 
     /// Render one frame from `cam`.
@@ -876,7 +960,7 @@ impl GpuLook {
                 {
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                     pass.set_pipeline(&self.pipe);
-                    pass.set_bind_group(0, &self.group, &[]);
+                    pass.set_bind_group(0, &self.group, &[0]);
                     pass.dispatch_workgroups(n.div_ceil(64) as u32, 1, 1);
                 }
                 queue.submit([enc.finish()]);
@@ -886,7 +970,7 @@ impl GpuLook {
                 {
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                     pass.set_pipeline(&self.guide_pipe);
-                    pass.set_bind_group(0, &self.group, &[]);
+                    pass.set_bind_group(0, &self.group, &[0]);
                     let c = self.grid.2;
                     pass.dispatch_workgroups(c.min(65535), c.div_ceil(65535), 1);
                 }
@@ -956,7 +1040,7 @@ impl GpuLook {
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&self.probe_pipe);
-            pass.set_bind_group(0, &self.group, &[]);
+            pass.set_bind_group(0, &self.group, &[0]);
             pass.dispatch_workgroups(lanes.len().div_ceil(64).max(1) as u32, 1, 1);
         }
         queue.submit([enc.finish()]);
