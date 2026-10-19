@@ -4,7 +4,7 @@
 //! ```text
 //! cargo run --release -p irys-diff --features gpu,assets --example look_bench -- <export dir> <bench dir>
 //!     [--width 480] [--bounces 7] [--ref-spp 32768] [--max-spp 1024] [--reps 2]
-//!     [--variant openpbr] [--clamp C]
+//!     [--variant openpbr] [--clamp C] [--samp bits]
 //! ```
 //!
 //! Writes `irys_ref.f32` (+ `irys_ref.json`) once, then for each spp level
@@ -51,11 +51,12 @@ fn main() {
     let reps: usize = opt(&args, "--reps", 2);
     let clamp: f32 = opt(&args, "--clamp", 0.0);
     let variant: String = opt(&args, "--variant", "openpbr".to_string());
+    let samp: u32 = opt(&args, "--samp", irys_diff::look::scene_gpu::samp::ALL);
     let sc = scene::load(&export, Some(width)).unwrap();
     let (w, h) = sc.size;
     let ctx = irys_gpu::GpuContext::init_blocking().expect("gpu");
     let g = GpuLook::new(ctx, &sc).expect("ray queries");
-    let base = Opts { spp: 1, max_bounces: bounces, clamp, ..Opts::default() };
+    let base = Opts { spp: 1, max_bounces: bounces, clamp, samp, ..Opts::default() };
     let _ = g.render(&sc.camera, &base); // warm
     let ref_path = dir.join("irys_ref.f32");
     if !ref_path.exists() {

@@ -59,6 +59,7 @@ fn main() {
         debug: opt("--debug").map_or(0, |s| s.parse().unwrap()),
         per_lane: rest.iter().any(|a| a == "--per-lane"),
         prof: 0,
+        samp: irys_diff::look::scene_gpu::samp::ALL,
     };
     let reps: usize = opt("--reps").map_or(1, |s| s.parse().unwrap());
     let t0 = std::time::Instant::now();

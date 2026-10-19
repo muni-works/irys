@@ -41,6 +41,7 @@ struct Params {
     minv2: [f32; 4],
     emit_off: [u32; 4],
     prof: [u32; 4],
+    samp: [u32; 4],
 }
 
 /// Profiling switches for [`Opts::prof`] (scene.wgsl's `PF_*`).
@@ -98,11 +99,25 @@ pub struct Opts {
     pub per_lane: bool,
     /// Profiling switches ([`prof`]); 0 renders normally.
     pub prof: u32,
+    /// Sampler switches ([`samp`]); [`samp::ALL`] by default.
+    pub samp: u32,
+}
+
+/// Sampler switches for [`Opts::samp`] (speed round 4: phase 3's samplers).
+pub mod samp {
+    /// Shuffled, Owen-scrambled Sobol 4-tuples (else the hash generator).
+    pub const SOBOL: u32 = 1;
+    /// Hero wavelengths by the film response (else uniform).
+    pub const SPECTRAL: u32 = 2;
+    /// NEE's sun / world split by peak radiance (else by irradiance).
+    pub const SUN_PEAK: u32 = 4;
+    /// Everything on.
+    pub const ALL: u32 = SOBOL | SPECTRAL | SUN_PEAK;
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Self { spp: 16, max_bounces: 7, rr_from: u32::MAX, clamp: 0.0, seed: 1, debug: 0, per_lane: false, prof: 0 }
+        Self { spp: 16, max_bounces: 7, rr_from: u32::MAX, clamp: 0.0, seed: 1, debug: 0, per_lane: false, prof: 0, samp: samp::ALL }
     }
 }
 
@@ -135,6 +150,7 @@ pub struct GpuLook {
     flags: [u32; 4],
     sun: ([f32; 4], [f32; 4]),
     picks: [f32; 4],
+    picks_peak: [f32; 4],
     env: [u32; 4],
     emit_off: [u32; 4],
     _keep: Vec<wgpu::Buffer>,
@@ -218,6 +234,12 @@ fn pack_material(m: &Material, portal_off: Option<u32>) -> [[f32; 4]; MS] {
     o[15] = [a[0] as f32, a[1] as f32, a[2] as f32, cos as f32];
     o[16] = [sm as f32, 0.0, 0.0, 0.0];
     o
+}
+
+/// `qmc::Spectral`'s CDF as a WGSL constant.
+fn spec_const() -> String {
+    let c: Vec<String> = crate::qmc::Spectral::get().cdf.iter().map(|x| format!("{x:?}")).collect();
+    format!("const SPEC_CDF = array<f32, {}>({});\n", c.len(), c.join(", "))
 }
 
 fn apply(xf: &[[f32; 4]; 3], p: [f32; 3]) -> [f64; 3] {
@@ -423,6 +445,21 @@ impl GpuLook {
             shares[0] + shares[1] + shares[2],
             1.0,
         ];
+        // Speed round 3's sun share (`prb::Env::sun_pick`): within the sun +
+        // world group, the sun's share by peak radiance against 0.4 of the
+        // world's brightest texel, kept in [0.1, 0.9].
+        let picks_peak = match (&scene.sun, &scene.env) {
+            (Some(s), Some(e)) => {
+                let sky = e.rgb.iter().map(|c| lum([c[0] as f64, c[1] as f64, c[2] as f64])).fold(0.0, f64::max) * 0.4;
+                let sun = lum(s.radiance).max(0.0);
+                // capped: the world keeps a tenth of the group, or its
+                // NEE samples become rare and its tail heavy
+                let p = if sun + sky > 0.0 { (sun / (sun + sky)).clamp(0.1, 0.9) } else { 0.5 };
+                let g = (shares[0] + shares[1]) as f64;
+                [(g * p) as f32, picks[1], picks[2], 1.0]
+            }
+            _ => picks,
+        };
         let sun = scene.sun.map_or(([0.0; 4], [0.0; 4]), |s| {
             let omega = std::f64::consts::TAU * (1.0 - s.radius.cos());
             ([s.dir[0] as f32, s.dir[1] as f32, s.dir[2] as f32, s.radius.cos() as f32], h4(s.radiance, omega))
@@ -582,7 +619,7 @@ impl GpuLook {
         });
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("look scene"),
-            source: wgpu::ShaderSource::Wgsl(format!("enable wgpu_ray_query;\n{SHADER}").into()),
+            source: wgpu::ShaderSource::Wgsl(format!("enable wgpu_ray_query;\n{}{}\n{SHADER}", crate::gpu::sobol_const(), spec_const()).into()),
         });
         let layout = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("look"),
@@ -668,6 +705,7 @@ impl GpuLook {
             flags: [pixels as u32, n_emit as u32, n_portal as u32, 0],
             sun,
             picks,
+            picks_peak,
             env,
             emit_off: [0, portal_first, 0, 0],
             _keep: [b_tris, b_inst, b_mats, b_texels, b_textab, b_tabs, b_emit, b_env]
@@ -700,13 +738,14 @@ impl GpuLook {
             resp: [norm[0] as f32 * per, norm[1] as f32 * per, norm[2] as f32 * per, 0.0],
             sun_dir: self.sun.0,
             sun_l: self.sun.1,
-            picks: self.picks,
+            picks: if o.samp & samp::SUN_PEAK != 0 { self.picks_peak } else { self.picks },
             env: self.env,
             minv0: [mi[0][0], mi[0][1], mi[0][2], 0.0],
             minv1: [mi[1][0], mi[1][1], mi[1][2], 0.0],
             minv2: [mi[2][0], mi[2][1], mi[2][2], 0.0],
             emit_off: self.emit_off,
             prof: [o.prof, 0, 0, 0],
+            samp: [o.samp, o.spp, 0, 0],
         }
     }
 

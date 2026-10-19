@@ -36,6 +36,7 @@ struct Params {
     minv2: vec4<f32>,
     emit_off: vec4<u32>,  // emitter cdf offset 0, portal first index, -, -
     prof: vec4<u32>,      // profiling: x bits (PF_*), -, -, -
+    samp: vec4<u32>,      // sampler: x bits (S_*), spp of the frame, -, -
 }
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -152,6 +153,93 @@ fn rng_new(path: vec2<u32>) -> vec2<u32> {
 
 fn rand(s: ptr<function, vec2<u32>>) -> f32 {
     return f32(rng_next(s).y >> 8u) * (1.0 / 16777216.0);
+}
+
+// ---- speed round 4: phase 3's sampler (`qmc.rs`, the same integers) ----
+//
+// Burley's shuffled, Owen-scrambled Sobol: a path draws 4-tuples, each
+// tuple its own scramble of dimensions 0-3 keyed by (pixel, tuple), the
+// sample index shuffled per tuple. `SOBOL_T`, `QKEY` (the host splices them
+// in from `qmc::byte_tables` / `value_keys`) and `SPEC_CDF`
+// (`qmc::Spectral`, the wavelength CDF by film response) are module constants.
+
+const S_SOBOL: u32 = 1u;
+const S_SPECTRAL: u32 = 2u;
+
+fn qhash(x0: u32) -> u32 {
+    var x = x0;
+    x = x ^ (x >> 16u);
+    x = x * 0x7feb352du;
+    x = x ^ (x >> 15u);
+    x = x * 0x846ca68bu;
+    return x ^ (x >> 16u);
+}
+
+fn qhash2(a: u32, b: u32) -> u32 {
+    return qhash(a ^ (qhash(b) + 0x9e3779b9u));
+}
+
+fn owen(x0: u32, seed: u32) -> u32 {
+    var x = reverseBits(x0);
+    x = x + seed;
+    x = x ^ (x * 0x6c50b47cu);
+    x = x ^ (x * 0xb82f1e52u);
+    x = x ^ (x * 0xc7afe638u);
+    x = x ^ (x * 0x8d22f6e6u);
+    return reverseBits(x);
+}
+
+fn sobol(i: u32, d: u32) -> u32 {
+    if (d == 0u) {
+        return reverseBits(i);
+    }
+    let t = (d - 1u) * 1024u;
+    return SOBOL_T[t + (i & 255u)]
+        ^ SOBOL_T[t + 256u + ((i >> 8u) & 255u)]
+        ^ SOBOL_T[t + 512u + ((i >> 16u) & 255u)]
+        ^ SOBOL_T[t + 768u + (i >> 24u)];
+}
+
+// The path's tuple counter and pixel key.
+var<private> q_tuple: u32 = 0u;
+var<private> q_pixel: u32 = 0u;
+
+// The next 4-tuple: Sobol, or four of the path's hash generator.
+fn draw4(rng: ptr<function, vec2<u32>>) -> vec4<f32> {
+    if ((P.samp.x & S_SOBOL) == 0u) {
+        return vec4<f32>(rand(rng), rand(rng), rand(rng), rand(rng));
+    }
+    let seed = qhash2(q_pixel, q_tuple);
+    q_tuple = q_tuple + 1u;
+    let j = owen(P.seed.z, seed);
+    var u = vec4<f32>(0.0);
+    for (var d = 0u; d < 4u; d = d + 1u) {
+        let x = owen(sobol(j, d), qhash(seed ^ QKEY[d]));
+        u[d] = f32(x >> 8u) * (1.0 / 16777216.0);
+    }
+    return u;
+}
+
+// `Spectral::lambda` and `Spectral::pdf` (relative to uniform).
+fn spec_lambda(u: f32) -> f32 {
+    var lo = 1u;
+    var hi = 256u;
+    loop {
+        if (lo >= hi) { break; }
+        let mid = (lo + hi) / 2u;
+        if (SPEC_CDF[mid] <= u) { lo = mid + 1u; } else { hi = mid; }
+    }
+    let b = min(lo - 1u, 255u);
+    let c0 = SPEC_CDF[b];
+    let c1 = SPEC_CDF[b + 1u];
+    let t = clamp((u - c0) / (c1 - c0), 0.0, 1.0);
+    return 380.0 + 400.0 * (f32(b) + t) / 256.0;
+}
+
+fn spec_pdf(l: f32) -> f32 {
+    if ((P.samp.x & S_SPECTRAL) == 0u) { return 1.0; }
+    let b = min(u32(max((l - 380.0) / 400.0 * 256.0, 0.0)), 255u);
+    return (SPEC_CDF[b + 1u] - SPEC_CDF[b]) * 256.0;
 }
 
 // ---- spectra ----
@@ -1445,16 +1533,22 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
     var iter = 0u;
     if (live) {
         var rng = rng_new(vec2<u32>(px, P.seed.z));
-        let u0 = rand(&rng);
+        q_pixel = qhash2(px, P.seed.x ^ qhash(P.seed.y));
+        q_tuple = 0u;
+        let u_cam = draw4(&rng);
         for (var k = 0u; k < NW; k = k + 1u) {
-            let v = u0 + f32(k) / f32(NW);
-            lam[k] = 380.0 + 400.0 * (v - floor(v));
+            let v = u_cam.x + f32(k) / f32(NW);
+            if ((P.samp.x & S_SPECTRAL) != 0u) {
+                lam[k] = spec_lambda(v - floor(v));
+            } else {
+                lam[k] = 380.0 + 400.0 * (v - floor(v));
+            }
         }
         let w = P.size.x;
         let fw = f32(P.size.x);
         let fh = f32(P.size.y);
-        let xs = f32(px % w) + rand(&rng);
-        let ys = f32(px / w) + rand(&rng);
+        let xs = f32(px % w) + u_cam.y;
+        let ys = f32(px / w) + u_cam.z;
         let sx = (2.0 * xs / fw - 1.0) * P.eye.w * fw / fh;
         let sy = (1.0 - 2.0 * ys / fh) * P.eye.w;
         var ro = P.eye.xyz;
@@ -1620,8 +1714,9 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
             let xo_up = offset_ray(s.x, ng);
             let xo_dn = offset_ray(s.x, -ng);
             // Next-event estimation.
-            let ul = vec4<f32>(rand(&rng), rand(&rng), rand(&rng), rand(&rng));
-            let ul2 = rand(&rng);
+            let ul = draw4(&rng);
+            let ub4 = draw4(&rng);
+            let ul2 = ub4.x;
             if (!prof_on(PF_NO_NEE)) {
                 let l = sample_light(s.x, ul, ul2);
                 if (l.ok && l.pdf > 0.0) {
@@ -1658,7 +1753,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
                 }
             }
             // The BSDF sample.
-            let ub = vec3<f32>(rand(&rng), rand(&rng), rand(&rng));
+            let ub = ub4.yzw;
             let pick = lobe_sample(mt, etap0, lw, wo, ub);
             if (pick.lobe == 3u && thin) {
                 // The thin pass: straight on, not a vertex (shadow rays
@@ -1718,6 +1813,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
         // (one sample in ~10^10 on the pavilion at 1080p).
         for (var k = 0u; k < NW; k = k + 1u) {
             if (!(rad[k] == rad[k]) || abs(rad[k]) > 1.0e9) { rad = vec4<f32>(0.0); }
+            rad[k] = rad[k] / spec_pdf(lam[k]);
             rgb = rgb + rad[k] * lane_rgb(lam[k]);
         }
         accum[px] = accum[px] + vec4<f32>(rgb, 0.0);
