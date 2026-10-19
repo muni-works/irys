@@ -2279,6 +2279,225 @@ pavilion-dolly,pavilion-orbit,fit,rose,head,swatch` resumes it.
 4. SSS in full scenes is Lambertian; volumes are not on this path.
 5. Timings are single runs on a GPU shared with another agent's work.
 
+## Speed round 4: the OpenPBR kernel on true materials (2026-10-19)
+
+Phase 5b left the full-scene kernel (`look/scene.wgsl`) losing at equal
+time on true materials: classroom 2.24 / 3.46 / 1.71, clamped pavilion
+20 / 30 / 31, and 2–3× slower per sample at 1080p. Five commits on
+`claude/speed4`:
+
+| piece | commit | what |
+|---|---|---|
+| 1 | profile | device counters and ablations behind `Opts::prof`, `examples/look_profile` |
+| 2 | phase 3's samplers | Sobol 4-tuples, film-response wavelengths, the sun share by peak (`Opts::samp`) |
+| 3 | light tree | `look::light_tree` over emitter clusters; two light fixes; path regeneration |
+| 4 | megakernel kept | the numbers against a wavefront; alpha-only fetch; fewer waits |
+| 5 | guiding | `gpu/guide.wgsl` in the kernel, a salted scramble, off under 256 spp |
+
+**The machine was shared throughout** (another agent's `recon_v1` at
+100–1000 % CPU and on the GPU, two vcad benches). Per-sample times moved
+by up to 1.6× between runs of the same binary: the kernel that took 8.4
+ms a sample at 480 × 270 when this round began took 12–14 ms during the
+final bench. Every timing below is fastest-of-N and interleaved, and
+irys was slowed more than Cycles (Cycles' times are within 15 % of 5b's).
+
+### 1. Where the time went (480 × 270, 7 bounces, before any change)
+
+| | classroom | pavilion |
+|---|---|---|
+| ms per sample | 8.4 | 14.7 |
+| camera ray + its vertex (bounces 0) | 11 % | 14 % |
+| per further bounce | ≈ 1.1 ms | ≈ 1.5 ms |
+| NEE (all of it: pick, eval, shadow) | 29 % | 32 % |
+| of it, shadow rays | 17 % | 23 % |
+| material evaluation (Lambertian ablation) | 2.5 % | 19 % |
+| alpha test in traversal | 1 % | 16 % |
+| rays per path: continuation / shadow | 5.74 / 1.24 | 3.21 / 3.21 |
+| non-opaque candidates per path: closest / shadow | 0.02 / 0 | 1.68 / 0.72 |
+| SIMD occupancy by iteration 0, 1, 2, 3, 4, 5, 6 | 1.0 .97 .90 .85 .81 .77 .73 | 1.0 .97 .81 .72 .49 .41 .33 |
+| distinct material classes per SIMD group (iterations 1–6) | 2.0–2.1 | 2.6–3.3 |
+| vertices by class | diffuse 62 %, metal 38 % | diffuse 46, transmissive 25, fuzz/thin 13, both 10, metal 6 |
+
+There was no one stage to fix. The classroom spent its time evenly per
+bounce, a third of it in NEE, and its NEE was mostly wasted: 84682
+emitter triangles picked by an area × luminance CDF gave a usable light
+sample (facing, above the surface) at only 1.24 of 5.8 vertices. The
+pavilion lost about a third of its SIMD lanes past bounce 3 to paths that
+had ended, and paid 16 % for alpha-testing foliage and 19 % for its mix
+of glass, water and leaves.
+
+### 2. Phase 3's samplers
+
+Burley's shuffled Owen-scrambled Sobol from `qmc::byte_tables` (camera:
+wavelength + jitter; per vertex: NEE, then the light's fifth draw + the
+BSDF's three), hero wavelengths by `qmc::Spectral`'s film-response CDF
+with each lane over its density, and the sun/world NEE split by peak
+radiance (round 3's share, capped to [0.1, 0.9]: uncapped, the world's
+rare NEE samples made a heavy tail). Equal-spp relMSE against irys's own
+references, one run each:
+
+| | 64 spp | 1024 spp |
+|---|---|---|
+| classroom, hash + uniform λ | 0.379 | 0.0296 |
+| classroom, Sobol + spectral | **0.109** | 0.0251 |
+| pavilion clamp 10, before | 0.073 | 0.0046 |
+| pavilion clamp 10, all three | 0.059 | 0.0037 |
+
+No measurable time per sample (Sobol's draws are cheaper than the 64-bit
+hash: 5 %). `samplers_are_unbiased`: frame means agree (|z| < 2).
+
+### 3. The light tree, two light bugs, path regeneration
+
+`look::light_tree`: a binary tree over clusters of ≤ 8 emitter triangles,
+binned SAOH splits (Conty Estevez & Kulla 2018, Cycles' shape), each
+child's centre, power, orientation cone and half-diagonal stored in its
+parent so a step is one read, and a receiver-normal bound where only
+reflection reaches the eye. Every triangle keeps its path as bits so a
+BSDF hit's pick probability is evaluated for MIS. Below the first level
+the traversal draws fresh bits from a hash chain: rescaling one u down
+15+ levels left a few bits, and a branch whose probability was below that
+resolution was picked far more often than its probability.
+
+Checking the tree against the CDF found **two bugs in 5b's lights**, not
+in the tree: sphere lights emitted from both sides, so NEE, whose shadow
+rays lights never block, saw the far side's inner face through the near
+one, twice what a BSDF ray (which stopped at the near side) saw; and
+bounce rays stopped at any light's geometry while shadow rays passed it.
+The MIS mix of the two strategies then depended on how lights are picked,
+and the tree rendered the classroom 2 % brighter than the CDF. Lights now
+emit outward, and every ray collects a light's emission and goes on
+(Cycles: lights block nothing). The classroom's mean moved toward
+Cycles' (red 0.441 → 0.431; Cycles 0.401) and its irys reference was
+re-rendered. CDF and tree now agree to 2·10⁻⁴.
+
+| classroom, equal spp | 16 | 64 | 256 | 1024 |
+|---|---|---|---|---|
+| CDF | 0.644 | 0.127 | 0.067 | 0.0265 |
+| tree | 0.483 | 0.095 | 0.060 | 0.0252 |
+
+The tree doubles the usable light samples (shadow rays per path 1.24 →
+2.45) and costs 13 % (interleaved profile) to 28 % (sweeps) per sample:
+a wash at equal time at small budgets, a small loss at large. It is on by
+default (`samp::LIGHT_TREE`), since the classroom is the one scene with
+many lights and the tree's advantage grows with their number.
+
+**Path regeneration** (`Opts::regen`, default 16): each thread renders 16
+of its pixel's samples back to back in one dispatch, a finished path
+starting the next at once, so a SIMD group runs until its last path ends
+rather than its longest per sample. The paths are the same (generator and
+Sobol index per sample: `regeneration_is_a_schedule`), the frame
+deterministic; the spectrum is summed in fixed point. Interleaved: pavilion
+13.1 → 9.8 ms per sample (−25 %), classroom 12.1 → 11.1 (−8 %); at 1080p
+no change (enough pixels already fill the device).
+
+### 4. The megakernel stays
+
+Material evaluation is 2.5 % of the classroom's time and 19 % of the
+pavilion's; perfect binning of the pavilion's ~3 material classes per
+SIMD group would save at most about two thirds of that, ~10 %, while a
+wavefront would move ~35 floats of four-lane path state (throughput,
+spectral MIS q, radiance, wavelengths, ray, MIS vertex and normal,
+generator) through memory between stages, ~0.4 GB per sample at 480 × 270
+— about what binning would save. The loss the profile did show, lanes
+idle past bounce 3, regeneration recovers inside the megakernel. Also
+here: the traversal's alpha test reads alpha alone (no colour, no sRGB
+decode; its share of the pavilion 9–12 % → 6–8 %), and `render` waits on
+the device every eighth dispatch group.
+
+### 5. Guiding
+
+Phase 3's `gpu/guide.wgsl` is included as is (`params.` → `P.`): a grid of
+16 cells along the scene's longest side × 6 normal axes, a 16 × 16
+equal-area histogram per cell of the BSDF strategy's radiance in 64-bit
+fixed point, built into CDFs with 10 % uniform. At an opaque reflective
+vertex on the four-lane path the kernel draws from the guide with
+probability mix × the diffuse lobe's share, and the mixture density is the
+BSDF strategy's pdf for every MIS weight. The frame's first quarter of
+samples trains, the guide rebuilt after each sample group.
+
+With one Sobol scramble across a pixel's samples a guided frame was
+1·10⁻⁴ bright (z 4 over 40 seeds; z 0 with the hash generator): later
+samples' points were correlated with the guide earlier samples trained.
+The scramble is now salted per training group and for the rest of the
+frame (`guiding_is_unbiased`). A guide trained on 16 samples made more
+fireflies than it removed (classroom 64 spp, 4-seed mean relMSE 0.27 vs
+0.23), so guiding acts only from 256 spp (`GUIDE_MIN_SPP`): 256 spp
+−13 % (4 seeds), 1024 spp −27 %. The pavilion's bounds are mostly sky and
+far trees, and it is not guided.
+
+### 6. Re-bench: true materials, equal time
+
+5b's protocol and Cycles references (480 × 270, 7 bounces, 32768-spp
+references, sweeps to 1024 spp, each renderer against its own reference,
+budgets at Cycles' 64 / 256 / 1024-spp times). The Cycles sweeps were
+re-run alongside irys's: three interleaved rounds, fastest per level.
+The irys classroom and clamped-pavilion references were re-rendered (the
+light fixes; the clamped estimator moves with the sun share).
+`irys s4` is every piece but guiding; `+ guide` adds it (mix ½).
+
+| scene | budget | Cycles | irys s4 | ratio | + guide | ratio | 5b ratio |
+|---|---|---|---|---|---|---|---|
+| classroom | 0.48 s | 0.160 | 0.143 | **0.89** | 0.173 | 1.08 | 2.24 |
+| classroom | 1.37 s | 0.113 | 0.186 | 1.64 | 0.159 | **1.40** | 3.46 |
+| classroom | 5.44 s | 0.021 | 0.093 | 4.44 | 0.058 | **2.75** | 1.71 |
+| pavilion, clamp 10 | 0.30 s | 0.0104 | 0.141 | 13.6 | — | | 20 |
+| pavilion, clamp 10 | 1.34 s | 0.0025 | 0.037 | 14.8 | — | | 30 |
+| pavilion, clamp 10 | 3.95 s | 0.0006 | 0.0107 | 17.2 | — | | 31 |
+| pavilion (unclamped) | 0.36 / 1.33 / 4.17 s | 2.3·10⁵ / 31 / 2013 | 1.72 / 0.53 / 0.13 | — | | | — |
+
+![speed4 classroom](speed4-classroom.png)
+![speed4 pavilion clamp](speed4-pavilion-clamp.png)
+
+Read with three cautions. The classroom references are a different
+picture from 5b's (the light fixes), so its 5b column is not the same
+comparison. relMSE here is a firefly count: the 20 worst pixels are 50–87 %
+of the error for **both** renderers (Cycles' classroom at 128 spp: 81 %),
+so a single run's curve is not monotone (irys at 128 spp 0.25, at 256
+0.06). And irys's times were taken under load: at 1024 spp it took 12–14
+s on the classroom against 8.7 s for the same work when the machine was
+quieter. Per sample, interleaved at 256 spp, this round against 5b's
+kernel: classroom 12.0 → 15.3 ms (+28 %: twice the usable shadow rays,
+the tree, lights no longer ending paths), pavilion 16.5 → 13.7 ms (−17 %).
+
+**1080p time per sample** (the files' cameras, 7 bounces, interleaved;
+Cycles at 64 spp in Blender, irys at 32 spp):
+
+| | Cycles | irys (5b) | irys (round 4) |
+|---|---|---|---|
+| classroom | 86 ms | 162 ms | 216 ms |
+| pavilion | 86 ms | 204 ms | 191 ms |
+
+(5b measured Cycles at 83 and 65 ms on a quieter machine.)
+
+**Gate verdict: not met.** The classroom is at or near parity at Cycles'
+64-spp budget (0.89 unguided, 1.08 guided) and 1.4–2.75× behind above it,
+where its error per sample is now Cycles' (at 1024 spp: guided 0.018,
+unguided 0.025, Cycles 0.021) and the whole gap is time per sample (irys
+2.5× Cycles' under this load). The clamped pavilion improved from 20–31×
+to 14–17× but stays far behind: per sample its error at 1024 spp is 6×
+Cycles' (0.0035 against 0.0006), and its sample is 2.2–3× slower.
+
+### Speed round 4 risks and next
+
+1. **The next lever is the pavilion's error per sample (6× Cycles' at
+   equal spp)**, not its speed: no sampler in this round moved it more than
+   25 %. An error map by path type (direct sun on foliage, the water's
+   caustics under the clamp, glass, sky through leaves) on the clamped
+   pavilion should say where; Cycles' indirect clamp (per path, by the
+   maximum channel) differs from irys's (per contribution, per lane),
+   which changes which paths are clamped.
+2. The classroom's gap is time per sample (5.3 ms for Cycles at 480 × 270
+   against 11–15 for irys). NEE with its shadow ray is ~40 % of a bounce;
+   the tree's traversal is 13 % of the frame. A cheaper tree (wider nodes,
+   quantised bounds) or lighter NEE at glossy-free diffuse vertices is next.
+3. All timings were on a shared, loaded machine; the ratios should be
+   re-measured on a quiet one before they gate anything.
+4. relMSE is dominated by a few dozen fireflies per frame in both
+   renderers; a firefly-robust companion metric (relMSE with the top 0.1 %
+   of pixels trimmed, or several seeds) would make these tables steadier.
+5. The light tree does not include the sun, the world or portals (fixed
+   group shares still pick between them).
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.

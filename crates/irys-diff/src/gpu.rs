@@ -73,7 +73,7 @@ fn wavefront_src(hw: bool, rest: &str) -> String {
 /// `qmc::byte_tables` (dimensions 1–3, four byte tables each) and
 /// `qmc::value_keys` as WGSL module constants, so the device's direction
 /// numbers and scramble keys are the CPU's by construction.
-fn sobol_const() -> String {
+pub(crate) fn sobol_const() -> String {
     let words: Vec<String> = crate::qmc::byte_tables().iter().map(|w| format!("{w}u")).collect();
     let keys: Vec<String> = crate::qmc::value_keys().iter().map(|w| format!("{w}u")).collect();
     format!(

@@ -14,6 +14,11 @@ use super::openpbr::{NE, OpenPbr, TN, Tables, fresnel_average, hats};
 use super::scene::{Camera, LookScene, Material, hat_inverse};
 
 const SHADER: &str = include_str!("scene.wgsl");
+/// Phase 3's grid × histogram guide, shared with the wavefront.
+const GUIDE: &str = include_str!("../gpu/guide.wgsl");
+/// Guide training records per path.
+const GDEPTH: u32 = 8;
+const GBINS: usize = 256;
 /// Spectrum bins across 380–780 nm.
 pub const BINS: usize = 40;
 const MS: usize = 20;
@@ -40,8 +45,52 @@ struct Params {
     minv1: [f32; 4],
     minv2: [f32; 4],
     emit_off: [u32; 4],
+    prof: [u32; 4],
+    samp: [u32; 4],
+    guide: [f32; 4],
+    gmin: [f32; 4],
+    gres: [u32; 4],
+    gres2: [u32; 4],
 }
 
+/// Profiling switches for [`Opts::prof`] (scene.wgsl's `PF_*`).
+pub mod prof {
+    /// Count rays, traversal candidates, material classes and SIMD occupancy ([`super::Frame::stats`]).
+    pub const STATS: u32 = 1;
+    /// No next-event estimation.
+    pub const NO_NEE: u32 = 2;
+    /// Next-event estimation without the shadow ray.
+    pub const NO_SHADOW: u32 = 4;
+    /// Every material a Lambertian of its base colour.
+    pub const LAMBERT: u32 = 8;
+    /// Cut-outs not alpha-tested in traversal.
+    pub const OPAQUE: u32 = 16;
+}
+
+/// The device's profiling counters (`prof::STATS`), summed over a frame.
+#[derive(Debug, Clone, Default)]
+pub struct Stats {
+    /// Camera rays, continuation rays (bounces and passes), shadow rays.
+    pub rays: [u64; 3],
+    /// Non-opaque candidates the closest-hit and shadow traversals tested.
+    pub candidates: [u64; 2],
+    /// Shaded vertices, and those on the per-wavelength (slow) path.
+    pub vertices: u64,
+    pub slow: u64,
+    /// Threads alive at loop iteration 0..8 (8: ≥ 7).
+    pub alive: [u64; 8],
+    /// SIMD groups (32 lanes) with any thread alive at iteration i.
+    pub simd_alive: [u64; 8],
+    /// Σ over SIMD groups of distinct material classes shaded at iteration i.
+    pub simd_classes: [u64; 8],
+    /// Shaded vertices per class: bits transmission 1, metal 2, coat 4,
+    /// fuzz/translucent/thin 8, slow path 16.
+    pub class: [u64; 32],
+    /// Light-tree picks whose evaluated probability differs from the sampled one.
+    pub tree_mismatch: u64,
+    /// Light-tree picks by ⌊−log2 p⌋.
+    pub tree_log2: Vec<u64>,
+}
 /// How to render a frame.
 #[derive(Debug, Clone, Copy)]
 pub struct Opts {
@@ -61,11 +110,42 @@ pub struct Opts {
     /// Evaluate every material per wavelength (the dispersive path) even
     /// where the four-lane path applies: the test of one against the other.
     pub per_lane: bool,
+    /// Profiling switches ([`prof`]); 0 renders normally.
+    pub prof: u32,
+    /// Sampler switches ([`samp`]); [`samp::ALL`] by default.
+    pub samp: u32,
+    /// Samples per dispatch, each thread regenerating its pixel's next path
+    /// as soon as one ends (1: one sample per dispatch, no regeneration).
+    pub regen: u32,
+    /// Path guiding at mostly-diffuse opaque vertices (phase 3's grid ×
+    /// histogram, `gpu/guide.wgsl`), trained during the frame's first
+    /// quarter of samples; the mix with the BSDF's own sampling (0: off).
+    /// Off for frames under [`GUIDE_MIN_SPP`]: a guide trained on fewer
+    /// than 64 samples a pixel made more fireflies than it removed.
+    pub guide: f32,
+}
+
+/// The fewest samples per pixel a frame needs for [`Opts::guide`] to act.
+pub const GUIDE_MIN_SPP: u32 = 256;
+
+/// Sampler switches for [`Opts::samp`] (speed round 4: phase 3's samplers).
+pub mod samp {
+    /// Shuffled, Owen-scrambled Sobol 4-tuples (else the hash generator).
+    pub const SOBOL: u32 = 1;
+    /// Hero wavelengths by the film response (else uniform).
+    pub const SPECTRAL: u32 = 2;
+    /// NEE's sun / world split by peak radiance (else by irradiance).
+    pub const SUN_PEAK: u32 = 4;
+    /// Emitter triangles by the light tree ([`super::super::light_tree`]),
+    /// else by the area × luminance CDF.
+    pub const LIGHT_TREE: u32 = 8;
+    /// Everything on.
+    pub const ALL: u32 = SOBOL | SPECTRAL | SUN_PEAK | LIGHT_TREE;
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Self { spp: 16, max_bounces: 7, rr_from: u32::MAX, clamp: 0.0, seed: 1, debug: 0, per_lane: false }
+        Self { spp: 16, max_bounces: 7, rr_from: u32::MAX, clamp: 0.0, seed: 1, debug: 0, per_lane: false, prof: 0, samp: samp::ALL, regen: 16, guide: 0.0 }
     }
 }
 
@@ -78,6 +158,8 @@ pub struct Frame {
     pub spectrum: Vec<f64>,
     /// Wall time of the samples (device), seconds.
     pub seconds: f64,
+    /// Counters, with `prof::STATS`.
+    pub stats: Option<Stats>,
 }
 
 /// What the device holds for one scene.
@@ -90,11 +172,16 @@ pub struct GpuLook {
     accum: wgpu::Buffer,
     spec: wgpu::Buffer,
     probe_io: wgpu::Buffer,
+    stats: wgpu::Buffer,
+    guide_pipe: wgpu::ComputePipeline,
+    gbuf: [wgpu::Buffer; 4],
+    grid: ([f32; 4], [u32; 3], u32),
     pixels: usize,
     size: (usize, usize),
     flags: [u32; 4],
     sun: ([f32; 4], [f32; 4]),
     picks: [f32; 4],
+    picks_peak: [f32; 4],
     env: [u32; 4],
     emit_off: [u32; 4],
     _keep: Vec<wgpu::Buffer>,
@@ -146,6 +233,9 @@ fn pack_material(m: &Material, portal_off: Option<u32>) -> [[f32; 4]; MS] {
     if m.metal_color.is_some() {
         flags |= 256;
     }
+    if m.light {
+        flags |= 512;
+    }
     let abbe = if p.transmission_dispersion_scale > 0.0 {
         p.transmission_dispersion_abbe_number / p.transmission_dispersion_scale
     } else {
@@ -178,6 +268,12 @@ fn pack_material(m: &Material, portal_off: Option<u32>) -> [[f32; 4]; MS] {
     o[15] = [a[0] as f32, a[1] as f32, a[2] as f32, cos as f32];
     o[16] = [sm as f32, 0.0, 0.0, 0.0];
     o
+}
+
+/// `qmc::Spectral`'s CDF as a WGSL constant.
+fn spec_const() -> String {
+    let c: Vec<String> = crate::qmc::Spectral::get().cdf.iter().map(|x| format!("{x:?}")).collect();
+    format!("const SPEC_CDF = array<f32, {}>({});\n", c.len(), c.join(", "))
 }
 
 fn apply(xf: &[[f32; 4]; 3], p: [f32; 3]) -> [f64; 3] {
@@ -279,6 +375,7 @@ impl GpuLook {
         let mut emit: Vec<[f32; 4]> = Vec::new();
         let mut inst: Vec<[u32; 4]> = Vec::new();
         let mut groups: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        let mut prims: Vec<super::light_tree::Prim> = Vec::new();
         let mut power = [0.0f64; 2];
         let mut order: Vec<(usize, usize)> = Vec::new(); // (group, instance)
         for (k, i) in scene.instances.iter().enumerate() {
@@ -317,6 +414,14 @@ impl GpuLook {
                 emit.push([p[1][0] as f32, p[1][1] as f32, p[1][2] as f32, area.max(1e-12) as f32]);
                 emit.push([p[2][0] as f32, p[2][1] as f32, p[2][2] as f32, 0.0]);
                 groups[g].push(area * l);
+                if g == 0 {
+                    prims.push(super::light_tree::Prim {
+                        p: p.map(|v| v.map(|x| x as f32)),
+                        energy: (area * l) as f32,
+                        two_sided: m.emit_both,
+                        back: m.emit_back,
+                    });
+                }
                 power[g] += area * l;
             }
         }
@@ -324,6 +429,16 @@ impl GpuLook {
         let n_portal = groups[1].len();
         if !seen_portal {
             portal_first = n_emit as u32;
+        }
+        let tree = super::light_tree::Tree::build(&prims);
+        let mut ltree = tree.nodes.clone();
+        if ltree.is_empty() {
+            ltree.push([0.0; 4]);
+        }
+        let (lt_clusters, lt_members) = tree.offsets();
+        let mut ltrail = tree.meta.clone();
+        if ltrail.is_empty() {
+            ltrail.push(0);
         }
         let c0 = cdf(&groups[0]);
         let c1 = cdf(&groups[1]);
@@ -348,6 +463,12 @@ impl GpuLook {
             }
         }
         let diag = ((0..3).map(|a| (hi[a] - lo[a]).powi(2)).sum::<f64>()).sqrt();
+        // The guide's grid: 16 cells along the bounds' longest side.
+        let long = (0..3).map(|a| hi[a] - lo[a]).fold(0.0, f64::max).max(1e-6) * 1.0001;
+        let cell = long / 16.0;
+        let gr: [u32; 3] = std::array::from_fn(|a| (((hi[a] - lo[a]) * 1.0001 / cell).ceil() as u32).max(1));
+        let cells = gr[0] * gr[1] * gr[2] * 6;
+        let grid = ([lo[0] as f32, lo[1] as f32, lo[2] as f32, (1.0 / cell) as f32], gr, cells);
         let d = (0.1 * diag).clamp(1.0, 10.0);
         let sun_e = scene.sun.map_or(0.0, |s| {
             std::f64::consts::PI * s.radius.sin().powi(2) * lum(s.radiance)
@@ -383,6 +504,21 @@ impl GpuLook {
             shares[0] + shares[1] + shares[2],
             1.0,
         ];
+        // Speed round 3's sun share (`prb::Env::sun_pick`): within the sun +
+        // world group, the sun's share by peak radiance against 0.4 of the
+        // world's brightest texel, kept in [0.1, 0.9].
+        let picks_peak = match (&scene.sun, &scene.env) {
+            (Some(s), Some(e)) => {
+                let sky = e.rgb.iter().map(|c| lum([c[0] as f64, c[1] as f64, c[2] as f64])).fold(0.0, f64::max) * 0.4;
+                let sun = lum(s.radiance).max(0.0);
+                // capped: the world keeps a tenth of the group, or its
+                // NEE samples become rare and its tail heavy
+                let p = if sun + sky > 0.0 { (sun / (sun + sky)).clamp(0.1, 0.9) } else { 0.5 };
+                let g = (shares[0] + shares[1]) as f64;
+                [(g * p) as f32, picks[1], picks[2], 1.0]
+            }
+            _ => picks,
+        };
         let sun = scene.sun.map_or(([0.0; 4], [0.0; 4]), |s| {
             let omega = std::f64::consts::TAU * (1.0 - s.radius.cos());
             ([s.dir[0] as f32, s.dir[1] as f32, s.dir[2] as f32, s.radius.cos() as f32], h4(s.radiance, omega))
@@ -519,6 +655,8 @@ impl GpuLook {
         let b_tabs = init("look tables", bytemuck::cast_slice(&tabs));
         let b_emit = init("look emitters", bytemuck::cast_slice(&emit));
         let b_env = init("look env", bytemuck::cast_slice(&envt));
+        let b_ltree = init("look light tree", bytemuck::cast_slice(&ltree));
+        let b_ltrail = init("look light trails", bytemuck::cast_slice(&ltrail));
         let (w, h) = scene.size;
         let pixels = w * h;
         let storage = |label: &str, bytes: u64| {
@@ -533,6 +671,13 @@ impl GpuLook {
         let groups_n = pixels.div_ceil(64);
         let spec = storage("look spectrum", (groups_n * BINS) as u64 * 4);
         let probe_io = storage("look probe", 1 << 20);
+        let stats = storage("look stats", 128 * 4);
+        let g_hist = storage("look guide hist", cells as u64 * GBINS as u64 * 8);
+        let g_cdf = storage("look guide cdf", cells as u64 * GBINS as u64 * 4);
+        let g_ok = storage("look guide ok", cells as u64 * 4);
+        let g_rec = storage("look guide records", (CHUNK as u64) * GDEPTH as u64 * 16);
+        let g_nrec = storage("look guide counts", CHUNK as u64 * 4);
+        let g_cnt = storage("look guide samples", cells as u64 * 4);
         let params = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("look params"),
             size: std::mem::size_of::<Params>() as u64,
@@ -541,11 +686,17 @@ impl GpuLook {
         });
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("look scene"),
-            source: wgpu::ShaderSource::Wgsl(format!("enable wgpu_ray_query;\n{SHADER}").into()),
+            source: wgpu::ShaderSource::Wgsl(format!(
+                "enable wgpu_ray_query;\n{}{}\n{SHADER}\n{}",
+                crate::gpu::sobol_const(),
+                spec_const(),
+                GUIDE.replace("params.", "P.")
+            ).into()),
         });
         let layout = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("look"),
-            entries: &(0..13u32)
+            entries: &(0..16u32)
+                .chain(50..56)
                 .map(|b| wgpu::BindGroupLayoutEntry {
                     binding: b,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -556,7 +707,7 @@ impl GpuLook {
                             min_binding_size: None,
                         },
                         11 => wgpu::BindingType::AccelerationStructure { vertex_return: false },
-                        9 | 10 | 12 => wgpu::BindingType::Buffer {
+                        9 | 10 | 12 | 13 | 50..=55 => wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
                             min_binding_size: None,
@@ -588,7 +739,8 @@ impl GpuLook {
         };
         let pipe = mk("trace");
         let probe_pipe = mk("probe");
-        let bufs: [(u32, &wgpu::Buffer); 12] = [
+        let guide_pipe = mk("guide_build");
+        let bufs: [(u32, &wgpu::Buffer); 21] = [
             (0, &params),
             (1, &b_tris),
             (2, &b_inst),
@@ -601,6 +753,15 @@ impl GpuLook {
             (9, &accum),
             (10, &spec),
             (12, &probe_io),
+            (13, &stats),
+            (14, &b_ltree),
+            (15, &b_ltrail),
+            (50, &g_hist),
+            (51, &g_cdf),
+            (52, &g_ok),
+            (53, &g_rec),
+            (54, &g_nrec),
+            (55, &g_cnt),
         ];
         let mut ents: Vec<wgpu::BindGroupEntry> = bufs
             .iter()
@@ -620,14 +781,19 @@ impl GpuLook {
             accum,
             spec,
             probe_io,
+            stats,
+            guide_pipe,
+            grid,
             pixels,
             size: scene.size,
             flags: [pixels as u32, n_emit as u32, n_portal as u32, 0],
             sun,
             picks,
+            picks_peak,
             env,
-            emit_off: [0, portal_first, 0, 0],
-            _keep: [b_tris, b_inst, b_mats, b_texels, b_textab, b_tabs, b_emit, b_env]
+            emit_off: [0, portal_first, lt_clusters as u32, lt_members as u32],
+            gbuf: [g_hist, g_cdf, g_ok, g_cnt],
+            _keep: [g_rec, g_nrec, b_tris, b_inst, b_mats, b_texels, b_textab, b_tabs, b_emit, b_env, b_ltree, b_ltrail]
                 .into_iter()
                 .chain(keep)
                 .collect(),
@@ -638,7 +804,7 @@ impl GpuLook {
         })
     }
 
-    fn params(&self, cam: &Camera, o: &Opts, sample: u32, first: u32) -> Params {
+    fn params(&self, cam: &Camera, o: &Opts, sample: u32, n: u32, first: u32, gflags: u32, salt: u32) -> Params {
         let band = (irys_light::spectrum::LAMBDA_MAX_NM - irys_light::spectrum::LAMBDA_MIN_NM) as f32;
         let norm = irys_light::spectrum::RESPONSE_NORM;
         let per = band / 4.0;
@@ -657,28 +823,54 @@ impl GpuLook {
             resp: [norm[0] as f32 * per, norm[1] as f32 * per, norm[2] as f32 * per, 0.0],
             sun_dir: self.sun.0,
             sun_l: self.sun.1,
-            picks: self.picks,
+            picks: if o.samp & samp::SUN_PEAK != 0 { self.picks_peak } else { self.picks },
             env: self.env,
             minv0: [mi[0][0], mi[0][1], mi[0][2], 0.0],
             minv1: [mi[1][0], mi[1][1], mi[1][2], 0.0],
             minv2: [mi[2][0], mi[2][1], mi[2][2], 0.0],
             emit_off: self.emit_off,
+            prof: [o.prof, 0, 0, 0],
+            samp: [o.samp, o.spp, n, salt],
+            guide: [o.guide, 0.0, 0.0, 0.0],
+            gmin: self.grid.0,
+            gres: [self.grid.1[0], self.grid.1[1], self.grid.1[2], gflags],
+            gres2: [GDEPTH, self.grid.2, 64, 0],
         }
     }
 
     /// Render one frame from `cam`.
     pub fn render(&self, cam: &Camera, o: &Opts) -> Frame {
+        let o = &Opts { guide: if o.spp >= GUIDE_MIN_SPP { o.guide } else { 0.0 }, ..*o };
         let (dev, queue) = (&self.ctx.device, &self.ctx.queue);
         let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         enc.clear_buffer(&self.accum, 0, None);
         enc.clear_buffer(&self.spec, 0, None);
+        enc.clear_buffer(&self.stats, 0, None);
+        if o.guide > 0.0 {
+            for b in &self.gbuf {
+                enc.clear_buffer(b, 0, None);
+            }
+        }
         queue.submit([enc.finish()]);
         dev.poll(wgpu::PollType::wait_indefinitely()).expect("device lost");
         let t0 = std::time::Instant::now();
-        for s in 0..o.spp {
+        let k = o.regen.max(1);
+        // Guiding: the first quarter of the samples (at least one group)
+        // trains, the guide rebuilt after each of those groups; it is a
+        // constant within a dispatch, so every sample is unbiased.
+        let train_until = (o.spp / 4).max(k.min(o.spp));
+        for s in (0..o.spp).step_by(k as usize) {
+            let ns = k.min(o.spp - s);
+            let training = o.guide > 0.0 && s < train_until;
+            let gflags = (o.guide > 0.0) as u32 | (training as u32) << 1;
             for first in (0..self.pixels).step_by(CHUNK) {
                 let n = (self.pixels - first).min(CHUNK);
-                let p = self.params(cam, o, s, first as u32);
+                let salt = match (o.guide > 0.0, training) {
+                    (false, _) => 0,
+                    (true, true) => 1 + s / k,
+                    (true, false) => 0x8000_0000,
+                };
+                let p = self.params(cam, o, s, ns, first as u32, gflags, salt);
                 queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&p));
                 let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
                 {
@@ -689,8 +881,23 @@ impl GpuLook {
                 }
                 queue.submit([enc.finish()]);
             }
-            dev.poll(wgpu::PollType::wait_indefinitely()).expect("device lost");
+            if training {
+                let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                    pass.set_pipeline(&self.guide_pipe);
+                    pass.set_bind_group(0, &self.group, &[]);
+                    let c = self.grid.2;
+                    pass.dispatch_workgroups(c.min(65535), c.div_ceil(65535), 1);
+                }
+                queue.submit([enc.finish()]);
+            }
+            // wait every eighth group only: the queue stays fed
+            if (s / k) % 8 == 7 {
+                dev.poll(wgpu::PollType::wait_indefinitely()).expect("device lost");
+            }
         }
+        dev.poll(wgpu::PollType::wait_indefinitely()).expect("device lost");
         let seconds = t0.elapsed().as_secs_f64();
         let acc = self.read(&self.accum, self.pixels * 4);
         let inv = 1.0 / o.spp.max(1) as f32;
@@ -708,7 +915,23 @@ impl GpuLook {
         for s in &mut spectrum {
             *s /= per_bin;
         }
-        Frame { rgb, spectrum, seconds }
+        let stats = (o.prof & prof::STATS != 0).then(|| {
+            let raw: Vec<u64> = self.read(&self.stats, 128).iter().map(|x| x.to_bits() as u64).collect();
+            let a8 = |o: usize| std::array::from_fn(|i| raw[o + i]);
+            Stats {
+                rays: [raw[0], raw[1], raw[2]],
+                candidates: [raw[3], raw[4]],
+                vertices: raw[7],
+                slow: raw[6],
+                alive: a8(8),
+                simd_alive: a8(16),
+                simd_classes: a8(24),
+                class: std::array::from_fn(|i| raw[32 + i]),
+                tree_mismatch: raw[5],
+                tree_log2: raw[64..128].to_vec(),
+            }
+        });
+        Frame { rgb, spectrum, seconds, stats }
     }
 
     /// Evaluate material lanes on the device: per lane `(material, λ,
@@ -727,7 +950,7 @@ impl GpuLook {
         }
         queue.write_buffer(&self.probe_io, 0, bytemuck::cast_slice(&io));
         let cam = Camera { eye: [0.0; 3], forward: [0.0, 1.0, 0.0], right: [1.0, 0.0, 0.0], up: [0.0, 0.0, 1.0], tan_half: 1.0 };
-        let p = self.params(&cam, &Opts::default(), 0, 0);
+        let p = self.params(&cam, &Opts::default(), 0, 1, 0, 0, 0);
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&p));
         let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
