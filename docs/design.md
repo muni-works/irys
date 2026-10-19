@@ -3347,3 +3347,143 @@ IOSurface-backed buffer) is not needed.
 5. The params ring assumes `size_of::<Params>()` rounds to 256 B slots;
    it is computed, so a larger `Params` (the speed round adds fields)
    only halves the slots per submit.
+
+## Splat training (2026-10-19)
+
+docs/belief-codec.md M0 needs a map that predicts photos at ≥ 25–30 dB
+held out; the garage map (gsplat on mew, rendered by irys) gives blobs at
+~13 dB. `crates/irys-splat` fits a 3DGS map to posed photos on this Mac's
+GPU through irys-gpu's wgpu 30 device: no CUDA, no gsplat. Model and
+schedule are gsplat `simple_trainer`'s (ipse `scripts/splat_train.py` ran
+it), so the result loads where the old one did.
+
+### Method: (b), a tile rasteriser for training, the ray tracer for rendering
+
+Measured, not argued: M1's ray-traced splat layer costs 155 ms – 2.3 s per
+garage frame *forward only* (AABB-callback k-buffer rounds); the trainer
+needs ~30 k forward + backward passes. The tile rasteriser's whole step
+(projection, composite, loss and its gradient, adjoint, Adam) is 10–70 ms
+of device time at 544 × 448 and 0.1–1 M splats, on a GPU shared with other
+sessions. (a) would also have needed a backward re-walk of every ray's
+rounds. So: (b), and `--irys-eval` scores the trained map through the ray
+tracer too, because the codec's prediction is the irys render (below).
+
+- **Projection** (`project.rs`, `proj.wgsl::project`): EWA, `Σ = R S Sᵀ Rᵀ`,
+  `Σ₂ = J W Σ Wᵀ Jᵀ + 0.3 I` (the same 0.3 px² the ray tracer applies),
+  camera-space mean clamped to 1.3 × the frustum, OpenCV pinhole with the
+  principal point (`look::pinhole`, pixel `(i, j)`'s centre at `(i, j)`),
+  opacity-aware radius `√(2 ln(255 o) λ_max)` (exact under the 1/255 cut),
+  SH ≤ 3 toward the splat (+½, clamped), optical depth as a 4th channel.
+- **Binning on the host** (`tiles.rs`): the only readback per step is
+  `(u, v, r, z)` per splat. One depth sort over splats, then a chunked
+  counting scatter into 16 × 16 tiles, so every tile list comes out
+  `(z, index)`-sorted with no per-intersection key sort; the same pass
+  writes the splat-major slot lists.
+- **Raster** (`raster.wgsl`): forward per tile (256 splats staged through
+  workgroup memory, α = min(0.99, o·G), skip < 1/255, stop before T < 1e-4);
+  backward replays the tile list back to front from T_N (3DGS's adjoint),
+  sums each splat's per-pixel gradient over the tile by a **fixed tree** in
+  workgroup memory into one record per (tile, splat), and `reduce` sums each
+  splat's records in the host's slot order. **No float atomics**: the
+  "sorted segments" pattern; repeated runs are bit-identical.
+- **Loss** (`loss.rs`, `proj.wgsl::ssim_*`): 0.8 L1 + 0.2 (1 − SSIM),
+  11 × 11 Gaussian σ 1.5, zero padding, five separable passes for value and
+  gradient; optional depth L1 (`--depth-weight`) where depth is valid.
+- **Adjoint + Adam** (`proj.wgsl::adjoint`): the projection's reverse line
+  by line, fused with Adam (gsplat's groups and rates: means 1.6e-4 ×
+  scene scale decayed ×0.01, log scales 5e-3, quats 1e-3, opacity 5e-2,
+  SH DC 2.5e-3, SH rest /20); densification statistics accumulate there.
+- **Schedule** (`train.rs`): `DefaultStrategy` — every 100 steps in
+  (500, 15 000] clone (≤ 0.01 scene scale) or split (2 samples, /1.6) where
+  the mean NDC screen gradient > 2e-4, prune opacity < 0.005 (and world size
+  > 0.1 scene scale after the first reset), opacity reset to ≤ 0.01 every
+  3000 (the dips in the curves), SH degree +1 every 1000 steps to 3.
+  Refinement reads the state back and re-uploads (f64 on the host).
+- **Adjoints are hand-written** (Rust f64 and WGSL f32); the tang IR is not
+  used — tile staging, sorted lists and a fixed-tree workgroup reduction are
+  not comprehensions. Each is checked (`tests/gradcheck.rs`):
+
+| check | result |
+|---|---|
+| host f64 adjoint vs central differences (h 1e-6, 24 splats, 48 × 36, linear functional of rgb + depth): means / log scales / quats / opacity logit / SH DC / SH rest (deg 1–3) | max rel 2.3e-7 / 5.4e-6 / 2.0e-5 / 6.2e-7 / 1.5e-6 / 1.4e-3 (median 6e-8; the max is the colour's clamp at 0) |
+| loss (L1 + D-SSIM + depth L1) vs central differences | 5.8e-7 of the largest gradient |
+| device raster vs f64 twin, 300 splats, 100 × 70 (edge tiles) | forward 3.2e-7; screen-space gradient u v A B C o r g b z ≤ 9.1e-7 of each type's max |
+| device projection adjoint vs host adjoint (fed the device's screen gradient), per type | ≤ 6.1e-7 |
+| device loss gradient vs host | 5.2e-7 |
+| device forward + adjoint, run twice | bit-identical |
+
+### Synthetic gate (`examples/synth_classroom`, `examples/splat_train`)
+
+The classroom (5b export, true OpenPBR materials) rendered by irys at
+512 spp (clamp 4), 544 × 448 with the K1's intrinsics, from 150 cameras on
+a closed walk (an ellipse at head height, gaze swept ±50° across the room,
+pitch wobble), exact depth from the sensor AOV; 2058 s. Every 8th view held
+out (131 train / 19 test). 30 000 steps.
+
+| init | held-out PSNR | SSIM | splats | train | raster render | irys ray tracer, same map |
+|---|---|---|---|---|---|---|
+| 30 k "SfM-like" points (random valid training-depth pixels) | **29.80 dB** | **0.837** | 987 098 | 6424 s | 75.8 ms (13.2 fps) | 23.26 dB, 0.726, 305 ms |
+| 100 k random in the camera box ± 2 × scene scale | **29.45 dB** | **0.832** | 858 766 | 4825 s | 17.6 ms (56.9 fps) | — |
+
+Gate (≥ 28 dB held out): **met** from sparse init (28.2 dB at step 8000).
+Train times are on a machine at load average 200–390 from other sessions
+(host binning 20–180 ms per step, device step 10–190 ms); render time is
+project + readback + bin + composite + readback, not the composite alone;
+the two render times differ by machine load at the moment each was taken
+(the random run finished on a quieter machine), not by the maps.
+The ground truth itself carries 512-spp noise, which caps PSNR.
+
+![splat training, synthetic](splat-train-synthetic.png)
+
+### Garage smoke test
+
+The 35 posed keyframes of `ipse-captures/2026-08-14-garage-sweep`, colour
+from `frames/<frame>.nv12` (the depth-aligned colour at the pose's own
+stamp; the nearest app JPEG is 46 ms off), no depth (StereoNet is mostly
+empty here), 100 k random splats in ± 4 m, `--scene-scale 3` (the cameras
+sit within ~0.1 m of each other, which would make gsplat's scale 0.1 m),
+7000 steps: held out (5 views) **23.65 dB, SSIM 0.788**, 739 967 splats,
+2119 s. Real-image handling works (NV12 decode, poses, intrinsics); the
+held-out views sit between training views of a turn-in-place sweep, so this
+says the cloud interpolates a panorama, not that it has geometry. Not a
+quality gate.
+
+![splat training, garage](splat-train-garage-smoke.png)
+
+### CLI and formats
+
+```
+cargo run --release -p irys-splat --example splat_train -- \
+    --images DIR --poses poses.jsonl --camera camera_info.json --out map.ply \
+    [--depth DIR | --with-depth] [--init points.ply | --seed-depth N | --random N] \
+    [--iters 30000] [--holdout 8] [--report DIR] [--irys-eval] [--scene-scale M]
+# or, for ipse docs/CAPTURE.md's export:
+cargo run --release -p irys-splat --example splat_train -- --train <capture>.train --with-depth --out map.ply
+```
+
+Pose lines: `cam_pos` + `cam_rot` (row-major, world ← optical — the
+CAPTURE.md / K1 sweep flavour) or a 4 × 4 camera → world matrix. `image` /
+`depth` names resolve against the given directory or the poses file's own
+(CAPTURE.md writes `images/N.png`, `depth/N.u16`); else `<frame>.nv12`,
+else the nearest `jpegs.jsonl` time, else `<frame>.jpg|png`. Depth `.u16`
+mm or `.f32` m. `tests/capture_format.rs` loads a fixture in CAPTURE.md's
+layout. Output: the INRIA layout with garage-perim `splat.ply`'s names and
+order (`x y z nx ny nz f_dc_* [f_rest_*] opacity scale_* rot_*`), read back
+by `PlyCloud`.
+
+### Deviations and risks
+
+1. **The rasteriser-trained map scores 6.5 dB lower through irys's ray
+   tracer** (23.3 vs 29.8 dB): the M1 risk 2 gap, now measured on a cloud
+   trained here. For M0 the codec should predict with the raster (it is
+   also faster), or fine-tune in the ray tracer — that is (a)'s backward,
+   still unbuilt.
+2. **Host binning** dominates under load (and is serial with the device).
+   A device scan + bucket scatter would remove the readback.
+3. NV12: CAPTURE.md says BT.601 *limited*; the sweep's Y spans 0–255 and
+   matches its JPEGs' mean, so the loader decodes **full** range. One of
+   the two is wrong; check against a capture with a known chart.
+4. Host state is f64 (params + Adam moments ≈ 1.4 KB per splat); the cap is
+   1.5 M splats. The classroom stopped growing at ~1 M by step 15 000.
+5. Dense Adam: every splat's moments move every step (torch's behaviour),
+   ≈ 1 M × 60 parameters per step on the device.
