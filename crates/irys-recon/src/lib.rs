@@ -21,3 +21,4 @@ pub mod mdl;
 pub mod model;
 pub mod render;
 pub mod search;
+pub mod tag;

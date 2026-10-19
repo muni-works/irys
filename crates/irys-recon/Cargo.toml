@@ -17,7 +17,20 @@ irys-diff = { path = "../irys-diff", features = ["assets"] }
 vcad-kernel = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# v1: tag36h11 detection (pure Rust, Apache-2.0), EXIF focal length (MIT),
+# STL export (vcad's own exporter), threads for the photo renderer.
+kornia-apriltag = "0.2"
+kornia-image = "0.2"
+kamadak-exif = "0.6"
+vcad-kernel-export = "0.10"
+rayon.workspace = true
+
+[features]
+# The synthetic photos are rendered with irys's OpenPBR scene kernel on the
+# device (`look::scene_gpu`); only `examples/recon_v1` needs it.
+gpu = ["irys-diff/gpu"]
 
 [[example]]
 name = "recon_v0"
+
