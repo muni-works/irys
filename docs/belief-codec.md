@@ -69,31 +69,36 @@ map directories; outputs go to `ipse/out/m0/`.
 
 Each item lands on its own irys branch, gated by the usual invariants.
 
-1. **Splats unparked.**
+**Status (2026-10-19, irys `claude/m1`):** built, every item a commit;
+numbers, API and deviations in irys `docs/design.md`, "M1".
+
+1. [x] **Splats unparked.**
    - A `.ply` loader for 3DGS: position, scale, rotation, opacity, SH up to
      degree 3.
    - Splats in the OpenPBR scene kernel (3DGRT proxies in the same TLAS as
      meshes, the sorted k-buffer composite from 2b, SH evaluated per view).
-   - Optional per-splat material for relighting later.
+   - Optional per-splat material for relighting later. *(not started)*
    - Gate: the garage splat renders within N dB PSNR of gsplat's own render at
-     held-out capture views.
-2. **AOVs.** First-hit distance (metric, with a real miss marker), instance id,
+     held-out capture views. *(gsplat is CUDA-only and the capture is not
+     yet registered to the map — M0 step 1 — so the gate ran against a CPU
+     EWA rasteriser at the map's held-out training cameras; see design.md.)*
+2. [x] **AOVs.** First-hit distance (metric, with a real miss marker), instance id,
    material id, normal, and the per-pixel σ of the belief (the σ input comes
    from the caller). Separate buffers, read back on demand.
-3. **Batched cameras.** N cameras × M scenes in one submit / one wait / one
+3. [x] **Batched cameras.** N cameras × M scenes in one submit / one wait / one
    readback; spectrum readback optional. Target: per-camera overhead under
    0.5 ms at 544×448 depth-only.
-4. **TLAS-only rebuild.** `set_instances` moves placements without re-uploading
+4. [x] **TLAS-only rebuild.** `set_instances` moves placements without re-uploading
    BLAS or geometry. Target: under 1 ms for 30 instances.
-5. **Camera principal point** (cx, cy offsets) plus OpenCV pinhole
+5. [x] **Camera principal point** (cx, cy offsets) plus OpenCV pinhole
    conventions, matching `camera_info.json`.
-6. **Residual pass.** The GPU computes |real − predicted| with a joint
+6. [x] **Residual pass.** The GPU computes |real − predicted| with a joint
    colour/depth noise model, giving the explained mask and the unexplained
    patch list. That feeds M0's coder and M4's patches.
-7. **irys-ffi + IOSurface spike.** A C ABI that renders into an IOSurface-backed
+7. [x] **irys-ffi + IOSurface spike.** A C ABI that renders into an IOSurface-backed
    texture that Swift/Metal presents with no copy. First answer whether wgpu 30
    exposes the Metal texture (`wgpu::hal` interop); fall back to a single
-   copy-to-shared-surface if not.
+   copy-to-shared-surface if not. *(wgpu 30 does: no copy.)*
 
 ---
 
