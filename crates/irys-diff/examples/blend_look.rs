@@ -58,6 +58,7 @@ fn main() {
         rr_from: opt("--rr").map_or(u32::MAX, |s| s.parse().unwrap()),
         debug: opt("--debug").map_or(0, |s| s.parse().unwrap()),
         per_lane: rest.iter().any(|a| a == "--per-lane"),
+        prof: 0,
     };
     let reps: usize = opt("--reps").map_or(1, |s| s.parse().unwrap());
     let t0 = std::time::Instant::now();

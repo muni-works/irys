@@ -35,6 +35,7 @@ struct Params {
     minv1: vec4<f32>,
     minv2: vec4<f32>,
     emit_off: vec4<u32>,  // emitter cdf offset 0, portal first index, -, -
+    prof: vec4<u32>,      // profiling: x bits (PF_*), -, -, -
 }
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -56,6 +57,23 @@ struct Params {
 @group(0) @binding(10) var<storage, read_write> spec: array<f32>;
 @group(0) @binding(11) var accel: acceleration_structure;
 @group(0) @binding(12) var<storage, read_write> probe_io: array<vec4<f32>>;
+// Profiling counters (`Opts::prof` with PF_STATS): see `scene_gpu::Stats`.
+@group(0) @binding(13) var<storage, read_write> stats: array<atomic<u32>>;
+
+const PF_STATS: u32 = 1u;      // count rays, candidates, classes, occupancy
+const PF_NO_NEE: u32 = 2u;     // no next-event estimation
+const PF_NO_SHADOW: u32 = 4u;  // NEE without its shadow ray (unoccluded)
+const PF_LAMBERT: u32 = 8u;    // every material a Lambertian of its base colour
+const PF_OPAQUE: u32 = 16u;    // no alpha test in traversal (cut-outs solid)
+
+var<private> st_cand: u32 = 0u;
+var<private> st_scand: u32 = 0u;
+var<workgroup> wg_alive: array<atomic<u32>, 16>;
+var<workgroup> wg_cls: array<atomic<u32>, 16>;
+
+fn prof_on(b: u32) -> bool {
+    return (P.prof.x & b) != 0u;
+}
 
 const PI: f32 = 3.14159265358979;
 const NONE: u32 = 0xffffffffu;
@@ -1181,9 +1199,10 @@ fn trace_ray(o: vec3<f32>, d: vec3<f32>, msk: u32) -> Surf {
         if (!rayQueryProceed(&rq)) { break; }
         let c = rayQueryGetCandidateIntersection(&rq);
         if (c.kind != RAY_QUERY_INTERSECTION_TRIANGLE) { continue; }
+        st_cand = st_cand + 1u;
         let ir = inst[c.instance_custom_data];
         let m = load_cand(ir.y);
-        if ((m.flags & F_CUTOUT) != 0u) {
+        if ((m.flags & F_CUTOUT) != 0u && !prof_on(PF_OPAQUE)) {
             let uv = tri_uv(ir.x + c.primitive_index, c.barycentrics);
             if (cand_alpha(m, uv) < 0.5) { continue; }
         }
@@ -1230,9 +1249,10 @@ fn shadow(o: vec3<f32>, d: vec3<f32>, tmax: f32, lam: vec4<f32>) -> vec4<f32> {
         if (!rayQueryProceed(&rq)) { break; }
         let c = rayQueryGetCandidateIntersection(&rq);
         if (c.kind != RAY_QUERY_INTERSECTION_TRIANGLE) { continue; }
+        st_scand = st_scand + 1u;
         let ir = inst[c.instance_custom_data];
         let mc = load_cand(ir.y);
-        if ((mc.flags & F_CUTOUT) != 0u) {
+        if ((mc.flags & F_CUTOUT) != 0u && !prof_on(PF_OPAQUE)) {
             let uv = tri_uv(ir.x + c.primitive_index, c.barycentrics);
             if (cand_alpha(mc, uv) < 0.5) { continue; }
             rayQueryConfirmIntersection(&rq);
@@ -1416,6 +1436,13 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
     var rad = vec4<f32>(0.0);
     var lam = vec4<f32>(0.0);
     let live = px < P.flags.x;
+    let pstats = prof_on(PF_STATS);
+    if (pstats && li < 16u) {
+        atomicStore(&wg_alive[li], 0u);
+        atomicStore(&wg_cls[li], 0u);
+    }
+    workgroupBarrier();
+    var iter = 0u;
     if (live) {
         var rng = rng_new(vec2<u32>(px, P.seed.z));
         let u0 = rand(&rng);
@@ -1445,6 +1472,13 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
         let clampv = P.fwd.w;
         loop {
             let s = trace_ray(ro, rd, msk);
+            let it = min(iter, 7u);
+            if (pstats) {
+                atomicAdd(&stats[select(1u, 0u, iter == 0u)], 1u);
+                atomicAdd(&stats[8u + it], 1u);
+                atomicAdd(&wg_alive[(li / 32u) * 8u + it], 1u);
+            }
+            iter = iter + 1u;
             if (!s.ok) {
                 let e = sky(rd);
                 var wm = 1.0;
@@ -1456,7 +1490,12 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
                 }
                 break;
             }
-            let m = load_mat(s.mat);
+            var m = load_mat(s.mat);
+            if (prof_on(PF_LAMBERT) && (m.flags & F_EMITTER) == 0u) {
+                m.met = 0.0; m.sw = 0.0; m.tw = 0.0; m.cw = 0.0; m.fw = 0.0; m.ss = 0.0;
+                m.tl = 0.0; m.filmw = 0.0; m.abbe = 0.0; m.metal_tex = NONE;
+                m.flags = m.flags & ~(F_THIN | F_METAL_SEP);
+            }
             if (P.size.z != 0u) {
                 // debug views: 1 material hash, 2 shading normal, 3 transmission weight
                 var c = vec3<f32>(0.0);
@@ -1541,6 +1580,14 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
             // The four-lane path where the index is the same at every
             // wavelength; per lane otherwise (and when P.up.w forces it).
             let fast = fast_ok(mt) && P.up.w == 0.0;
+            if (pstats) {
+                let cls = select(0u, 1u, mt.tw > 0.0) | select(0u, 2u, mt.met > 0.0) | select(0u, 4u, mt.cw > 0.0)
+                    | select(0u, 8u, mt.fw > 0.0 || mt.tl > 0.0 || thin) | select(0u, 16u, !fast);
+                atomicAdd(&stats[32u + cls], 1u);
+                atomicAdd(&stats[7u], 1u);
+                if (!fast) { atomicAdd(&stats[6u], 1u); }
+                atomicOr(&wg_cls[(li / 32u) * 8u + it], 1u << cls);
+            }
             var at: array<At, 4>;
             var a4: At4;
             var lw: Lobes;
@@ -1575,7 +1622,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
             // Next-event estimation.
             let ul = vec4<f32>(rand(&rng), rand(&rng), rand(&rng), rand(&rng));
             let ul2 = rand(&rng);
-            {
+            if (!prof_on(PF_NO_NEE)) {
                 let l = sample_light(s.x, ul, ul2);
                 if (l.ok && l.pdf > 0.0) {
                     let above = dot(l.wi, ng) > 0.0;
@@ -1584,7 +1631,11 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
                     if ((above && wi.z > 0.0) || (!above && wi.z < 0.0)) {
                         var dist = l.dist;
                         if (dist < 3e38) { dist = length(s.x + l.wi * l.dist - xo) * (1.0 - 1e-4); }
-                        let tr = shadow(xo, l.wi, dist, lam);
+                        var tr = vec4<f32>(1.0);
+                        if (!prof_on(PF_NO_SHADOW)) {
+                            tr = shadow(xo, l.wi, dist, lam);
+                            if (pstats) { atomicAdd(&stats[2u], 1u); }
+                        }
                         if (max(max(tr.x, tr.y), max(tr.z, tr.w)) > 0.0) {
                             var pb: f32;
                             var f4: vec4<f32>;
@@ -1670,6 +1721,18 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
             rgb = rgb + rad[k] * lane_rgb(lam[k]);
         }
         accum[px] = accum[px] + vec4<f32>(rgb, 0.0);
+    }
+    if (pstats) {
+        atomicAdd(&stats[3u], st_cand);
+        atomicAdd(&stats[4u], st_scand);
+        workgroupBarrier();
+        if (li < 16u) {
+            let n = atomicLoad(&wg_alive[li]);
+            if (n > 0u) {
+                atomicAdd(&stats[16u + (li % 8u)], 1u);
+                atomicAdd(&stats[24u + (li % 8u)], countOneBits(atomicLoad(&wg_cls[li])));
+            }
+        }
     }
     // The frame's mean spectrum: each workgroup sums its lanes into BINS
     // slots of its own, in lane order (no float atomics: deterministic).

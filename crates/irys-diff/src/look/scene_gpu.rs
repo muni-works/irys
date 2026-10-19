@@ -40,8 +40,43 @@ struct Params {
     minv1: [f32; 4],
     minv2: [f32; 4],
     emit_off: [u32; 4],
+    prof: [u32; 4],
 }
 
+/// Profiling switches for [`Opts::prof`] (scene.wgsl's `PF_*`).
+pub mod prof {
+    /// Count rays, traversal candidates, material classes and SIMD occupancy ([`super::Frame::stats`]).
+    pub const STATS: u32 = 1;
+    /// No next-event estimation.
+    pub const NO_NEE: u32 = 2;
+    /// Next-event estimation without the shadow ray.
+    pub const NO_SHADOW: u32 = 4;
+    /// Every material a Lambertian of its base colour.
+    pub const LAMBERT: u32 = 8;
+    /// Cut-outs not alpha-tested in traversal.
+    pub const OPAQUE: u32 = 16;
+}
+
+/// The device's profiling counters (`prof::STATS`), summed over a frame.
+#[derive(Debug, Clone, Default)]
+pub struct Stats {
+    /// Camera rays, continuation rays (bounces and passes), shadow rays.
+    pub rays: [u64; 3],
+    /// Non-opaque candidates the closest-hit and shadow traversals tested.
+    pub candidates: [u64; 2],
+    /// Shaded vertices, and those on the per-wavelength (slow) path.
+    pub vertices: u64,
+    pub slow: u64,
+    /// Threads alive at loop iteration 0..8 (8: ≥ 7).
+    pub alive: [u64; 8],
+    /// SIMD groups (32 lanes) with any thread alive at iteration i.
+    pub simd_alive: [u64; 8],
+    /// Σ over SIMD groups of distinct material classes shaded at iteration i.
+    pub simd_classes: [u64; 8],
+    /// Shaded vertices per class: bits transmission 1, metal 2, coat 4,
+    /// fuzz/translucent/thin 8, slow path 16.
+    pub class: [u64; 32],
+}
 /// How to render a frame.
 #[derive(Debug, Clone, Copy)]
 pub struct Opts {
@@ -61,11 +96,13 @@ pub struct Opts {
     /// Evaluate every material per wavelength (the dispersive path) even
     /// where the four-lane path applies: the test of one against the other.
     pub per_lane: bool,
+    /// Profiling switches ([`prof`]); 0 renders normally.
+    pub prof: u32,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Self { spp: 16, max_bounces: 7, rr_from: u32::MAX, clamp: 0.0, seed: 1, debug: 0, per_lane: false }
+        Self { spp: 16, max_bounces: 7, rr_from: u32::MAX, clamp: 0.0, seed: 1, debug: 0, per_lane: false, prof: 0 }
     }
 }
 
@@ -78,6 +115,8 @@ pub struct Frame {
     pub spectrum: Vec<f64>,
     /// Wall time of the samples (device), seconds.
     pub seconds: f64,
+    /// Counters, with `prof::STATS`.
+    pub stats: Option<Stats>,
 }
 
 /// What the device holds for one scene.
@@ -90,6 +129,7 @@ pub struct GpuLook {
     accum: wgpu::Buffer,
     spec: wgpu::Buffer,
     probe_io: wgpu::Buffer,
+    stats: wgpu::Buffer,
     pixels: usize,
     size: (usize, usize),
     flags: [u32; 4],
@@ -533,6 +573,7 @@ impl GpuLook {
         let groups_n = pixels.div_ceil(64);
         let spec = storage("look spectrum", (groups_n * BINS) as u64 * 4);
         let probe_io = storage("look probe", 1 << 20);
+        let stats = storage("look stats", 64 * 4);
         let params = dev.create_buffer(&wgpu::BufferDescriptor {
             label: Some("look params"),
             size: std::mem::size_of::<Params>() as u64,
@@ -545,7 +586,7 @@ impl GpuLook {
         });
         let layout = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("look"),
-            entries: &(0..13u32)
+            entries: &(0..14u32)
                 .map(|b| wgpu::BindGroupLayoutEntry {
                     binding: b,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -556,7 +597,7 @@ impl GpuLook {
                             min_binding_size: None,
                         },
                         11 => wgpu::BindingType::AccelerationStructure { vertex_return: false },
-                        9 | 10 | 12 => wgpu::BindingType::Buffer {
+                        9 | 10 | 12 | 13 => wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
                             min_binding_size: None,
@@ -588,7 +629,7 @@ impl GpuLook {
         };
         let pipe = mk("trace");
         let probe_pipe = mk("probe");
-        let bufs: [(u32, &wgpu::Buffer); 12] = [
+        let bufs: [(u32, &wgpu::Buffer); 13] = [
             (0, &params),
             (1, &b_tris),
             (2, &b_inst),
@@ -601,6 +642,7 @@ impl GpuLook {
             (9, &accum),
             (10, &spec),
             (12, &probe_io),
+            (13, &stats),
         ];
         let mut ents: Vec<wgpu::BindGroupEntry> = bufs
             .iter()
@@ -620,6 +662,7 @@ impl GpuLook {
             accum,
             spec,
             probe_io,
+            stats,
             pixels,
             size: scene.size,
             flags: [pixels as u32, n_emit as u32, n_portal as u32, 0],
@@ -663,6 +706,7 @@ impl GpuLook {
             minv1: [mi[1][0], mi[1][1], mi[1][2], 0.0],
             minv2: [mi[2][0], mi[2][1], mi[2][2], 0.0],
             emit_off: self.emit_off,
+            prof: [o.prof, 0, 0, 0],
         }
     }
 
@@ -672,6 +716,7 @@ impl GpuLook {
         let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         enc.clear_buffer(&self.accum, 0, None);
         enc.clear_buffer(&self.spec, 0, None);
+        enc.clear_buffer(&self.stats, 0, None);
         queue.submit([enc.finish()]);
         dev.poll(wgpu::PollType::wait_indefinitely()).expect("device lost");
         let t0 = std::time::Instant::now();
@@ -708,7 +753,21 @@ impl GpuLook {
         for s in &mut spectrum {
             *s /= per_bin;
         }
-        Frame { rgb, spectrum, seconds }
+        let stats = (o.prof & prof::STATS != 0).then(|| {
+            let raw: Vec<u64> = self.read(&self.stats, 64).iter().map(|x| x.to_bits() as u64).collect();
+            let a8 = |o: usize| std::array::from_fn(|i| raw[o + i]);
+            Stats {
+                rays: [raw[0], raw[1], raw[2]],
+                candidates: [raw[3], raw[4]],
+                vertices: raw[7],
+                slow: raw[6],
+                alive: a8(8),
+                simd_alive: a8(16),
+                simd_classes: a8(24),
+                class: std::array::from_fn(|i| raw[32 + i]),
+            }
+        });
+        Frame { rgb, spectrum, seconds, stats }
     }
 
     /// Evaluate material lanes on the device: per lane `(material, λ,
