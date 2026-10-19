@@ -445,7 +445,7 @@ the camera. Domain B is the shifted, unlabelled-use slice: lower and
 wider cameras, harder lights and stronger post.
 
 - 40 000 training scenes (301 k objects, 7.5 per scene, a gauge in 63 % of
-  scenes), 400 held-out A, 1 000 B for tuning and 300 held-out B. 4.6 GB.
+  scenes), 400 held-out A, 1 000 B for tuning and 300 held-out B. 4.4 GB.
 - Rate: 12–19 scenes/s on this Mac. The CPU stages (sampling, meshing,
   labels) run in parallel and the device renders one frame at a time.
   M1's batched sensor path was not merged when this was built, so this
