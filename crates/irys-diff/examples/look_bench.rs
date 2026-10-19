@@ -4,7 +4,7 @@
 //! ```text
 //! cargo run --release -p irys-diff --features gpu,assets --example look_bench -- <export dir> <bench dir>
 //!     [--width 480] [--bounces 7] [--ref-spp 32768] [--max-spp 1024] [--reps 2]
-//!     [--variant openpbr] [--clamp C] [--samp bits]
+//!     [--variant openpbr] [--clamp C] [--samp bits] [--prof bits] [--regen K] [--guide mix]
 //! ```
 //!
 //! Writes `irys_ref.f32` (+ `irys_ref.json`) once, then for each spp level
@@ -54,11 +54,13 @@ fn main() {
     let samp: u32 = opt(&args, "--samp", irys_diff::look::scene_gpu::samp::ALL);
     let prof: u32 = opt(&args, "--prof", 0);
     let regen: u32 = opt(&args, "--regen", 16);
+    let guide: f32 = opt(&args, "--guide", 0.0);
+    let seed_base: u64 = opt(&args, "--seed-base", 1000);
     let sc = scene::load(&export, Some(width)).unwrap();
     let (w, h) = sc.size;
     let ctx = irys_gpu::GpuContext::init_blocking().expect("gpu");
     let g = GpuLook::new(ctx, &sc).expect("ray queries");
-    let base = Opts { spp: 1, max_bounces: bounces, clamp, samp, prof, regen, ..Opts::default() };
+    let base = Opts { spp: 1, max_bounces: bounces, clamp, samp, prof, regen, guide, ..Opts::default() };
     let _ = g.render(&sc.camera, &base); // warm
     let ref_path = dir.join("irys_ref.f32");
     if !ref_path.exists() {
@@ -89,7 +91,7 @@ fn main() {
         let mut best = f64::MAX;
         let mut img = Vec::new();
         for r in 0..reps {
-            let f = g.render(&sc.camera, &Opts { spp, seed: 1000 + spp as u64 * 7919 + r as u64 * 0, ..base });
+            let f = g.render(&sc.camera, &Opts { spp, seed: seed_base + spp as u64 * 7919 + r as u64 * 0, ..base });
             best = best.min(f.seconds);
             img = f.rgb;
         }

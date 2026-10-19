@@ -36,7 +36,11 @@ struct Params {
     minv2: vec4<f32>,
     emit_off: vec4<u32>,  // emitter cdf offset 0, portal first index, tree clusters, tree members
     prof: vec4<u32>,      // profiling: x bits (PF_*), -, -, -
-    samp: vec4<u32>,      // sampler: x bits (S_*), spp of the frame, -, -
+    samp: vec4<u32>,      // sampler: x bits (S_*), spp of the frame, samples this dispatch, scramble salt
+    guide: vec4<f32>,     // guiding (guide.wgsl): mix, -, -, -
+    gmin: vec4<f32>,      // grid origin, 1 / cell
+    gres: vec4<u32>,      // grid cells xyz, flags (1 on, 2 training)
+    gres2: vec4<u32>,     // records per path, cells, samples a cell needs, -
 }
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -1741,7 +1745,11 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
         // starting the next at once, so a SIMD group's lanes stay busy
         // until its last path ends rather than its longest one in each
         // sample. The order is fixed per thread: still deterministic.
-        q_pixel = qhash2(px, P.seed.x ^ qhash(P.seed.y));
+        // samp.w salts the scramble: with guiding, every training group and
+        // then the rest of the frame scramble independently, so no sample's
+        // points are correlated with the guide earlier samples trained (one
+        // scramble across them biased a guided frame by 1e-4).
+        q_pixel = qhash2(px, P.seed.x ^ qhash(P.seed.y ^ P.samp.w));
         let nsamp = max(P.samp.z, 1u);
         let w = P.size.x;
         let fw = f32(P.size.x);
@@ -1777,6 +1785,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
                         if (!(rad[k] == rad[k]) || abs(rad[k]) > 1.0e9) { bad = true; }
                     }
                     if (bad) { rad = vec4<f32>(0.0); }
+                    if (guide_on() && guide_training()) { guide_flush(gid.x, rad.x + rad.y + rad.z + rad.w); }
                     for (var k = 0u; k < NW; k = k + 1u) {
                         let r = rad[k] / spec_pdf(lam[k]);
                         acc = acc + r * lane_rgb(lam[k]);
@@ -1979,7 +1988,18 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
             // come through (transmission, thin walls, translucency).
             var nr = ng;
             if (mt.tw > 0.0 || thin || mt.tl > 0.0) { nr = vec3<f32>(0.0); }
-            if (prof_on(32u)) { nr = vec3<f32>(0.0); }
+            // Guiding (guide.wgsl): at an opaque reflective vertex on the
+            // four-lane path, a direction from the cell's histogram with
+            // probability gc (the mix × the diffuse lobe's share, 0 where
+            // the cell is untrained), the BSDF's own sampling otherwise; the
+            // mixture's density is the BSDF strategy's pdf everywhere (MIS).
+            let geligible = guide_on() && fast && !inside && dot(nr, nr) > 0.0;
+            var gcell = 0u;
+            var gc = 0.0;
+            if (geligible) {
+                gcell = guide_cell(s.x, ng);
+                gc = guide_mix(gcell) * lw.w[2];
+            }
             let xo_up = offset_ray(s.x, ng);
             let xo_dn = offset_ray(s.x, -ng);
             // Next-event estimation.
@@ -2005,6 +2025,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
                             var f4: vec4<f32>;
                             if (fast) {
                                 pb = lobe_pdf_e(mt, a4.etap, lw, wo, wi);
+                                if (gc > 0.0) { pb = gc * guide_pdf(gcell, l.wi) + (1.0 - gc) * pb; }
                                 f4 = eval4(mt, a4, wo, wi);
                             } else {
                                 pb = spectral_pdf(mt, &at, lw, wo, wi, q);
@@ -2022,8 +2043,15 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
                 }
             }
             // The BSDF sample.
-            let ub = ub4.yzw;
-            let pick = lobe_sample(mt, etap0, lw, wo, ub);
+            var ub = ub4.yzw;
+            var pick: Pick;
+            if (gc > 0.0 && ub.x < gc) {
+                pick.wi = local_frame(ns, guide_sample(gcell, ub.y, ub.z));
+                pick.lobe = 2u;
+            } else {
+                if (gc > 0.0) { ub.x = min((ub.x - gc) / (1.0 - gc), 0.99999994); }
+                pick = lobe_sample(mt, etap0, lw, wo, ub);
+            }
             if (pick.lobe == 3u && thin) {
                 // The thin pass: straight on, not a vertex (shadow rays
                 // took the same pass at the previous vertex).
@@ -2051,8 +2079,13 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
             if (fast) {
                 // every lane's density is the hero's: q is unchanged
                 pdf = lobe_pdf_e(mt, a4.etap, lw, wo, wi);
+                if (gc > 0.0) { pdf = gc * guide_pdf(gcell, wi_w) + (1.0 - gc) * pdf; }
                 if (!(pdf > 0.0) || pdf > 3.0e38) { alive = false; continue; }
                 tp = tp * eval4(mt, a4, wo, wi) * (abs(wi.z) / pdf);
+                if (geligible && guide_training()) {
+                    guide_record(gid.x, gcell, guide_bin(wi_w), rad.x + rad.y + rad.z + rad.w,
+                        tp.x + tp.y + tp.z + tp.w, pdf);
+                }
             } else {
                 pdf = spectral_pdf(mt, &at, lw, wo, wi, q);
                 let p0 = lobe_pdf(mt, at[0], lw, wo, wi);

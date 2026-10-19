@@ -355,3 +355,24 @@ fn regeneration_is_a_schedule() {
         assert!(ds < 1e-6, "spectrum, regen {n}: {ds}");
     }
 }
+
+/// Speed round 4: guiding (trained in the frame's first quarter, then
+/// fixed) keeps the frame's mean.
+#[test]
+fn guiding_is_unbiased() {
+    let Some(ctx) = gpu() else {
+        eprintln!("no device: skipped");
+        return;
+    };
+    let s = lit_scene((96, 48));
+    let Some(g) = GpuLook::new(ctx, &s) else {
+        eprintln!("no ray queries: skipped");
+        return;
+    };
+    let o = Opts { spp: 128, max_bounces: 6, ..Opts::default() };
+    let (m0, e0) = frame_mean(&g, &s, o, 24);
+    let (m, e) = frame_mean(&g, &s, Opts { guide: 0.5, ..o }, 24);
+    let z = (m - m0) / (e * e + e0 * e0).sqrt();
+    eprintln!("guided {m:.5} ± {e:.5} vs {m0:.5} ± {e0:.5}: z {z:+.2}");
+    assert!(z.abs() < 4.0, "z {z}");
+}
