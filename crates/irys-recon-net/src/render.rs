@@ -28,6 +28,9 @@ pub struct Labels {
 }
 
 pub const TABLE: u16 = u16::MAX;
+/// What a camera ray sees past the plane's horizon (the model image's
+/// backdrop; labels fold it into [`TABLE`]).
+pub const BACKDROP: u16 = u16::MAX - 1;
 
 /// Primary rays through an irys TLAS.
 pub struct Caster {
@@ -80,7 +83,7 @@ impl Caster {
                 return (h.payload as u16, h.hit.t * along, n);
             }
         }
-        (TABLE, if t_plane.is_finite() { t_plane * along } else { 1e5 }, [0.0, 0.0, 1.0])
+        if t_plane.is_finite() { (TABLE, t_plane * along, [0.0, 0.0, 1.0]) } else { (BACKDROP, 1e5, [0.0, 0.0, 1.0]) }
     }
 
     pub fn labels(&self, cam: &Cam) -> Labels {
@@ -89,7 +92,7 @@ impl Caster {
         let px: Vec<(u16, f64, [f64; 3])> = (0..w * h).into_par_iter().map(|i| self.cast(cam, (i % w) as f64 + 0.5, (i / w) as f64 + 0.5)).collect();
         Labels {
             size: (w, h),
-            inst: px.iter().map(|p| p.0).collect(),
+            inst: px.iter().map(|p| if p.0 == BACKDROP { TABLE } else { p.0 }).collect(),
             depth: px.iter().map(|p| p.1 as f32).collect(),
             normal: px.iter().map(|p| [p.2[0] as f32, p.2[1] as f32, p.2[2] as f32]).collect(),
         }
@@ -133,6 +136,11 @@ impl Compare {
                 let x = x0 as f64 + (sx as f64 + 0.5) / s as f64;
                 let y = y0 as f64 + (sy as f64 + 0.5) / s as f64;
                 let (id, _, nn) = caster.cast(&cam, x, y);
+                // The background's appearance is linear in the image
+                // coordinates (vignetting, light falloff, a wall's shading).
+                if id == TABLE || id == BACKDROP {
+                    return (id, [2.0 * x / w as f64 - 1.0, 2.0 * y / h as f64 - 1.0, 0.0]);
+                }
                 (id, nn)
             })
             .collect();
@@ -144,7 +152,8 @@ impl Compare {
 /// window) and return the model image and the per-pixel residual.
 ///
 /// Every object gets `c₀ + c·n` per channel (four unknowns, least squares
-/// over its sub-samples), the table a constant per channel: the shading
+/// over its sub-samples), the table and the backdrop `c₀ + c·(x, y)` in the
+/// image: the shading
 /// that any albedo under any low-frequency light makes, so what is left in
 /// the residual is geometry.
 pub fn appearance(cast: &Cast, target: &[[f64; 3]]) -> Vec<[f64; 3]> {
@@ -160,7 +169,7 @@ pub fn appearance(cast: &Cast, target: &[[f64; 3]]) -> Vec<[f64; 3]> {
             let id = cast.id[k];
             let t = target[(y / s) * w + x / s];
             let n = cast.n[k];
-            let b = if id == TABLE { [1.0, 0.0, 0.0, 0.0] } else { [1.0, n[0], n[1], n[2]] };
+            let b = [1.0, n[0], n[1], n[2]];
             let e = acc.entry(id).or_insert(([[0.0; 4]; 4], [[0.0; 4]; 3]));
             for i in 0..4 {
                 for j in 0..4 {
@@ -189,7 +198,7 @@ pub fn appearance(cast: &Cast, target: &[[f64; 3]]) -> Vec<[f64; 3]> {
             let k = y * w * s + x;
             let id = cast.id[k];
             let n = cast.n[k];
-            let b = if id == TABLE { [1.0, 0.0, 0.0, 0.0] } else { [1.0, n[0], n[1], n[2]] };
+            let b = [1.0, n[0], n[1], n[2]];
             let c = coef[&id];
             let p = &mut img[(y / s) * w + x / s];
             for ch in 0..3 {
@@ -391,6 +400,14 @@ mod gpu {
             fps: 24.0,
             dropped: Vec::new(),
         }
+    }
+
+    /// A clean linear render (no camera post) at `size`.
+    pub fn render_linear(ctx: &'static irys_gpu::GpuContext, s: &Scene, meshes: &[Tris], size: (usize, usize), spp: u32) -> Result<Vec<[f64; 3]>, String> {
+        let ls = look_scene(s, meshes, size);
+        let g = GpuLook::new(ctx, &ls).ok_or("no ray queries on this device")?;
+        let fr = g.render(&ls.camera, &Opts { spp, max_bounces: 3, clamp: 6.0, seed: s.seed + 1, ..Opts::default() });
+        Ok(fr.rgb.chunks_exact(3).map(|c| [c[0] as f64, c[1] as f64, c[2] as f64]).map(|c| c.map(|v| if v.is_finite() { v } else { 0.0 })).collect())
     }
 
     /// The synthetic photograph: path traced at `2 × out` and `spp`, then the

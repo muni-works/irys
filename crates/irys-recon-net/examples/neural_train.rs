@@ -36,15 +36,30 @@ pub fn flip(s: &Sample) -> Sample {
     f
 }
 
-fn batches(samples: &[&Sample], workers: usize, per: usize, flips: &[bool]) -> Vec<Batch> {
+/// Photometric jitter: a per-channel gain and a tone power, on the bytes.
+pub fn jitter(s: &mut Sample, seed: u64) {
+    let mut r = Mix(seed);
+    let gamma = 0.8 + 0.45 * r.uniform();
+    let gain = [0.85 + 0.3 * r.uniform(), 0.85 + 0.3 * r.uniform(), 0.85 + 0.3 * r.uniform()];
+    for (k, b) in s.rgb.iter_mut().enumerate() {
+        let v = (*b as f64 / 255.0).powf(gamma) * gain[k % 3];
+        *b = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    }
+}
+
+fn batches(samples: &[&Sample], workers: usize, per: usize, flips: &[bool], seeds: Option<&[u64]>) -> Vec<Batch> {
     let total = workers * per;
     let prepared: Vec<(Vec<f64>, irys_recon_net::data::Targets)> = samples
         .par_iter()
         .zip(flips)
-        .map(|(s, &fl)| {
-            let s2;
-            let s = if fl {
-                s2 = flip(s);
+        .enumerate()
+        .map(|(i, (s, &fl))| {
+            let mut s2;
+            let s = if fl || seeds.is_some() {
+                s2 = if fl { flip(s) } else { (*s).clone() };
+                if let Some(sd) = seeds {
+                    jitter(&mut s2, sd[i]);
+                }
                 &s2
             } else {
                 *s
@@ -70,6 +85,7 @@ fn main() {
     let workers: usize = arg(&a, "--workers", 12);
     let per: usize = arg(&a, "--per", 4);
     let lr_max: f64 = arg(&a, "--lr", 1e-3);
+    let wd: f64 = arg(&a, "--wd", 1e-4);
     let arch = Arch { d: arg(&a, "--d", 128), tok_hidden: arg(&a, "--tok", 256), ch_hidden: arg(&a, "--ch", 384), blocks: arg(&a, "--blocks", 6) };
     std::fs::create_dir_all(&out).unwrap();
     let t0 = std::time::Instant::now();
@@ -85,6 +101,7 @@ fn main() {
     let mut nrun = 0.0;
     let val_n = (val.len() / total).min(4) * total;
     let t_train = std::time::Instant::now();
+    let mut best_val = f64::INFINITY;
     for step in 1..=steps {
         let warm = 300.0;
         let lr = if (step as f64) < warm {
@@ -95,9 +112,10 @@ fn main() {
         };
         let picks: Vec<&Sample> = (0..total).map(|_| &train[(rng.uniform() * train.len() as f64) as usize % train.len()]).collect();
         let flips: Vec<bool> = (0..total).map(|_| rng.uniform() < 0.5).collect();
-        let bs = batches(&picks, workers, per, &flips);
+        let seeds: Vec<u64> = (0..total).map(|_| (rng.uniform() * 1e15) as u64).collect();
+        let bs = batches(&picks, workers, per, &flips, Some(&seeds));
         let (l, g) = tr.grads(&bs);
-        let gn = tr.adam(&g, lr, 5.0, 1e-4);
+        let gn = tr.adam(&g, lr, 5.0, wd);
         for (r, v) in run.iter_mut().zip(&l) {
             *r += v;
         }
@@ -117,7 +135,7 @@ fn main() {
                 let mut nv = 0.0;
                 for c in val[..val_n].chunks(total) {
                     let refs: Vec<&Sample> = c.iter().collect();
-                    let bs = batches(&refs, workers, per, &vec![false; total]);
+                    let bs = batches(&refs, workers, per, &vec![false; total], None);
                     let (l, _) = tr.grads(&bs);
                     for (r, v) in vl.iter_mut().zip(&l) {
                         *r += v;
@@ -128,6 +146,12 @@ fn main() {
                     rec.insert(format!("val_{n}"), (vl[k] / nv).into());
                 }
                 tr.weights().save(&out.join("weights.json")).unwrap();
+                let v = vl[0] / nv;
+                if v < best_val {
+                    best_val = v;
+                    tr.weights().save(&out.join("weights-best.json")).unwrap();
+                    rec.insert("best".into(), true.into());
+                }
             }
             println!(
                 "step {step:6}  {:.0}s  lr {lr:.2e}  |g| {gn:7.3}  loss {:.4}  fg {:.4} off {:.4} dep {:.4} ctr {:.4} cls {:.4} tok {:.4} par {:.4} yaw {:.4} plane {:.4}{}",

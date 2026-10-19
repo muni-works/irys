@@ -297,9 +297,19 @@ fn token_names(f: Family, t: &[usize; NTOK]) -> Vec<String> {
 /// slot over its vocabulary, plus [`irys_recon::mdl::NATS_PER_PARAM`] per
 /// used continuous parameter.
 pub fn program_length(o: &Object) -> f64 {
-    let toks = o.token_mask().iter().filter(|&&m| m).count() as f64;
+    program_length_with(o, structure_nats(o))
+}
+
+/// The structure's share under the uniform grammar: one choice per used slot.
+pub fn structure_nats(o: &Object) -> f64 {
+    o.token_mask().iter().filter(|&&m| m).count() as f64 * (VOCAB as f64).ln()
+}
+
+/// Program length with the structure coded by a prior of `structure` nats
+/// (`−log p(structure)`: the grammar's, or the network's).
+pub fn program_length_with(o: &Object, structure: f64) -> f64 {
     let pars = (0..o.params.len()).filter(|&k| param_used(o.family, &o.tokens, k)).count() as f64;
-    toks * (VOCAB as f64).ln() + pars * irys_recon::mdl::NATS_PER_PARAM + 3.0 * irys_recon::mdl::NATS_PER_PARAM
+    structure + pars * irys_recon::mdl::NATS_PER_PARAM + 3.0 * irys_recon::mdl::NATS_PER_PARAM
 }
 
 // ---------------------------------------------------------------------------
