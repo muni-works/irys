@@ -356,6 +356,29 @@ fn tex(t: u32, uv: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(srgb_dec(c.x), srgb_dec(c.y), srgb_dec(c.z), c.w);
 }
 
+// Alpha alone, bilinear and wrapped as `tex`: the traversal's alpha test
+// needs no colour (and no sRGB decode).
+fn tex_alpha(t: u32, uv: vec2<f32>) -> f32 {
+    let e = textab[t];
+    let x = (uv.x - floor(uv.x)) * f32(e.y) - 0.5;
+    let y = (uv.y - floor(uv.y)) * f32(e.z) - 0.5;
+    let x0 = floor(x);
+    let y0 = floor(y);
+    let fx = x - x0;
+    let fy = y - y0;
+    let xi0 = u32((i32(x0) % i32(e.y) + i32(e.y)) % i32(e.y));
+    let yi0 = u32((i32(y0) % i32(e.z) + i32(e.z)) % i32(e.z));
+    let xi1 = (xi0 + 1u) % e.y;
+    let yi1 = (yi0 + 1u) % e.z;
+    let r0 = e.x + yi0 * e.y;
+    let r1 = e.x + yi1 * e.y;
+    let a00 = f32(texels[r0 + xi0] >> 24u);
+    let a10 = f32(texels[r0 + xi1] >> 24u);
+    let a01 = f32(texels[r1 + xi0] >> 24u);
+    let a11 = f32(texels[r1 + xi1] >> 24u);
+    return mix(mix(a00, a10, fx), mix(a01, a11, fx), fy) / 255.0;
+}
+
 // ---- the albedo tables (look::openpbr::Tables, look::sheen) ----
 
 fn cell(x: f32) -> vec2<f32> {
@@ -1280,7 +1303,7 @@ fn load_cand(i: u32) -> Cand {
 
 fn cand_alpha(c: Cand, uv: vec2<f32>) -> f32 {
     if (c.alpha_tex == NONE) { return 1.0; }
-    return tex(c.alpha_tex, uv * c.xf.xy + c.xf.zw).w;
+    return tex_alpha(c.alpha_tex, uv * c.xf.xy + c.xf.zw);
 }
 
 fn alpha_at(m: Mat, uv: vec2<f32>) -> f32 {

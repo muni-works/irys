@@ -811,8 +811,12 @@ impl GpuLook {
                 }
                 queue.submit([enc.finish()]);
             }
-            dev.poll(wgpu::PollType::wait_indefinitely()).expect("device lost");
+            // wait every eighth group only: the queue stays fed
+            if (s / k) % 8 == 7 {
+                dev.poll(wgpu::PollType::wait_indefinitely()).expect("device lost");
+            }
         }
+        dev.poll(wgpu::PollType::wait_indefinitely()).expect("device lost");
         let seconds = t0.elapsed().as_secs_f64();
         let acc = self.read(&self.accum, self.pixels * 4);
         let inv = 1.0 / o.spp.max(1) as f32;
