@@ -1,0 +1,25 @@
+[package]
+name = "irys-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "irys: a C ABI for rendering into an IOSurface-backed Metal texture (M1 spike)"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+irys-diff = { path = "../irys-diff", features = ["gpu", "assets"] }
+irys-gpu.workspace = true
+irys-light.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# The same versions wgpu-hal 30's Metal backend links, so its texture type
+# and ours are one type.
+objc2 = "0.6"
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice", "MTLTexture", "MTLResource", "MTLAllocation", "MTLPixelFormat", "objc2-io-surface"] }
+objc2-io-surface = { version = "0.3", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "objc2", "objc2-core-foundation"] }

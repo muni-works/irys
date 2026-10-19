@@ -106,3 +106,11 @@ required-features = ["gpu", "assets"]
 [[example]]
 name = "look_bench"
 required-features = ["gpu", "assets"]
+
+[[example]]
+name = "m1_garage"
+required-features = ["gpu", "assets"]
+
+[[example]]
+name = "m1_bench"
+required-features = ["gpu", "assets"]

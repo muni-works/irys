@@ -3095,3 +3095,255 @@ strands darken the frame deterministically.
    thick so they read at 1024².
 6. Per-path GPU/CPU agreement falls with hair depth: f32 rounding moves
    lobe choices, while the frames still agree.
+
+## M1: the belief codec's prerequisites (2026-10-19)
+
+docs/belief-codec.md, M1. Everything is new files in `look/` except a
+handful of additive hooks in `scene_gpu.rs` / `scene.wgsl` (listed under
+deviations). Timings are `--release` on the M4 Max with other sessions
+sharing the GPU, so single numbers move ±30 %; the tables give medians.
+
+### 1. Splats in the scene kernel (`irys_light::ply`, `look::splat_gpu`, `splat.wgsl`)
+
+- **Loader.** `PlyCloud::load` reads the standard 3DGS layout (any property
+  order, binary LE or ASCII): `x y z`, `scale_*` (log → `exp`), `rot_0..3`
+  (`[w, x, y, z]`, normalised), `opacity` (logit → sigmoid), `f_dc_*`, and
+  `f_rest_*` (channel-major in the file, transposed to coefficient-major;
+  degree from the count, 0/9/24/45 → 0–3). The garage files carry
+  `nx ny nz` (skipped) and degree 0 only: `splat.ply` 274 499 splats,
+  `splat7k.ply` 623 176, `splat30k.ply` 1 705 391.
+- **TLAS.** One more TLAS instance (mask `0x10`, which no existing ray
+  carries) holds an AABB BLAS of every splat's proxy box. Splats occlude
+  meshes and meshes occlude splats on the camera segment: the opaque hit
+  is traced first and the splats are composited over `(0, t_hit)`; the
+  path continues with `T`.
+- **Composite.** 3DGRT's k-buffer in rounds (K = 16 in the scene kernel,
+  64 in the sensor kernel): one ray query per round collects the K nearest
+  responses after the last composited `(t, index)` — a total order, so
+  the hardware's candidate order cannot change the result — and once the
+  buffer is full commits the K-th `t`, so the traversal culls boxes past
+  it. `C += T α c; T *= 1 − α`, out at `T ≤ 1e-4`.
+- **Response.** Sort key `t* = −dᵀAΔ / dᵀAd` (the peak along the ray);
+  `α = min(0.99, o · exp(−½ q))` where `q` is the ray's Mahalanobis
+  distance under Σ's marginal across the ray **plus the trainer's 0.3 px²
+  screen-space dilation** at distance `t*` (`pix` = the camera's angular
+  pixel size). Cut at α < 1/255 (the trainer's cut, not 3σ: a hard 3σ cut
+  showed as facets on large opaque splats). Proxy box = the ellipsoid
+  where α reaches 1/255 (`√(2 ln 255 o) σ`) plus 2 cm for the dilation;
+  a response whose peak falls outside its box is dropped, on the device
+  and in the f64 twin alike, so culling by box is exact.
+- **Colour.** SH up to degree 3 at the ray direction (+ ½, clamped), stored
+  as f16. The cloud is trained on sRGB images, so the layer is composited
+  in sRGB (as the trainer does) and decoded once per layer:
+  `L = dec(C / α) · α`. In the spectral kernel it enters as emission lifted
+  onto the hats.
+
+| Gate | Result |
+|---|---|
+| device vs `splat_gpu::composite_cpu` (f64 brute force: same response, order, cut-offs), 400 random degree-3 splats around a quad, 48 × 40 | max \|Δ\| 2.0e-6 (rgb and coverage), 0 px over 1e-3; splat-depth Δt 7e-7; quad pixels exact distance, misses `+∞` |
+| AOVs and frames run twice; batch vs one by one | bit-identical |
+| path tracer (64 spp, jittered) vs the sensor's unjittered splat layer, frame mean | 0.0240 vs 0.0239 |
+| irys vs a CPU EWA rasteriser written for the gate (`examples/m1_garage`: projection, 0.3 px dilation, depth sort, tiles), small far splats | 1 splat 46.6 dB, 5: 43.8, 30: 36.0, 300: 26.4, 3000 (dense overlap): 26.3 dB |
+
+The garage at four of the map's held-out training cameras (518 × 420,
+`examples/m1_garage`), irys's splat layer against the CPU EWA rasteriser
+(near plane 0.01 m and Jacobian clamp as gsplat's defaults):
+
+| cloud | splats | upload + BLAS | PSNR vs CPU raster, views 0 / 32 / 64 / 96 | sensor ms | scene kernel, 1 spp, ms |
+|---|---|---|---|---|---|
+| `splat7k.ply` | 623 176 | 0.08 s | 25.5 / 17.3 / 19.2 / 15.3 | 170–1050 | 500–4360 |
+| `splat30k.ply` | 1 705 391 | 0.39 s | 13.7 / 14.3 / 19.5 / 15.3 | 700–2300 | 3000–9000 |
+| `splat.ply` (the map's) | 274 499 | 0.11 s | 20.3 / 15.5 / 16.5 / 19.3 | 155–500 | 500–1750 |
+
+
+**Real frames.** The garage map is in its own floor frame (built from the
+`perim` capture through VGGT); the 2026-08-14 sweep's `poses.jsonl` is in
+the sweep's own VGGT frame. Registering one to the other is M0's step 1. A
+quick yaw + translation search plus ICP against the sweep's StereoNet
+depth did not converge (most keyframe depth is the 80–130 mm floor
+StereoNet reports when unsure, 1.6 k usable pairs at 5 cm), and renders at
+those poses scored 6–11 dB against the frames for irys *and* the CPU
+rasteriser alike: a pose problem, not a renderer one. The training
+images of the map are not on this machine (`perim.derived` holds poses and
+depth, not `views/`), and gsplat is CUDA-only. So the gate here is irys
+against the trainer-style CPU rasteriser at the map's own held-out
+training cameras (`splat_train.py`'s every-8th views, reconstructed from
+`extri.npy`, `intri.npy`, `floor.npy`): ray-traced 3DGS and EWA splatting
+are different approximations, and they part where the splats are large,
+near and overlapping — exactly this map (an under-trained, blurry cloud).
+The PSNR against real JPEGs waits on M0's registration.
+
+### 2. AOVs (`look::sensor`, `sensor.wgsl`)
+
+`Sensor::new(&look, (w, h), max_cameras)`, then `trace(&cams, aov::DIST |
+aov::INST | …)` (one submit, no wait) and `read(which)` (one wait, one
+mapped copy for every AOV asked for), or `render` for both. Each AOV is its
+own device buffer, camera-major, read back only on request; `buffer(aov)`
+hands one to another device pass (the residual).
+
+| AOV | type | miss | splat layer |
+|---|---|---|---|
+| `DIST` | f32, metres along the unit ray (`Pinhole::z_per_dist` → optical z) | `+∞` | `t` where `T` crossed ½ |
+| `INST` | u32 instance index | `u32::MAX` | `0xffff_fffe` |
+| `MAT` | u32 material index | `u32::MAX` | `0xffff_fffe` |
+| `NORMAL` | world shading normal facing the camera, octahedral snorm16 (decoded to `[f32; 3]`) | 0 | 0 |
+| `SIGMA` | f32: the caller's σ per instance slot / splats / miss (`set_sigma`) of what the pixel sees | miss σ | splat σ |
+| `RGB` | the splat layer: linear premultiplied rgb + coverage | 0 | — |
+
+The kernel is `scene.wgsl`'s own `trace_ray` (cut-outs alpha-tested,
+masks as the camera's) and `splat_segment`, one ray per pixel at the pixel
+centre, no shading; `sensor.wgsl` is appended to the scene module and binds
+the scene's buffers directly (bindings 70–78).
+
+### 3. Batched cameras (`Sensor`, `look::batch`)
+
+N cameras of one size in one dispatch (x: pixel, y: camera). Depth only,
+544 × 448, 30 instances (≈ 67 k placed triangles), `examples/m1_bench`:
+
+| batch | total ms | per camera ms |
+|---|---|---|
+| 1 | 0.93 | 0.93 |
+| 8 | 2.30 | **0.29** |
+| 64 | 13.8 | **0.22** |
+
+That is with the readback of every depth (1 MB per camera) included; the
+target (< 0.5 ms per camera) holds from batch 8 on. All six AOVs at batch
+8: 2.4 ms per camera (the readback of 28 B per pixel dominates). "M
+scenes" are M placements of the scene in one TLAS (muni's environments
+40 m apart), moved with `set_instances`.
+
+`GpuLook::render_batch(&cams, &opts, spectrum)` does the same for the path
+tracer: every sample of every camera in one submit (the scene's params
+uniform is now a ring of 4096 256-byte slots with dynamic offsets), one
+wait, one readback, the spectrum optional. Bit-identical to `render`
+camera by camera.
+
+### 4. TLAS-only rebuild (`look::instances`)
+
+`GpuLook::set_instances(&[Instance])` rewrites the 16-byte instance table
+and rebuilds the TLAS; no BLAS, vertex, material or texture buffer is
+touched. Up to the instance count the scene was built with (slots beyond
+the current count are emptied); emitting placements must stay put (their
+light samples are baked in world space) and are refused otherwise. The
+build is waited on before return — wgpu 30's Metal backend orders no
+acceleration-structure build before the work that reads it (the speed
+round's device fact); without the wait the next trace could read the old
+TLAS. A scene rebuilt with `set_instances` renders bit-identically (AOVs and
+frames) to one built from scratch with the same placements.
+
+30 placements (`examples/m1_bench`): median **0.79 ms** (min 0.65, max
+3.2 under load), the wait included; `tests/m1.rs` measures 0.45–0.74 ms
+on a smaller scene.
+
+### 5. Camera principal point (`look::pinhole`)
+
+`Pinhole { width, height, fx, fy, cx, cy, rot, pos }` with OpenCV's
+conventions (pixel `(0, 0)`'s centre at `(0, 0)`; x right, y down, z
+forward; `rot` = camera → world). `from_camera_info` reads a ROS
+`camera_info.json` (distortion must be zero). `camera()` builds the
+kernel's `Camera` with `tan_half` = 1 and the principal point and focal
+lengths folded into unnormalised `forward / right / up`, so the scene
+kernel needed no change: its pixel `(i, j)` + jitter ½ lands exactly on
+OpenCV's `(i, j)`. Tested against analytic ray–plane depths on a tilted
+plane (worst relative error 4e-7), `project` ∘ `ray` round trips, and the
+kernel's ray formula at four pixels (1e-12).
+
+### 6. The residual pass (`look::residual`, `residual.wgsl`)
+
+`Residual::run_sensor(real_rgb, real_z, &sensor, camera, sigma, &k, &noise)`
+reads the predicted RGB / DIST / SIGMA straight from the sensor's device
+buffers (`run_host` takes them from the host).
+
+- **Model.** Colour in sRGB: `σ_c² = floor² + shot · c_real`; depth as
+  optical z: `σ_z = a + b z²` (stereo), plus the belief's σ in quadrature.
+  `e` = mean colour χ² + depth χ²; explained when `e < τ` (9.21: χ²₂ at
+  99 %). Ranged by the camera but missed by the prediction: unexplained.
+- **Components.** 4-connected over unexplained pixels, joined only across
+  depth-continuous neighbours (`|Δz| ≤ 5 cm + 5 %`, either depth missing:
+  joined). Min-label propagation + pointer jumping (32 steps per submit
+  between convergence checks); the fixed point is each component's
+  smallest pixel index whatever the thread order. Count, bbox and Σz (mm)
+  by integer atomics; a compact list of components ≥ `min_pixels`, sorted
+  by root on the host.
+- **Gate** (`tests/m1_residual.rs`): mask identical to the f64 host model;
+  components identical to a host union–find on the device's mask; planted
+  box / box behind it (split by a 0.3 m step) / poster (colour only) /
+  unranged hole found with exact bboxes and pixel counts, noise explained;
+  run twice identical; device-resident and host-upload inputs identical.
+
+544 × 448 (`examples/m1_bench`, the real frame uploaded from the host):
+7–12 ms, three convergence rounds on a frame-sized component, one
+readback of the list and the explained count.
+
+### 7. irys-ffi and the IOSurface (`crates/irys-ffi`)
+
+**wgpu 30 can do it, with no copy.** `Device::as_hal::<Metal>()` gives the
+`MTLDevice`; `newTextureWithDescriptor:iosurface:plane:` makes a texture
+whose storage is the IOSurface (`RGBA8Unorm`, shader read/write, shared);
+`hal::metal::Device::texture_from_raw` + `Device::create_texture_from_hal`
+make it an ordinary `wgpu::Texture`. `look::present::Present` writes the
+path tracer's accumulator into it (÷ spp, sRGB) as a storage texture in the
+same submit as the samples, and waits; Swift presents the surface. The
+objc2 crates are the versions wgpu-hal links (objc2 0.6, objc2-metal 0.3),
+so the types are one type.
+
+C ABI (`include/irys.h`): `irys_context_create`, `irys_scene_load(ctx,
+export_dir, splat_ply, w, h)` (either may be NULL; neither: a demo scene),
+`irys_scene_set_camera(fx, fy, cx, cy, rot[9], pos[3])` (OpenCV),
+`irys_scene_render_iosurface(scene, IOSurfaceRef, spp)` /
+`_iosurface_id(scene, IOSurfaceGetID, spp)`, `irys_scene_render_rgba8`
+(the readback path, for comparison), `irys_last_error`.
+
+`harness/run.sh` builds the dylib and a headless Swift program
+(`swiftc -import-objc-header`): it makes a 320 × 240 'RGBA' IOSurface,
+renders into it, locks it and reads it on the CPU, and compares with
+`irys_scene_render_rgba8`: **max |Δ| 0** (bit-identical), first frame
+287 ms (pipeline and BLAS builds, the texture wrap), then 10.2 ms per
+8-spp frame of the demo scene. The fallback (one GPU copy into a shared
+IOSurface-backed buffer) is not needed.
+
+### M1 deviations
+
+1. **Shared files touched** (all additive): `look/scene_gpu.rs` — the
+   splat include and `with_splats`, one more TLAS slot (mask `0x10`),
+   bindings 60–62, binding 0 becomes a dynamic-offset ring of 4096 slots,
+   `pub(super)` accessors, `m1: Shared` (clones of the geometry buffers,
+   TLAS and BLASes for the sensor and `set_instances`); `look/scene.wgsl`
+   — the camera-segment splat composite in `trace` (14 lines);
+   `look/mod.rs`; `irys-light/src/lib.rs`; the workspace `Cargo.toml`
+   (`irys-ffi`).
+2. Splats are on **camera segments only** in the scene kernel: they cast
+   no shadows and bounce rays do not see them (2b composited every
+   segment). The sensor needs nothing else; relighting splats (per-splat
+   material) is not started.
+3. **Splat cost** is the open problem (below): every candidate is a
+   procedural-AABB callback, and this map's splats are large.
+4. The emitter table is baked in world space, so `set_instances` refuses
+   to move emitters rather than re-pack them.
+5. The garage's PSNR against real frames is blocked on M0's registration
+   (above), and gsplat is unavailable here; the CPU rasteriser stands in.
+
+### M1 risks and next
+
+1. **Splat speed.** 155 ms – 2.3 s per 518 × 420 garage frame in the
+   sensor (≈ 230–420 AABB candidates per ray on the map's cloud, ~1.3
+   rounds at K = 64, more on the 30k cloud); the scene kernel 2–4× that.
+   Far from M0's needs. 3DGRT's own answer is stretched-icosahedron
+   triangle proxies (hardware any-hit instead of a shader callback per
+   box); a cheaper first step is a tighter, opacity- and size-aware proxy
+   and pruning the map's huge low-opacity splats.
+2. **Ray-traced vs rasterised 3DGS.** A rasteriser-trained cloud traced
+   per pixel differs where splats are large, near and overlapping
+   (13–25 dB here, 26 dB on dense synthetic clouds, > 36 dB sparse). 3DGRT
+   fine-tunes in its own renderer; for M0 the codec's prediction should be
+   the irys render, so retraining (or fine-tuning) against irys is the fix
+   if the residual is dominated by it.
+3. The k-buffer arrays (64 × 8 B per thread in the sensor) and the splat
+   code in the megakernel may cost occupancy for scenes without splats;
+   not separated from other sessions' GPU load in the timings here.
+4. `set_instances` waits on the TLAS build (≈ 0.9 ms of its time). An
+   in-encoder build with an explicit barrier would remove the wait if
+   wgpu's Metal backend ever orders it.
+5. The params ring assumes `size_of::<Params>()` rounds to 256 B slots;
+   it is computed, so a larger `Params` (the speed round adds fields)
+   only halves the slots per submit.
