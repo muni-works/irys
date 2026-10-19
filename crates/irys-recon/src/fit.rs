@@ -34,6 +34,17 @@ pub struct Target {
     pub dist: Vec<Vec<f64>>,
     /// Image size.
     pub size: (usize, usize),
+    /// v1: per-pixel weight (0 excludes: the tag, off the table); empty is
+    /// every pixel at 1.
+    pub weight: Vec<Vec<f64>>,
+    /// v1: the part's coverage as the photo's chromaticity measures it
+    /// (0 the backdrop's colour, 1 the part's), per view; empty is none.
+    /// Shading leaves chromaticity alone, so this pins the silhouette
+    /// (and the table seen through holes) where the grey image's contrast
+    /// is a shadow's or a contact's.
+    pub cov_obs: Vec<Vec<f64>>,
+    /// Its noise, per view (coverage units).
+    pub cov_sigma: Vec<f64>,
 }
 
 impl Target {
@@ -48,7 +59,43 @@ impl Target {
             })
             .collect();
         let dist = mask.iter().map(|m| boundary_distance(m, size)).collect();
-        Self { img, mask, dist, size }
+        Self { img, mask, dist, size, weight: Vec::new(), cov_obs: Vec::new(), cov_sigma: Vec::new() }
+    }
+
+    /// v1: from images, masks (a segmentation) and pixel weights.
+    pub fn from_masks(img: Vec<Vec<f64>>, mask: Vec<Vec<f64>>, weight: Vec<Vec<f64>>, size: (usize, usize)) -> Self {
+        let dist = mask.iter().map(|m| boundary_distance(m, size)).collect();
+        Self { img, mask, dist, size, weight, cov_obs: Vec::new(), cov_sigma: Vec::new() }
+    }
+
+    /// With observed chromatic coverage.
+    pub fn with_cov(mut self, cov_obs: Vec<Vec<f64>>, cov_sigma: Vec<f64>) -> Self {
+        self.cov_obs = cov_obs;
+        self.cov_sigma = cov_sigma;
+        self
+    }
+
+    /// v1: box-downsampled by 2, masks by majority, weights by their minimum.
+    pub fn half_masks(&self) -> Self {
+        let (w, h) = self.size;
+        let (w2, h2) = (w / 2, h / 2);
+        let px = |v: &Vec<f64>, i: usize| {
+            let (x, y) = (2 * (i % w2), 2 * (i / w2));
+            [v[y * w + x], v[y * w + x + 1], v[(y + 1) * w + x], v[(y + 1) * w + x + 1]]
+        };
+        let mean = |v: &Vec<f64>| -> Vec<f64> { (0..w2 * h2).map(|i| px(v, i).iter().sum::<f64>() / 4.0).collect() };
+        let img = self.img.iter().map(mean).collect();
+        let mask = self.mask.iter().map(|m| mean(m).iter().map(|&x| (x >= 0.5) as u8 as f64).collect()).collect();
+        let weight = self.weight.iter().map(|m| (0..w2 * h2).map(|i| px(m, i).iter().fold(1.0f64, |a, &b| a.min(b))).collect()).collect();
+        let cov = self.cov_obs.iter().map(mean).collect();
+        // A 2 × 2 mean halves independent noise.
+        let cs = self.cov_sigma.iter().map(|s| s / 2.0).collect();
+        Self::from_masks(img, mask, weight, (w2, h2)).with_cov(cov, cs)
+    }
+
+    /// Pixel `p`'s weight in view `v`.
+    pub fn w(&self, v: usize, p: usize) -> f64 {
+        self.weight.get(v).map_or(1.0, |w| w[p])
     }
 
     /// Box-downsampled by 2 (a 2 × 2 box is the pixel of the half-size
@@ -223,6 +270,8 @@ pub struct Fitter {
     pub target: Target,
     /// Per-pixel noise variance of `I − T`.
     pub sigma2: f64,
+    /// v1: Huber threshold in units of σ (`None`: Gaussian, v0).
+    pub huber: Option<f64>,
     renderer: Renderer,
 }
 
@@ -236,7 +285,7 @@ struct Lin {
 impl Fitter {
     /// Build one; estimates the noise from two seeds of `probe`'s render.
     pub fn new(setup: Setup, target: Target, target_spp: usize, probe: &Program) -> Self {
-        let mut renderer = Renderer::new(setup.views.len());
+        let mut renderer = Renderer::new(setup.n_views());
         let a = renderer.eval(probe, &setup, false).expect("probe builds");
         let mut s2 = setup.clone();
         s2.seed += 1;
@@ -251,13 +300,19 @@ impl Fitter {
         }
         let model = acc / n / 2.0;
         let sigma2 = model * (1.0 + setup.film.spp as f64 / target_spp as f64);
-        Self { setup, target, sigma2, renderer }
+        Self { setup, target, sigma2, huber: None, renderer }
     }
 
     /// With a known noise level (no probe renders).
     pub fn with_sigma2(setup: Setup, target: Target, sigma2: f64) -> Self {
-        let renderer = Renderer::new(setup.views.len());
-        Self { setup, target, sigma2, renderer }
+        let renderer = Renderer::new(setup.n_views());
+        Self { setup, target, sigma2, huber: None, renderer }
+    }
+
+    /// The same with Huber's loss at `k` σ.
+    pub fn robust(mut self, k: Option<f64>) -> Self {
+        self.huber = k;
+        self
     }
 
     /// Render `prog` (with its Jacobian).
@@ -273,25 +328,69 @@ impl Fitter {
         let mut nll = 0.0;
         let jac = e.jac.as_ref();
         for v in 0..e.img.len() {
-            let d: Vec<f64> = e.img[v].iter().zip(&self.target.img[v]).map(|(a, b)| (a - b) / sn).collect();
+            let mut d: Vec<f64> = e.img[v].iter().zip(&self.target.img[v]).map(|(a, b)| (a - b) / sn).collect();
+            // Per-pixel row scale: the pixel's weight and, with Huber, the
+            // IRLS weight at the current residual (`√w`, so `½Σ(√w r)²` has
+            // the robust loss's gradient and Gauss–Newton matrix).
+            let scale: Vec<f64> = (0..d.len())
+                .map(|p| {
+                    let wt = self.target.w(v, p);
+                    nll += wt * match self.huber {
+                        Some(k) => crate::look::huber_rho(d[p], k),
+                        None => 0.5 * d[p] * d[p],
+                    };
+                    (wt * self.huber.map_or(1.0, |k| crate::look::huber_w(d[p], k))).sqrt()
+                })
+                .collect();
+            for (x, s) in d.iter_mut().zip(&scale) {
+                *x *= s;
+            }
             let db = blur(&d, size, 1, level.sigma);
-            nll += 0.5 * d.iter().map(|x| x * x).sum::<f64>();
             r.extend_from_slice(&db);
             if let Some(jv) = jac {
-                let ji: Vec<f64> = jv[v].img.iter().map(|x| x / sn).collect();
+                let ji: Vec<f64> = jv[v].img.iter().enumerate().map(|(i, x)| x / sn * scale[i / np]).collect();
                 j.extend(blur(&ji, size, np, level.sigma));
             }
             if level.lambda > 0.0 {
                 let (dist, m, c) = (&self.target.dist[v], &self.target.mask[v], &e.cov[v]);
                 for p in 0..c.len() {
-                    r.push(level.lambda * dist[p] * (c[p] - m[p]));
+                    r.push(level.lambda * self.target.w(v, p) * dist[p] * (c[p] - m[p]));
                 }
                 if let Some(jv) = jac {
                     let ViewJac { mask, .. } = &jv[v];
                     for p in 0..c.len() {
                         for k in 0..np {
-                            j.push(level.lambda * dist[p] * mask[p * np + k]);
+                            j.push(level.lambda * self.target.w(v, p) * dist[p] * mask[p * np + k]);
                         }
+                    }
+                }
+            }
+        }
+        // The chromatic coverage term, every level (it is noise-scaled
+        // like the image term and counts in the likelihood).
+        for v in 0..self.target.cov_obs.len().min(e.cov.len()) {
+            let (co, c) = (&self.target.cov_obs[v], &e.cov[v]);
+            let s = self.target.cov_sigma[v];
+            for p in 0..c.len() {
+                let wt = self.target.w(v, p);
+                if wt == 0.0 {
+                    r.push(0.0);
+                    if let Some(jv) = jac {
+                        j.extend(std::iter::repeat_n(0.0, np));
+                        let _ = jv;
+                    }
+                    continue;
+                }
+                let d = (c[p] - co[p]) / s;
+                nll += wt * match self.huber {
+                    Some(k) => crate::look::huber_rho(d, k),
+                    None => 0.5 * d * d,
+                };
+                let sc = (wt * self.huber.map_or(1.0, |k| crate::look::huber_w(d, k))).sqrt();
+                r.push(sc * d);
+                if let Some(jv) = jac {
+                    for k in 0..np {
+                        j.push(sc * jv[v].mask[p * np + k] / s);
                     }
                 }
             }
@@ -381,7 +480,8 @@ impl Fitter {
             .img
             .iter()
             .zip(&self.target.img)
-            .map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y) / sn).collect())
+            .enumerate()
+            .map(|(v, (a, b))| a.iter().zip(b).enumerate().map(|(p, (x, y))| if self.target.w(v, p) > 0.0 { (x - y) / sn } else { 0.0 }).collect())
             .collect();
         Ok(Fit { prog: cur, nll: lin.nll, fisher, residual, img: e.img, iters, evals })
     }

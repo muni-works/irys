@@ -82,6 +82,13 @@ pub struct Program {
     pub corner: Corner,
     /// Features, applied in order.
     pub features: Vec<Feature>,
+    /// v1: where the part stands on the tag plane, `[x, y, yaw]` (mm, mm,
+    /// degrees about `+z`): part frame → world is `Rz(yaw)` then `(x, y, 0)`.
+    /// `None` in v0 (the part at the origin). Its three parameters come
+    /// last in [`Program::params`]; [`Program::build`] ignores it (the
+    /// solid is in the part frame) and the photo renderer places it.
+    #[serde(default)]
+    pub pose: Option<[f64; 3]>,
 }
 
 fn permute(v: &mut Vec<usize>, k: usize, out: &mut Vec<Vec<usize>>) {
@@ -242,6 +249,9 @@ impl Program {
         for f in &self.features {
             p.extend(f.params());
         }
+        if let Some(q) = self.pose {
+            p.extend(q);
+        }
         p
     }
 
@@ -262,6 +272,14 @@ impl Program {
             f.set_params(&p[i..i + n]);
             i += n;
         }
+        if let Some(q) = self.pose.as_mut() {
+            q.copy_from_slice(&p[i..i + 3]);
+        }
+    }
+
+    /// Index of the pose's first parameter in [`Program::params`].
+    pub fn pose_index(&self) -> Option<usize> {
+        self.pose.map(|_| self.params().len() - 3)
     }
 
     /// Parameters whose image derivative is mostly not on primary edges:
@@ -329,6 +347,11 @@ impl Program {
                     hi,
                 });
             }
+        }
+        if self.pose.is_some() {
+            v.push(mm("pose.x".into(), 200.0, -400.0, 400.0));
+            v.push(mm("pose.y".into(), 200.0, -400.0, 400.0));
+            v.push(ParamInfo { name: "pose.yaw".into(), unit: Unit::Deg, range: 360.0, lo: -720.0, hi: 720.0 });
         }
         v
     }
@@ -424,7 +447,7 @@ impl Program {
     }
 
     /// The base outline, counter-clockwise, as sketch segments.
-    fn outline(&self) -> Vec<SketchSegment> {
+    pub(crate) fn outline(&self) -> Vec<SketchSegment> {
         let (a, b) = (self.w / 2.0, self.d / 2.0);
         let p = km::Point2::new;
         let line = |s: km::Point2, e: km::Point2| SketchSegment::Line { start: s, end: e };
@@ -616,6 +639,9 @@ impl Program {
                 }
             };
         }
+        if let Some([x, y, yaw]) = self.pose {
+            s += &format!("\npose {x:.3} {y:.3} {yaw:.3}");
+        }
         s
     }
 
@@ -639,6 +665,7 @@ impl Program {
             h: num(head[3])?,
             corner,
             features: Vec::new(),
+            pose: None,
         };
         for l in lines {
             let a: Vec<&str> = l.split_whitespace().collect();
@@ -646,6 +673,10 @@ impl Program {
             let n = |i: usize| -> Result<usize, String> {
                 a.get(i).ok_or(format!("{l}: arity"))?.parse::<usize>().map_err(|e| e.to_string())
             };
+            if a[0] == "pose" {
+                p.pose = Some([v(1)?, v(2)?, v(3)?]);
+                continue;
+            }
             p.features.push(match a[0] {
                 "hole" => Feature::Hole { x: v(1)?, y: v(2)?, r: v(3)? },
                 "counterbore" => Feature::Counterbore { x: v(1)?, y: v(2)?, r: v(3)?, cr: v(4)?, cd: v(5)? },
@@ -663,6 +694,61 @@ impl Program {
             });
         }
         Ok(p)
+    }
+
+    /// The same part described in a frame turned by `k` quarter turns
+    /// about `+z` (the plate's symmetry: a pose with yaw `ψ` and this
+    /// program is the pose with yaw `ψ − 90k` and the turned one). Width
+    /// and depth swap on odd `k`; slot axes swap; patterns turn.
+    pub fn quarter_turned(&self, k: i32) -> Program {
+        let k = k.rem_euclid(4);
+        let rot = |x: f64, y: f64| -> (f64, f64) {
+            match k {
+                0 => (x, y),
+                1 => (-y, x),
+                2 => (-x, -y),
+                _ => (y, -x),
+            }
+        };
+        let swap = k % 2 == 1;
+        let mut q = self.clone();
+        if swap {
+            std::mem::swap(&mut q.w, &mut q.d);
+        }
+        for f in &mut q.features {
+            *f = match *f {
+                Feature::Hole { x, y, r } => {
+                    let (x, y) = rot(x, y);
+                    Feature::Hole { x, y, r }
+                }
+                Feature::Counterbore { x, y, r, cr, cd } => {
+                    let (x, y) = rot(x, y);
+                    Feature::Counterbore { x, y, r, cr, cd }
+                }
+                Feature::Slot { x, y, len, r, axis } => {
+                    let (x, y) = rot(x, y);
+                    let axis = if swap { if axis == Axis::X { Axis::Y } else { Axis::X } } else { axis };
+                    Feature::Slot { x, y, len, r, axis }
+                }
+                Feature::Boss { x, y, r, bh } => {
+                    let (x, y) = rot(x, y);
+                    Feature::Boss { x, y, r, bh }
+                }
+                Feature::LinearHoles { x, y, dx, dy, r, n } => {
+                    let (x, y) = rot(x, y);
+                    let (dx, dy) = rot(dx, dy);
+                    Feature::LinearHoles { x, y, dx, dy, r, n }
+                }
+                Feature::CircularHoles { x, y, rad, phase, r, n } => {
+                    let (x, y) = rot(x, y);
+                    Feature::CircularHoles { x, y, rad, phase: phase + 90.0 * k as f64, r, n }
+                }
+            };
+        }
+        if let Some(p) = q.pose.as_mut() {
+            p[2] -= 90.0 * k as f64;
+        }
+        q
     }
 
     /// The discrete structure: corner kind and feature signatures in order.

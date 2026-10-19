@@ -85,7 +85,7 @@ pub fn program(seed: u64) -> Program {
         } else {
             Corner::Chamfer(q(range(&mut r, 3.0, 8.0)))
         };
-        let mut p = Program { w, d, h, corner, features: Vec::new() };
+        let mut p = Program { w, d, h, corner, features: Vec::new(), pose: None };
         let k = {
             let u = r.uniform();
             if u < 0.3 { 1 } else if u < 0.7 { 2 } else { 3 }
