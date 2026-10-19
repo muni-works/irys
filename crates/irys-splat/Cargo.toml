@@ -1,0 +1,20 @@
+[package]
+name = "irys-splat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "irys: a 3DGS trainer on irys's own GPU tier — tile rasteriser forward and adjoint, Adam, densification"
+publish = false   # irys-diff is unpublished
+
+[dependencies]
+irys-diff = { path = "../irys-diff", features = ["gpu", "assets"] }
+irys-gpu.workspace = true
+irys-light.workspace = true
+rayon.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

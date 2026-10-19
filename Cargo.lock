@@ -1133,6 +1133,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "irys-splat"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "image",
+ "irys-diff",
+ "irys-gpu",
+ "irys-light",
+ "pollster",
+ "rayon",
+ "serde_json",
+]
+
+[[package]]
 name = "itertools"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
