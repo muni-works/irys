@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 
 use irys_diff::look::scene;
-use irys_diff::look::scene_gpu::{GpuLook, Opts, prof};
+use irys_diff::look::scene_gpu::{GpuLook, Opts, prof, samp};
 
 fn opt<T: std::str::FromStr>(args: &[String], k: &str, d: T) -> T {
     args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(d)
@@ -36,12 +36,13 @@ fn main() {
     let _ = g.render(&sc.camera, &Opts { spp: 2, ..base });
     println!("{} {w}x{h}, emitters {:?}, shares {:?}", export.display(), g.emitters, g.shares);
 
-    let f = g.render(&sc.camera, &Opts { spp: 8, prof: prof::STATS, ..base });
+    let f = g.render(&sc.camera, &Opts { spp: 8, prof: prof::STATS, regen: 1, ..base });
     let s = f.stats.unwrap();
     let px = (w * h * 8) as f64;
     println!("per path (8 spp): camera {:.2} cont {:.2} shadow {:.2} rays; candidates closest {:.2} shadow {:.2}; vertices {:.2} (slow {:.3})",
         s.rays[0] as f64 / px, s.rays[1] as f64 / px, s.rays[2] as f64 / px,
         s.candidates[0] as f64 / px, s.candidates[1] as f64 / px, s.vertices as f64 / px, s.slow as f64 / px);
+    println!("tree mismatches {}; picks by -log2 p: {:?}", s.tree_mismatch, &s.tree_log2[..40]);
     println!("iter  alive%  simd-occupancy  classes/simd");
     for i in 0..8 {
         if s.simd_alive[i] == 0 { continue; }
@@ -62,6 +63,13 @@ fn main() {
 
     let variants: Vec<(&str, Opts)> = vec![
         ("full", base),
+        ("regen 1", Opts { regen: 1, ..base }),
+        ("regen 4", Opts { regen: 4, ..base }),
+        ("regen 8", Opts { regen: 8, ..base }),
+        ("regen 32", Opts { regen: 32, ..base }),
+        ("area CDF", Opts { samp: samp::ALL & !samp::LIGHT_TREE, ..base }),
+        ("CDF + tree walk", Opts { samp: samp::ALL & !samp::LIGHT_TREE, prof: 128, ..base }),
+        ("hash rng", Opts { samp: samp::ALL & !samp::SOBOL, ..base }),
         ("bounces 0", Opts { max_bounces: 0, ..base }),
         ("bounces 1", Opts { max_bounces: 1, ..base }),
         ("bounces 3", Opts { max_bounces: 3, ..base }),

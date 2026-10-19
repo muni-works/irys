@@ -52,11 +52,13 @@ fn main() {
     let clamp: f32 = opt(&args, "--clamp", 0.0);
     let variant: String = opt(&args, "--variant", "openpbr".to_string());
     let samp: u32 = opt(&args, "--samp", irys_diff::look::scene_gpu::samp::ALL);
+    let prof: u32 = opt(&args, "--prof", 0);
+    let regen: u32 = opt(&args, "--regen", 16);
     let sc = scene::load(&export, Some(width)).unwrap();
     let (w, h) = sc.size;
     let ctx = irys_gpu::GpuContext::init_blocking().expect("gpu");
     let g = GpuLook::new(ctx, &sc).expect("ray queries");
-    let base = Opts { spp: 1, max_bounces: bounces, clamp, samp, ..Opts::default() };
+    let base = Opts { spp: 1, max_bounces: bounces, clamp, samp, prof, regen, ..Opts::default() };
     let _ = g.render(&sc.camera, &base); // warm
     let ref_path = dir.join("irys_ref.f32");
     if !ref_path.exists() {

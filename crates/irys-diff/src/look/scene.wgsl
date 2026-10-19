@@ -34,7 +34,7 @@ struct Params {
     minv0: vec4<f32>,     // M⁻¹ rows (rgb → hats)
     minv1: vec4<f32>,
     minv2: vec4<f32>,
-    emit_off: vec4<u32>,  // emitter cdf offset 0, portal first index, -, -
+    emit_off: vec4<u32>,  // emitter cdf offset 0, portal first index, tree clusters, tree members
     prof: vec4<u32>,      // profiling: x bits (PF_*), -, -, -
     samp: vec4<u32>,      // sampler: x bits (S_*), spp of the frame, -, -
 }
@@ -60,12 +60,20 @@ struct Params {
 @group(0) @binding(12) var<storage, read_write> probe_io: array<vec4<f32>>;
 // Profiling counters (`Opts::prof` with PF_STATS): see `scene_gpu::Stats`.
 @group(0) @binding(13) var<storage, read_write> stats: array<atomic<u32>>;
+// Speed round 4's light tree (`look::light_tree`): five vec4 per inner node,
+// both children's (centre, power), (axis, cos θ_o), then (r²_l, r²_r, link_l,
+// link_r); and (u32) per emitter triangle its path bits (the depth in the
+// top 6), then per cluster (first, count) from emit_off.z, per member
+// (triangle, power bits) from emit_off.w.
+@group(0) @binding(14) var<storage, read> ltree: array<vec4<f32>>;
+@group(0) @binding(15) var<storage, read> ltrail: array<u32>;
 
 const PF_STATS: u32 = 1u;      // count rays, candidates, classes, occupancy
 const PF_NO_NEE: u32 = 2u;     // no next-event estimation
 const PF_NO_SHADOW: u32 = 4u;  // NEE without its shadow ray (unoccluded)
 const PF_LAMBERT: u32 = 8u;    // every material a Lambertian of its base colour
 const PF_OPAQUE: u32 = 16u;    // no alpha test in traversal (cut-outs solid)
+const PF_BSDF_ONLY: u32 = 64u; // no NEE, emitters and the sky by BSDF sampling alone (MIS weight 1)
 
 var<private> st_cand: u32 = 0u;
 var<private> st_scand: u32 = 0u;
@@ -103,6 +111,7 @@ const F_SPOT: u32 = 32u;
 const F_EMIT_BOTH: u32 = 64u;
 const F_EMITTER: u32 = 128u;
 const F_METAL_SEP: u32 = 256u;
+const F_LIGHT: u32 = 512u;
 
 // ---- prb::Rng (as skin.wgsl), keyed by a 64-bit path index ----
 
@@ -165,6 +174,7 @@ fn rand(s: ptr<function, vec2<u32>>) -> f32 {
 
 const S_SOBOL: u32 = 1u;
 const S_SPECTRAL: u32 = 2u;
+const S_LIGHT_TREE: u32 = 8u;
 
 fn qhash(x0: u32) -> u32 {
     var x = x0;
@@ -203,6 +213,7 @@ fn sobol(i: u32, d: u32) -> u32 {
 // The path's tuple counter and pixel key.
 var<private> q_tuple: u32 = 0u;
 var<private> q_pixel: u32 = 0u;
+var<private> q_sample: u32 = 0u;
 
 // The next 4-tuple: Sobol, or four of the path's hash generator.
 fn draw4(rng: ptr<function, vec2<u32>>) -> vec4<f32> {
@@ -211,7 +222,7 @@ fn draw4(rng: ptr<function, vec2<u32>>) -> vec4<f32> {
     }
     let seed = qhash2(q_pixel, q_tuple);
     q_tuple = q_tuple + 1u;
-    let j = owen(P.seed.z, seed);
+    let j = owen(q_sample, seed);
     var u = vec4<f32>(0.0);
     for (var d = 0u; d < 4u; d = d + 1u) {
         let x = owen(sobol(j, d), qhash(seed ^ QKEY[d]));
@@ -1415,6 +1426,148 @@ fn emitter_le(m: Mat, xl: vec3<f32>, ng: vec3<f32>, d: vec3<f32>, x: vec3<f32>) 
     return m.emis * spot_mask(m, x);
 }
 
+// ---- the light tree (look::light_tree, the same arithmetic) ----
+
+fn cos_minus(ca: f32, sa: f32, cb: f32, sb: f32) -> f32 {
+    if (ca >= cb) { return 1.0; }
+    return ca * cb + sa * sb;
+}
+
+// Conty's importance of a child (centre c, squared half-diagonal r2, power
+// e, cone (axis, cos_o)) at `x`, receiver normal `n` (zero: none).
+fn lt_importance(c: vec3<f32>, r2: f32, energy: f32, axis: vec3<f32>, cos_o: f32, x: vec3<f32>, n: vec3<f32>) -> f32 {
+    if (!(energy > 0.0)) { return 0.0; }
+    let v = x - c;
+    let d2 = dot(v, v);
+    if (d2 <= r2) { return energy / max(r2, 1e-8); }
+    let d = sqrt(d2);
+    let sin_u = min(sqrt(r2 / d2), 1.0);
+    let cos_u = sqrt(max(1.0 - sin_u * sin_u, 0.0));
+    let w = v / d;
+    let cos_t = clamp(dot(axis, w), -1.0, 1.0);
+    var ct = 1.0;
+    var st = 0.0;
+    if (cos_t < cos_o) {
+        let s_t = sqrt(max(1.0 - cos_t * cos_t, 0.0));
+        let s_o = sqrt(max(1.0 - cos_o * cos_o, 0.0));
+        ct = cos_t * cos_o + s_t * s_o;
+        st = s_t * cos_o - cos_t * s_o;
+    }
+    let cos_e = cos_minus(ct, st, cos_u, sin_u);
+    if (cos_e <= 0.0) { return 0.0; }
+    var cos_i = 1.0;
+    if (dot(n, n) > 0.0) {
+        let ci = clamp(-dot(n, w), -1.0, 1.0);
+        let si = sqrt(max(1.0 - ci * ci, 0.0));
+        cos_i = cos_minus(ci, si, cos_u, sin_u);
+        if (cos_i <= 0.0) { return 0.0; }
+    }
+    return energy * cos_e * cos_i / max(d2, r2);
+}
+
+// Both children of inner node `i`: (importance l, importance r, link l bits, link r bits).
+fn lt_pair(i: u32, x: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
+    let o = 5u * i;
+    let a = ltree[o];
+    let b = ltree[o + 1u];
+    let ca = ltree[o + 2u];
+    let cb = ltree[o + 3u];
+    let m = ltree[o + 4u];
+    let il = lt_importance(a.xyz, m.x, a.w, ca.xyz, ca.w, x, n);
+    let ir = lt_importance(b.xyz, m.y, b.w, cb.xyz, cb.w, x, n);
+    return vec4<f32>(il, ir, m.z, m.w);
+}
+
+// The emitter `u` picks (NONE: none), with its probability. (Not as an
+// f32's bits: a small index is a denormal, and the device flushes those.)
+struct TreePick { i: u32, p: f32 }
+
+// The first level takes `u0` (the stratified draw); every level below,
+// and the pick in the cluster, a fresh 24 bits from a 32-bit hash chain
+// seeded once from the path's generator. Rescaling one u down 15+ levels
+// leaves it a few bits, and a branch of probability below that resolution
+// is then picked far more often than its probability says.
+fn tree_sample(u0: f32, x: vec3<f32>, n: vec3<f32>, rng: ptr<function, vec2<u32>>) -> TreePick {
+    var u = u0;
+    var h = rng_next(rng).y;
+    var i = 0u;
+    var p = 1.0;
+    for (var guard = 0u; guard < 32u; guard = guard + 1u) {
+        let q = lt_pair(i, x, n);
+        let s = q.x + q.y;
+        if (!(s > 0.0)) { break; }
+        let pl = q.x / s;
+        var link = 0u;
+        if (u < pl) {
+            p = p * pl;
+            link = bitcast<u32>(q.z);
+        } else {
+            p = p * (1.0 - pl);
+            link = bitcast<u32>(q.w);
+        }
+        h = qhash(h + 0x9e3779b9u);
+        u = f32(h >> 8u) * (1.0 / 16777216.0);
+        if ((link & 0x80000000u) != 0u) {
+            let k = link & 0x7fffffffu;
+            let first = ltrail[P.emit_off.z + 2u * k];
+            let count = ltrail[P.emit_off.z + 2u * k + 1u];
+            let mo = P.emit_off.w + 2u * first;
+            var tot = 0.0;
+            for (var j = 0u; j < count; j = j + 1u) { tot = tot + bitcast<f32>(ltrail[mo + 2u * j + 1u]); }
+            var acc = 0.0;
+            for (var j = 0u; j < count; j = j + 1u) {
+                let e = bitcast<f32>(ltrail[mo + 2u * j + 1u]);
+                acc = acc + e;
+                if (u * tot < acc || j + 1u == count) {
+                    if (!(tot > 0.0) || !(e > 0.0)) { break; }
+                    return TreePick(ltrail[mo + 2u * j], p * e / tot);
+                }
+            }
+            break;
+        }
+        i = link;
+    }
+    return TreePick(NONE, 0.0);
+}
+
+fn tree_pdf(id: u32, x: vec3<f32>, n: vec3<f32>) -> f32 {
+    let tr = ltrail[id];
+    let depth = tr >> 26u;
+    var i = 0u;
+    var p = 1.0;
+    var link = 0u;
+    for (var k = 0u; k < depth; k = k + 1u) {
+        let q = lt_pair(i, x, n);
+        let s = q.x + q.y;
+        if (!(s > 0.0)) { return 0.0; }
+        if (((tr >> k) & 1u) != 0u) {
+            p = p * q.y / s;
+            link = bitcast<u32>(q.w);
+        } else {
+            p = p * q.x / s;
+            link = bitcast<u32>(q.z);
+        }
+        i = link;
+    }
+    let c = link & 0x7fffffffu;
+    let first = ltrail[P.emit_off.z + 2u * c];
+    let count = ltrail[P.emit_off.z + 2u * c + 1u];
+    let mo = P.emit_off.w + 2u * first;
+    var tot = 0.0;
+    var mine = 0.0;
+    for (var j = 0u; j < count; j = j + 1u) {
+        let e = bitcast<f32>(ltrail[mo + 2u * j + 1u]);
+        tot = tot + e;
+        if (ltrail[mo + 2u * j] == id) { mine = e; }
+    }
+    if (!(tot > 0.0)) { return 0.0; }
+    return p * mine / tot;
+}
+
+fn tree_on() -> bool {
+    return (P.samp.x & S_LIGHT_TREE) != 0u;
+}
+
 fn pick_cdf(first: u32, n: u32, u: f32) -> u32 {
     var lo = first;
     var hi = first + n - 1u;
@@ -1426,7 +1579,7 @@ fn pick_cdf(first: u32, n: u32, u: f32) -> u32 {
     return lo;
 }
 
-fn sample_light(x: vec3<f32>, u: vec4<f32>, u2: f32) -> LS {
+fn sample_light(x: vec3<f32>, nr: vec3<f32>, u: vec4<f32>, u2: f32, rng: ptr<function, vec2<u32>>) -> LS {
     var s: LS;
     s.ok = false;
     let pk = P.picks;
@@ -1472,7 +1625,27 @@ fn sample_light(x: vec3<f32>, u: vec4<f32>, u2: f32) -> LS {
         uu = (u.x - pk.z) / max(g, 1e-12);
     }
     if (n == 0u) { return s; }
-    let i = pick_cdf(first, n, clamp(uu, 0.0, 0.99999994));
+    var i = 0u;
+    var pe = 0.0;
+    if (first == 0u && tree_on()) {
+        let t = tree_sample(clamp(uu, 0.0, 0.99999994), x, nr, rng);
+        i = t.i;
+        pe = t.p;
+        if (i == NONE) { return s; }
+        if (prof_on(PF_STATS)) {
+            let q = tree_pdf(i, x, nr);
+            if (abs(q - pe) > 1e-4 * max(pe, 1e-30)) { atomicAdd(&stats[5u], 1u); }
+            atomicAdd(&stats[64u + min(u32(-log2(max(pe, 1e-30))), 63u)], 1u);
+        }
+    } else {
+        i = pick_cdf(first, n, clamp(uu, 0.0, 0.99999994));
+        pe = emitter_prob(i, first);
+        if (prof_on(128u) && first == 0u) {
+            // profiling: the tree's traversal cost alone, its pick unused
+            let t = tree_sample(clamp(uu, 0.0, 0.99999994), x, nr, rng);
+            if (t.p < 0.0) { pe = 0.0; }
+        }
+    }
     let t = emitter_tri(i);
     let su = sqrt(u.y);
     let b0 = 1.0 - su;
@@ -1490,24 +1663,31 @@ fn sample_light(x: vec3<f32>, u: vec4<f32>, u2: f32) -> LS {
     s.ok = max(max(s.le.x, s.le.y), s.le.z) > 0.0;
     s.wi = wi;
     s.dist = dist;
-    s.pdf = g * emitter_prob(i, first) / t[1].w * d2 / cl;
+    s.pdf = g * pe / t[1].w * d2 / cl;
     return s;
 }
 
 // The light strategy's pdf of hitting emitter triangle `i` at distance
 // `dist` with cosine `cl` (solid angle, from the previous vertex).
-fn emitter_pdf(i: u32, dist: f32, cl: f32) -> f32 {
+fn emitter_pdf(i: u32, dist: f32, cl: f32, x: vec3<f32>, nr: vec3<f32>) -> f32 {
     let portal = i >= P.emit_off.y && P.flags.z > 0u;
     let first = select(0u, P.emit_off.y, portal);
     let g = select(P.picks.z - P.picks.y, P.picks.w - P.picks.z, portal);
     let t1 = emit[3u * i + 1u];
-    return g * emitter_prob(i, first) / t1.w * dist * dist / max(cl, 1e-6);
+    var pe = 0.0;
+    if (!portal && tree_on()) {
+        pe = tree_pdf(i, x, nr);
+    } else {
+        pe = emitter_prob(i, first);
+    }
+    return g * pe / t1.w * dist * dist / max(cl, 1e-6);
 }
 
 // ---- the integrator ----
 
-var<workgroup> wg_val: array<f32, 256>;
-var<workgroup> wg_bin: array<u32, 256>;
+// The frame's mean spectrum, per workgroup, in fixed point (SPEC_FIX).
+var<workgroup> wg_spec: array<atomic<u32>, 40>;
+const SPEC_FIX: f32 = 4096.0;
 
 fn local_frame(ns: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(dot(v, basis_t(ns)), dot(v, basis_b(ns)), dot(v, ns));
@@ -1529,42 +1709,95 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
         atomicStore(&wg_alive[li], 0u);
         atomicStore(&wg_cls[li], 0u);
     }
+    if (li < BINS) { atomicStore(&wg_spec[li], 0u); }
     workgroupBarrier();
     var iter = 0u;
     if (live) {
-        var rng = rng_new(vec2<u32>(px, P.seed.z));
+        // Path regeneration: this thread renders samples seed.z ..
+        // seed.z + samp.z of its pixel back to back, a finished path
+        // starting the next at once, so a SIMD group's lanes stay busy
+        // until its last path ends rather than its longest one in each
+        // sample. The order is fixed per thread: still deterministic.
         q_pixel = qhash2(px, P.seed.x ^ qhash(P.seed.y));
-        q_tuple = 0u;
-        let u_cam = draw4(&rng);
-        for (var k = 0u; k < NW; k = k + 1u) {
-            let v = u_cam.x + f32(k) / f32(NW);
-            if ((P.samp.x & S_SPECTRAL) != 0u) {
-                lam[k] = spec_lambda(v - floor(v));
-            } else {
-                lam[k] = 380.0 + 400.0 * (v - floor(v));
-            }
-        }
+        let nsamp = max(P.samp.z, 1u);
         let w = P.size.x;
         let fw = f32(P.size.x);
         let fh = f32(P.size.y);
-        let xs = f32(px % w) + u_cam.y;
-        let ys = f32(px / w) + u_cam.z;
-        let sx = (2.0 * xs / fw - 1.0) * P.eye.w * fw / fh;
-        let sy = (1.0 - 2.0 * ys / fh) * P.eye.w;
-        var ro = P.eye.xyz;
-        var rd = normalize(P.fwd.xyz + P.right.xyz * sx + P.up.xyz * sy);
+        let clampv = P.fwd.w;
+        var sample = 0u;
+        var alive = false;
+        var started = false;
+        var acc = vec3<f32>(0.0);
+        var rng = vec2<u32>(0u);
+        var ro = vec3<f32>(0.0);
+        var rd = vec3<f32>(0.0, 0.0, 1.0);
         var tp = vec4<f32>(1.0);
         // Spectral MIS over whole paths: q_j = P_j / P_hero, the lanes'
         // path densities relative to the hero's; a contribution is divided
         // by their mean (balance heuristic over the four wavelengths).
         var q = vec4<f32>(1.0);
-        var prev_x = ro;
+        var prev_x = vec3<f32>(0.0);
         var prev_pdf = 0.0;      // 0: camera ray, no rival strategy
+        var prev_n = vec3<f32>(0.0);  // the light tree's receiver normal there
         var msk = M_GEOMETRY | M_LIGHT;
         var bounce = 0u;
         var passes = 0u;
-        let clampv = P.fwd.w;
         loop {
+            if (!alive) {
+                if (started) {
+                    // A guard, not a clamp: a path whose radiance is beyond
+                    // anything the scene can emit (1e9; the brightest pixel
+                    // of a converged pavilion is ~170) came from a vanishing
+                    // pdf in f32 and is dropped.
+                    var bad = false;
+                    for (var k = 0u; k < NW; k = k + 1u) {
+                        if (!(rad[k] == rad[k]) || abs(rad[k]) > 1.0e9) { bad = true; }
+                    }
+                    if (bad) { rad = vec4<f32>(0.0); }
+                    for (var k = 0u; k < NW; k = k + 1u) {
+                        let r = rad[k] / spec_pdf(lam[k]);
+                        acc = acc + r * lane_rgb(lam[k]);
+                        // the frame's mean spectrum, in fixed point (integer
+                        // adds commute: deterministic in any order)
+                        let b = min(u32((lam[k] - 380.0) / 400.0 * f32(BINS)), BINS - 1u);
+                        atomicAdd(&wg_spec[b], u32(clamp(r * SPEC_FIX + 0.5, 0.0, 1048576.0)));
+                    }
+                }
+                if (sample >= nsamp) { break; }
+                // a new path
+                let si = P.seed.z + sample;
+                sample = sample + 1u;
+                started = true;
+                alive = true;
+                rng = rng_new(vec2<u32>(px, si));
+                q_sample = si;
+                q_tuple = 0u;
+                let u_cam = draw4(&rng);
+                for (var k = 0u; k < NW; k = k + 1u) {
+                    let v = u_cam.x + f32(k) / f32(NW);
+                    if ((P.samp.x & S_SPECTRAL) != 0u) {
+                        lam[k] = spec_lambda(v - floor(v));
+                    } else {
+                        lam[k] = 380.0 + 400.0 * (v - floor(v));
+                    }
+                }
+                let xs = f32(px % w) + u_cam.y;
+                let ys = f32(px / w) + u_cam.z;
+                let sx = (2.0 * xs / fw - 1.0) * P.eye.w * fw / fh;
+                let sy = (1.0 - 2.0 * ys / fh) * P.eye.w;
+                ro = P.eye.xyz;
+                rd = normalize(P.fwd.xyz + P.right.xyz * sx + P.up.xyz * sy);
+                tp = vec4<f32>(1.0);
+                q = vec4<f32>(1.0);
+                rad = vec4<f32>(0.0);
+                prev_x = ro;
+                prev_pdf = 0.0;
+                prev_n = vec3<f32>(0.0);
+                msk = M_GEOMETRY | M_LIGHT;
+                bounce = 0u;
+                passes = 0u;
+                iter = 0u;
+            }
             let s = trace_ray(ro, rd, msk);
             let it = min(iter, 7u);
             if (pstats) {
@@ -1576,13 +1809,13 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
             if (!s.ok) {
                 let e = sky(rd);
                 var wm = 1.0;
-                if (prev_pdf > 0.0) { wm = mis(prev_pdf, e.w); }
+                if (prev_pdf > 0.0 && !prof_on(PF_BSDF_ONLY)) { wm = mis(prev_pdf, e.w); }
                 for (var k = 0u; k < NW; k = k + 1u) {
                     var c = tp[k] * lifth(e.xyz, lam[k]) * wm / qbar(q);
                     if (clampv > 0.0 && bounce > 0u) { c = min(c, clampv); }
                     rad[k] = rad[k] + c;
                 }
-                break;
+                alive = false; continue;
             }
             var m = load_mat(s.mat);
             if (prof_on(PF_LAMBERT) && (m.flags & F_EMITTER) == 0u) {
@@ -1602,7 +1835,7 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
                     c = vec3<f32>(m.tw, f32(dot(s.ng, rd) < 0.0), s.t * 0.05);
                 }
                 accum[px] = accum[px] + vec4<f32>(c, 0.0);
-                break;
+                alive = false; continue;
             }
             // Emitters: collect what faces the ray, then stop (or, for a
             // portal's transparent side, pass).
@@ -1610,29 +1843,36 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
                 let le = emitter_le(m, s.x, s.ng, rd, prev_x);
                 if (max(max(le.x, le.y), le.z) > 0.0) {
                     var wm = 1.0;
-                    if (prev_pdf > 0.0 && s.emit_index != NONE) {
+                    if (prev_pdf > 0.0 && s.emit_index != NONE && !prof_on(PF_BSDF_ONLY)) {
                         let dv = s.x - prev_x;
-                        wm = mis(prev_pdf, emitter_pdf(s.emit_index, length(dv), abs(dot(s.ng, rd))));
+                        wm = mis(prev_pdf, emitter_pdf(s.emit_index, length(dv), abs(dot(s.ng, rd)), prev_x, prev_n));
                     }
                     for (var k = 0u; k < NW; k = k + 1u) {
                         var c = tp[k] * lifth(le, lam[k]) * wm / qbar(q);
                         if (clampv > 0.0 && bounce > 0u) { c = min(c, clampv); }
                         rad[k] = rad[k] + c;
                     }
-                    break;
+                    if ((m.flags & F_LIGHT) == 0u) { alive = false; continue; }
+                }
+                // A light blocks nothing (Cycles): the ray goes on past it,
+                // as shadow rays, which never see lights, already do.
+                if ((m.flags & F_LIGHT) != 0u && passes < 32u) {
+                    passes = passes + 1u;
+                    ro = offset_ray(s.x, select(s.ng, -s.ng, dot(s.ng, rd) < 0.0));
+                    continue;
                 }
                 if ((m.flags & F_PORTAL) != 0u && passes < 32u) {
                     passes = passes + 1u;
                     ro = offset_ray(s.x, select(s.ng, -s.ng, dot(s.ng, rd) < 0.0));
                     continue;
                 }
-                break;
+                alive = false; continue;
             }
-            if (bounce >= P.size.w) { break; }
+            if (bounce >= P.size.w) { alive = false; continue; }
             // Constant opacity: a stochastic pass (not a vertex).
             if (m.opacity < 1.0 && (m.flags & F_CUTOUT) == 0u) {
                 if (rand(&rng) >= m.opacity) {
-                    if (passes >= 32u) { break; }
+                    if (passes >= 32u) { alive = false; continue; }
                     passes = passes + 1u;
                     ro = offset_ray(s.x, select(s.ng, -s.ng, dot(s.ng, rd) < 0.0));
                     continue;
@@ -1711,14 +1951,20 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
                 lw.w[4] = lw.w[4] * 0.25;
                 etap0 = at[0].etap;
             }
+            // The light tree's receiver bound: the facing geometric normal
+            // where only reflection reaches the eye, none where light may
+            // come through (transmission, thin walls, translucency).
+            var nr = ng;
+            if (mt.tw > 0.0 || thin || mt.tl > 0.0) { nr = vec3<f32>(0.0); }
+            if (prof_on(32u)) { nr = vec3<f32>(0.0); }
             let xo_up = offset_ray(s.x, ng);
             let xo_dn = offset_ray(s.x, -ng);
             // Next-event estimation.
             let ul = draw4(&rng);
             let ub4 = draw4(&rng);
             let ul2 = ub4.x;
-            if (!prof_on(PF_NO_NEE)) {
-                let l = sample_light(s.x, ul, ul2);
+            if (!prof_on(PF_NO_NEE | PF_BSDF_ONLY)) {
+                let l = sample_light(s.x, nr, ul, ul2, &rng);
                 if (l.ok && l.pdf > 0.0) {
                     let above = dot(l.wi, ng) > 0.0;
                     let xo = select(xo_dn, xo_up, above);
@@ -1765,16 +2011,16 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
                         tp[k] = tp[k] * thin_pass(mt, at[k]) / lw.w[3];
                     }
                 }
-                if (passes >= 32u) { break; }
+                if (passes >= 32u) { alive = false; continue; }
                 passes = passes + 1u;
                 ro = xo_dn;
                 continue;
             }
             let wi = pick.wi;
-            if (dot(wi, wi) < 0.5 || wi.z == 0.0) { break; }
+            if (dot(wi, wi) < 0.5 || wi.z == 0.0) { alive = false; continue; }
             let wi_w = normalize(world_of(ns, wi));
             let above = dot(wi_w, ng) > 0.0;
-            if (above != (wi.z > 0.0)) { break; }
+            if (above != (wi.z > 0.0)) { alive = false; continue; }
             // Spectral MIS (Wilkie+ 2014): every lane over the mean of the
             // four wavelengths' densities, so a dispersive near-delta
             // refraction carries its hero ×4 and the rest ~0, unbiased.
@@ -1782,12 +2028,12 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
             if (fast) {
                 // every lane's density is the hero's: q is unchanged
                 pdf = lobe_pdf_e(mt, a4.etap, lw, wo, wi);
-                if (!(pdf > 0.0) || pdf > 3.0e38) { break; }
+                if (!(pdf > 0.0) || pdf > 3.0e38) { alive = false; continue; }
                 tp = tp * eval4(mt, a4, wo, wi) * (abs(wi.z) / pdf);
             } else {
                 pdf = spectral_pdf(mt, &at, lw, wo, wi, q);
                 let p0 = lobe_pdf(mt, at[0], lw, wo, wi);
-                if (!(pdf > 0.0) || pdf > 3.0e38 || !(p0 > 0.0)) { break; }
+                if (!(pdf > 0.0) || pdf > 3.0e38 || !(p0 > 0.0)) { alive = false; continue; }
                 for (var k = 0u; k < NW; k = k + 1u) {
                     tp[k] = tp[k] * eval_dir(mt, at[k], wo, wi) * abs(wi.z) / p0;
                     if (k > 0u) { q[k] = q[k] * lobe_pdf(mt, at[k], lw, wo, wi) / p0; }
@@ -1796,27 +2042,18 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
             bounce = bounce + 1u;
             if (bounce >= P.flags.w) {
                 let q = clamp(max(max(tp.x, tp.y), max(tp.z, tp.w)), 0.05, 1.0);
-                if (rand(&rng) >= q) { break; }
+                if (rand(&rng) >= q) { alive = false; continue; }
                 tp = tp / q;
             }
-            if (max(max(tp.x, tp.y), max(tp.z, tp.w)) <= 0.0) { break; }
+            if (max(max(tp.x, tp.y), max(tp.z, tp.w)) <= 0.0) { alive = false; continue; }
             prev_x = s.x;
+            prev_n = nr;
             prev_pdf = pdf;
             msk = M_GEOMETRY | M_LIGHT | M_LIGHT_HIDDEN | M_PORTAL;
             ro = select(xo_dn, xo_up, above);
             rd = wi_w;
         }
-        var rgb = vec3<f32>(0.0);
-        // A guard, not a clamp: a path whose radiance is beyond anything
-        // the scene can emit (1e9; the brightest pixel of a converged
-        // pavilion is ~170) came from a vanishing pdf in f32 and is dropped
-        // (one sample in ~10^10 on the pavilion at 1080p).
-        for (var k = 0u; k < NW; k = k + 1u) {
-            if (!(rad[k] == rad[k]) || abs(rad[k]) > 1.0e9) { rad = vec4<f32>(0.0); }
-            rad[k] = rad[k] / spec_pdf(lam[k]);
-            rgb = rgb + rad[k] * lane_rgb(lam[k]);
-        }
-        accum[px] = accum[px] + vec4<f32>(rgb, 0.0);
+        accum[px] = accum[px] + vec4<f32>(acc, 0.0);
     }
     if (pstats) {
         atomicAdd(&stats[3u], st_cand);
@@ -1830,19 +2067,12 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
             }
         }
     }
-    // The frame's mean spectrum: each workgroup sums its lanes into BINS
-    // slots of its own, in lane order (no float atomics: deterministic).
-    for (var k = 0u; k < NW; k = k + 1u) {
-        wg_val[li * NW + k] = select(0.0, rad[k], live);
-        wg_bin[li * NW + k] = min(u32((lam[k] - 380.0) / 400.0 * f32(BINS)), BINS - 1u);
-    }
+    // The frame's mean spectrum: each workgroup adds its fixed-point bins
+    // to slots of its own.
     workgroupBarrier();
-    if (li == 0u) {
+    if (li < BINS) {
         let g = (P.seed.w / 64u) + wid.x;
-        for (var i = 0u; i < 256u; i = i + 1u) {
-            let b = wg_bin[i];
-            spec[g * BINS + b] = spec[g * BINS + b] + wg_val[i];
-        }
+        spec[g * BINS + li] = spec[g * BINS + li] + f32(atomicLoad(&wg_spec[li])) / SPEC_FIX;
     }
 }
 

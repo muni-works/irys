@@ -321,10 +321,37 @@ fn samplers_are_unbiased() {
     };
     let o = Opts { spp: 64, max_bounces: 6, ..Opts::default() };
     let (m0, e0) = frame_mean(&g, &s, Opts { samp: 0, ..o }, 24);
-    for (name, bits) in [("sobol", samp::SOBOL), ("spectral", samp::SPECTRAL), ("sun share", samp::SUN_PEAK), ("all", samp::ALL)] {
+    for (name, bits) in [("sobol", samp::SOBOL), ("spectral", samp::SPECTRAL), ("sun share", samp::SUN_PEAK), ("light tree", samp::LIGHT_TREE), ("all", samp::ALL)] {
         let (m, e) = frame_mean(&g, &s, Opts { samp: bits, ..o }, 24);
         let z = (m - m0) / (e * e + e0 * e0).sqrt();
         eprintln!("{name:10} {m:.5} ± {e:.5} vs {m0:.5} ± {e0:.5}: z {z:+.2}");
         assert!(z.abs() < 4.0, "{name}: z {z}");
+    }
+}
+
+/// Speed round 4: path regeneration changes the schedule, not the paths
+/// (each sample keeps its generator and Sobol index): the frame equals the
+/// one-sample-per-dispatch frame to f32 summation order.
+#[test]
+fn regeneration_is_a_schedule() {
+    let Some(ctx) = gpu() else {
+        eprintln!("no device: skipped");
+        return;
+    };
+    let s = lit_scene((64, 32));
+    let Some(g) = GpuLook::new(ctx, &s) else {
+        eprintln!("no ray queries: skipped");
+        return;
+    };
+    let o = Opts { spp: 24, max_bounces: 6, ..Opts::default() };
+    let a = g.render(&s.camera, &Opts { regen: 1, ..o });
+    let b = g.render(&s.camera, &Opts { regen: 8, ..o });
+    let c = g.render(&s.camera, &Opts { regen: 5, ..o });
+    for (n, f) in [("8", &b), ("5", &c)] {
+        let worst = a.rgb.iter().zip(&f.rgb).map(|(x, y)| ((x - y).abs() / (x.abs() + 1e-3)) as f64).fold(0.0, f64::max);
+        eprintln!("regen {n}: worst relative difference {worst:.2e}");
+        assert!(worst < 1e-4, "regen {n}: {worst}");
+        let ds = a.spectrum.iter().zip(&f.spectrum).map(|(x, y)| (x - y).abs() / (x.abs() + 1e-3)).fold(0.0, f64::max);
+        assert!(ds < 1e-6, "spectrum, regen {n}: {ds}");
     }
 }
