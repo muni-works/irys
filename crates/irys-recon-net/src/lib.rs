@@ -13,8 +13,11 @@
 //! - [`search`]: proposals into the MDL search and LM fit (v2).
 //! - [`faithful`] (v3): the compare image as irys's OpenPBR scene kernel
 //!   renders it, with the appearance fitted to the photo.
+//! - [`velocity`], [`edgejac`] (v3): analytic vertex velocities for every
+//!   family and the edge-sampled image Jacobian (primary and shadow edges).
 
 pub mod data;
+pub mod edgejac;
 pub mod eval;
 #[cfg(feature = "gpu")]
 pub mod faithful;
@@ -24,3 +27,4 @@ pub mod render;
 pub mod scene;
 pub mod search;
 pub mod train;
+pub mod velocity;

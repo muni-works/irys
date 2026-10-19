@@ -40,3 +40,7 @@ required-features = ["gpu"]
 [[example]]
 name = "neural_v3_fidelity"
 required-features = ["gpu"]
+
+[[example]]
+name = "neural_v3_jaccheck"
+required-features = ["gpu"]
