@@ -12,6 +12,7 @@ members = [
     "crates/irys-recon",
     "crates/irys-recon-net",
     "crates/irys-ffi",
+    "crates/irys-splat",
 ]
 
 [workspace.package]
