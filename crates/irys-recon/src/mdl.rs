@@ -32,7 +32,7 @@ pub fn program_length(p: &Program) -> f64 {
 }
 
 /// The score's three terms.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Score {
     /// Residual, nats.
     pub residual: f64,

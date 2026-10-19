@@ -61,6 +61,12 @@ fn canonical_merges_equivalent_holes() {
         ..p.clone()
     };
     assert!(canon::same_topology(&p, &pattern));
+    // A vertical run fitted with a hair of dx either way is one pattern.
+    let up = Feature::LinearHoles { x: 0.0, y: -10.0, dx: 0.013, dy: 10.0, r: 2.0, n: 3 };
+    let down = Feature::LinearHoles { x: 0.026, y: 10.0, dx: -0.013, dy: -10.0, r: 2.0, n: 3 };
+    let a = Program { features: vec![up], ..p.clone() };
+    let b = Program { features: vec![down], ..p.clone() };
+    assert!(canon::errors(&a, &b).unwrap().iter().all(|(_, e)| *e < 0.05));
     let e = canon::errors(&pattern, &p).unwrap();
     assert!(e.iter().all(|(_, v)| *v < 1e-6), "{e:?}");
 }

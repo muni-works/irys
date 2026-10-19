@@ -18,7 +18,7 @@ const GATE: std::ops::Range<u64> = 3000..3020;
 const TARGET_SPP: usize = 64;
 const TOL_MM: f64 = 0.5;
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Part {
     seed: u64,
     truth: String,
@@ -43,6 +43,7 @@ struct Part {
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mut seeds, mut views, mut out) = (GATE, 3usize, PathBuf::from("out/recon_v0"));
+    let mut rescore = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--seeds" => {
@@ -52,10 +53,27 @@ fn main() {
             }
             "--views" => views = args.next().unwrap().parse().unwrap(),
             "--out" => out = args.next().unwrap().into(),
+            "--rescore" => rescore = true,
             _ => panic!("unknown argument {a}"),
         }
     }
     fs::create_dir_all(&out).unwrap();
+    if rescore {
+        // Re-judge a finished run's saved programs against the current normal
+        // form (no rendering): topology, errors, pass.
+        let mut parts: Vec<Part> = serde_json::from_str(&fs::read_to_string(out.join("report.json")).unwrap()).unwrap();
+        for p in &mut parts {
+            let (t, r) = (Program::from_text(&p.truth).unwrap(), Program::from_text(&p.recovered).unwrap());
+            p.topology_ok = canon::same_topology(&t, &r);
+            p.recovered_signature = canon::canonical(&r).signature();
+            p.errors = canon::errors(&t, &r).unwrap_or_default();
+            p.max_error_mm = p.topology_ok.then(|| p.errors.iter().fold(0.0f64, |m, e| m.max(e.1)));
+            p.pass = p.max_error_mm.is_some_and(|e| e <= TOL_MM);
+            println!("seed {}: {}", p.seed, if p.pass { "PASS" } else { "FAIL" });
+        }
+        write_report(&out, &parts, views);
+        return;
+    }
     let setup = Setup::new(render::views().into_iter().take(views).collect());
     let bg = background(&setup, TARGET_SPP);
     let mut parts = Vec::new();

@@ -3,8 +3,8 @@
 //! [`canonical`] (no e-graph: the family is small enough for rewrite rules
 //! applied to a fixed point):
 //!
-//! 1. Patterns are normalised: a linear pattern runs in `+x` (or `+y` when
-//!    vertical), a circular pattern's phase is reduced into `[0, 360/n)`.
+//! 1. Patterns are normalised: a linear pattern runs positive along its
+//!    dominant axis, a circular pattern's phase is reduced into `[0, 360/n)`.
 //! 2. Equivalent holes are merged: plain holes and the members of hole
 //!    patterns are grouped by radius (within [`R_TOL`]); a group of three or
 //!    more on a circle at equal angles becomes one circular pattern, a group
@@ -35,7 +35,9 @@ fn order(f: &Feature) -> usize {
 
 fn normalise(f: &Feature) -> Feature {
     match *f {
-        Feature::LinearHoles { x, y, dx, dy, r, n } if dx < -1e-9 || (dx.abs() <= 1e-9 && dy < 0.0) => {
+        // Along its dominant axis, in the positive direction (a fitted
+        // vertical run has dx ≈ ±0.01, so the sign of dx alone is noise).
+        Feature::LinearHoles { x, y, dx, dy, r, n } if (dx.abs() >= dy.abs() && dx < 0.0) || (dy.abs() > dx.abs() && dy < 0.0) => {
             let k = (n - 1) as f64;
             Feature::LinearHoles { x: x + k * dx, y: y + k * dy, dx: -dx, dy: -dy, r, n }
         }
