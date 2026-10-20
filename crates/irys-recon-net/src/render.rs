@@ -348,6 +348,17 @@ mod gpu {
         )
     }
 
+    /// The scene's own world and key, as the photo was lit (v3's oracle).
+    pub fn true_light(s: &Scene) -> (Equirect, Sun) {
+        let e = env(&s.light);
+        let mean_env: f64 = e.rgb.iter().map(|c| (c[0] + c[1] + c[2]) as f64 / 3.0).sum::<f64>() / e.rgb.len() as f64;
+        let (az, el) = (s.light.key[0].to_radians(), s.light.key[1].to_radians());
+        let kr = s.light.key_radius.to_radians();
+        let ke = mean_env * std::f64::consts::PI * s.light.key_radiance;
+        let krad = ke / (std::f64::consts::PI * kr.sin().powi(2));
+        (e, Sun { dir: [el.cos() * az.cos(), el.cos() * az.sin(), el.sin()], radius: kr, radiance: [krad, krad * 0.97, krad * 0.93] })
+    }
+
     /// The scene as irys's OpenPBR kernel wants it, at `size`.
     pub fn look_scene(s: &Scene, meshes: &[Tris], size: (usize, usize)) -> LookScene {
         let mut lm = Vec::new();
@@ -359,6 +370,22 @@ mod gpu {
                 continue;
             }
             mats.push(material(&o.mat, &format!("obj{i}")));
+            lm.push(Mesh {
+                positions: m.p.iter().map(|q| [q[0] as f32, q[1] as f32, q[2] as f32]).collect(),
+                normals: Vec::new(),
+                uvs: Vec::new(),
+                indices: m.t.iter().flatten().copied().collect(),
+                material: mats.len() - 1,
+            });
+            inst.push(LInst { mesh: lm.len() - 1, xf: id, mask: mask::GEOMETRY });
+        }
+        // Clutter: rendered, never labelled.
+        for (j, c) in s.clutter.iter().enumerate() {
+            let Ok(m) = crate::scene::mesh_fast(c).map(|m| m.posed(c.pose)) else { continue };
+            if m.t.is_empty() {
+                continue;
+            }
+            mats.push(material(&c.mat, &format!("clutter{j}")));
             lm.push(Mesh {
                 positions: m.p.iter().map(|q| [q[0] as f32, q[1] as f32, q[2] as f32]).collect(),
                 normals: Vec::new(),
@@ -423,7 +450,8 @@ mod gpu {
             eprintln!("gpulook new {:.3}s render {:.3}s", (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
         }
         let mut lin: Vec<f64> = fr.rgb.iter().map(|&x| if x.is_finite() { x as f64 } else { 0.0 }).collect();
-        lin = irys_recon::fit::blur(&lin, big, 3, s.post[0] * 2.0);
+        // Defocus is a property of the lens: the same angular blur at any size.
+        lin = irys_recon::fit::blur(&lin, big, 3, s.post[0] * 2.0 * out.0 as f64 / 128.0);
         let px: Vec<[f64; 3]> = lin.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
         let small = downsample(&px, big, 2);
         let mut lum: Vec<f64> = small.iter().map(|c| (c[0] + c[1] + c[2]) / 3.0).collect();

@@ -89,10 +89,25 @@ fn main() {
     let arch = Arch { d: arg(&a, "--d", 128), tok_hidden: arg(&a, "--tok", 256), ch_hidden: arg(&a, "--ch", 384), blocks: arg(&a, "--blocks", 6) };
     std::fs::create_dir_all(&out).unwrap();
     let t0 = std::time::Instant::now();
-    let train = read_dir(&data, "train-a");
-    let val = read_dir(&data, "test-a");
-    println!("{} train, {} held-out samples ({:.1}s)", train.len(), val.len(), t0.elapsed().as_secs_f64());
-    let mut tr = Trainer::new(arch, per, workers, None, 1);
+    // v3: several training streams (comma-separated prefixes), mixed by
+    // `--mix` weights, and a warm start from `--init`.
+    let prefixes: String = arg(&a, "--train", "train-a".to_string());
+    let mix: Vec<f64> = arg(&a, "--mix", String::new()).split(',').filter(|x| !x.is_empty()).map(|x| x.parse().unwrap()).collect();
+    let streams: Vec<Vec<Sample>> = prefixes.split(',').map(|p| read_dir(&data, p)).collect();
+    let mix: Vec<f64> = if mix.len() == streams.len() { mix } else { vec![1.0; streams.len()] };
+    let train: Vec<Sample> = Vec::new();
+    let val = read_dir(&data, &arg(&a, "--val", "test-a".to_string()));
+    println!("{:?} train, {} held-out samples ({:.1}s)", streams.iter().map(|s| s.len()).collect::<Vec<_>>(), val.len(), t0.elapsed().as_secs_f64());
+    let init: String = arg(&a, "--init", String::new());
+    let (arch, params) = if init.is_empty() {
+        (arch, None)
+    } else {
+        let w = irys_recon_net::train::Weights::load(std::path::Path::new(&init)).unwrap();
+        (w.arch, Some(w.f64s()))
+    };
+    let mut tr = Trainer::new(arch, per, workers, params, 1);
+    let warm_steps: f64 = arg(&a, "--warm", 300.0);
+    let mix_tot: f64 = mix.iter().sum();
     println!("{} parameters, {} workers × {per}, native {}", tr.parameter_count(), workers, tr.native);
     let total = workers * per;
     let mut rng = Mix(42);
@@ -103,14 +118,26 @@ fn main() {
     let t_train = std::time::Instant::now();
     let mut best_val = f64::INFINITY;
     for step in 1..=steps {
-        let warm = 300.0;
+        let warm = warm_steps;
         let lr = if (step as f64) < warm {
             lr_max * step as f64 / warm
         } else {
             let p = (step as f64 - warm) / (steps as f64 - warm);
             1e-5 + 0.5 * (lr_max - 1e-5) * (1.0 + (std::f64::consts::PI * p).cos())
         };
-        let picks: Vec<&Sample> = (0..total).map(|_| &train[(rng.uniform() * train.len() as f64) as usize % train.len()]).collect();
+        let _ = &train;
+        let picks: Vec<&Sample> = (0..total)
+            .map(|_| {
+                let mut u = rng.uniform() * mix_tot;
+                let mut k = 0;
+                while k + 1 < streams.len() && u > mix[k] {
+                    u -= mix[k];
+                    k += 1;
+                }
+                let st = &streams[k];
+                &st[(rng.uniform() * st.len() as f64) as usize % st.len()]
+            })
+            .collect();
         let flips: Vec<bool> = (0..total).map(|_| rng.uniform() < 0.5).collect();
         let seeds: Vec<u64> = (0..total).map(|_| (rng.uniform() * 1e15) as u64).collect();
         let bs = batches(&picks, workers, per, &flips, Some(&seeds));

@@ -169,7 +169,7 @@ fn main() {
     }
     let table = Mat { rgb: [tmean[0] / tc.max(1.0) * k_alb, tmean[1] / tc.max(1.0) * k_alb, tmean[2] / tc.max(1.0) * k_alb].map(|v| v.clamp(0.01, 0.9)), rough: 0.7, metal: false };
     let light = Lighting { zenith: [0.9, 0.9, 0.9], horizon: [0.5, 0.5, 0.5], window: [90.0, 30.0, 25.0, 3.0], key: [200.0, 60.0, 0.0], key_radius: 8.0, key_radiance: 1.2 };
-    let rs = Scene { objects: scene_objs.clone(), table, cam, light, seed: 7, post: [0.0, 1.0, 95.0, 0.0] };
+    let rs = Scene { objects: scene_objs.clone(), table, cam, light, seed: 7, post: [0.0, 1.0, 95.0, 0.0], clutter: Vec::new() };
     let big = (512, 384);
     let ctx_gpu = irys_diff::gpu::context().expect("gpu");
     let meshes = irys_recon_net::render::world_meshes(&scene_objs);

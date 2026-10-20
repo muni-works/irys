@@ -15,7 +15,14 @@
 //! - `grid`: a base with a rows × columns pattern of key caps at a pitch —
 //!   keyboards (the pitch is a scale gauge: 19.05 mm);
 //! - `shell`: a walled shell with ribs (open tray) or a honeycomb lid of
-//!   hexagonal cells — 3D-printed cases.
+//!   hexagonal cells — 3D-printed cases;
+//! - `wall` (v3): a backplane standing on the desk, plain or a pegboard
+//!   (a lattice in front of a back sheet, so the holes read dark);
+//! - `arm` (v3): an articulated wall mount — a plate on the wall, two links
+//!   folded at an angle, and a head (a clamp, a monitor or a speaker).
+//!
+//! v3 also lets a `product` hang on the wall (`stand` token 2: raised by
+//! `lift`, a bracket behind), for a monitor or a power strip on the wall.
 //!
 //! Every object meshes in its own frame: centred in `x, y`, standing on
 //! `z = 0`. The text form is one line per object (`Object::to_text`).
@@ -39,16 +46,18 @@ pub enum Family {
     Product = 2,
     Grid = 3,
     Shell = 4,
+    Wall = 5,
+    Arm = 6,
 }
 
-pub const FAMILIES: [Family; 5] = [Family::Plate, Family::Lathe, Family::Product, Family::Grid, Family::Shell];
+pub const FAMILIES: [Family; 7] = [Family::Plate, Family::Lathe, Family::Product, Family::Grid, Family::Shell, Family::Wall, Family::Arm];
 
 impl Family {
     pub fn from_token(t: usize) -> Option<Family> {
         FAMILIES.get(t).copied()
     }
     pub fn name(self) -> &'static str {
-        ["plate", "lathe", "product", "grid", "shell"][self as usize]
+        ["plate", "lathe", "product", "grid", "shell", "wall", "arm"][self as usize]
     }
     /// Parameter names, in slot order.
     pub fn param_names(self) -> &'static [&'static str] {
@@ -58,6 +67,8 @@ impl Family {
             Family::Product => &["w", "d", "h", "r", "lift"],
             Family::Grid => &["w", "d", "h", "pitch", "key_h"],
             Family::Shell => &["w", "d", "h", "wall", "cell"],
+            Family::Wall => &["w", "h", "t", "pitch", "hole"],
+            Family::Arm => &["l1", "l2", "r", "z", "hw", "hh", "hd", "a"],
         }
     }
     /// Whether a yaw is observable (a solid of revolution has none).
@@ -83,9 +94,11 @@ pub enum Class {
     HoneycombCase = 11,
     Tray = 12,
     Webcam = 13,
+    Pegboard = 14,
+    WallArm = 15,
 }
 
-pub const CLASS_LIST: [Class; 14] = [
+pub const CLASS_LIST: [Class; 16] = [
     Class::Bracket,
     Class::GearPlate,
     Class::Can,
@@ -100,6 +113,8 @@ pub const CLASS_LIST: [Class; 14] = [
     Class::HoneycombCase,
     Class::Tray,
     Class::Webcam,
+    Class::Pegboard,
+    Class::WallArm,
 ];
 
 impl Class {
@@ -122,6 +137,8 @@ impl Class {
             "honeycomb case",
             "tray",
             "webcam",
+            "wall",
+            "wall arm",
         ][self as usize]
     }
     pub fn family(self) -> Family {
@@ -132,6 +149,8 @@ impl Class {
             Monitor | PowerStrip | Speaker | Mouse | Webcam => Family::Product,
             Keyboard => Family::Grid,
             HoneycombCase | Tray => Family::Shell,
+            Pegboard => Family::Wall,
+            WallArm => Family::Arm,
         }
     }
     /// A known size that sets the metric scale: `(parameter slot, mm)`.
@@ -227,6 +246,8 @@ impl Object {
         let p = &self.params;
         match self.family {
             Family::Lathe => p[1..5].iter().cloned().fold(0.0, f64::max),
+            Family::Wall => 0.5 * p[0].hypot(p[2]),
+            Family::Arm => arm_reach(p) + 0.5 * if self.tokens[1] == 0 { 40.0 } else { p[4] },
             _ => 0.5 * p[0].hypot(p[1]),
         }
     }
@@ -236,8 +257,10 @@ impl Object {
         let p = &self.params;
         match self.family {
             Family::Lathe => p[0],
-            Family::Product if self.tokens[2] == 1 => p[2] + p[4],
+            Family::Product if self.tokens[2] >= 1 => p[2] + p[4],
             Family::Grid => p[2] + p[4],
+            Family::Wall => p[1],
+            Family::Arm => p[3] + 0.5 * if self.tokens[1] == 0 { 60.0 } else { p[5] }.max(90.0),
             _ => p[2],
         }
     }
@@ -253,6 +276,8 @@ impl Object {
             Family::Product => p[3] < 0.5 * p[0].min(p[1]).min(if self.tokens[1] == 1 { p[2] } else { 1e9 }),
             Family::Grid => p[3] > 5.0 && p[0] > 2.0 * p[3] && p[1] > 2.0 * p[3],
             Family::Shell => p[3] > 0.5 && p[3] < 0.2 * p[0].min(p[1]) && p[4] > 2.0 * p[3] && p[4] < 0.4 * p[0].min(p[1]),
+            Family::Wall => p[0] > 50.0 && p[1] > 50.0 && p[2] > 2.0 && (self.tokens[1] == 0 || (p[3] > 8.0 && p[4] > 1.0 && p[4] < 0.35 * p[3])),
+            Family::Arm => p[0] > 20.0 && p[1] > 20.0 && p[2] > 3.0 && p[3] > p[2] + 30.0 && p[7] > 0.0 && p[7] < 80.0 && (self.tokens[1] == 0 || p[3] > 0.5 * p[5] + 10.0),
         }
     }
 }
@@ -264,13 +289,17 @@ pub fn token_mask(f: Family, t: &[usize; NTOK]) -> [bool; NTOK] {
         Family::Product => [true, true, true, false],
         Family::Grid => [true, false, true, false],
         Family::Shell => [true, true, t[1] == 0, false],
+        Family::Wall => [true, true, false, false],
+        Family::Arm => [true, true, false, false],
     }
 }
 
 pub fn param_used(f: Family, t: &[usize; NTOK], k: usize) -> bool {
     match f {
-        Family::Product => k < 4 || t[2] == 1,
+        Family::Product => k < 4 || t[2] >= 1,
         Family::Shell => k < 4 || t[1] == 1,
+        Family::Wall => k < 3 || t[1] == 1,
+        Family::Arm => k < 4 || k == 7 || t[1] != 0,
         _ => k < f.param_names().len(),
     }
 }
@@ -285,8 +314,13 @@ fn token_names(f: Family, t: &[usize; NTOK]) -> Vec<String> {
             if t[2] == 1 {
                 v.push("stand".into());
             }
+            if t[2] == 2 {
+                v.push("on-wall".into());
+            }
             v
         }
+        Family::Wall => vec![if t[1] == 0 { "plain".into() } else { "pegboard".into() }],
+        Family::Arm => vec![["head=clamp", "head=monitor", "head=speaker"][t[1].min(2)].into()],
         Family::Grid => vec![format!("rows={}", t[2])],
         Family::Shell if t[1] == 0 => vec![format!("open ribs={}", t[2])],
         Family::Shell => vec!["hex".into()],
@@ -352,6 +386,27 @@ fn material(r: &mut Mix, class: Class) -> Mat {
                 Mat { rgb: [g, g, g * 0.98], rough: range(r, 0.2, 0.6), metal: false }
             } else {
                 Mat { rgb: pick(r, &PLA), rough: range(r, 0.2, 0.6), metal: false }
+            }
+        }
+        Class::Pegboard => {
+            if u < 0.55 {
+                let g = range(r, 0.6, 0.92);
+                Mat { rgb: [g, g, g * 0.98], rough: range(r, 0.5, 0.9), metal: false }
+            } else if u < 0.75 {
+                Mat { rgb: [range(r, 0.45, 0.65), range(r, 0.30, 0.42), range(r, 0.18, 0.26)], rough: range(r, 0.5, 0.9), metal: false }
+            } else if u < 0.88 {
+                let g = range(r, 0.04, 0.2);
+                Mat { rgb: [g, g, g], rough: range(r, 0.4, 0.8), metal: false }
+            } else {
+                Mat { rgb: pick(r, &PLA), rough: range(r, 0.4, 0.8), metal: false }
+            }
+        }
+        Class::WallArm => {
+            if u < 0.3 {
+                Mat { rgb: [0.8, 0.81, 0.83], rough: range(r, 0.25, 0.5), metal: true }
+            } else {
+                let g = range(r, 0.03, 0.25);
+                Mat { rgb: [g, g, g * 1.02], rough: range(r, 0.3, 0.7), metal: false }
             }
         }
         _ => {
@@ -430,6 +485,20 @@ pub fn sample_object(r: &mut Mix, class: Class) -> Object {
             Class::Tray => {
                 let ribs = (r.uniform() * 4.0) as usize;
                 ([4, 0, ribs, 0], vec![range(r, 80.0, 200.0), range(r, 60.0, 150.0), range(r, 18.0, 50.0), range(r, 2.0, 4.0), 10.0])
+            }
+            Class::Pegboard => {
+                let peg = (r.uniform() < 0.6) as usize;
+                let pitch = pick(r, &[25.4, 25.0, 38.1, 40.0]);
+                ([5, peg, 0, 0], vec![range(r, 900.0, 1800.0), range(r, 350.0, 750.0), range(r, 12.0, 22.0), pitch, range(r, 2.5, 4.0)])
+            }
+            Class::WallArm => {
+                let head = (r.uniform() * 3.0) as usize;
+                let (hw, hh, hd) = match head {
+                    1 => (range(r, 480.0, 620.0), range(r, 280.0, 380.0), range(r, 15.0, 40.0)),
+                    2 => (range(r, 80.0, 150.0), range(r, 150.0, 250.0), range(r, 80.0, 150.0)),
+                    _ => (40.0, 60.0, 40.0),
+                };
+                ([6, head, 0, 0], vec![range(r, 120.0, 300.0), range(r, 120.0, 300.0), range(r, 8.0, 16.0), range(r, 180.0, 420.0), hw, hh, hd, range(r, 15.0, 70.0)])
             }
         };
         let o = Object { class, family, tokens, params, pose: [0.0, 0.0, range(r, -180.0, 180.0)], mat: material(r, class) };
@@ -533,6 +602,10 @@ pub struct Scene {
     pub seed: u64,
     /// Camera post: blur σ (px), gamma tweak, JPEG quality, noise gain.
     pub post: [f64; 4],
+    /// v3: things in the photo that are not in the inventory (a desk mat,
+    /// cables, small clutter): rendered, labelled as background.
+    #[serde(default)]
+    pub clutter: Vec<Object>,
 }
 
 /// Which slice of the world a stream draws from: `A` is the supervised
@@ -542,10 +615,15 @@ pub struct Scene {
 pub enum Domain {
     A,
     B,
+    /// v3: desks like the photo's (low camera, a wall, things mounted on it).
+    Desk,
 }
 
 /// A random tabletop scene, deterministic in `seed`.
 pub fn sample_scene(seed: u64, domain: Domain, size: (usize, usize)) -> Scene {
+    if domain == Domain::Desk {
+        return sample_desk(seed, size);
+    }
     let mut r = Mix(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ if domain == Domain::A { 0xA } else { 0xB0B });
     let n = 3 + (r.uniform() * 10.0) as usize;
     // Desk-scale scenes sometimes hold a monitor and a keyboard; bench-scale
@@ -613,7 +691,7 @@ pub fn sample_scene(seed: u64, domain: Domain, size: (usize, usize)) -> Scene {
     // Camera: looking along +y (azimuth 0), so poses are camera-relative.
     let (el_lo, el_hi, fov_lo, fov_hi) = match domain {
         Domain::A => (28.0, 65.0, 58.0, 72.0),
-        Domain::B => (22.0, 50.0, 66.0, 78.0),
+        Domain::B | Domain::Desk => (22.0, 50.0, 66.0, 78.0),
     };
     let el: f64 = range(&mut r, el_lo, el_hi);
     let hfov = range(&mut r, fov_lo, fov_hi);
@@ -646,7 +724,7 @@ pub fn sample_scene(seed: u64, domain: Domain, size: (usize, usize)) -> Scene {
             key_radius: range(&mut r, 3.0, 12.0),
             key_radiance: range(&mut r, 0.6, 2.0),
         },
-        Domain::B => Lighting {
+        Domain::B | Domain::Desk => Lighting {
             zenith: tint(lvl * 0.7),
             horizon: tint(lvl * range(&mut r, 0.8, 1.2)),
             window: [range(&mut r, 0.0, 360.0), range(&mut r, 5.0, 25.0), range(&mut r, 20.0, 40.0), lvl * range(&mut r, 4.0, 9.0)],
@@ -672,9 +750,9 @@ pub fn sample_scene(seed: u64, domain: Domain, size: (usize, usize)) -> Scene {
     };
     let post = match domain {
         Domain::A => [range(&mut r, 0.3, 0.8), range(&mut r, 0.92, 1.08), range(&mut r, 82.0, 95.0), range(&mut r, 0.5, 1.5)],
-        Domain::B => [range(&mut r, 0.6, 1.2), range(&mut r, 0.8, 1.2), range(&mut r, 70.0, 88.0), range(&mut r, 1.0, 3.0)],
+        Domain::B | Domain::Desk => [range(&mut r, 0.6, 1.2), range(&mut r, 0.8, 1.2), range(&mut r, 70.0, 88.0), range(&mut r, 1.0, 3.0)],
     };
-    Scene { objects, table, cam, light, seed, post }
+    Scene { objects, table, cam, light, seed, post, clutter: Vec::new() }
 }
 
 // ---------------------------------------------------------------------------
@@ -877,7 +955,7 @@ pub fn mesh(o: &Object) -> Result<Tris, String> {
         Family::Lathe => lathe(p[0], &p[1..5], 32),
         Family::Product => {
             let (w, d, h, r) = (p[0], p[1], p[2], p[3]);
-            let z0 = if o.tokens[2] == 1 { p[4] } else { 0.0 };
+            let z0 = if o.tokens[2] >= 1 { p[4] } else { 0.0 };
             let mut m = if o.tokens[1] == 0 { prism(&rounded_rect(w, d, r, seg), z0, z0 + h) } else {
                 let mut b = rounded_box(w, d, h, r, seg);
                 for q in &mut b.p {
@@ -890,7 +968,15 @@ pub fn mesh(o: &Object) -> Result<Tris, String> {
                 m.append(cuboid(0.0, d * 0.5 + 8.0, neck, 14.0, 4.0, z0 + 0.4 * h));
                 m.append(prism(&rounded_rect((0.4 * w).clamp(120.0, 260.0), 160.0f64.min(0.6 * z0 + 80.0), 20.0, seg), 0.0, 6.0).posed([0.0, d * 0.5 + 8.0, 0.0]));
             }
+            if o.tokens[2] == 2 {
+                // On the wall: a bracket behind, toward +y.
+                m.append(cuboid(0.0, d * 0.5 + 5.0, (0.3 * w).min(100.0), 10.0, z0 + 0.3 * h, z0 + 0.7 * h));
+            }
             m
+        }
+        Family::Wall | Family::Arm => {
+            let g = crate::velocity::mesh_g::<f64>(o, &o.params);
+            Tris { p: g.p, t: g.t }
         }
         Family::Grid => {
             let (w, d, h, pitch, kh) = (p[0], p[1], p[2], p[3], p[4]);
@@ -1094,6 +1180,11 @@ fn circle(cx: f64, cy: f64, r: f64, n: usize) -> Vec<[f64; 2]> {
     .collect()
 }
 
+/// How far an arm reaches from the wall (both links), mm.
+pub fn arm_reach(p: &[f64]) -> f64 {
+    (p[0] + p[1]) * (p[7].to_radians()).cos().max(0.3)
+}
+
 /// A plate's mesh without vcad.
 pub fn plate_fast(prog: &Program) -> Tris {
     let r = match prog.corner {
@@ -1196,4 +1287,207 @@ mod tests {
         assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
         assert!(a.objects.len() >= 3);
     }
+}
+
+/// v3: a desk like the photo's. A low camera looks across the desk at a
+/// half wall (plain or pegboard); on the wall hang arms (clamp, monitor or
+/// speaker heads), sometimes a monitor and a power strip; on the desk a
+/// keyboard, a mouse, a can and a few small things, often on a desk mat,
+/// with cables and clutter that are not in the inventory.
+pub fn sample_desk(seed: u64, size: (usize, usize)) -> Scene {
+    let mut r = Mix(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xDE5C);
+    let mut objects: Vec<Object> = Vec::new();
+    // The wall.
+    let mut wall = sample_object(&mut r, Class::Pegboard);
+    // A wall that fills the top of the frame: wide and at least shoulder high.
+    wall.params[0] = range(&mut r, 1300.0, 2000.0);
+    wall.params[1] = range(&mut r, 450.0, 800.0);
+    let y_wall = range(&mut r, 300.0, 560.0);
+    wall.pose = [range(&mut r, -100.0, 100.0), y_wall, 0.0];
+    let half_w = 0.5 * wall.params[0];
+    objects.push(wall.clone());
+    // On the wall.
+    let mut taken: Vec<(f64, f64)> = Vec::new(); // x, half width
+    let place_x = |r: &mut Mix, hw: f64, taken: &mut Vec<(f64, f64)>| -> Option<f64> {
+        for _ in 0..60 {
+            let x = range(r, wall.pose[0] - half_w + hw + 20.0, wall.pose[0] + half_w - hw - 20.0);
+            if taken.iter().all(|&(t, w)| (x - t).abs() > w + hw + 30.0) {
+                taken.push((x, hw));
+                return Some(x);
+            }
+        }
+        None
+    };
+    let n_arm = 1 + (r.uniform() * 3.6) as usize;
+    let mut monitor_done = false;
+    for _ in 0..n_arm {
+        let mut a = sample_object(&mut r, Class::WallArm);
+        if a.tokens[1] == 1 {
+            if monitor_done {
+                a.tokens[1] = 2;
+                a.params[4] = range(&mut r, 80.0, 150.0);
+                a.params[5] = range(&mut r, 150.0, 250.0);
+                a.params[6] = range(&mut r, 80.0, 150.0);
+            }
+            monitor_done = true;
+        }
+        if !a.valid() {
+            continue;
+        }
+        let hw = a.radius().min(half_w - 40.0);
+        if let Some(x) = place_x(&mut r, hw.max(60.0), &mut taken) {
+            a.pose = [x, y_wall, 0.0];
+            objects.push(a);
+        }
+    }
+    let mon = r.uniform();
+    if !monitor_done && mon < 0.35 {
+        let mut m = sample_object(&mut r, Class::Monitor);
+        m.tokens[2] = 2;
+        m.params[1] = range(&mut r, 15.0, 30.0);
+        m.params[4] = range(&mut r, 80.0, 260.0);
+        if let Some(x) = place_x(&mut r, 0.5 * m.params[0], &mut taken) {
+            m.pose = [x, y_wall - 0.5 * m.params[1] - 10.0, 0.0];
+            objects.push(m);
+            monitor_done = true;
+        }
+    }
+    if r.uniform() < 0.45 {
+        let mut p = sample_object(&mut r, Class::PowerStrip);
+        p.tokens[2] = 2;
+        p.params[4] = range(&mut r, 40.0, 320.0);
+        if let Some(x) = place_x(&mut r, 0.5 * p.params[0], &mut taken) {
+            p.pose = [x, y_wall - 0.5 * p.params[1] - 10.0, 0.0];
+            objects.push(p);
+        }
+    }
+    // On the desk.
+    let mut desk: Vec<Class> = Vec::new();
+    if !monitor_done && r.uniform() < 0.6 {
+        desk.push(Class::Monitor);
+    }
+    if r.uniform() < 0.85 {
+        desk.push(Class::Keyboard);
+    }
+    if r.uniform() < 0.75 {
+        desk.push(Class::Mouse);
+    }
+    if r.uniform() < 0.65 {
+        desk.push(Class::Can);
+    }
+    let extra = 1 + (r.uniform() * 4.0) as usize;
+    let small = [Class::Cup, Class::Bottle, Class::Tray, Class::HoneycombCase, Class::Webcam, Class::Speaker, Class::Bracket, Class::GearPlate, Class::Humidifier];
+    for _ in 0..extra {
+        desk.push(pick(&mut r, &small));
+    }
+    let mut objs: Vec<Object> = desk.iter().map(|&c| sample_object(&mut r, c)).collect();
+    objs.sort_by(|a, b| b.radius().total_cmp(&a.radius()));
+    let x_span = (half_w - 50.0).min(650.0);
+    for mut o in objs {
+        let mut placed = false;
+        for _ in 0..300 {
+            let (x, y) = match o.class {
+                Class::Keyboard => (range(&mut r, -150.0, 150.0), range(&mut r, -80.0, 120.0)),
+                Class::Monitor => (range(&mut r, -200.0, 200.0), y_wall - range(&mut r, 120.0, 220.0)),
+                _ => (range(&mut r, -x_span, x_span), range(&mut r, -150.0, y_wall - o.radius() - 40.0)),
+            };
+            if y + o.radius() > y_wall - 5.0 {
+                continue;
+            }
+            let ok = objects.iter().filter(|p| p.family != Family::Wall && p.family != Family::Arm && !(p.family == Family::Product && p.tokens[2] == 2)).all(|p| (p.pose[0] - x).hypot(p.pose[1] - y) > 1.02 * (p.radius() + o.radius()));
+            if ok {
+                o.pose[0] = x;
+                o.pose[1] = y;
+                if matches!(o.class, Class::Monitor | Class::Keyboard) {
+                    o.pose[2] = range(&mut r, -12.0, 12.0);
+                }
+                placed = true;
+                break;
+            }
+        }
+        if placed {
+            objects.push(o);
+        }
+    }
+    // Not in the inventory: a desk mat, cables, clutter.
+    let mut clutter = Vec::new();
+    if r.uniform() < 0.55 {
+        let g = range(&mut r, 0.03, 0.3);
+        clutter.push(Object {
+            class: Class::PowerStrip,
+            family: Family::Product,
+            tokens: [2, 0, 0, 0],
+            params: vec![range(&mut r, 600.0, 900.0), range(&mut r, 260.0, 420.0), range(&mut r, 2.0, 4.0), range(&mut r, 5.0, 25.0), 50.0],
+            pose: [range(&mut r, -150.0, 150.0), range(&mut r, -60.0, 120.0), range(&mut r, -6.0, 6.0)],
+            mat: Mat { rgb: [g, g, g * 1.05], rough: range(&mut r, 0.6, 0.95), metal: false },
+        });
+    }
+    for _ in 0..(r.uniform() * 4.0) as usize {
+        let g = range(&mut r, 0.02, 0.6);
+        clutter.push(Object {
+            class: Class::PowerStrip,
+            family: Family::Product,
+            tokens: [2, 0, 0, 0],
+            params: vec![range(&mut r, 250.0, 800.0), range(&mut r, 4.0, 8.0), range(&mut r, 4.0, 8.0), 1.5, 50.0],
+            pose: [range(&mut r, -500.0, 500.0), range(&mut r, -100.0, y_wall - 30.0), range(&mut r, -90.0, 90.0)],
+            mat: Mat { rgb: [g, g, g], rough: 0.5, metal: false },
+        });
+    }
+    for _ in 0..(r.uniform() * 4.0) as usize {
+        let c = pick(&mut r, &[Class::Cup, Class::Webcam, Class::Tray, Class::Bracket]);
+        let mut o = sample_object(&mut r, c);
+        for v in o.params.iter_mut() {
+            *v *= range(&mut r, 0.4, 0.9);
+        }
+        o.pose = [range(&mut r, -600.0, 600.0), range(&mut r, -100.0, y_wall - 40.0), range(&mut r, -180.0, 180.0)];
+        if o.valid() {
+            clutter.push(o);
+        }
+    }
+    // The camera: low and close, across the desk at the wall (a seated
+    // person's phone): the desk's front a hand's width below the frame.
+    let hfov = range(&mut r, 64.0, 76.0);
+    let eye = [range(&mut r, -80.0, 80.0), -range(&mut r, 380.0, 620.0), range(&mut r, 160.0, 330.0)];
+    let dist = y_wall - eye[1];
+    let pitch = range(&mut r, 4.0, 18.0).to_radians();
+    let at = [eye[0] + range(&mut r, -60.0, 60.0), y_wall, eye[2] - dist * pitch.tan()];
+    let cam = Cam { eye, at, hfov, size };
+    let warm = range(&mut r, -0.15, 0.15);
+    let lvl = range(&mut r, 0.4, 1.2);
+    let tint = |k: f64| [k * (1.0 + warm), k, k * (1.0 - warm)];
+    let light = Lighting {
+        zenith: tint(lvl * 0.8),
+        horizon: tint(lvl * range(&mut r, 0.6, 1.1)),
+        window: [range(&mut r, 0.0, 360.0), range(&mut r, 5.0, 40.0), range(&mut r, 12.0, 35.0), lvl * range(&mut r, 2.0, 8.0)],
+        key: [range(&mut r, 0.0, 360.0), range(&mut r, 35.0, 85.0), 0.0],
+        key_radius: range(&mut r, 1.5, 10.0),
+        key_radiance: range(&mut r, 0.6, 3.0),
+    };
+    // Screens: a monitor (on the desk, the wall or an arm) is a dark glossy
+    // face more often than a grey box.
+    for o in objects.iter_mut() {
+        let screen = o.class == Class::Monitor || (o.class == Class::WallArm && o.tokens[1] == 1);
+        if screen && r.uniform() < 0.7 {
+            let g = range(&mut r, 0.01, 0.07);
+            o.mat = Mat { rgb: [g, g * 1.1, g * 1.6], rough: range(&mut r, 0.05, 0.25), metal: false };
+        }
+    }
+    let table = {
+        let u = r.uniform();
+        let rgb = if u < 0.45 {
+            let g = range(&mut r, 0.02, 0.12);
+            [g, g, g * 1.02]
+        } else if u < 0.7 {
+            [range(&mut r, 0.45, 0.65), range(&mut r, 0.30, 0.42), range(&mut r, 0.18, 0.26)]
+        } else if u < 0.9 {
+            let g = range(&mut r, 0.55, 0.85);
+            [g, g, g * 0.98]
+        } else {
+            let g = range(&mut r, 0.08, 0.3);
+            [g, g, g * 1.02]
+        };
+        Mat { rgb, rough: range(&mut r, 0.4, 0.9), metal: false }
+    };
+    let post = [range(&mut r, 0.4, 1.0), range(&mut r, 0.85, 1.15), range(&mut r, 75.0, 92.0), range(&mut r, 0.8, 2.5)];
+    Scene { objects, table, cam, light, seed, post, clutter }
 }

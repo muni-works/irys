@@ -137,7 +137,9 @@ pub fn valid_token(f: Family, k: usize, v: usize) -> bool {
         (Family::Plate, 2) => (1..=7).contains(&v),
         (Family::Plate, 3) => (1..=3).contains(&v),
         (Family::Product, 1) => v <= 1,
-        (Family::Product, 2) => v <= 1,
+        (Family::Product, 2) => v <= 2,
+        (Family::Wall, 1) => v <= 1,
+        (Family::Arm, 1) => v <= 2,
         (Family::Grid, 2) => (2..=7).contains(&v),
         (Family::Shell, 1) => v <= 1,
         (Family::Shell, 2) => v <= 4,
@@ -219,6 +221,11 @@ pub fn object(p: &Proposal, h: &Hypothesis, cam: &Cam, mat: crate::scene::Mat) -
             *v = match (h.family, k) {
                 (Family::Product, 4) => 50.0,
                 (Family::Shell, 4) => 10.0,
+                (Family::Wall, 3) => 25.4,
+                (Family::Wall, 4) => 3.0,
+                (Family::Arm, 4) => 40.0,
+                (Family::Arm, 5) => 60.0,
+                (Family::Arm, 6) => 40.0,
                 _ => *v,
             };
         }
@@ -241,7 +248,7 @@ pub fn repair(o: &mut Object) {
     match fam {
         Family::Plate => {
             p[2] = p[2].max(1.5);
-            p[4] = p[4].clamp(0.6, 15.0);
+            p[4] = p[4].min(15.0).max(0.6);
             if toks[1] == 0 {
                 let (n, m) = (toks[2].max(1) as f64, toks[3].max(1) as f64);
                 p[5] = p[5].max(2.0 * p[4] + 2.0);
@@ -265,14 +272,29 @@ pub fn repair(o: &mut Object) {
             p[1] = p[1].max(2.2 * p[3]);
         }
         Family::Shell => {
-            p[3] = p[3].clamp(0.6, 0.15 * p[0].min(p[1]));
-            p[4] = p[4].clamp(2.2 * p[3], 0.35 * p[0].min(p[1]));
+            p[3] = p[3].min(0.15 * p[0].min(p[1])).max(0.6);
+            p[4] = p[4].min(0.35 * p[0].min(p[1])).max(2.2 * p[3]);
         }
         Family::Lathe => {
             p[0] = p[0].max(6.0);
             for r in &mut p[1..5] {
                 *r = r.max(2.5);
             }
+        }
+        Family::Wall => {
+            p[0] = p[0].max(60.0);
+            p[1] = p[1].max(60.0);
+            p[2] = p[2].max(3.0);
+            p[3] = p[3].clamp(9.0, 120.0);
+            p[4] = p[4].min(0.3 * p[3]).max(1.2);
+        }
+        Family::Arm => {
+            p[0] = p[0].max(25.0);
+            p[1] = p[1].max(25.0);
+            p[2] = p[2].clamp(3.5, 40.0);
+            p[7] = p[7].clamp(1.0, 79.0);
+            let lo = if toks[1] == 0 { p[2] + 31.0 } else { (p[2] + 31.0).max(0.5 * p[5] + 11.0) };
+            p[3] = p[3].max(lo);
         }
     }
 }
@@ -310,4 +332,42 @@ pub fn rescale(objs: &mut [Object], cam: &mut Cam, s: f64) {
         cam.eye[c] *= s;
         cam.at[c] *= s;
     }
+}
+
+/// The net's scene: objects (top-1 structure, with `−log p` of it),
+/// alternatives (the next `k − 1` structures), the camera, and which
+/// detections set the scale as gauges.
+pub fn net_scene(out: &crate::train::Out, hfov: f64, k: usize, mat: crate::scene::Mat) -> (Vec<(Object, f64)>, Vec<Vec<(Object, f64)>>, Cam, Vec<usize>, Vec<Vec<f64>>) {
+    let props = proposals(out, 0.35);
+    let mut cam = camera(out, hfov);
+    let mut objs = Vec::new();
+    let mut alts = Vec::new();
+    let mut probs = Vec::new();
+    // Each detection's parameter σ in log units (the head's normalised σ × 1.5).
+    let mut sds = Vec::new();
+    for p in &props {
+        let hs = hypotheses(p, k);
+        let cands: Vec<(Object, f64)> = hs.iter().filter_map(|h| object(p, h, &cam, mat).map(|o| (o, -h.logp))).collect();
+        if let Some(first) = cands.first() {
+            probs.push(p.cls[first.0.class as usize]);
+            objs.push(first.clone());
+            alts.push(cands[1..].to_vec());
+            sds.push(p.sigma.iter().map(|s| (1.5 * s).clamp(0.02, 1.0)).collect());
+        }
+    }
+    let plain: Vec<Object> = objs.iter().map(|o: &(Object, f64)| o.0.clone()).collect();
+    let (s, who) = gauge_scale(&plain, &probs);
+    if who.is_empty() {
+        return (objs, alts, cam, who, sds);
+    }
+    for o in objs.iter_mut() {
+        rescale(std::slice::from_mut(&mut o.0), &mut cam.clone(), s);
+    }
+    for a in alts.iter_mut() {
+        for o in a.iter_mut() {
+            rescale(std::slice::from_mut(&mut o.0), &mut cam.clone(), s);
+        }
+    }
+    rescale(&mut [], &mut cam, s);
+    (objs, alts, cam, who, sds)
 }
