@@ -292,7 +292,11 @@ fn detect_polarity(img: &Grey, lin: &Grey, tag_mm: f64) -> Vec<TagObs> {
     let bytes: Vec<u8> = img.px.iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect();
     let fam = TagFamily::tag36_h11().expect("tag36h11");
     let mut out: Vec<TagObs> = Vec::new();
-    // Large photos are decimated by 2 inside the detector; small ones not.
+    // Every decimation level runs and their tags are merged (first find of an
+    // id wins; corners are refined on `lin` either way). A tag big enough for
+    // one level can be too small or too large for another: stopping at the
+    // first level that found anything lost the K1's box tag whenever the
+    // floor tag was also in frame.
     for down in [2usize, 3, 4, 1] {
         let Ok(mut cfg) = DecodeTagsConfig::new(vec![TagFamilyKind::Tag36H11]) else { continue };
         cfg.downscale_factor = down;
@@ -324,9 +328,6 @@ fn detect_polarity(img: &Grey, lin: &Grey, tag_mm: f64) -> Vec<TagObs> {
             }
             let corners = refine(lin, &c, tag_mm);
             out.push(TagObs { id, hamming: ham, corners });
-        }
-        if !out.is_empty() {
-            break;
         }
     }
     out
