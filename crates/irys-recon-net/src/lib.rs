@@ -15,6 +15,7 @@
 //!   renders it, with the appearance fitted to the photo.
 //! - [`velocity`], [`edgejac`] (v3): analytic vertex velocities for every
 //!   family and the edge-sampled image Jacobian (primary and shadow edges).
+//! - [`search3`] (v3): the MDL search on the faithful render.
 
 pub mod data;
 pub mod edgejac;
@@ -26,5 +27,7 @@ pub mod net;
 pub mod render;
 pub mod scene;
 pub mod search;
+#[cfg(feature = "gpu")]
+pub mod search3;
 pub mod train;
 pub mod velocity;

@@ -348,6 +348,17 @@ mod gpu {
         )
     }
 
+    /// The scene's own world and key, as the photo was lit (v3's oracle).
+    pub fn true_light(s: &Scene) -> (Equirect, Sun) {
+        let e = env(&s.light);
+        let mean_env: f64 = e.rgb.iter().map(|c| (c[0] + c[1] + c[2]) as f64 / 3.0).sum::<f64>() / e.rgb.len() as f64;
+        let (az, el) = (s.light.key[0].to_radians(), s.light.key[1].to_radians());
+        let kr = s.light.key_radius.to_radians();
+        let ke = mean_env * std::f64::consts::PI * s.light.key_radiance;
+        let krad = ke / (std::f64::consts::PI * kr.sin().powi(2));
+        (e, Sun { dir: [el.cos() * az.cos(), el.cos() * az.sin(), el.sin()], radius: kr, radiance: [krad, krad * 0.97, krad * 0.93] })
+    }
+
     /// The scene as irys's OpenPBR kernel wants it, at `size`.
     pub fn look_scene(s: &Scene, meshes: &[Tris], size: (usize, usize)) -> LookScene {
         let mut lm = Vec::new();

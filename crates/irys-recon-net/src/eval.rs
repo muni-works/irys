@@ -201,3 +201,36 @@ pub fn row(mode: &str, scenes: usize, s: &Score, mdl: f64, secs: f64) -> Row {
         seconds_per_scene: secs,
     }
 }
+
+/// v3: the truth a single prediction matches (same rule as [`score`]).
+pub fn match_one(p: &Object, pcam: &Cam, truth: &[(Object, usize)], tcam: &Cam, min_px: usize) -> Option<usize> {
+    let pc = pcam.resized((crate::data::W, crate::data::H));
+    let tc = tcam.resized((crate::data::W, crate::data::H));
+    let pp = pc.project([p.pose[0], p.pose[1], 0.0])?;
+    truth
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.1 >= min_px)
+        .filter_map(|(j, (t, vis))| {
+            let tp = tc.project([t.pose[0], t.pose[1], 0.0])?;
+            let d = (pp[0] - tp[0]).hypot(pp[1] - tp[1]);
+            let r_px = (*vis as f64 / std::f64::consts::PI).sqrt();
+            (d < (0.6 * r_px).max(4.0)).then_some((d, j))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|x| x.1)
+}
+
+/// v3: one prediction's error against its truth, defined for any
+/// structure: the mean relative error of the used dimensions when the
+/// topology is right, else `1 +` the relative error of the bounding
+/// footprint and height (a wrong structure is always worse than a right one).
+pub fn object_error(p: &Object, t: &Object) -> (bool, f64) {
+    let topo = p.family == t.family && (0..4).all(|k| !t.token_mask()[k] || p.tokens[k] == t.tokens[k]);
+    if topo {
+        let e: Vec<f64> = (0..t.params.len()).filter(|&k| param_used(t.family, &t.tokens, k)).map(|k| (p.params[k] - t.params[k]).abs() / t.params[k]).collect();
+        return (true, e.iter().sum::<f64>() / e.len().max(1) as f64);
+    }
+    let rel = |a: f64, b: f64| (a - b).abs() / b.max(1e-6);
+    (false, 1.0 + (rel(p.radius(), t.radius()) + rel(p.height(), t.height())) / 2.0)
+}
