@@ -118,6 +118,13 @@ numbers, API and deviations in irys `docs/design.md`, "M1".
 - Objects: static by default. Dynamic ones get a phyz step (rigid, contact
   with the map SDF) plus a constant-velocity fallback.
 - σ grows for regions and objects not observed (staleness).
+- **Deformable and chaotic things** (snow, cables, cloth, a plowed windrow)
+  get a *generative* learned residual: a latent diffusion prior, not a
+  regressor. Following PhysLDM (2610.07609), regression on chaotic dynamics
+  predicts a damped, unphysical average; diffusion models the distribution.
+  Lockstep still holds: the sampler is seeded from the delta's seq and the
+  state hash, and evaluated in deterministic f64 on CPU (or its quantised
+  outputs are carried in the delta), so both ends sample the same future.
 
 **Update** (the robot side only; it needs the camera):
 1. Render the expected frame (irys, M1 batched + AOVs).

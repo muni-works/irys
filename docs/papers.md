@@ -16,6 +16,7 @@ papers, cited from memory — check before quoting.
 | — | materials | OpenPBR (ASWF 2024); position-free MC layers (Guo+ 2018); diffuse-interface layers 2203.11835 ✓; neural appearance 2305.02678 ✓ |
 | — | film | WS-KPN 2202.05977 ✓; two-stage adaptive 2103.16115 ✓; nonlinear Noise2Noise 2512.24794 ✓ |
 | — | compiler | SLANG.D (Bangaru+ TOG 2023) — closest analogue to tang IR; megakernels considered harmful (Laine+ 2013) |
+| — | learned dynamics (belief loop, video → physics) | PhysLDM 2610.07609 (Zhang, Xu, Pan 2026; not yet verified against the arXiv API): a spatiotemporal VAE plus latent diffusion predicts 64 frames of volumetric deformable motion in one pass. Chaotic dynamics need a *generative* model: regression learns the damped average. Differentiable, with higher-order use ("design the throw that best reveals E" = our D-optimal sensing). Pair it with irys for pixel-space fitting of stiffness. |
 
 Rule: 1 and 2 go in before anything else. Both are cheap on day one and
 painful to retrofit.
