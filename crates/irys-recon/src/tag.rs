@@ -273,7 +273,21 @@ pub fn detect(img: &Grey, tag_mm: f64) -> Vec<TagObs> {
 /// edge there; on the sRGB-encoded image it shifts towards the dark side
 /// (the tag looks smaller, the camera farther: 0.6 % in the synthetic
 /// photos).
+///
+/// Negative tags (black and white swapped, as a two-colour print with the
+/// filaments assigned the other way round comes out) are found too: when the
+/// image holds no tag of normal polarity, it is searched again inverted.
+/// Inversion moves no edge, so the corners refine the same way.
 pub fn detect_refined(img: &Grey, lin: &Grey, tag_mm: f64) -> Vec<TagObs> {
+    let found = detect_polarity(img, lin, tag_mm);
+    if !found.is_empty() {
+        return found;
+    }
+    let invert = |g: &Grey| Grey { size: g.size, px: g.px.iter().map(|v| 1.0 - v).collect() };
+    detect_polarity(&invert(img), &invert(lin), tag_mm)
+}
+
+fn detect_polarity(img: &Grey, lin: &Grey, tag_mm: f64) -> Vec<TagObs> {
     let (w, h) = img.size;
     let bytes: Vec<u8> = img.px.iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect();
     let fam = TagFamily::tag36_h11().expect("tag36h11");

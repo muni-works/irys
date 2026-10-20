@@ -73,6 +73,26 @@ fn finds_the_tag_and_the_camera() {
 }
 
 #[test]
+fn finds_a_negative_tag() {
+    let size = (1200, 900);
+    let k = Intrinsics { f: 1000.0, cx: 600.0, cy: 450.0 };
+    let pose = look_at([120.0, -260.0, 220.0], [10.0, 5.0, 0.0]);
+    let mut img = photo(&k, &pose, size);
+    for v in &mut img.px {
+        *v = 1.0 - *v;
+    }
+    let obs = tag::detect(&img, tag::TAG_MM);
+    assert_eq!(obs.len(), 1, "one negative tag");
+    assert_eq!(obs[0].id, tag::TAG_ID);
+    let mut worst = 0.0f64;
+    for (c, q) in tag::corners_mm(tag::TAG_MM).iter().zip(&obs[0].corners) {
+        let p = pose.project(&k, [c[0], c[1], 0.0]).unwrap();
+        worst = worst.max((p[0] - q[0]).hypot(p[1] - q[1]));
+    }
+    assert!(worst < 0.25, "negative tag corners within a quarter pixel: {worst}");
+}
+
+#[test]
 fn exif_round_trip() {
     let img = image::RgbImage::from_pixel(16, 8, image::Rgb([90, 90, 90]));
     let mut buf = Vec::new();
