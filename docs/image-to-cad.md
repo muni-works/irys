@@ -598,3 +598,370 @@ since the synthetic B result says it would lower its MDL and not its error.
    are often in view but rarely recognised as gauges).
 4. A proper search-only baseline using v0's proposer moves per object, so
    the comparison is with v1's search rather than with a straw man.
+
+## v3: a faithful compare image (2026-10-19)
+
+v2's search and teacher lowered the description length and raised the
+dimension error. v3 changes the objective, not the search: the model image
+is irys's own OpenPBR render with a fitted appearance, its Jacobian comes
+from the edge term, and the score is made robust to what the appearance
+model still gets wrong. The short version: **on 50 held-out synthetic
+scenes the search now lowers the dimension error** where the camera is
+known (median 10.7 % → 7.2 %, the same detections 13.1 % → 9.4 %; v2's
+search raised it to 13.8 %); with the network's camera it is neutral
+(10.7 % → 11.3 %; v2: 16.0 %). Renderer-as-teacher fine-tuning, in four
+forms, still does not lower it, for the same reason: it works through the
+network's camera. The desk photo is still mostly not recovered.
+
+### A faithful compare image (`faithful.rs`, `look/relight.rs`)
+
+- **The render.** `faithful::Compare3` holds the scene on the device:
+  every mesh in its own frame, placed by the TLAS instance transform, so a
+  pose move is M1's `set_instances` (1–13 ms) and only a change of shape
+  rebuilds (30–80 ms). It is the OpenPBR scene kernel the photos are made
+  with: NEE, the light tree, shadows from the key and the world, three
+  bounces. Instance ids come from M1's sensor kernel; several cameras go
+  through `render_batch` (the desk figure's two views).
+- **Relighting without a rebuild.** `GpuLook::set_env`, `set_sun` and
+  `set_materials` (new, `look/relight.rs`) rewrite one buffer each.
+- **The appearance** (`faithful::fit_appearance`): the world is a
+  non-negative mix of 32 lobes (a sky, the ground, 30 `cos⁸` lobes at four
+  elevations) plus one key light. Light transport is linear in emission, so
+  each lobe is one basis render and the key one render per direction; the
+  weights are NNLS per channel with Gram blocks shared across 55 key
+  directions (then the best one's neighbours at four sizes) and a 9-step
+  grid of the tone gamma (exposure is the lights' scale). Then per object
+  the base colour in closed form on its eroded instance mask, and
+  roughness / metal by a choice among six; the lens's defocus by a 1-D
+  search. Saturated photo channels are an
+  inequality (at least 1), handled as an active set. 170 renders, 3–7 s at
+  256 × 192.
+- **Resolution.** The photos are rendered at 2× and kept at 512 × 384
+  (`neural_data --hi 4`); the search runs at 512 × 384 (4× v2's 128 × 96 in
+  each axis) over a blur homotopy σ = 4, 2, 1 px, the appearance is fitted
+  at 256 × 192. The net still reads 128 × 96.
+
+**The ceiling** (`neural_v3_fidelity`): each held-out scene's TRUE program
+(geometry, poses, camera) through the compare path, PSNR of the display
+image against the photo:
+
+| compare path | 256 × 192 (30 scenes) | 512 × 384 (20 scenes) |
+|---|---|---|
+| v2: TLAS cast, linear appearance `c₀ + c·n`, at 128 × 96 | 27.6 dB | 27.1 dB |
+| v2's, at the compare size | 27.3 dB | 26.6 dB |
+| v3, the scene's own substances and light (exposure fitted) | **38.4 dB** | **38.9 dB** |
+| v3, appearance fitted from grey | **32.8 dB** | **33.1 dB** |
+
+![photo | v3 with the true appearance | v3 with the fitted appearance](neural-v3-fidelity.png)
+
+The renderer itself is within the photo's noise and JPEG (38 dB); the
+fitted appearance loses 5.6 dB of it, and that gap turns out to be the
+whole story of the score (below).
+
+### Edge gradients for every family (`velocity.rs`, `edgejac.rs`)
+
+- **Analytic vertex velocities.** The scene families' meshers are restated
+  generically over a scalar and run with forward-mode duals whose tangents
+  are the eight parameter slots and the pose `(x, y, yaw)`; every
+  topological choice (key-cap columns, honeycomb cells, a clamp's side, the
+  plate's ear clipping) is made on the value. The f64 instance is the
+  mesher bit for bit and every dual matches central differences of the
+  vertices (`velocity::tests`), for all 16 classes including v3's walls and
+  arms.
+- **The edge term** is v0's (`jac.rs`): crease, silhouette and boundary
+  edges are projected, sampled two per pixel of length, checked for
+  visibility through the TLAS (one side must be the object at the edge's
+  depth, and the sides must differ), and deposit `(f₋ − f₊) v_n` into
+  their pixel, with `v_n` from the duals and the projection's derivative.
+  `f₋ − f₊` is read from the faithful render one pixel either side, so the
+  difference carries the OpenPBR shading, the shadows and the world.
+- **2f's secondary edges for the shadows:** every edge on the key light's
+  silhouette is projected onto the support plane along the key,
+  `Ṗ = Ẋ − (Ẋ_z / L_z) L`, and sampled where both sides of it are the plane
+  at the shadow point's depth.
+
+**Check** (`neural_v3_jaccheck`): each used column against central
+differences of the faithful render (two renders with common random numbers,
+64 spp, both blurred 2 px at 512 × 384), 20 held-out scenes, up to six
+objects per family. Median cosine / ratio (`J·J_fd / |J_fd|²`):
+
+| family | all columns | without the shadow term | weakest columns | differences vs themselves |
+|---|---|---|---|---|
+| plate | 0.90 / 1.02 | 0.88 / 0.86 | h 0.81, r 0.79 | 0.98 |
+| product | 0.88 / 0.76 | 0.84 / 0.69 | w 0.84 | 0.99 |
+| shell | 0.84 / 1.01 | 0.78 / 0.97 | cell 0.14 | 0.98 |
+| lathe | 0.82 / 0.66 | 0.78 / 0.60 | r1 0.43, r2 0.69 | 0.97 |
+| grid | 0.82 / 0.70 | 0.71 / 0.47 | pitch 0.20 (held at 19.05 mm), h 0.65, key_h 0.68 | 0.97 |
+| arm (12 desk scenes) | 0.89 / 0.75 | | r 0.61, y 0.72 | 0.99 |
+| wall (12 desk scenes) | 0.42 / 0.33 | | t 0.02, pitch 0.03, x 0.33, y 0.38 | 0.97 |
+
+The shadow term adds 0.02–0.11 to every family's cosine, most for the
+keyboard (its base's shadow is most of its signal). What it misses is the
+interior term: a lathe's inner radii change the shading of the bulge, not
+an edge; a honeycomb cell changes many tiny edges inside one face. Those
+columns (`search3::weak`: the lathe's r1 and r2, the keyboard's h and
+key_h, the honeycomb cell, a wall's thickness and hole pitch) keep forward
+differences — one rebuild and
+render each — and every other column of the search and of the teacher is
+the edge term's: v2's finite-difference Jacobians and teacher gradients are
+gone everywhere else.
+
+### A better score (`search3.rs`, `examples/neural_v3_oracle`)
+
+With the faithful image in place, the first re-test said the same thing as
+v2: on five development scenes, true camera, the search took the paired
+dimension error (each detection, before and after, both topology-correct)
+from 14 % to 31 %. The diagnosis, step by step:
+
+1. **σ and correlation.** v2 measured the residual in units of the
+   photo's noise and summed every blurred pixel as if independent. The
+   render's own Monte Carlo noise is larger than the photo's at search spp,
+   and a σ-px blur makes ~`1 + 4πσ²` pixels one measurement. Now the σ of
+   each level is measured (photo noise and render noise, both blurred as the
+   residual is, `noise_levels`) and the sum is divided by `κ = 1 + 4πσ²`.
+2. **The sensor clips.** The photos' exposure saturates the brightest
+   surfaces; an unclipped model is then "too bright" exactly where the photo
+   is pinned at 1, and a fitted exposure is biased low everywhere else. The
+   model is now blurred by the lens, clipped, then blurred by the level, and
+   saturated channels are an inequality in the appearance fit.
+3. **The appearance is the nuisance that absorbs the residual.** With the
+   *true* appearance, an oracle (`neural_v3_oracle --true-app`: every other
+   object at its truth, each object coded by its true program, a perturbed
+   one and every other family's sized default; 5 tuning scenes, 33
+   objects) picks the true structure for 32 of 33 objects (97 %); with the
+   fitted appearance, for 19 (58 %). Partial oracles on the
+   search (true camera) located it: the scene's true light and tone with
+   fitted substances still raise the error (12 % → 16 %); only with the
+   true substances too does the search lower it (12 % → 8 %). Geometry was
+   paying for the substances' misfit: a box loses height so that fewer of
+   its side pixels are mis-shaded, a lathe pinches its bulge.
+
+The fixes, each a term of the score or of its nuisance model:
+
+- **Per-candidate appearance freedom.** Every candidate gets its own colour
+  and a linear-in-normal correction of its shading (`a + b·n` per channel,
+  closed form on its own pixels, ridge on `b`), so a candidate is not
+  judged by how well the substance fitted to a different shape suits it.
+- **A band-passed residual.** Each level compares `G(σ) − G(2.5σ)` of
+  model and photo: shading that varies slowly across a face (what a misfit
+  of light or substance leaves) is removed, edges and their contrast stay.
+- **A tempered likelihood.** The residual's dispersion `τ` (its Huber sum
+  per independent measurement at the start, over the noise-only value;
+  9–15 on these scenes) divides the residual term, so the program length,
+  the Fisher term and the priors are weighed against a residual whose
+  scale is honest about the model's own error.
+- **The network as the prior.** Each detection's parameters get the
+  head's Gaussian (`σ` from its log-σ output, in log units) and its
+  position ± 30 mm; the structure's code is `−log p(structure) / T` from
+  the token heads with `T = 0.1`.
+
+With these terms the same oracle (fitted appearance) picks the true
+structure for 26 of 33 (79 %). The rest of the gap to 97 % is the fitted
+appearance's: started from the truth, the fit drifts to a median 13 %
+relative error with the fitted appearance and stays at 3 % with the true
+one, so the network's priors are still what holds the dimensions near the
+truth in the search.
+
+Tuning, on 12 separate scenes (`v3-tune`, true camera, paired error):
+
+| score | dims (median, topology-correct) | paired before → after | topology | recall |
+|---|---|---|---|---|
+| net alone | 16.0 % | | 0.71 | 0.76 |
+| everything, `T = 0.4` | 7.8 % | 16.2 % → 10.9 % | 0.59 | 0.71 |
+| … `T = 1` | 7.7 % | 16.2 % → 10.9 % | 0.57 | 0.70 |
+| … no position prior | 8.4 % | 16.2 % → 11.1 % | 0.57 | 0.71 |
+| … no band-pass | 13.4 % | 16.2 % → 16.2 % | 0.56 | 0.72 |
+| … 8 spp (from 16) | 8.9 % | 16.2 % → 11.5 % | 0.55 | 0.74 |
+| **… 8 spp, `T = 0.1`** (used below) | 9.6 % | 16.2 % → 13.9 % | **0.73** | **0.78** |
+
+and on the five development scenes, in the order the terms were added:
+σ alone 14 % → 31 %; + prior and τ 12 % → 17 %; + appearance freedom
+14 % → 15 %; + band-pass 14 % → 13 %; with the oracle's appearance 12 % →
+8 %. The band-pass and the appearance freedom are what turn the search from
+raising the error to lowering it. A tighter structure prior trades some of
+the dimension gain for the topology: at `T = 0.4` the search re-codes more
+objects (and gets more of them wrong) than the net; at `T = 0.1` it keeps
+the net's structure unless the image clearly disagrees, and topology and
+recall end above the net's.
+
+### Walls and wall mounts (`scene.rs`, `Domain::Desk`)
+
+Two families and one product variant, all meshing in the language's own
+way (centred, standing on the desk plane) and all with analytic velocities:
+
+| family | tokens | parameters | classes |
+|---|---|---|---|
+| wall | plain / pegboard | w h t pitch hole | wall (a backplane on the desk; a pegboard is a lattice of strips in front of a back sheet, so the holes read dark) |
+| arm | head = clamp / monitor / speaker | l1 l2 r z hw hh hd a | wall arm (a plate on the wall, two links folded at ±a in plan, a head at the end) |
+| product, `on-wall` | stand token 2 | w d h r lift | monitor on the wall, power strip on the wall (raised by `lift`, a bracket behind) |
+
+The class head had two free slots, so the network's shape is unchanged and
+the v2 weights warm-start it. `Domain::Desk` samples desks like the
+photo's: a half wall (plain or pegboard, 1.3–2 m wide, 0.45–0.8 m high)
+behind the desk; one to four arms on it (at most one monitor head), a
+monitor on the wall or on the desk, a power strip on the wall; on the desk
+a keyboard, a mouse, a can and a few small things; a desk mat, cables and
+small clutter that are rendered but labelled as background (`Scene::clutter`);
+dark glossy screens; a low camera close to the desk (0.4–0.6 m from its
+front edge, 160–330 mm up, 4–18° down) looking at the wall.
+
+![desk scenes from the data engine](neural-v3-desk-data.png)
+
+Training: v2's network warm-started and fine-tuned on mixtures of domain
+A (40 k scenes) and desk scenes, as the same tang tensor-IR graph on the CPU
+workers (12 × 4 images, compiled C): 4 000 steps on a first desk
+sampler (A : desk 1 : 1, 40 min), then 6 000 steps on the second, closer one
+(12 k scenes, A : desk 1 : 2, 86 min). tang's GPU path was not used: it is
+still on wgpu 25 against irys's 30. Net alone, 100 held-out desk scenes
+(`desk2-test`) and 50 domain-A scenes:
+
+| | desk recall / precision | desk class / topology | desk dims | A recall / topology / dims |
+|---|---|---|---|---|
+| v2's network | 0.35 / 0.32 | 0.09 / 0.14 | 20 % | 0.72 / 0.72 / 10.7 % |
+| desk-tuned (first sampler) | 0.34 / 0.49 | 0.54 / 0.32 | 27 % | 0.72 / 0.74 / 10.4 % |
+| desk-tuned (second sampler) | **0.40 / 0.58** | **0.66 / 0.44** | **16 %** | 0.72 / 0.73 / 11.1 % |
+
+The desk is learned without losing domain A, but desk scenes stay much
+harder than tabletops: walls and arms occlude, and most of a desk's objects
+are small at 128 × 96.
+
+### Synthetic results (`examples/neural_v3_eval`)
+
+50 held-out domain-A scenes (`v3-a`, seeds 6 000 010–6 000 059, never used
+for development or tuning), photos at 512 × 384; search at 512 × 384, 8 spp,
+σ = 4, 2, 1 px; the same matching and scoring as v2 (dimension errors over
+topology-correct matches). The last row is v2's code on the same 50 scenes.
+
+| | net | net + search | net + search, true camera | search only, true camera |
+|---|---|---|---|---|
+| inventory recall / precision | 0.72 / 0.90 | 0.70 / 0.91 | 0.68 / 0.89 | 0.07 / 0.81 |
+| class accuracy | 0.81 | 0.84 | 0.84 | 0.16 |
+| topology accuracy | 0.72 | 0.71 | 0.72 | 0.08 |
+| dims within 0.5 mm / 1 mm | 6.4 % / 15.5 % | 7.5 % / 13.7 % | **11.7 % / 22.4 %** | 20 % / 20 % (n = 5) |
+| objects with every dim ≤ 1 mm | 0 % | 0 % | 0.5 % | 0 % |
+| median dim error | 4.7 mm (10.7 %) | 4.8 mm (11.3 %) | **3.2 mm (7.2 %)** | 5.7 mm (6.0 %, n = 5) |
+| paired: the same detections before → after | | 12.9 % → 13.7 % (n 166, 48 % improved) | **13.1 % → 9.4 %** (n 162, 61 % improved) | |
+| median position / yaw error | 28 mm / 15.6° | 22 mm / 2.3° | **5.7 mm / 1.5°** | 10 mm / 0.6° |
+| seconds per scene | 0.03 (+ 6 s appearance) | 94 | 72 | 151 |
+| *v2 on the same scenes: median dim error* | *10.7 %* | *16.0 %* | *13.8 %* | *67.5 %* |
+
+What this says:
+
+- **With the true camera, the search now lowers the dimension error**:
+  median 10.7 % → 7.2 % (4.7 → 3.2 mm), the paired error of the same
+  detections 13.1 % → 9.4 %, the share of dimensions within 1 mm 15.5 % →
+  22.4 %, position 28 → 5.7 mm, yaw 15.6° → 1.5°, with topology unchanged
+  (0.72). v2's search on the same scenes took the median from 10.7 % to
+  13.8 % and topology from 0.72 to 0.60. This is the success criterion for
+  the search, met where the camera is known (a tag, a calibrated robot).
+- **With the net's camera it is neutral** (10.7 % → 11.3 %; v2: 16.0 %).
+  Pose improves (yaw 15.6° → 2.3°), dimensions do not: the camera's height
+  is the scene's scale and no image fixes it without a gauge, and its pitch
+  is only partly fixed by the frame; the search makes every object
+  image-consistent with a camera that is wrong by the plane head's error.
+  Refining the pitch on the frame (6° either way) and taking the scale from
+  the priors afterwards (`prior_scale`; 11.4 % without it) is what keeps it
+  from v2's rise.
+- **Recall drops by 0.02–0.04**: a detection whose position moves past the
+  matching radius (4 px at 128 × 96) is counted missed; precision does not
+  fall, so these are moves, not drops.
+- **Search alone** is still a straw man (v2's segmentation and seven sized
+  defaults): its blobs merge neighbours, and under the band-passed, tempered
+  score a default that does not fit is costlier than no object, so most are
+  dropped (precision 0.81 at recall 0.07).
+- **The 0.5 mm / 1 mm gates remain out of reach** for one 512 × 384 view of
+  half-metre scenes (1.2 mm a pixel on a desk); no mode passes an object on
+  all dimensions at 0.5 mm.
+
+### Renderer as teacher (`examples/neural_v3_finetune`, `examples/neural_v3_pseudo`)
+
+All variants read only the photos (and their field of view) of the
+unlabelled shifted-domain tuning set (600 scenes of domain B, photos at
+256 × 192); they start from v2's network and are scored on 100 held-out B
+scenes (labels used only to score; net alone, so the camera is the plane
+head's):
+
+| | before (v2's net) | gradient teacher | Gauss–Newton | GN, scale-free | distillation |
+|---|---|---|---|---|---|
+| scene MDL, untempered (nats) | 65.4 k | **64.4 k (−1.6 %)** | 65.9 k | 67.1 k | 65.2 k (−0.3 %) |
+| recall / precision | 0.66 / 0.78 | 0.65 / 0.80 | 0.66 / 0.80 | 0.66 / 0.80 | 0.66 / **0.82** |
+| topology accuracy | **0.72** | 0.70 | 0.71 | 0.69 | 0.71 |
+| median dimension error | **6.4 mm (14.1 %)** | 7.7 mm (15.6 %) | 7.3 mm (16.2 %) | 6.8 mm (14.6 %) | 6.9 mm (14.9 %) |
+| dims within 1 mm | **12.3 %** | 11.3 % | 10.4 % | 12.4 % | 11.1 % |
+| median position / yaw error | 44 mm / 21° | 45 mm / **14°** | 43 mm / 21° | 45 mm / 19° | 44 mm / 26° |
+
+- **Gradient teacher** (v2's design, v3's parts): `∂L/∂head` from the edge
+  Jacobian contracted with the band-passed residual, REINFORCE on the
+  structure under v3's MDL, 100 steps of 8 photos + 4 anchor images.
+- **Gauss–Newton teacher:** the parameter heads regressed toward one damped
+  GN step of v3's score (with the head's own σ as the prior), after the
+  pitch is refined on the frame; **scale-free:** the image's mean log-size
+  step removed, since the photo fixes shape only up to scale.
+- **Distillation:** the full v3 search (net camera, pitch refined, priors'
+  scale) run on 80 tuning photos, its scenes labelled through the TLAS as
+  pseudo-labels, and 400 steps of supervised fine-tuning on them mixed 1:2
+  with domain-A batches.
+
+**The teacher still does not lower the dimension error**, in any of the
+four forms. What it does do: the gradient teacher lowers the held-out
+description length (as v2's did) and the yaw error (21° → 14°), and
+distillation lifts precision (0.78 → 0.82). The reason is the same one the
+net-camera row of the synthetic table shows: every teacher here works
+through the network's own camera, and with no gauge in view the camera's
+height (the scene's metric scale) is not observable from the image at all,
+while its pitch is only partly so. The network's dimensions are metric
+priors learned from labels; the teacher's are image-consistent under a
+camera that is off by its plane head's error, so it moves them toward the
+wrong answer by about that error. Removing the common scale from the steps
+(scale-free) is the best of the four, at 14.6 % against 14.1 %: what is
+left is the per-object perspective error of a wrong pitch and the
+appearance misfit the oracle measured. With the true camera the search does
+lower the error (above), so the next teacher needs the camera: gauges in
+the tuning photos (63 % of scenes hold a can or a keyboard), or the
+teacher's loss restricted to scenes where one fires.
+
+### The desk photo (`examples/neural_v3_desk`)
+
+The figure is photo | irys OpenPBR re-render of the recovered scene with the
+fitted appearance (colours from the photo) | residual | labelled inventory;
+the inventory with a by-eye check is in
+[neural-v3-inventory.md](neural-v3-inventory.md).
+
+![desk: photo, re-render, residual, inventory](neural-v3-desk.png)
+
+With the desk-tuned network the plane head now puts the camera 280 mm above
+the desk at 17.6° (v2: 378 mm, 35.7°), and the network proposes wall
+hardware (two arms with speaker heads, a power strip on the wall). It still
+does not find the keyboard, the mouse, the can or the monitor, so no gauge
+sets the scale, and the success criterion for the desk is **not met**. The
+search keeps 8 of 11 detections and moves them; it cannot add what the net
+missed: births from the residual (`search3::births`: components of the
+band-passed residual on the near desk, each offered every family's sized
+seed) found 26 candidate regions and none shortened the description, because
+the photo's residual dispersion is τ ≈ 91 against 9–15 on synthetic scenes.
+That number is the honest summary of the desk: the scene language and the
+appearance model explain this photo an order of magnitude worse than they
+explain a synthetic one (the screen's light, the lamp bar, the cables and
+the wall's clutter are not in the language), so the MDL is too uncertain to
+pay for a new object.
+
+### Next
+
+1. **The camera.** Every remaining failure on synthetic scenes runs
+   through it: the search lowers the error with the true camera and not with
+   the network's, and the teacher only ever sees the network's. Gauge-aware
+   training and decoding (the can and the key pitch are in 63 % of scenes,
+   rarely recognised as gauges), a pitch/height head trained against the
+   horizon and the table's texture, or a tag where the robot has one.
+2. **The appearance.** The oracle's 79 % → 97 % and the 3 % → 13 % drift are
+   the fitted appearance. Per-object roughness and metal are a choice among
+   six fitted on the starting geometry; fitting them per candidate (one
+   render each) or jointly with the shape in a final pass is the next term.
+3. **The desk.** Detection at the photo's resolution (crops at 512 × 384
+   around residual components and the net's low-confidence peaks), a screen
+   (emissive) material and cables in the data engine, and births that are
+   scored against a local dispersion rather than the frame's.
+4. **The wall's own Jacobian.** Its pose and thickness columns agree poorly
+   (cosine 0.02–0.4) because most of a wall's edges are off-screen or
+   hidden; forward differences for those, or treating the wall as a plane
+   fit rather than an object.

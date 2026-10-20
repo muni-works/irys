@@ -52,3 +52,15 @@ required-features = ["gpu"]
 [[example]]
 name = "neural_v3_oracle"
 required-features = ["gpu"]
+
+[[example]]
+name = "neural_v3_finetune"
+required-features = ["gpu"]
+
+[[example]]
+name = "neural_v3_desk"
+required-features = ["gpu"]
+
+[[example]]
+name = "neural_v3_pseudo"
+required-features = ["gpu"]

@@ -73,6 +73,7 @@ fn main() {
     let mut scores: Vec<(String, Score, f64, f64)> = modes.split(',').map(|m| (m.to_string(), Score::default(), 0.0, 0.0)).collect();
     let mut paired: Vec<(String, Vec<f64>, Vec<f64>)> = Vec::new();
     let mut per_scene = Vec::new();
+    let mut raw_sum = vec![0.0f64; scores.len()];
     for (si, s) in samples.iter().enumerate() {
         let hi = image::open(hi_path(&data, &set, s.scene.seed)).unwrap().to_rgb8();
         let rgb8: Vec<u8> = resample_rgb8(&hi, size).iter().flat_map(|p| p.map(irys_recon::render::srgb8)).collect();
@@ -82,7 +83,7 @@ fn main() {
         let (objs, alts, cam, gauges, sds) = net_scene(&o, s.scene.cam.hfov, k_alt, GREY);
         let t_net = t0.elapsed().as_secs_f64();
         let mut rec = serde_json::json!({"seed": s.scene.seed, "truth": s.program, "gauges": gauges});
-        for (mode, sc, mdl, secs) in scores.iter_mut() {
+        for (mi, (mode, sc, mdl, secs)) in scores.iter_mut().enumerate() {
             let t1 = std::time::Instant::now();
             let (init, cands, c): (Vec<(Object, f64)>, Vec<Vec<(Object, f64)>>, Cam) = match mode.as_str() {
                 "net" => (objs.clone(), Vec::new(), cam),
@@ -248,6 +249,9 @@ fn main() {
             };
             let dt = t1.elapsed().as_secs_f64() + if mode.starts_with("net") { t_net } else { 0.0 };
             let m = mdl_pre.unwrap_or_else(|| search3::scene_mdl(&pred, &ctx));
+            // The same score untempered (τ = 1): comparable across modes and
+            // weights, where the tempered one is normalised by each start's own τ.
+            let m_raw = if mode == "net" { (m - pred.iter().map(irys_recon_net::scene::program_length).sum::<f64>()) * ctx.tau + pred.iter().map(irys_recon_net::scene::program_length).sum::<f64>() } else { f64::NAN };
             let one = score(&pred, &c, &truth, &tcam, 30);
             // Paired: each initial detection's error before and after (both
             // topology-correct), matched to the same truth.
@@ -277,10 +281,11 @@ fn main() {
             }
             sc.add(&one);
             *mdl += m;
+            raw_sum[mi] += m_raw;
             *secs += dt;
             rec[mode.as_str()] = serde_json::json!({
                 "program": pred.iter().map(|o| o.to_text()).collect::<Vec<_>>(),
-                "mdl": m, "seconds": dt, "matched": one.matched, "gt": one.gt, "pred": one.pred, "topo_ok": one.topo_ok,
+                "mdl": m, "mdl_raw": m_raw, "seconds": dt, "matched": one.matched, "gt": one.gt, "pred": one.pred, "topo_ok": one.topo_ok,
                 "tau": ctx.tau, "builds": counts.builds, "moves": counts.moves, "renders": counts.renders, "jacobians": counts.jacobians,
                 "candidates": cand_rec, "dim_err_rel": one.dim_err_rel,
             });
@@ -296,7 +301,8 @@ fn main() {
         let pj: Vec<_> = paired.iter().map(|(m, b, a)| serde_json::json!({"mode": m, "n": b.len(), "before_median_rel": median(b), "after_median_rel": median(a),
             "before_mean_rel": b.iter().sum::<f64>() / b.len().max(1) as f64, "after_mean_rel": a.iter().sum::<f64>() / a.len().max(1) as f64,
             "improved_frac": b.iter().zip(a).filter(|(x, y)| y < x).count() as f64 / b.len().max(1) as f64})).collect();
-        std::fs::write(out.join("summary.json"), serde_json::to_string_pretty(&serde_json::json!({"rows": rows, "paired": pj})).unwrap()).unwrap();
+        let raw: Vec<_> = scores.iter().zip(&raw_sum).map(|((m, ..), r)| serde_json::json!({"mode": m, "mean_mdl_raw": r / (si + 1) as f64})).collect();
+        std::fs::write(out.join("summary.json"), serde_json::to_string_pretty(&serde_json::json!({"rows": rows, "paired": pj, "raw": raw})).unwrap()).unwrap();
         std::fs::write(out.join("scenes.json"), serde_json::to_string_pretty(&per_scene).unwrap()).unwrap();
     }
 }

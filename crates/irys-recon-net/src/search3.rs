@@ -1,13 +1,17 @@
 //! v3's MDL search: v2's (`search.rs`) with the faithful compare image
 //! ([`crate::faithful`]) and the edge-sampled Jacobian ([`crate::edgejac`]).
 //!
-//!     MDL = Σ ρ(r/σ)/κ  +  ½ log det(F/κ + I)  +  program length     (nats)
+//! ```text
+//! MDL = Σ ρ(r/σ)/(κτ)  +  ½ log det(Σ_p F/(κτ) + I)  +  ½ Σ ((θ − θ₀)/σ_p)²  +  program length     (nats)
+//! ```
 //!
-//! `r` is the blurred difference between the OpenPBR render of the scene
+//! `r` is the band-passed difference between the OpenPBR render of the scene
 //! (fitted lights and substances) and the photo, `κ` the number of pixels a
 //! blur of σ px makes one independent measurement of (`1 + 4πσ²`, so the
 //! residual is not counted once per correlated pixel), `F = JᵀWJ` with `J`
-//! from the edge term on analytic vertex velocities. Per object (largest
+//! from the edge term on analytic vertex velocities, `τ` the residual's
+//! dispersion ([`dispersion`]) and `θ₀, σ_p` the network's prior on the
+//! parameters (the structure is coded by its `−log p / T`). Per object (largest
 //! first) every candidate structure is fitted by Levenberg–Marquardt over a
 //! blur homotopy and the shortest description kept; dropping the object is
 //! always a candidate.
@@ -259,10 +263,11 @@ pub fn jacobian(st: &State, i: usize, model: &[[f64; 3]], ctx: &Ctx3, win: Windo
 /// Columns whose edge term misses most of the derivative
 /// (`neural_v3_jaccheck`: cosine under 0.8 against central differences):
 /// the lathe's inner profile radii (shading of the bulge, an interior
-/// term), the keyboard's base and key-cap heights and the honeycomb cell.
+/// term), the keyboard's base and key-cap heights, the honeycomb cell, and
+/// a wall's thickness and hole pitch (desk scenes: 0.02–0.03).
 pub fn weak(o: &Object, slot: usize) -> bool {
     use scene::Family::*;
-    matches!((o.family, slot), (Lathe, 2) | (Lathe, 3) | (Grid, 2) | (Grid, 4)) || (o.family == Shell && o.tokens[1] == 1 && slot == 4)
+    matches!((o.family, slot), (Lathe, 2) | (Lathe, 3) | (Grid, 2) | (Grid, 4) | (Wall, 2) | (Wall, 3)) || (o.family == Shell && o.tokens[1] == 1 && slot == 4)
 }
 
 fn solve(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {

@@ -65,7 +65,8 @@ fn main() {
     let modes: String = arg(&a, "--modes", "net,net+search,net+search@truecam,search".to_string());
     let iters: usize = arg(&a, "--iters", 8);
     std::fs::create_dir_all(&out).unwrap();
-    let samples: Vec<Sample> = read_dir(&data, &set).into_iter().take(n).collect();
+    let skip: usize = arg(&a, "--skip", 0);
+    let samples: Vec<Sample> = read_dir(&data, &set).into_iter().skip(skip).take(n).collect();
     let w = Weights::load(&wpath).unwrap();
     let mut net = Infer::new(&w, 8);
     let mut scores: Vec<(String, Score, f64, f64)> = modes.split(',').map(|m| (m.to_string(), Score::default(), 0.0, 0.0)).collect();

@@ -3,7 +3,9 @@
 //! continuous parameters fitted by Levenberg–Marquardt on the irys-cast
 //! model image, and the candidate with the shortest description kept:
 //!
-//!     MDL = Σ ρ(r/σ)  +  ½ log det(F + I)  +  program length     (nats)
+//! ```text
+//! MDL = Σ ρ(r/σ)  +  ½ log det(F + I)  +  program length     (nats)
+//! ```
 //!
 //! over the object's window, with `ρ` Huber, `F = JᵀWJ` the Fisher
 //! information of its normalised parameters, and the program length of
