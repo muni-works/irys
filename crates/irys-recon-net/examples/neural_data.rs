@@ -23,7 +23,11 @@ fn main() {
     let shard: usize = arg(&a, "--shard", 500);
     let spp: u32 = arg(&a, "--spp", 32);
     let preview: usize = arg(&a, "--preview", 0);
-    let domain = if arg(&a, "--domain", "a".to_string()) == "b" { Domain::B } else { Domain::A };
+    let domain = match arg(&a, "--domain", "a".to_string()).as_str() {
+        "b" => Domain::B,
+        "desk" => Domain::Desk,
+        _ => Domain::A,
+    };
     // v3: also keep the photo at `hi ×` (the compare image's target).
     let hi: usize = arg(&a, "--hi", 0);
     std::fs::create_dir_all(&out).unwrap();

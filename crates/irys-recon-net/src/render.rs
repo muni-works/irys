@@ -379,6 +379,22 @@ mod gpu {
             });
             inst.push(LInst { mesh: lm.len() - 1, xf: id, mask: mask::GEOMETRY });
         }
+        // Clutter: rendered, never labelled.
+        for (j, c) in s.clutter.iter().enumerate() {
+            let Ok(m) = crate::scene::mesh_fast(c).map(|m| m.posed(c.pose)) else { continue };
+            if m.t.is_empty() {
+                continue;
+            }
+            mats.push(material(&c.mat, &format!("clutter{j}")));
+            lm.push(Mesh {
+                positions: m.p.iter().map(|q| [q[0] as f32, q[1] as f32, q[2] as f32]).collect(),
+                normals: Vec::new(),
+                uvs: Vec::new(),
+                indices: m.t.iter().flatten().copied().collect(),
+                material: mats.len() - 1,
+            });
+            inst.push(LInst { mesh: lm.len() - 1, xf: id, mask: mask::GEOMETRY });
+        }
         mats.push(material(&s.table, "table"));
         let half = 20000.0f32;
         lm.push(Mesh {

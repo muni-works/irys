@@ -354,7 +354,7 @@ pub fn mesh_g<T: Sc>(o: &Object, p: &[T]) -> TrisG<T> {
         Family::Lathe => lathe(p[0], &p[1..5], 32),
         Family::Product => {
             let (w, d, h, r) = (p[0], p[1], p[2], p[3]);
-            let z0 = if o.tokens[2] == 1 { p[4] } else { k(0.0) };
+            let z0 = if o.tokens[2] >= 1 { p[4] } else { k(0.0) };
             let mut m = if o.tokens[1] == 0 {
                 prism(&rounded_rect(w, d, r, seg), z0, z0 + h)
             } else {
@@ -369,6 +369,71 @@ pub fn mesh_g<T: Sc>(o: &Object, p: &[T]) -> TrisG<T> {
                 m.append(cuboid(k(0.0), d * k(0.5) + k(8.0), neck, k(14.0), k(4.0), z0 + k::<T>(0.4) * h));
                 let foot = prism(&rounded_rect(cl(k::<T>(0.4) * w, k(120.0), k(260.0)), mn(k(160.0), k::<T>(0.6) * z0 + k(80.0)), k(20.0), seg), k(0.0), k(6.0));
                 m.append(foot.posed([k(0.0), d * k(0.5) + k(8.0), k(0.0)]));
+            }
+            if o.tokens[2] == 2 {
+                m.append(cuboid(k(0.0), d * k(0.5) + k(5.0), mn(k::<T>(0.3) * w, k(100.0)), k(10.0), z0 + k::<T>(0.3) * h, z0 + k::<T>(0.7) * h));
+            }
+            m
+        }
+        Family::Wall => {
+            // The face at y = 0, the body behind it (+y).
+            let (w, h, t) = (p[0], p[1], p[2]);
+            if o.tokens[1] == 0 {
+                return cuboid(k(0.0), t / k(2.0), w, t, k(0.0), h);
+            }
+            let (pitch, hole) = (p[3], p[4]);
+            let sheet = k::<T>(4.0);
+            let mut m = cuboid(k(0.0), t - sheet / k(2.0), w, sheet, k(0.0), h);
+            let nx = (w.v() / pitch.v()).floor().max(1.0) as usize;
+            let nz = (h.v() / pitch.v()).floor().max(1.0) as usize;
+            let x0 = -w / k(2.0) + (w - k::<T>(nx as f64) * pitch) / k(2.0);
+            let zb = (h - k::<T>(nz as f64) * pitch) / k(2.0);
+            let half = pitch / k(2.0);
+            let fy = sheet / k(2.0);
+            // Horizontal strips between the hole rows (and the margins).
+            let mut lo = k::<T>(0.0);
+            for j in 0..=nz {
+                let hi = if j < nz { zb + k::<T>(j as f64) * pitch + half - hole } else { h };
+                if hi.v() - lo.v() > 1e-6 {
+                    m.append(cuboid(k(0.0), fy, w, sheet, lo, hi));
+                }
+                if j < nz {
+                    lo = zb + k::<T>(j as f64) * pitch + half + hole;
+                }
+            }
+            // Vertical segments between the holes of each row.
+            for j in 0..nz {
+                let (z0, z1) = (zb + k::<T>(j as f64) * pitch + half - hole, zb + k::<T>(j as f64) * pitch + half + hole);
+                let mut left = -w / k(2.0);
+                for i in 0..=nx {
+                    let right = if i < nx { x0 + k::<T>(i as f64) * pitch + half - hole } else { w / k(2.0) };
+                    if right.v() - left.v() > 1e-6 {
+                        m.append(cuboid((left + right) / k(2.0), fy, right - left, sheet, z0, z1));
+                    }
+                    if i < nx {
+                        left = x0 + k::<T>(i as f64) * pitch + half + hole;
+                    }
+                }
+            }
+            m
+        }
+        Family::Arm => {
+            // A plate on the wall (the wall's face is y = 0), two links folded
+            // at ±a in plan, and a head at the end, all toward −y.
+            let (l1, l2, r, z, hw, hh, hd, a) = (p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+            let (sa, ca) = sin_cos(a * k(std::f64::consts::PI / 180.0));
+            let mut m = cuboid(k(0.0), k(-4.0), k(60.0), k(8.0), z - k(45.0), z + k(45.0));
+            let p0 = [k::<T>(0.0), k::<T>(-8.0)];
+            let p1 = [p0[0] + l1 * sa, p0[1] - l1 * ca];
+            let p2 = [p1[0] - l2 * sa, p1[1] - l2 * ca];
+            let bar = |a0: [T; 2], b0: [T; 2], n: [T; 2]| {
+                prism(&[[a0[0] - n[0] * r, a0[1] - n[1] * r], [b0[0] - n[0] * r, b0[1] - n[1] * r], [b0[0] + n[0] * r, b0[1] + n[1] * r], [a0[0] + n[0] * r, a0[1] + n[1] * r]], z - r, z + r)
+            };
+            m.append(bar(p0, p1, [ca, sa]));
+            m.append(bar(p1, p2, [ca, -sa]));
+            match o.tokens[1] {
+                0 => m.append(cuboid(p2[0], p2[1] - k(20.0), k(40.0), k(40.0), z - k(30.0), z + k(30.0))),
+                _ => m.append(cuboid(p2[0], p2[1] - r - hd / k(2.0), hw, hd, z - hh / k(2.0), z + hh / k(2.0))),
             }
             m
         }

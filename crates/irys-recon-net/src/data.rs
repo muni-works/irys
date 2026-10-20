@@ -52,9 +52,18 @@ impl Sample {
 
     /// Labels for an already rendered photo.
     pub fn label(scene: Scene, rgb: Vec<u8>, meshes: &[crate::scene::Tris]) -> Sample {
-        let caster = Caster::new(meshes);
+        // Clutter occludes like anything else and is labelled as the table.
+        let mut all = meshes.to_vec();
+        all.extend(crate::render::world_meshes(&scene.clutter));
+        let caster = Caster::new(&all);
         let cam = scene.cam.resized((W, H));
-        let l = caster.labels(&cam);
+        let mut l = caster.labels(&cam);
+        let n = meshes.len();
+        for v in l.inst.iter_mut() {
+            if *v != TABLE && *v as usize >= n {
+                *v = TABLE;
+            }
+        }
         let gauges = scene
             .objects
             .iter()

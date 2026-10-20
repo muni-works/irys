@@ -137,7 +137,9 @@ pub fn valid_token(f: Family, k: usize, v: usize) -> bool {
         (Family::Plate, 2) => (1..=7).contains(&v),
         (Family::Plate, 3) => (1..=3).contains(&v),
         (Family::Product, 1) => v <= 1,
-        (Family::Product, 2) => v <= 1,
+        (Family::Product, 2) => v <= 2,
+        (Family::Wall, 1) => v <= 1,
+        (Family::Arm, 1) => v <= 2,
         (Family::Grid, 2) => (2..=7).contains(&v),
         (Family::Shell, 1) => v <= 1,
         (Family::Shell, 2) => v <= 4,
@@ -219,6 +221,11 @@ pub fn object(p: &Proposal, h: &Hypothesis, cam: &Cam, mat: crate::scene::Mat) -
             *v = match (h.family, k) {
                 (Family::Product, 4) => 50.0,
                 (Family::Shell, 4) => 10.0,
+                (Family::Wall, 3) => 25.4,
+                (Family::Wall, 4) => 3.0,
+                (Family::Arm, 4) => 40.0,
+                (Family::Arm, 5) => 60.0,
+                (Family::Arm, 6) => 40.0,
                 _ => *v,
             };
         }
@@ -273,6 +280,21 @@ pub fn repair(o: &mut Object) {
             for r in &mut p[1..5] {
                 *r = r.max(2.5);
             }
+        }
+        Family::Wall => {
+            p[0] = p[0].max(60.0);
+            p[1] = p[1].max(60.0);
+            p[2] = p[2].max(3.0);
+            p[3] = p[3].clamp(9.0, 120.0);
+            p[4] = p[4].min(0.3 * p[3]).max(1.2);
+        }
+        Family::Arm => {
+            p[0] = p[0].max(25.0);
+            p[1] = p[1].max(25.0);
+            p[2] = p[2].clamp(3.5, 40.0);
+            p[7] = p[7].clamp(1.0, 79.0);
+            let lo = if toks[1] == 0 { p[2] + 31.0 } else { (p[2] + 31.0).max(0.5 * p[5] + 11.0) };
+            p[3] = p[3].max(lo);
         }
     }
 }
