@@ -153,7 +153,13 @@ fn render(a: &[String]) {
         })
         .collect();
     let pla = [[0.85, 0.28, 0.04], [0.05, 0.18, 0.65], [0.65, 0.05, 0.06], [0.08, 0.45, 0.15], [0.80, 0.62, 0.04], [0.35, 0.08, 0.45]];
+    let views: u64 = opt(a, "--views", 1u64);
     for seed in seeds(a) {
+      for k in 0..views {
+        // Every view redraws the same scene (same generator, same order);
+        // views after the first only move the camera, around the pair.
+        let out = if views > 1 { out.join(format!("v{k}")) } else { out.clone() };
+        std::fs::create_dir_all(&out).unwrap();
         let mut rng = Mix(seed * 7919 + 13);
         let truth = generate::program(seed);
         let solid = truth.build().expect("gate parts build");
@@ -166,8 +172,15 @@ fn render(a: &[String]) {
         // The camera: looking at the pair from the side, 30–60° up.
         let mid = [pose[0] * 0.45, pose[1] * 0.45, 0.0];
         let az = dir + if rng.uniform() < 0.5 { 90.0 } else { -90.0 } + (rng.uniform() - 0.5) * 60.0;
-        let el = 30.0 + 30.0 * rng.uniform();
-        let range = 300.0 + 80.0 * rng.uniform();
+        let mut el = 30.0 + 30.0 * rng.uniform();
+        let mut range = 300.0 + 80.0 * rng.uniform();
+        let mut az = az;
+        if k > 0 {
+            let mut cr = Mix(seed * 104_729 + k);
+            az += k as f64 * 360.0 / views as f64 + (cr.uniform() - 0.5) * 20.0;
+            el = 30.0 + 30.0 * cr.uniform();
+            range = 300.0 + 80.0 * cr.uniform();
+        }
         let eye = [
             mid[0] + range * el.to_radians().cos() * az.to_radians().cos(),
             mid[1] + range * el.to_radians().cos() * az.to_radians().sin(),
@@ -244,7 +257,7 @@ fn render(a: &[String]) {
         // Indirect samples clamped (Cycles' `sample_clamp_indirect`): the
         // sun seen through a glossy bounce otherwise leaves fireflies on
         // the part, which a camera would not.
-        let fr = g.render(&scene.camera, &Opts { spp, max_bounces: 4, clamp: 6.0, seed: seed + 1, ..Opts::default() });
+        let fr = g.render(&scene.camera, &Opts { spp, max_bounces: 4, clamp: 6.0, seed: seed + 1 + 1000 * k, ..Opts::default() });
         // The camera: defocus (σ 0.7 px), exposure to a 99th percentile of
         // 0.9, Poisson–Gaussian noise, sRGB with an extra power, JPEG.
         let (w, h) = size;
@@ -259,7 +272,7 @@ fn render(a: &[String]) {
         let expo = 0.9 / lum[lum.len() * 99 / 100].max(1e-6);
         let extra_gamma = 0.9 + 0.2 * rng.uniform();
         let q = 85 + (rng.uniform() * 8.0) as u8;
-        let mut noise = Mix(seed ^ 0xa11ce);
+        let mut noise = Mix(seed ^ 0xa11ce ^ (k << 32));
         let mut gauss = move || {
             let (u1, u2) = (noise.uniform().max(1e-12), noise.uniform());
             (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
@@ -295,7 +308,8 @@ fn render(a: &[String]) {
             jpeg_quality: q,
         };
         std::fs::write(out.join(format!("{seed}.json")), serde_json::to_string_pretty(&t).unwrap()).unwrap();
-        println!("seed {seed}: {:.1}s, pose ({:.1}, {:.1}, {:.1}°), el {:.0}°, {env_name}", t0.elapsed().as_secs_f64(), pose[0], pose[1], pose[2], el);
+        println!("seed {seed} view {k}: {:.1}s, pose ({:.1}, {:.1}, {:.1}°), el {:.0}°, {env_name}", t0.elapsed().as_secs_f64(), pose[0], pose[1], pose[2], el);
+      }
     }
 }
 
@@ -357,14 +371,16 @@ fn gate(a: &[String]) {
     if a.iter().any(|x| x == "--v0-search") {
         o.search = irys_recon::search::Options { huber: Some(o.huber), ..irys_recon::search::Options::v0() };
     }
+    let views: u64 = opt(a, "--views", 1u64);
+    let vdir = |k: u64| if views > 1 { dir.join(format!("v{k}")) } else { dir.clone() };
     let mut parts = Vec::new();
     for seed in seeds(a) {
-        let t: Truth = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{seed}.json"))).unwrap()).unwrap();
+        let t: Truth = serde_json::from_str(&std::fs::read_to_string(vdir(0).join(format!("{seed}.json"))).unwrap()).unwrap();
         let truth = Program::from_text(&t.program).unwrap();
         let t0 = std::time::Instant::now();
-        let photo = v1::load(&dir.join(format!("{seed}.jpg"))).unwrap();
+        let photos: Vec<_> = (0..views).map(|k| v1::load(&vdir(k).join(format!("{seed}.jpg"))).unwrap()).collect();
         let f_true = t.f35 as f64 / 36f64.hypot(24.0) * (t.size.0 as f64).hypot(t.size.1 as f64);
-        let r = v1::recover_photos(std::slice::from_ref(&photo), &o);
+        let r = v1::recover_photos(&photos, &o);
         let part = match r {
             Ok(v) => {
                 let (q, pe) = aligned(t.pose, &v.rec.program);
