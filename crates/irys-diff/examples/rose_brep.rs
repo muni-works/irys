@@ -307,5 +307,145 @@ fn main() {
         (p - e2e).abs() / pe
     );
     println!("  total {:.1?}", t0.elapsed());
+    // HERO=dir: the paper's hero figure, from this run's data. Same camera,
+    // larger frame: feature edges and per-node (screen velocity, share of
+    // dℒ/dθ) as TSV, and (with the gpu feature) a beauty render of the plate.
+    if let Ok(dir) = std::env::var("HERO") {
+        hero(std::path::Path::new(&dir), &frozen, &mean_grad, &fwd.velocities);
+    }
     let _ = mean_grad;
+}
+
+const HW: usize = 2000;
+const HH: usize = 1600;
+#[cfg(all(feature = "gpu", feature = "assets"))]
+const EXPOSE: f64 = 1.4;
+#[cfg(all(feature = "gpu", feature = "assets"))]
+const CROP: [u32; 4] = [330, 260, 1340, 1080];
+
+fn hero(dir: &std::path::Path, frozen: &FrozenMesh, g: &[KVec3], v: &[KVec3]) {
+    use std::fmt::Write as _;
+    std::fs::create_dir_all(dir).unwrap();
+    let mut s = scene(mesh(frozen), 1);
+    s.size = (HW, HH);
+    let (eye, fwd, right, up, tan_half) = s.camera();
+    let pos: Vec<Point3> = frozen.positions.iter().map(|p| Point3::new(p.x, p.y, p.z)).collect();
+    let tris = &frozen.triangles;
+    let nrm: Vec<irys_core::Vec3> = tris
+        .iter()
+        .map(|t| {
+            let [a, b, c] = t.map(|i| pos[i as usize]);
+            (b - a).cross(c - a)
+        })
+        .collect();
+    let front = |k: usize| nrm[k].dot(eye - pos[tris[k][0] as usize]) > 0.0;
+    // Feature edges: a boundary, or a dihedral over 25°, with a front face.
+    let mut adj: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+    for (k, t) in tris.iter().enumerate() {
+        for e in 0..3 {
+            let (a, b) = (t[e], t[(e + 1) % 3]);
+            adj.entry((a.min(b), a.max(b))).or_default().push(k);
+        }
+    }
+    let mut edges = String::new();
+    for (&(a, b), fs) in &adj {
+        if !fs.iter().any(|&k| front(k)) {
+            continue;
+        }
+        let keep = match fs[..] {
+            [k0, k1] => {
+                let (n0, n1) = (nrm[k0], nrm[k1]);
+                n0.dot(n1) / (n0.norm() * n1.norm()).max(1e-300) < 25f64.to_radians().cos()
+            }
+            _ => true,
+        };
+        if !keep {
+            continue;
+        }
+        if let (Some((pa, _)), Some((pb, _))) = (s.project(pos[a as usize]), s.project(pos[b as usize])) {
+            writeln!(edges, "{:.2}\t{:.2}\t{:.2}\t{:.2}", pa[0], pa[1], pb[0], pb[1]).unwrap();
+        }
+    }
+    std::fs::write(dir.join("edges.tsv"), edges).unwrap();
+    // Nodes: screen position, screen velocity (px per mm of θ), share of dℒ/dθ.
+    let mut nodes = String::new();
+    for (i, p) in pos.iter().enumerate() {
+        let c = g[i].dot(&v[i]);
+        if c == 0.0 {
+            continue;
+        }
+        if let Some((q, jac)) = s.project(*p) {
+            let w = irys_core::Vec3::new(v[i].x, v[i].y, v[i].z);
+            writeln!(nodes, "{:.2}\t{:.2}\t{:.4}\t{:.4}\t{:.6e}", q[0], q[1], jac[0].dot(w), jac[1].dot(w), c).unwrap();
+        }
+    }
+    std::fs::write(dir.join("nodes.tsv"), nodes).unwrap();
+    #[cfg(all(feature = "gpu", feature = "assets"))]
+    beauty(dir, frozen, [[eye.x, eye.y, eye.z], [fwd.x, fwd.y, fwd.z], [right.x, right.y, right.z], [up.x, up.y, up.z]], tan_half);
+    #[cfg(not(all(feature = "gpu", feature = "assets")))]
+    let _ = (fwd, right, up, tan_half);
+}
+
+#[cfg(all(feature = "gpu", feature = "assets"))]
+fn beauty(dir: &std::path::Path, frozen: &FrozenMesh, cam: [[f64; 3]; 4], tan_half: f64) {
+    use irys_diff::look::openpbr::OpenPbr;
+    use irys_diff::look::scene::{Camera as LCam, Equirect, Instance, LookScene, Material, Mesh as LMesh, Sun, mask};
+    use irys_diff::look::scene_gpu::{GpuLook, Opts};
+    let id: [[f32; 4]; 3] = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+    let part = LMesh {
+        positions: frozen.positions.iter().map(|p| [p.x as f32, p.y as f32, p.z as f32]).collect(),
+        normals: Vec::new(),
+        uvs: Vec::new(),
+        indices: frozen.triangles.iter().flatten().copied().collect(),
+        material: 0,
+    };
+    // The page's background (#0b0907) through the tone map below, so the
+    // render has no frame on the paper; one large softbox placed near the
+    // mirror direction of the camera off the plate's face, so the anodised
+    // face carries a long highlight and the bore walls catch its edge.
+    let inv = |s8: f64| {
+        let s = s8 / 255.0;
+        let t = if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) };
+        (t / (1.0 - t) / EXPOSE) as f32
+    };
+    let bg = [inv(11.0), inv(9.0), inv(7.0)];
+    let (w, h) = (64u32, 32u32);
+    let rgb = vec![bg; (w * h) as usize];
+    let alu = Material::new(
+        "anodised aluminium",
+        OpenPbr { base_color: [0.16, 0.16, 0.17], base_metalness: 1.0, specular_roughness: 0.28, ..OpenPbr::default() },
+    );
+    let scene = LookScene {
+        meshes: vec![part],
+        instances: vec![Instance { mesh: 0, xf: id, mask: mask::GEOMETRY }],
+        materials: vec![alu],
+        textures: Vec::new(),
+        env: Some(Equirect { size: (w, h), rgb }),
+        sun: Some(Sun { dir: { let d = [-0.42f64, -0.86, 0.30]; let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt(); [d[0] / n, d[1] / n, d[2] / n] }, radius: 14f64.to_radians(), radiance: [40.0, 38.5, 36.0] }),
+        portal_skies: Vec::new(),
+        camera: LCam { eye: cam[0], forward: cam[1], right: cam[2], up: cam[3], tan_half },
+        size: (HW, HH),
+        frames: Vec::new(),
+        fps: 24.0,
+        dropped: Vec::new(),
+    };
+    let ctx = irys_diff::gpu::context().expect("gpu");
+    let g = GpuLook::new(ctx, &scene).expect("ray queries");
+    let fr = g.render(&scene.camera, &Opts { spp: 512, max_bounces: 6, clamp: 8.0, seed: 7, ..Opts::default() });
+    let px: Vec<u8> = fr
+        .rgb
+        .iter()
+        .map(|&x| {
+            let x: f64 = if x.is_finite() { (x as f64 * EXPOSE).max(0.0) } else { 0.0 };
+            let t = x / (1.0 + x); // Reinhard, then sRGB
+            let s = if t <= 0.0031308 { 12.92 * t } else { 1.055 * t.powf(1.0 / 2.4) - 0.055 };
+            (s * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+        })
+        .collect();
+    let full = image::RgbImage::from_raw(HW as u32, HH as u32, px).unwrap();
+    full.save(dir.join("beauty.png")).unwrap();
+    // The paper's crop (CROP: x, y, w, h in full-frame pixels; the TSVs stay full-frame).
+    let [x, y, w, h] = CROP;
+    image::imageops::crop_imm(&full, x, y, w, h).to_image().save(dir.join("beauty-crop.png")).unwrap();
+    std::fs::write(dir.join("crop.tsv"), format!("{x}\t{y}\t{w}\t{h}\n")).unwrap();
 }
