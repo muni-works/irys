@@ -2596,6 +2596,63 @@ Cycles' (0.0035 against 0.0006), and its sample is 2.2–3× slower.
 5. The light tree does not include the sun, the world or portals (fixed
    group shares still pick between them).
 
+## Baseline: Mitsuba 3 at equal footing (2026-11-07)
+
+The review's "no external baselines; Mitsuba 3 is the obvious one".
+`bench/mitsuba/` (README, `results.md`, raw CSVs): Mitsuba 3.9.1 on the same
+M4 Max GPU (`metal_ad_spectral`), irys's scenes exported to it
+(`examples/mitsuba_bench.rs`: PLYs, camera, environment, rig), irys's rough
+conductor as a Mitsuba BSDF plugin with the same formulas, irys's sky and sun
+baked to an envmap; each system renders its own 4096-spp target and takes the
+gradient of the same mean-squared loss with decorrelated seeds, and is held
+against its own central differences.
+
+**The reference first.** Central differences of one noisy image's MSE are
+not the gradient either system estimates: `E[(I − T)²] = (E I − T)² + Var I`,
+and `Var I` moves with roughness and pose. Taken that way, both renderers sat
+6–150 % off their references in the same direction. The bench's CD is of
+`mean((I_a − T)(I_b − T))` over two independent renders, unbiased for the
+expected image's loss; against it both are unbiased (material) — a trap
+worth naming in the paper, since a gradient test that uses the naive CD fails
+for a correct renderer.
+
+| material, `Scene::pair` 128², depth 4 + NEE, 64 seeds | irys | Mitsuba `prb` |
+|---|---|---|
+| z against own CD, all θ, 1/4/16 spp | ≤ 1.7 | ≤ 1.5 |
+| ms per gradient, 1 / 4 / 16 spp | 2.7 / 2.7 / 5.5 | 21.0 / 27.5 / 31.2 |
+| relative variance at 16 spp (α, F0×3) | 2.6e-2, 5.9e-5, 7.6e-5, 2.4e-5 | 3.3e-2, 1.3e-4, 3.4e-4, 7.2e-5 |
+| **equal-variance time, Mitsuba / irys** | | **7.0×, 12.6×, 25.5×, 17.0×** |
+
+(An earlier identical run had Mitsuba at 13.8 / 18.2 / 22.3 ms: 4.8–17.6×.)
+The variance gap is mostly light sampling — irys draws the sun lobe exactly,
+Mitsuba importance-samples the baked bitmap — and the time gap is per-call
+overhead as much as throughput (Mitsuba: 16× the samples for 1.5× the time).
+
+**Pose: no valid comparison yet.** On phase 2e's arm (96 × 72, depth 2 +
+NEE) irys's edge + interior gradient matches CD on pitch and yaw (z +0.8,
+−2.6 at 65 536 edge samples / 16 spp) and is 15 % high on the elbow (z +3.3:
+no shadow or reflection edges). Mitsuba's `prb_projective` converges to the
+wrong value (pitch −2.1e-4 at 256 spp against its own CD −6.45e-4, z +13;
+yaw and elbow off the other way), through its boundary term (its continuous
+part alone is −8e-6, like irys's interior −2e-5). Ruled out: guiding (none,
+four rounds), `direct_projective`, the Metal backend (LLVM agrees), the BSDF
+plugin (all-diffuse agrees), vertex welding; Mitsuba's CD matches irys's to
+2 %, so the scenes match. `sanity_projective.py`: the same setup reproduces
+CD on a translating box (welded: ratio 0.99–1.03; Mitsuba's own split-seam `cube`:
+1.86×). What breaks it on the arm is not found, so the bench reports
+Mitsuba's pose numbers as measured and claims nothing from them; 260–340 ms
+per Mitsuba pose gradient against irys's 8.6–60 ms is recorded, not argued.
+
+Mismatches, all documented in the README: spectral sampling and lane→RGB
+weights; the sky's tint approximated by RGB upsampling and the sun lobe
+resampled at 0.18° texels; Mitsuba's diffuse one-sided (closed meshes,
+up-facing floor: no effect); the targets differ by 2.7–2.9 % mean relative
+L1 per pixel. irys's pose interior term is CPU time.
+
+Next: the arm with Mitsuba's own shapes replacing the PLYs, and a Mitsuba
+issue with the arm scene if it reproduces there; then the comparison at the
+fit's size (192²) where Mitsuba's per-call overhead amortises.
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.

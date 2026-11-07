@@ -74,6 +74,10 @@ name = "rose_fit"
 required-features = ["gpu"]
 
 [[example]]
+name = "mitsuba_bench"
+required-features = ["gpu"]
+
+[[example]]
 name = "skin"
 required-features = ["gpu", "assets"]
 
