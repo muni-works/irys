@@ -197,6 +197,19 @@ fn main() {
         let (p, ax) = (v("pivot_mm"), v("axis"));
         let at = |s: f64| place.world(&id, Point3::new(p[0] + ax[0] * s, p[1] + ax[1] * s, p[2] + ax[2] * s));
         writeln!(ann, "joint\t{name}\t{}\t{}\t{}", p2(at(0.0)), p2(at(-80.0)), p2(at(80.0))).unwrap();
+        // its range of motion: a circle of 120 mm about the axis, swept over the joint's limits
+        let lim = v("limits_deg");
+        let axv = [ax[0], ax[1], ax[2]];
+        let u = { let c = cross(axv, if axv[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] }); norm(c) };
+        let w = cross(axv, u);
+        let arc: Vec<String> = (0..=32)
+            .map(|k| {
+                let t = (lim[0] + (lim[1] - lim[0]) * k as f64 / 32.0).to_radians();
+                let (st, ct) = t.sin_cos();
+                p2(place.world(&id, Point3::new(p[0] + 120.0 * (u[0] * ct + w[0] * st), p[1] + 120.0 * (u[1] * ct + w[1] * st), p[2] + 120.0 * (u[2] * ct + w[2] * st))))
+            })
+            .collect();
+        writeln!(ann, "arc\t{name}\t{}\t{}\t{}\t{}\t{}", j["parent"].as_str().unwrap_or(""), j["child"].as_str().unwrap_or(""), lim[0], lim[1], arc.join("\t")).unwrap();
     }
     for (name, l) in joints["links"].as_object().unwrap() {
         let Some(b) = l["aabb_mm"].as_array() else { continue }; // the ankle cross has no parts of its own
@@ -205,6 +218,10 @@ fn main() {
     }
     std::fs::write(out.join("annotation.tsv"), ann).unwrap();
 
+    if a.iter().any(|x| x == "--no-render") {
+        println!("wrote {} (annotation only)", out.display());
+        return;
+    }
     let spp: u32 = opt(&a, "--spp", 256);
     let ctx = irys_diff::gpu::context().expect("gpu");
     let g = GpuLook::new(ctx, &sc).expect("ray queries");
