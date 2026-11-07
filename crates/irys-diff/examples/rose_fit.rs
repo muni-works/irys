@@ -29,7 +29,8 @@
 //!   `--pyramid` fits the pose-only phase on 8×/4×/2× block-averaged images;
 //!   `--check` adds the intersection-curve term (`--no-curves` drops it).
 //!   2f diagnostics: `EDGE_POLICY=2d|front|vis` (host edge samples,
-//!   `CPU_TRACE` to trace them in f64), `CMP` (device vs host samples),
+//!   `CPU_TRACE` to trace them in f64), `CMP` (the device's draws scored by
+//!   the host too, split by who calls each visible),
 //!   `MASK=r` / `MASK=-r` (loss only off / only on the arm), `CD_H`,
 //!   `CD_SEEDS`, `IRYS_SEC_DUMP` (largest secondary samples), `PIERCE`
 //!   (which instances interpenetrate).
@@ -495,27 +496,66 @@ fn main() {
                 let smp = gedges.sample(&ge, &scene, &rig, &phi0, es);
                 if sd == 0 {
                     eprintln!("device: {} of {} samples visible", smp.visible, smp.len());
-                    if std::env::var("CMP").is_ok() {
-                        let h = vis::EdgeSamples::with_policy(&scene, &edges, &rig, &phi0, n_edge, es, true);
-                        let (mut lost, mut gained, mut same_pt, mut wdiff) = (0, 0, 0, 0);
-                        for i in 0..n_edge {
-                            let (hw, dw) = (&h.weights()[i], &smp.weights()[i]);
-                            let hv = hw.iter().any(|x| *x != 0.0);
-                            let dv = dw.iter().any(|x| *x != 0.0);
-                            let hp = h.points()[2 * i];
-                            if hv == dv { same_pt += 1; }
-                            if hv && !dv { lost += 1; if lost <= 12 { eprintln!("  lost {i}: host pt {hp:?} w {hw:?}"); } }
-                            if dv && !hv { gained += 1; }
-                            if hv && dv && (hw[0] - dw[0]).abs() > 1e-2 * hw[0].abs() { wdiff += 1; if wdiff <= 10 { eprintln!("  w {i}: host {hw:?} dev {dw:?}"); } }
-                        }
-                        let sh: Vec<f64> = (0..3).map(|j| h.weights().iter().map(|w| w[j]).sum()).collect();
-                        let sd2: Vec<f64> = (0..3).map(|j| smp.weights().iter().map(|w| w[j]).sum()).collect();
-                        eprintln!("  Σ|w| host {sh:?} device {sd2:?}");
-                        eprintln!("  host-only {lost}, device-only {gained}, same visibility: {same_pt}, weights differ >1%: {wdiff}");
-                    }
                 }
                 let l = gpu::widen(&ge.forward(&scene, &th, es));
                 er.push(smp.gradient(&scene, es, &l, &d_img));
+                if std::env::var("CMP").is_ok() {
+                    // 2f: the device's own draws scored by the host (f64
+                    // ownership, `EdgeSamples::at_draws`), split by who
+                    // calls each sample visible; both traced on the device.
+                    let nw = scene.wavelengths;
+                    let per = |smp: &vis::EdgeSamples, l: &[f64]| -> Vec<[f64; 3]> {
+                        (0..smp.len())
+                            .map(|i| {
+                                let w = &smp.weights()[i];
+                                let lam: [f64; irys_diff::prb::HERO] =
+                                    irys_diff::prb::wavelengths(irys_diff::prb::Rng::new(es, i as u64).uniform(), nw);
+                                let px = smp.pixels()[i];
+                                let mut s = 0.0;
+                                for k in 0..nw {
+                                    let d = l[2 * i * nw + k] - l[(2 * i + 1) * nw + k];
+                                    let hw = irys_light::spectrum::hero_weight(lam[k]);
+                                    for c in 0..3 {
+                                        s += d * hw[c] as f64 / nw as f64 * d_img[px * 3 + c];
+                                    }
+                                }
+                                [w[0] * s, w[1] * s, w[2] * s]
+                            })
+                            .collect()
+                    };
+                    let dev = per(&smp, &l);
+                    gedges.debug = true;
+                    let _ = gedges.sample(&ge, &scene, &rig, &phi0, es);
+                    let draws = gedges.draws(&ge);
+                    gedges.debug = false;
+                    let _ = ge.forward(&scene, &th, es); // consumes the device-points flag
+                    let d: Vec<Option<vis::Draw>> = draws.iter().map(|x| x.0).collect();
+                    let h = vis::EdgeSamples::at_draws(&scene, &edges, &rig, &phi0, &d, true);
+                    scene.set_points(Some(h.points().to_vec()));
+                    let lh = gpu::widen(&ge.forward(&scene, &th, es));
+                    let host = per(&h, &lh);
+                    let mut cat = std::collections::BTreeMap::<String, (usize, [f64; 3], [f64; 3])>::new();
+                    for i in 0..n_edge {
+                        let hv = h.weights()[i].iter().any(|x| *x != 0.0);
+                        let dv = smp.weights()[i].iter().any(|x| *x != 0.0);
+                        let k = match (hv, dv) {
+                            (true, true) => "both".to_string(),
+                            (true, false) => format!("host only (device {})", draws[i].1),
+                            (false, true) => "device only".into(),
+                            _ => continue,
+                        };
+                        let e = cat.entry(k).or_insert((0, [0.0; 3], [0.0; 3]));
+                        e.0 += 1;
+                        for c in 0..3 {
+                            e.1[c] += host[i][c];
+                            e.2[c] += dev[i][c];
+                        }
+                    }
+                    for (k, (n, a, b)) in &cat {
+                        let f = |v: &[f64; 3]| v.map(|x| format!("{x:+.3e}")).join(", ");
+                        eprintln!("  cmp seed {sd} {k}: {n} samples, host ({}), device ({})", f(a), f(b));
+                    }
+                }
                 scene.set_points(None);
             }
             if !no_curves {

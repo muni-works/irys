@@ -1197,7 +1197,9 @@ Deviations:
    the node's size near `x`, or a near-field strategy (edges within a few
    `r` of `x`, by an exact local search), is the next lever; then fewer
    iterations would do.
-2. **`GpuEdges`' remaining bias** on rose (weights on ~8 % of samples).
+2. **`GpuEdges`' remaining bias** on rose (weights on ~8 % of samples). Found
+   (2026-11-07, below): the device's ownership ray slipped past slivers
+   and zero-area CAD fillers; fixed, with a roll residual characterised.
 3. The basin is still ±5° on the elbow; a fit started outside it fails.
    The blur is the only lever measured monotone, and needs the corrected
    gradient (2e's blurred fit had the biased one) — not re-tried here.
@@ -1205,6 +1207,102 @@ Deviations:
    sampled; the camera gate's c2/c3 sit at z −2.6/−2.2.
 5. The secondary term is CPU f64; at 4 samples per vertex it is a quarter
    of an iteration. A device port needs the dual trace first.
+
+### Phase 2f: the device edge sampler's bias, found (2026-11-07)
+
+2f left `GpuEdges` reading 30 % low on rose's arm mask (residual (a)
+above: 1.71e-3 on pitch against CD 2.53e-3, z −8 at 16 seeds; `rose_fit
+--control --check --depth 1 --no-sun --no-secondary --no-curves`,
+`MASK=-1`, `CD_H=0.003`), cause not found. Found, and fixed for the part
+that was a bug.
+
+**How.** Comparing device and host samples by index (2f's `CMP`) cannot
+settle it: the two draws drift apart in `u` (f32 against f64 sums over
+186 450 slots), so sample `i` is rarely the same point (15 of ~6000 within
+0.002 px), and every "differs" count mixes different samples.
+`GpuEdges::debug` now makes the device record where each sample landed
+(slot, `t`), and `EdgeSamples::at_draws` scores those exact draws on the
+host in f64. Same draws, same pair traces, split by who calls a sample
+visible (`CMP` now prints this; 8 seeds, pitch):
+
+| | samples | host Σ | device Σ |
+|---|---|---|---|
+| both visible | 47 226 | 1.679e-3 | 1.679e-3 |
+| host only, device ray missed everything (−1) | 537 | **7.56e-4** | 0 |
+| host only, other refusals (−2, −3, −4) | 561 | 1e-5 | 0 |
+| device only | 1 153 | 0 | 9e-5 |
+
+Where both call a sample visible they agree to four digits, and the host
+evaluating the device's draws is unbiased (2.374e-3 against its own
+2.372e-3): the device's *ownership test* was the whole deficit, and
+within it the 67 samples per frame whose inner ray hit nothing.
+
+**Cause.** Rose's CAD tessellation is full of zero-area filler triangles
+(three collinear points: sides 73.0 + 48.6 = 121.6 mm), long slivers
+(150 × 0.13 mm) and micro-triangles (0.07 mm) — all thinner on screen
+than `ε = 1e-3 px`, so the host's inner point lands past them on a
+coplanar neighbour, which it accepts. The device asked the same question
+with an f32 ray from the eye 1.7 m away, and at those triangles the ray
+slipped through (the neighbour's own edge is within f32's ~1e-4 mm of the
+point) to the sky behind — refusing exactly the silhouette samples with
+the largest jumps. A larger `ε` did not help (0.1 px still missed): it is
+the sliver's neighbourhood, not the offset. (On the way, two wrong leads,
+measured and dropped: f32 cumulative sums, emulated on the host, are
+unbiased; and the refusals are not grazing-angle leaks — the facets face
+the camera at cos 0.6–0.7.)
+
+**Fix** (`gpu/edges.wgsl`, `edge_sample`). Ownership is decided in screen
+space, where projecting a vertex is well conditioned: a test point inside
+the triangle's projection next to the sample (the inner point if it is
+inside, else halfway across the triangle along the same normal), and no
+surface in front of the triangle's depth there (perspective-correct, by
+1/z) whose own projection contains the point. Hits whose triangle does
+not contain it are the same leaks and are stepped over (up to 8); back
+faces never hide anything on a closed solid and are stepped over too. A
+back-facing sampled triangle (the 0.02-importance side of a silhouette)
+keeps the ray test. Two density details, measured neutral on rose but
+right: the weight uses the slot's realised f32 width (`wt[si] − start`)
+over its length rather than `len × importance`, and `u` is one `fma`, on
+the same f32 grid as the sums.
+
+| `--check`, mask, depth 1, sky only | pitch | roll | elbow |
+|---|---|---|---|
+| device before, 16 seeds | 1.76e-3 (z −8) | 2.30e-4 (z −2) | −2.9e-5 (z −3) |
+| **device after, 256 seeds** | **2.580e-3 (z +1)** | 5.50e-4 (z +6) | −1.5e-6 (z −3) |
+| host samples (`EDGE_POLICY=front`), 256 seeds | 2.338e-3 (z −5) | 3.69e-4 (z −1) | −2.5e-5 (z −5) |
+| CD (h 0.003, 16 seeds) | 2.517e-3 | 3.804e-4 | 8.12e-5 |
+
+On the device's own draws, device = host + (5.7 ± 6.9, 7.0 ± 4.2,
+−1.1 ± 4.0)e-5 (64 seeds), the device-only samples; both-visible differ
+by < 2e-6. Full scene (depth 5, sun, NEE, no secondary term, 16 seeds):
+device (z +4, +2, +5), host ID-buffer samples `--vis` (z +2, 0, +4) —
+both short the secondary term there, as 2f measured.
+
+**Test.** `phase2f::gpu_tier::device_ownership_matches_the_host_at_cad_scale`:
+a millimetre arm 1.5 m from the origin, seen from 1.7 m through 11° (rose's
+frame), whose upper link is a CAD-style box (each face fanned from a
+corner over its own number of boundary points: zero-area triangles,
+slivers, T-junctions), four seeds × 16 384 device draws scored on the host:
+host-visible weight the device refuses < 0.05 %, device-only < 1 %,
+both-visible weights within 1 %. The old kernel: 0.17 % refused (fails);
+the new: 0.000 %. The synthetic scene is far milder than rose (0.17 %
+against rose's 30 % of the gradient) — rose's worst triangles are T-junction
+fillers along long straight edges, which no generated box quite matches —
+so the test catches the bug class, with 3× margin, not its size.
+
+What is left, characterised:
+
+1. **Roll reads 45 % high on the device** (5.50e-4 against CD 3.80e-4,
+   z +6 at 256 seeds; 1.7e-4 absolute, 7 % of the gradient's norm). A
+   third of it is the device-only samples (accepted where the host's inner
+   point lands on a non-coplanar neighbour, −3, and refuses); the rest is
+   in the draws' heavy tail (per-seed roll up to 2.2e-3, the host's to
+   1.4e-3). Refusing every back-face sample moves it by nothing (5.61e-4).
+2. **The host is not the reference either**: at 256 seeds its pitch and
+   elbow are z −5. The device and the host now err by similar norms
+   (0.20e-3 and 0.21e-3 of a 2.55e-3 gradient), in different components.
+3. Fits keep `--vis` until both are run against CD on the shaded scene;
+   the device's draws cost 3 ms against the host's 100+.
 
 ## Phase 3: sampling (2026-10-17)
 
