@@ -12,6 +12,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let fd = args.iter().any(|a| a == "--fd");
     let sec = !args.iter().any(|a| a == "--no-secondary");
+    let aoe = !args.iter().any(|a| a == "--no-ao");
     let eye = Vec3::new(150.0, -190.0, 170.0);
     let at = Vec3::new(5.0, 0.0, 5.0);
     let f = (at - eye).normalize();
@@ -20,7 +21,7 @@ fn main() {
     let size = (200, 150);
     let cam = Camera { f: 330.0, cx: 100.0, cy: 75.0, r: [[r.x, r.y, r.z], [d.x, d.y, d.z], [f.x, f.y, f.z]], eye: [eye.x, eye.y, eye.z], size };
     let look = Look { key_dir: [-0.5, 0.3, 0.8], key: 0.9, ..Look::default() };
-    let rig = Rig { views: vec![View { cam, look }], ss: 3, fd_occluded: fd, secondary: sec, shadow_samples: 20_000 };
+    let rig = Rig { views: vec![View { cam, look }], ss: 3, fd_occluded: fd, secondary: sec, shadow_samples: 20_000, ao_edges: aoe };
     let prog = Program {
         w: 60.0,
         d: 44.0,

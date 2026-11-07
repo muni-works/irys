@@ -291,6 +291,8 @@ pub struct V1Options {
     pub fd_occluded: bool,
     /// Shadow (secondary) edges.
     pub secondary: bool,
+    /// The ambient occlusion's boundary term.
+    pub ao_edges: bool,
     /// Where the backdrop is.
     pub region: Region,
     /// The chromatic coverage term ([`Target::cov_obs`]).
@@ -307,6 +309,7 @@ impl Default for V1Options {
             search: Options { huber: Some(1.5), ..Options::default() },
             fd_occluded: true,
             secondary: true,
+            ao_edges: true,
             region: Region::default(),
             chroma: true,
         }
@@ -401,6 +404,7 @@ pub fn recover_photos(photos: &[Photo], o: &V1Options) -> Result<V1, String> {
         fd_occluded: o.fd_occluded,
         secondary: o.secondary,
         shadow_samples: 4000,
+        ao_edges: o.ao_edges,
     };
     let mut lin = Target::from_masks(
         framed.iter().map(|f| f.grey.clone()).collect(),
