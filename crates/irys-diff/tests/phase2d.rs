@@ -7,6 +7,9 @@
 //! so a one-seed estimate of its gradient is unbiased for the expected one
 //! and the two can be compared at any spp.
 
+mod common;
+
+use common::paper;
 use irys_core::{Point3, Transform, Vec3};
 use irys_diff::ggx::PARAMS;
 use irys_diff::prb::{self, Kernels, Loss, Opaque, Placement, Scene, Surface};
@@ -290,6 +293,7 @@ fn box_silhouette_gradient_matches_central_differences() {
             cd[j],
             rel(est.mean[j], cd[j]),
         );
+        paper(&format!("edge.box_z{}", j + 1), z.abs());
         assert!(
             (est.mean[j] - cd[j]).abs() < 4.0 * est.stderr[j] + 0.03 * cd[j].abs(),
             "φ{j}: z {z}"
@@ -421,6 +425,10 @@ mod gpu_tier {
             );
             assert!(rel(gc[j], gg[j]) < 2e-3, "φ{j}");
         }
+        paper(
+            "edge.dev_vs_cpu",
+            (0..3).map(|j| rel(gc[j], gg[j])).fold(0.0, f64::max),
+        );
     }
 
     /// Moving instances and re-uploading the geometry is the same frame as

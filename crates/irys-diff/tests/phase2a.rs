@@ -3,7 +3,11 @@
 
 #![cfg(feature = "gpu")]
 
+mod common;
+
 use std::time::Instant;
+
+use common::{paper, paper_n};
 
 use irys_diff::ggx::PARAMS;
 use irys_diff::gpu::{self, GpuPrb};
@@ -65,6 +69,7 @@ fn gpu_replay_is_bit_exact() {
             "depth {depth}: {same}/{} lanes bit-identical ({lit} nonzero)",
             l.len()
         );
+        paper_n("gpu.replay_lanes", same);
         assert_eq!(same, l.len());
         assert!(
             lit > l.len() / 2,
@@ -100,17 +105,23 @@ fn gpu_gradient_matches_cpu_f64() {
         errs[errs.len() * 99 / 100],
         errs.len()
     );
+    paper("gpu.l_median", errs[errs.len() / 2]);
+    paper("gpu.l_p99", errs[errs.len() * 99 / 100]);
     let (vg, gg) = gpu::gradient(&mut g, &scene, &THETA0, (7, 7), &L2(&t));
     let (vc, gc) = prb::gradient(&scene, &THETA0, (7, 7), &mut k, &L2(&t));
     eprintln!("loss gpu {vg:.6e} cpu {vc:.6e} rel {:.1e}", rel(vg, vc));
+    paper("gpu.loss_rel", rel(vg, vc));
+    let mut worst = 0.0f64;
     for p in 0..PARAMS {
         let e = rel(gg[p], gc[p]);
         eprintln!(
             "θ{p}: gpu {:+.6e}  cpu f64 {:+.6e}  rel {e:.1e}",
             gg[p], gc[p]
         );
+        worst = worst.max(e);
         assert!(e < 1e-3, "θ{p}: gpu {} vs cpu {}", gg[p], gc[p]);
     }
+    paper("gpu.dtheta_max", worst);
     assert!(rel(vg, vc) < 1e-3);
 }
 
@@ -228,6 +239,7 @@ fn gpu_throughput() {
         grad * 1e3,
         dev * 1e3
     );
+    paper("rel.gpu_grad_ms", dev * 1e3);
     let (fwd, rep) = (fwd / (2 * N) as f64, rep / N as f64);
     let paths = scene.paths() as f64;
     eprintln!(
@@ -254,4 +266,5 @@ fn gpu_throughput() {
         cg * 1e3,
         cg / dev
     );
+    paper("rel.cpu_grad_ms", cg * 1e3);
 }

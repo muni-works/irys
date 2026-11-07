@@ -68,6 +68,17 @@ const EXPOSURE: f32 = 0.6;
 const CONTEXT_CAM: ([f64; 3], [f64; 3], f64) =
     arm::FIT_CAM;
 
+/// One number the paper quotes, as `PAPER\t<key>\t<value>` on stderr, for
+/// the repro script that regenerates `data/measured.tsv`.
+fn paper(key: &str, v: f64) {
+    eprintln!("PAPER\t{key}\t{v:e}");
+}
+
+/// A count the paper quotes, printed plain.
+fn paper_n(key: &str, n: usize) {
+    eprintln!("PAPER\t{key}\t{n}");
+}
+
 fn accumulate(g: &mut GpuPrb, s: &Scene, theta: &[f64; 4], seed: u64, frames: u64) -> Vec<f32> {
     let mut acc = vec![0.0f64; s.size.0 * s.size.1 * 3];
     for f in 0..frames {
@@ -807,6 +818,11 @@ fn main() {
         per(t_edge),
         per(t_int)
     );
+    paper("fit.seconds", t.elapsed().as_secs_f64());
+    paper_n("fit.iters", iters);
+    paper("fit.ms_theta", per(t_theta));
+    paper("fit.ms_edge", per(t_edge));
+    paper("fit.ms_intsec", per(t_int));
     eprintln!(
         "φ (mean of the last {tail}) start {:?}° → {:?}° vs truth {:?}° (error {:?}°)",
         phi0.map(deg),
@@ -814,6 +830,14 @@ fn main() {
         truth_phi.map(deg),
         [0, 1, 2].map(|j| deg(phi_hat[j] - truth_phi[j])),
     );
+    for (key, v) in ["fit.phi_pitch", "fit.phi_roll", "fit.phi_elbow"].iter().zip(phi_hat) {
+        paper(key, v.to_degrees());
+    }
     eprintln!("θ start {theta0:.3?} → {theta_hat:.3?} vs truth {truth_theta:?}");
+    for (key, v) in ["fit.alpha", "fit.f0_450", "fit.f0_550", "fit.f0_650"].iter().zip(theta_hat) {
+        paper(key, v);
+    }
     eprintln!("image MSE {e_hat:.3e} (truth re-rendered: {e_truth:.3e})");
+    paper("fit.mse", e_hat);
+    paper("fit.mse_truth", e_truth);
 }

@@ -3,6 +3,9 @@
 //! with 2e's edge and interior terms, against central differences of the
 //! fully shaded image. The scenes are 2e's (`tests/phase2e.rs`), copied.
 
+mod common;
+
+use common::paper;
 use irys_core::{Point3, Transform, Vec3};
 use irys_diff::ggx::PARAMS;
 use irys_diff::interior::{self, Tangents};
@@ -268,6 +271,10 @@ fn report(name: &str, e: &Estimate, i: &Estimate, sc: &Estimate, t: &Estimate, c
                 e.mean[j], e.stderr[j], i.mean[j], i.stderr[j], sc.mean[j], sc.stderr[j],
                 t.mean[j], t.stderr[j], cd.mean[j], cd.stderr[j]
             );
+            if name == "floor" {
+                paper(&format!("sec.floor_z{}", j + 1), z);
+                paper(&format!("sec.no_sec_z{}", j + 1), z2);
+            }
             z
         })
         .collect()
@@ -398,6 +405,7 @@ fn secondary_estimators_compared() {
         ("warp K=8 κ=1600", Some(SecMode::WarpNee { k: 8, kappa: 1600.0 })),
         ("warp K=32 κ=400", Some(SecMode::WarpNee { k: 32, kappa: 400.0 })),
     ];
+    let mut se: Vec<(&str, Vec<f64>)> = Vec::new();
     for (name, mode) in modes {
         let t0 = std::time::Instant::now();
         let runs: Vec<Vec<f64>> = (0..seeds)
@@ -415,7 +423,16 @@ fn secondary_estimators_compared() {
             "{name:20} {:+.3} ± {:.3}  {:+.3} ± {:.3}  {:+.3} ± {:.3}   {dt:.1?} per estimate",
             e.mean[0], e.stderr[0], e.mean[1], e.stderr[1], e.mean[2], e.stderr[2]
         );
+        se.push((name, e.stderr.clone()));
     }
+    // The warp's best setting (K=8, κ=1600) against edge sampling's light
+    // share: the smallest per-φ variance ratio, the paper's lower bound.
+    let find = |n: &str| &se.iter().find(|(m, _)| *m == n).unwrap().1;
+    let (warp, edge) = (find("warp K=8 κ=1600"), find("edges, light share"));
+    paper(
+        "sec.var_vs_warp",
+        (0..3).map(|j| (warp[j] / edge[j]).powi(2)).fold(f64::INFINITY, f64::min),
+    );
 }
 
 /// Piece 2: links sunk into each other (negative gaps at both joints) —

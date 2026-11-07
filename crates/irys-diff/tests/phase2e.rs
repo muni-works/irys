@@ -2,6 +2,9 @@
 //! with the edge term ([`irys_diff::vis`]), against central differences of
 //! the fully shaded image.
 
+mod common;
+
+use common::paper;
 use irys_core::{Point3, Transform, Vec3};
 use irys_diff::ggx::PARAMS;
 use irys_diff::interior::{self, Tangents};
@@ -155,6 +158,7 @@ fn dual_trace_values_are_the_forward_pass() {
         "dual values vs forward: worst rel {worst:.2e} over {} lanes",
         l.len()
     );
+    paper("int.dual_vs_fwd", worst);
     assert!(worst < 1e-6, "{worst}");
 }
 
@@ -524,6 +528,9 @@ fn cut_with(depth: usize, seeds: u64) -> f64 {
     }
     let gm = ratios.iter().product::<f64>().powf(1.0 / 3.0);
     eprintln!("depth {depth}: geometric-mean variance ratio {gm:.2}");
+    if depth == 1 {
+        paper("idbuf.var", gm);
+    }
     gm
 }
 
@@ -918,6 +925,10 @@ mod gpu_tier {
             ms(fwd2),
             ms(sum2)
         );
+        paper("edge.host_ms", ms(host));
+        paper("edge.dev_ms", ms(dd));
+        paper("edge.total_before_ms", ms(host + fwd + sum));
+        paper("edge.total_after_ms", ms(dh + dd + fwd2 + sum2));
     }
 }
 

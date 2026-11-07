@@ -1,7 +1,11 @@
 //! The phase 1 exit gate: gradients against central differences, compiled
 //! against interpreted, replay against forward, and one inverse problem.
 
+mod common;
+
 use std::time::Instant;
+
+use common::paper;
 
 use irys_diff::ggx::{self, COLUMNS, DF, Graph, PARAMS, THETA};
 use irys_diff::prb::{self, Kernels, L2, Mean, Scene};
@@ -45,11 +49,16 @@ fn gradient_matches_central_differences_frozen_sampler() {
     let (_, g) = prb::gradient(&scene, &THETA0, (7, 7), &mut k, &L2(&target));
     let t_grad = t.elapsed();
     let fd = central(&scene, &THETA0, 7, &mut k, &L2(&target), 1e-5);
+    let (mut lo, mut hi) = (f64::INFINITY, 0.0f64);
     for p in 0..PARAMS {
         let e = rel(g[p], fd[p]);
         eprintln!("θ{p}: prb {:+.6e}  fd {:+.6e}  rel {e:.1e}", g[p], fd[p]);
+        (lo, hi) = (lo.min(e), hi.max(e));
         assert!(e < 1e-5, "θ{p}: prb {} vs fd {}", g[p], fd[p]);
     }
+    paper("p1.cd_frozen_lo", lo);
+    paper("p1.cd_frozen_hi", hi);
+    paper("hero.cd_frozen", hi);
     eprintln!(
         "gradient (forward + replay, interpreter, {} paths): {t_grad:?}",
         scene.paths()
@@ -168,6 +177,7 @@ fn compiled_matches_interpreter() {
     eprintln!(
         "compiled f32 vs interpreter f64: f {worst_f:.1e}, pdf {worst_d:.1e}, δθ {worst_t:.1e}"
     );
+    paper("p1.c_vs_interp", worst_t);
     assert!(worst_f < 1e-4 && worst_d < 1e-4 && worst_t < 1e-4);
 }
 
@@ -234,6 +244,7 @@ fn replay_is_bit_exact_and_constant_memory() {
             words[0].0,
             words[0].0 as f64 / scene.paths() as f64
         );
+        paper("hero.words_4l", words[0].0 as f64 / scene.paths() as f64);
     }
 }
 
@@ -336,6 +347,8 @@ fn hero_wavelengths_cut_colour_noise() {
         t1 / t4,
         c1 / c4
     );
+    paper("hero.var_total", t1 / t4);
+    paper("hero.var_chroma", c1 / c4);
     assert!(c1 / c4 > 3.0, "chroma variance only {:.2}× lower", c1 / c4);
     assert!(t1 / t4 > 1.5, "total variance only {:.2}× lower", t1 / t4);
 }

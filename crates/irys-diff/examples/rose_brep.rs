@@ -56,6 +56,17 @@ const H: usize = 128;
 
 // ---- the plate on vcad's current kernel, with the bore as θ ----
 
+/// One number the paper quotes, as `PAPER\t<key>\t<value>` on stderr, for
+/// the repro script that regenerates `data/measured.tsv`.
+fn paper(key: &str, v: f64) {
+    eprintln!("PAPER\t{key}\t{v:e}");
+}
+
+/// A count the paper quotes, printed plain.
+fn paper_n(key: &str, n: usize) {
+    eprintln!("PAPER\t{key}\t{n}");
+}
+
 fn cube(axis: usize, at: [f64; 3], size: [f64; 3]) -> Solid {
     let s = place(axis, size);
     let a = place(axis, at);
@@ -213,6 +224,8 @@ fn main() {
         plan.triangles.len(),
         t0.elapsed()
     );
+    paper_n("brep.nodes", plan.nodes.len());
+    paper_n("brep.tris", plan.triangles.len());
 
     // irys: ∂ℒ/∂x per plan node, averaged over independent seeds.
     let g = weights();
@@ -306,6 +319,13 @@ fn main() {
         (p - e2e).abs() / e2e.abs(),
         (p - e2e).abs() / pe
     );
+    paper("brep.pull", p);
+    paper("brep.pull_se", pe);
+    paper("brep.fwd_rel", seam_fwd);
+    paper("brep.fd", fd);
+    paper("brep.fd_rel", seam_fd);
+    paper("brep.e2e", e2e);
+    paper("brep.e2e_rel", (p - e2e).abs() / e2e.abs());
     println!("  total {:.1?}", t0.elapsed());
     // HERO=dir: the paper's hero figure, from this run's data. Same camera,
     // larger frame: feature edges and per-node (screen velocity, share of

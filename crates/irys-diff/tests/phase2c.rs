@@ -5,6 +5,9 @@
 
 #![cfg(feature = "gpu")]
 
+mod common;
+
+use common::{paper, paper_n};
 use irys_diff::ggx::PARAMS;
 use irys_diff::gpu::{self, GpuPrb};
 use irys_diff::prb::{self, Kernels, L2, Scene};
@@ -108,6 +111,7 @@ fn nee_cpu_gradient_matches_central_differences() {
     let t = prb::image(&scene, 99, &prb::forward(&scene, &GOLD, 99, &mut k).0);
     let (_, d) = prb::gradient(&scene, &THETA0, (7, 7), &mut k, &L2(&t));
     let h = 1e-5;
+    let mut worst = 0.0f64;
     for p in 0..PARAMS {
         let (mut lo, mut hi) = (THETA0, THETA0);
         lo[p] -= h;
@@ -117,8 +121,10 @@ fn nee_cpu_gradient_matches_central_differences() {
             / (2.0 * h);
         let e = rel(d[p], fd);
         eprintln!("θ{p}: cpu prb {:+.9e}  fd {fd:+.9e}  rel {e:.1e}", d[p]);
+        worst = worst.max(e);
         assert!(e < 1e-5, "θ{p}: prb {} vs fd {fd}", d[p]);
     }
+    paper("nee.cpu_cd_max", worst);
 }
 
 /// GPU f32 against the CPU f64 interpreter, frozen sampler: `L` per lane,
@@ -142,19 +148,23 @@ fn nee_gpu_matches_cpu_f64() {
         errs[errs.len() * 99 / 100],
         errs.len()
     );
+    paper("nee.gpu_l_p99", errs[errs.len() * 99 / 100]);
     assert!(far * 50 < errs.len(), "{far} lanes diverge");
     let (vg, gg) = g.gradient_l2(&scene, &THETA0, (7, 7));
     let (vc, gc) = prb::gradient(&scene, &THETA0, (7, 7), &mut k, &L2(&t));
     eprintln!("loss gpu {vg:.6e} cpu {vc:.6e} rel {:.1e}", rel(vg, vc));
     assert!(rel(vg, vc) < 1e-2);
+    let mut worst = 0.0f64;
     for p in 0..PARAMS {
         let e = rel(gg[p], gc[p]);
         eprintln!(
             "θ{p}: gpu {:+.6e}  cpu f64 {:+.6e}  rel {e:.1e}",
             gg[p], gc[p]
         );
+        worst = worst.max(e);
         assert!(e < 2e-2, "θ{p}: gpu {} vs cpu {}", gg[p], gc[p]);
     }
+    paper("nee.gpu_dtheta_max", worst);
 }
 
 /// GPU PRB against GPU central differences, device-scored, frozen sampler.
@@ -235,6 +245,7 @@ fn nee_cuts_variance_at_equal_spp() {
         "per-pixel variance at {spp} spp: bsdf {v_bsdf:.3e}, nee+mis {v_nee:.3e}, ratio {:.1}×; image means rel {bias:.1e}, worst 8×8 block z {z:.2}",
         v_bsdf / v_nee
     );
+    paper("nee.var_ratio", v_bsdf / v_nee);
     assert!(bias < 1e-2, "means differ by {bias}");
     assert!(z < 4.5, "a block's means differ by {z} σ");
     assert!(v_nee * 2.0 < v_bsdf, "NEE does not cut variance");
@@ -267,6 +278,9 @@ fn nee_throughput() {
             scene.paths() as f64 / fwd / 1e6,
             grad * 1e3
         );
+        let tag = if nee { "_nee" } else { "" };
+        paper(&format!("rel.fwd{tag}_ms"), fwd * 1e3);
+        paper(&format!("rel.grad{tag}_ms"), grad * 1e3);
     }
 }
 
@@ -370,6 +384,7 @@ fn megapixel_in_one_call() {
         g.chunks(),
         l.len()
     );
+    paper_n("mega.lanes", same);
     assert!(g.chunks() > 1);
     assert_eq!(same, l.len());
     assert!(img.iter().all(|x| x.is_finite()));
