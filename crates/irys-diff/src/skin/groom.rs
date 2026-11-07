@@ -85,11 +85,11 @@ fn luma(c: [f64; 3]) -> f64 {
 
 /// `v` projected onto the plane of `n`, normalised (or `fallback`).
 fn tangent(v: Vec3, n: Vec3, fallback: Vec3) -> Vec3 {
-    let t = v - n * v.dot(&n);
+    let t = v - n * v.dot(n);
     if t.norm() > 1e-9 {
         t.normalize()
     } else {
-        let f = fallback - n * fallback.dot(&n);
+        let f = fallback - n * fallback.dot(n);
         f.normalize()
     }
 }
@@ -127,14 +127,14 @@ pub fn groom(mesh: &Mesh, albedo: &Texture, spec: &GroomSpec) -> Groom {
     // Triangle areas, for area-uniform roots.
     let tris: Vec<[usize; 3]> = mesh
         .indices
-        .chunks_exact(3)
+        .as_chunks::<3>().0.iter()
         .map(|t| [t[0] as usize, t[1] as usize, t[2] as usize])
         .collect();
     let mut cdf = Vec::with_capacity(tris.len());
     let mut total = 0.0;
     for t in &tris {
         let [a, b, cc] = t.map(|i| mesh.positions[i]);
-        total += 0.5 * (b - a).cross(&(cc - a)).norm();
+        total += 0.5 * (b - a).cross(cc - a).norm();
         cdf.push(total);
     }
     let mut rng = Rng::new(spec.seed, 0);
@@ -185,7 +185,7 @@ pub fn groom(mesh: &Mesh, albedo: &Texture, spec: &GroomSpec) -> Groom {
         // The hairline is soft: density ramps up over 0.3 units above it.
         let wiggle = 0.06 * (0.07 * phi).sin() + 0.03 * (0.19 * phi + 1.3).sin();
         let ramp = ((dz - hairline(phi) - wiggle) / 0.35).clamp(0.0, 1.0);
-        if ramp > 0.0 && dz < 3.2 && !ear && n.dot(&q.normalize()) > 0.2 {
+        if ramp > 0.0 && dz < 3.2 && !ear && n.dot(q.normalize()) > 0.2 {
             if accept(spec.scalp_density * ramp * ramp * (3.0 - 2.0 * ramp)) {
                 roots.push((Region::Scalp, p, n));
             }
@@ -243,7 +243,7 @@ pub fn groom(mesh: &Mesh, albedo: &Texture, spec: &GroomSpec) -> Groom {
             Region::Scalp => {
                 let (turn, glen) = nearest_guide(p);
                 let away = tangent(p - crown, n, Vec3::new(0.0, 1.0, -1.0));
-                let side = n.cross(&away);
+                let side = n.cross(away);
                 let t = turn + 0.25 * (rng.uniform() - 0.5);
                 let comb = (away * t.cos() + side * t.sin()).normalize();
                 let len = glen * (0.85 + 0.3 * rng.uniform());
@@ -256,14 +256,14 @@ pub fn groom(mesh: &Mesh, albedo: &Texture, spec: &GroomSpec) -> Groom {
                 let rise = (0.9 - 0.9 * (q.x.abs() / 1.1)).clamp(-0.2, 0.9);
                 let comb = tangent(out + Vec3::new(0.0, 0.0, rise), n, out);
                 let t = 0.35 * (rng.uniform() - 0.5);
-                let side = n.cross(&comb);
+                let side = n.cross(comb);
                 let comb = (comb * t.cos() + side * t.sin()).normalize();
                 (1, 4, 0.08 + 0.09 * rng.uniform(), 0.08 + 0.08 * rng.uniform(), comb, spec.radius[1])
             }
             Region::Stubble => {
                 let down = tangent(Vec3::new(0.0, 0.0, -1.0), n, Vec3::new(0.0, -1.0, 0.0));
                 let t = 0.8 * (rng.uniform() - 0.5);
-                let side = n.cross(&down);
+                let side = n.cross(down);
                 let comb = (down * t.cos() + side * t.sin()).normalize();
                 (2, 2, 0.015 + 0.025 * rng.uniform(), 0.25 + 0.35 * rng.uniform(), comb, spec.radius[2])
             }
@@ -275,11 +275,11 @@ pub fn groom(mesh: &Mesh, albedo: &Texture, spec: &GroomSpec) -> Groom {
         for _ in 0..segs {
             // Bend toward the surface, and wander.
             let wob = Vec3::new(rng.uniform() - 0.5, rng.uniform() - 0.5, rng.uniform() - 0.5) * 0.25;
-            dir = (dir - n * (0.12 * dir.dot(&n).max(0.0)) + wob).normalize();
-            if dir.dot(&n) < 0.05 {
-                dir = (dir + n * (0.05 - dir.dot(&n))).normalize();
+            dir = (dir - n * (0.12 * dir.dot(n).max(0.0)) + wob).normalize();
+            if dir.dot(n) < 0.05 {
+                dir = (dir + n * (0.05 - dir.dot(n))).normalize();
             }
-            x = x + dir * step;
+            x += dir * step;
             pts.push(x);
         }
         strands.push(&pts, r);

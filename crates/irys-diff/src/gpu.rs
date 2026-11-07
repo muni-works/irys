@@ -1897,7 +1897,7 @@ impl GpuEdges {
     /// The device's points, as camera-plane pairs (for tests).
     pub fn points(&self, gp: &GpuPrb) -> Vec<[f64; 2]> {
         gp.read(&self.pts, 2 * self.n as usize * 2)
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|p| [p[0] as f64, p[1] as f64])
             .collect()
     }

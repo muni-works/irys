@@ -40,7 +40,7 @@ impl Texture {
     pub fn from_rgb8(size: (usize, usize), rgb: &[u8], srgb: bool) -> Self {
         assert_eq!(rgb.len(), size.0 * size.1 * 3);
         let texels = rgb
-            .chunks_exact(3)
+            .as_chunks::<3>().0.iter()
             .map(|p| {
                 let f = |b: u8| {
                     let x = b as f32 / 255.0;
@@ -109,7 +109,7 @@ impl Mesh {
         let n = self.positions.len();
         let mut t = vec![Vec3::zeros(); n];
         let mut b = vec![Vec3::zeros(); n];
-        for c in self.indices.chunks_exact(3) {
+        for c in self.indices.as_chunks::<3>().0 {
             let [i0, i1, i2] = [c[0] as usize, c[1] as usize, c[2] as usize];
             let (p0, p1, p2) = (self.positions[i0], self.positions[i1], self.positions[i2]);
             let (w0, w1, w2) = (self.uvs[i0], self.uvs[i1], self.uvs[i2]);
@@ -131,13 +131,13 @@ impl Mesh {
         self.tangents = (0..n)
             .map(|i| {
                 let nn = self.normals[i];
-                let mut tt = t[i] - nn * nn.dot(&t[i]);
+                let mut tt = t[i] - nn * nn.dot(t[i]);
                 if tt.norm() < 1e-12 {
                     // No UV gradient: any perpendicular will do.
                     tt = basis(nn).0;
                 }
                 let tt = tt.normalize();
-                let w = if nn.cross(&tt).dot(&b[i]) < 0.0 {
+                let w = if nn.cross(tt).dot(b[i]) < 0.0 {
                     -1.0
                 } else {
                     1.0
@@ -150,10 +150,10 @@ impl Mesh {
     /// Per-vertex normals as area-weighted face normals.
     pub fn compute_normals(&mut self) {
         let mut n = vec![Vec3::zeros(); self.positions.len()];
-        for c in self.indices.chunks_exact(3) {
+        for c in self.indices.as_chunks::<3>().0 {
             let [i0, i1, i2] = [c[0] as usize, c[1] as usize, c[2] as usize];
             let f = (self.positions[i1] - self.positions[i0])
-                .cross(&(self.positions[i2] - self.positions[i0]));
+                .cross(self.positions[i2] - self.positions[i0]);
             for i in [i0, i1, i2] {
                 n[i] += f;
             }
@@ -298,12 +298,12 @@ pub fn shade(mesh: &Mesh, bvh: &Bvh<TriMesh>, hit: &Hit) -> Shading {
 pub fn bump(s: &Shading, rgb: [f64; 3], strength: f64) -> Vec3 {
     let n = s.ns;
     let t0 = Vec3::new(s.tangent[0], s.tangent[1], s.tangent[2]);
-    let t = t0 - n * n.dot(&t0);
+    let t = t0 - n * n.dot(t0);
     if t.norm() < 1e-9 {
         return n;
     }
     let t = t.normalize();
-    let b = n.cross(&t) * s.tangent[3];
+    let b = n.cross(t) * s.tangent[3];
     // Green is `+b` (`+v`): OpenGL's green-up, with `v` running up the
     // image as in this asset's UVs ([`load`] flips glTF's). The map's own
     // evidence: as a height gradient in image-down coordinates, `(r, −g)`

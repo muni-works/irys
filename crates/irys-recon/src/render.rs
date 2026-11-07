@@ -131,7 +131,7 @@ impl KernelCache {
 pub fn grey(scene: &Scene, seed: u64, k: &mut KernelCache) -> Vec<f64> {
     let (l, _) = prb::forward(scene, &THETA, seed, k.get(scene));
     let rgb = prb::image(scene, seed, &l);
-    rgb.chunks_exact(3).map(|c| (c[0] + c[1] + c[2]) / 3.0).collect()
+    rgb.as_chunks::<3>().0.iter().map(|c| (c[0] + c[1] + c[2]) / 3.0).collect()
 }
 
 /// `L` per path for `scene` in points mode (one wavelength per path).
@@ -173,7 +173,7 @@ pub fn hits_plane(scene: &Scene, s: [f64; 2], plane: (Vec3, f64), tol: f64) -> O
     let ray = Ray::new(eye, f + r * s[0] + u * s[1]);
     let h = scene.tlas().trace_closest(&ray)?;
     let p = h.hit.point;
-    Some((plane.0.dot(&p.coords()) - plane.1).abs() < tol)
+    Some((plane.0.dot(p.coords()) - plane.1).abs() < tol)
 }
 
 /// Linear grey to 8-bit sRGB.

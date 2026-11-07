@@ -117,7 +117,7 @@ impl Pinhole {
     /// [`Scene::project`] through this pinhole, without the Jacobian.
     pub fn project(&self, size: (usize, usize), p: Point3) -> Option<[f64; 2]> {
         let d = p - self.eye;
-        let z = d.dot(&self.forward);
+        let z = d.dot(self.forward);
         if z <= 0.0 {
             return None;
         }
@@ -125,8 +125,8 @@ impl Pinhole {
         let kx = w / (2.0 * self.tan_half * w / h);
         let ky = h / (2.0 * self.tan_half);
         Some([
-            d.dot(&self.right) / z * kx + w / 2.0,
-            h / 2.0 - d.dot(&self.up) / z * ky,
+            d.dot(self.right) / z * kx + w / 2.0,
+            h / 2.0 - d.dot(self.up) / z * ky,
         ])
     }
 }
@@ -230,7 +230,7 @@ impl Edges {
                 .iter()
                 .map(|t| {
                     let [a, b, c] = t.map(|i| pos[i as usize]);
-                    (b - a).cross(&(c - a))
+                    (b - a).cross(c - a)
                 })
                 .collect();
             let mut map: std::collections::HashMap<_, Vec<(usize, usize)>> =
@@ -250,7 +250,7 @@ impl Edges {
                     let (n0, n1) = (normal[t0], normal[t1]);
                     let (l0, l1) = (n0.norm(), n1.norm());
                     if l0 > 0.0 && l1 > 0.0 {
-                        let c = n0.dot(&n1) / (l0 * l1);
+                        let c = n0.dot(n1) / (l0 * l1);
                         let (a, b) = if c > 1.0 - 1e-10 {
                             (FLAT, FLAT)
                         } else {
@@ -323,7 +323,7 @@ impl Visibility {
                 let r = Ray::new(eye, fwd + right * sx + up * sy);
                 if let Some(hit) = scene.tlas().trace_closest_range(&r, 0.0, f64::INFINITY) {
                     id[y * w + x] = hit.payload as u32;
-                    depth[y * w + x] = (hit.hit.point - eye).dot(&fwd);
+                    depth[y * w + x] = (hit.hit.point - eye).dot(fwd);
                 }
             }
         }
@@ -571,7 +571,7 @@ impl EdgeSamples {
                 .iter()
                 .map(|[p, q]| {
                     let dx = (p[mi].apply_point(&xl) - q[mi].apply_point(&xl)) / (2.0 * RIG_H);
-                    [jac[0].dot(&dx), jac[1].dot(&dx)]
+                    [jac[0].dot(dx), jac[1].dot(dx)]
                 })
                 .collect::<Vec<_>>()
         };
@@ -652,7 +652,7 @@ impl EdgeSamples {
             let facing = |tri: usize| {
                 let x = place.to_world.apply_point(&pos[tris[tri][0] as usize]);
                 let n = place.to_world.apply_normal(&normal[tri]);
-                n.dot(&(eye - x)) / (n.norm() * (eye - x).norm()).max(1e-300)
+                n.dot(eye - x) / (n.norm() * (eye - x).norm()).max(1e-300)
             };
             let front = |tri: usize| facing(tri) > 0.0;
             for (tri, t) in tris.iter().enumerate() {
@@ -662,7 +662,7 @@ impl EdgeSamples {
                     .collect();
                 let pz: Vec<Option<([f64; 2], f64)>> = wp
                     .iter()
-                    .map(|&x| scene.project(x).map(|p| (p.0, (x - eye).dot(&fwd))))
+                    .map(|&x| scene.project(x).map(|p| (p.0, (x - eye).dot(fwd))))
                     .collect();
                 if pz.iter().all(Option::is_none) {
                     continue;
@@ -823,7 +823,7 @@ impl EdgeSamples {
             let r = fwd + right * sx + up * sy;
             let e = b - a;
             let w0 = eye - a;
-            let (aa, bb, cc, dd, ee) = (r.dot(&r), r.dot(&e), e.dot(&e), r.dot(&w0), e.dot(&w0));
+            let (aa, bb, cc, dd, ee) = (r.dot(r), r.dot(e), e.dot(e), r.dot(w0), e.dot(w0));
             let den = aa * cc - bb * bb;
             let v = if den.abs() > 0.0 {
                 ((aa * ee - bb * dd) / den).clamp(0.0, 1.0)
@@ -867,7 +867,7 @@ impl EdgeSamples {
                     && lh > 0.0
                     && nt.dot(nh) / (ln * lh) > 1.0 - 1e-6
                     && local.is_some_and(|q| {
-                        (nt / ln).dot(&(q - la)).abs() < 1e-4 * (lb - la).norm().max(1e-9)
+                        (nt / ln).dot(q - la).abs() < 1e-4 * (lb - la).norm().max(1e-9)
                     })
             });
             let (Some(jac), true) = (jac, own) else {
@@ -1034,20 +1034,20 @@ fn tri_world(scene: &Scene, k: usize, t: usize, place: Option<&Transform>) -> [P
 /// interval overlap on the planes' common line).
 pub fn tri_tri(ta: [Point3; 3], tb: [Point3; 3]) -> Option<(Point3, Point3)> {
     let plane = |t: &[Point3; 3]| {
-        let n = (t[1] - t[0]).cross(&(t[2] - t[0]));
+        let n = (t[1] - t[0]).cross(t[2] - t[0]);
         let l = n.norm();
-        (l > 0.0).then(|| (n / l, n.dot(&t[0].coords()) / l))
+        (l > 0.0).then(|| (n / l, n.dot(t[0].coords()) / l))
     };
     let (na, da) = plane(&ta)?;
     let (nb, db) = plane(&tb)?;
-    let dir = na.cross(&nb);
+    let dir = na.cross(nb);
     if dir.norm() < 1e-9 {
         return None;
     }
     let dir = dir.normalize();
     // The part of `t` on the other plane, as an interval along `dir`.
     let clip = |t: &[Point3; 3], n: Vec3, d: f64| -> Option<(f64, f64, Point3, Point3)> {
-        let s: Vec<f64> = t.iter().map(|p| n.dot(&p.coords()) - d).collect();
+        let s: Vec<f64> = t.iter().map(|p| n.dot(p.coords()) - d).collect();
         let mut pts = Vec::new();
         for i in 0..3 {
             let j = (i + 1) % 3;
@@ -1060,7 +1060,7 @@ pub fn tri_tri(ta: [Point3; 3], tb: [Point3; 3]) -> Option<(Point3, Point3)> {
             return None;
         }
         let (p, q) = (pts[0], pts[1]);
-        let (u, v) = (dir.dot(&p.coords()), dir.dot(&q.coords()));
+        let (u, v) = (dir.dot(p.coords()), dir.dot(q.coords()));
         Some(if u <= v { (u, v, p, q) } else { (v, u, q, p) })
     };
     let (a0, a1, pa0, pa1) = clip(&ta, nb, db)?;
@@ -1207,7 +1207,7 @@ impl EdgeSamples {
             let r = fwd + right * sx + up * sy;
             let e = sg.b - sg.a;
             let w0 = eye - sg.a;
-            let (aa, bb, cc, dd, ee) = (r.dot(&r), r.dot(&e), e.dot(&e), r.dot(&w0), e.dot(&w0));
+            let (aa, bb, cc, dd, ee) = (r.dot(r), r.dot(e), e.dot(e), r.dot(w0), e.dot(w0));
             let den = aa * cc - bb * bb;
             let v = if den.abs() > 0.0 { ((aa * ee - bb * dd) / den).clamp(0.0, 1.0) } else { t };
             let x = sg.a + e * v;
@@ -1238,17 +1238,17 @@ impl EdgeSamples {
             let line_at = |j: usize, side: usize| -> Option<Point3> {
                 let ta = tri_world(scene, sg.ka, sg.ta, placement(sg.ka, j, side));
                 let tb = tri_world(scene, sg.kb, sg.tb, placement(sg.kb, j, side));
-                let n1 = (ta[1] - ta[0]).cross(&(ta[2] - ta[0])).normalize();
-                let n2 = (tb[1] - tb[0]).cross(&(tb[2] - tb[0])).normalize();
-                let dir = n1.cross(&n2);
+                let n1 = (ta[1] - ta[0]).cross(ta[2] - ta[0]).normalize();
+                let n2 = (tb[1] - tb[0]).cross(tb[2] - tb[0]).normalize();
+                let dir = n1.cross(n2);
                 let l2 = dir.norm_squared();
                 if l2 < 1e-18 {
                     return None;
                 }
                 // Point on both planes nearest x: x minus its plane
                 // offsets, solved in the planes' normal space.
-                let (d1, d2) = (n1.dot(&(x - ta[0])), n2.dot(&(x - tb[0])));
-                let c = n1.dot(&n2);
+                let (d1, d2) = (n1.dot(x - ta[0]), n2.dot(x - tb[0]));
+                let c = n1.dot(n2);
                 let det = 1.0 - c * c;
                 let (g1, g2) = ((d1 - c * d2) / det, (d2 - c * d1) / det);
                 Some(x - n1 * g1 - n2 * g2)
@@ -1257,7 +1257,7 @@ impl EdgeSamples {
                 .map(|j| match (line_at(j, 0), line_at(j, 1)) {
                     (Some(p), Some(q)) => {
                         let dx = (p - q) / (2.0 * RIG_H);
-                        let vel = [jac[0].dot(&dx), jac[1].dot(&dx)];
+                        let vel = [jac[0].dot(dx), jac[1].dot(dx)];
                         (vel[0] * nrm[0] + vel[1] * nrm[1]) * total / n as f64
                     }
                     _ => 0.0,

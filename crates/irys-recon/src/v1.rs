@@ -413,7 +413,7 @@ pub fn recover_photos(photos: &[Photo], o: &V1Options) -> Result<V1, String> {
     }
     // Appearance from the base box, at half resolution.
     let half = lin.half_masks();
-    let mut hrig = rig.scaled(0.5);
+    let hrig = rig.scaled(0.5);
     let dbg = std::env::var("RECON_DEBUG").is_ok();
     if dbg {
         if let Ok(d) = std::env::var("RECON_DEBUG") {

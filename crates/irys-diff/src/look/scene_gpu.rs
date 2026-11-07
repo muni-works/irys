@@ -367,7 +367,7 @@ impl GpuLook {
         let mut first_tri = Vec::with_capacity(scene.meshes.len());
         for m in &scene.meshes {
             first_tri.push((tris.len() / 7) as u32);
-            for t in m.indices.chunks_exact(3) {
+            for t in m.indices.as_chunks::<3>().0 {
                 let [a, b, c] = [t[0] as usize, t[1] as usize, t[2] as usize];
                 for &i in &[a, b, c] {
                     let p = m.positions[i];
@@ -438,7 +438,7 @@ impl GpuLook {
                 lum(m.emission)
             };
             emit_base[k] = (emit.len() / 3) as u32;
-            for t in mesh.indices.chunks_exact(3) {
+            for t in mesh.indices.as_chunks::<3>().0 {
                 let p = [t[0], t[1], t[2]].map(|v| apply(&i.xf, mesh.positions[v as usize]));
                 let e1 = [p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]];
                 let e2 = [p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]];
@@ -1000,7 +1000,7 @@ impl GpuLook {
         let seconds = t0.elapsed().as_secs_f64();
         let acc = self.read(&self.accum, self.pixels * 4);
         let inv = 1.0 / o.spp.max(1) as f32;
-        let rgb = acc.chunks_exact(4).flat_map(|p| [p[0] * inv, p[1] * inv, p[2] * inv]).collect();
+        let rgb = acc.as_chunks::<4>().0.iter().flat_map(|p| [p[0] * inv, p[1] * inv, p[2] * inv]).collect();
         let groups = self.pixels.div_ceil(64);
         let sp = self.read(&self.spec, groups * BINS);
         let mut spectrum = vec![0.0f64; BINS];
@@ -1038,7 +1038,7 @@ impl GpuLook {
     /// [sampled ω_i, lobe])`.
     pub fn probe(&self, lanes: &[(u32, f32, bool, [f32; 3], [f32; 3], [f32; 3])]) -> Vec<[[f32; 4]; 3]> {
         let (dev, queue) = (&self.ctx.device, &self.ctx.queue);
-        assert!(1 + lanes.len() * 7 <= (1 << 20) / 16, "too many probe lanes");
+        assert!(lanes.len() * 7 < (1 << 20) / 16, "too many probe lanes");
         let mut io: Vec<[f32; 4]> = vec![[f32::from_bits(lanes.len() as u32), 0.0, 0.0, 0.0]];
         for l in lanes {
             io.push([f32::from_bits(l.0), l.1, if l.2 { 1.0 } else { 0.0 }, 0.0]);

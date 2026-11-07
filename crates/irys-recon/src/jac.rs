@@ -61,7 +61,7 @@ pub(crate) struct Cand {
 
 pub(crate) fn face_normal(p: &[Point3], t: &[u32; 3]) -> Vec3 {
     let (a, b, c) = (p[t[0] as usize], p[t[1] as usize], p[t[2] as usize]);
-    (b - a).cross(&(c - a))
+    (b - a).cross((c - a))
 }
 
 /// Candidate edges: every triangle edge that is not shared with exactly one
@@ -105,7 +105,7 @@ pub(crate) fn candidates_from(eye: Point3, p: &[Point3], t: &[[u32; 3]]) -> Vec<
         let n = normals[ti];
         let c = p[t[ti][0] as usize];
         let nn = n.norm();
-        if nn == 0.0 { 0.0 } else { n.dot(&(eye - c)) / (nn * (eye - c).norm()) }
+        if nn == 0.0 { 0.0 } else { n.dot((eye - c)) / (nn * (eye - c).norm()) }
     };
     let mut out = Vec::new();
     for list in edges.values() {
@@ -119,7 +119,7 @@ pub(crate) fn candidates_from(eye: Point3, p: &[Point3], t: &[[u32; 3]]) -> Vec<
                 if li == 0.0 || lj == 0.0 {
                     continue;
                 }
-                let cos = ni.dot(&nj) / (li * lj);
+                let cos = ni.dot(nj) / (li * lj);
                 if cos > 1.0 - 1e-7 {
                     continue; // coplanar: f is continuous across it
                 }
@@ -237,7 +237,7 @@ pub fn edge_jacobian(
         if len < 1e-9 {
             continue;
         }
-        let (za, zb) = ((pa - eye).dot(&fwd), (pb - eye).dot(&fwd));
+        let (za, zb) = ((pa - eye).dot(fwd), (pb - eye).dot(fwd));
         pieces.push(Piece { ci, sa, sb, za, zb, t0, t1, we: len * c.weight });
     }
     if pieces.is_empty() || n == 0 {
@@ -283,7 +283,7 @@ pub fn edge_jacobian(
         let wn: Vec<f64> = (0..np)
             .map(|j| {
                 let v = vel[c.a][j] * (1.0 - t3) + vel[c.b][j] * t3;
-                let sv = [jp[0].dot(&v), jp[1].dot(&v)];
+                let sv = [jp[0].dot(v), jp[1].dot(v)];
                 scale * (nrm[0] * sv[0] + nrm[1] * sv[1])
             })
             .collect();
@@ -291,7 +291,7 @@ pub fn edge_jacobian(
         let outer = scene.screen(s[0] + EPS_PX * nrm[0], s[1] + EPS_PX * nrm[1]);
         // Ownership: the inner ray must land on the owner's plane.
         let fnrm = face_normal(p, &t[c.tri]).normalize();
-        let plane = (fnrm, fnrm.dot(&p[c.a].coords()));
+        let plane = (fnrm, fnrm.dot(p[c.a].coords()));
         if render::hits_plane(scene, inner, plane, 1e-2) != Some(true) {
             continue;
         }
@@ -300,17 +300,16 @@ pub fn edge_jacobian(
         // meets the eye more squarely, the sample is that face's to draw.
         // This is what keeps a crease counted once when the tessellation
         // splits one side of it with T-junctions (unmatched edges).
-        if let Some(hit) = ray_hit(scene, outer) {
-            if (hit.point - x).norm() < 2e-2 {
+        if let Some(hit) = ray_hit(scene, outer)
+            && (hit.point - x).norm() < 2e-2 {
                 let view = (eye0 - x).normalize();
-                let fo = hit.normal.as_ref().dot(&view).abs();
-                let fi = fnrm.dot(&view).abs();
+                let fo = hit.normal.as_ref().dot(view).abs();
+                let fi = fnrm.dot(view).abs();
                 let tie = (fo - fi).abs() < 1e-9;
                 if fo > fi + 1e-9 || (tie && key(hit.normal.as_ref()) > key(&fnrm)) {
                     continue;
                 }
             }
-        }
         let px = (s[1].floor().clamp(0.0, h as f64 - 1.0) as usize) * w + s[0].floor().clamp(0.0, w as f64 - 1.0) as usize;
         samples.push(Sample { px, wn });
         points.push(inner);

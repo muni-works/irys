@@ -518,11 +518,10 @@ impl<'a> Track<'a> {
                 tau = -(1.0 - rng.uniform()).ln();
                 let x = o + d * t;
                 let dens = self.m.density.at(x);
-                if emissive {
-                    if let Some((eg, le)) = &self.m.emission {
+                if emissive
+                    && let Some((eg, le)) = &self.m.emission {
                         *l += *beta * eg.at(x) * lift(*le, lambda) / mu;
                     }
-                }
                 let st = self.theta[0] * dens * self.c;
                 let sts = self.theta_s[0] * dens * self.c;
                 let u = rng.uniform();
@@ -631,8 +630,8 @@ impl VolumeScene {
         let px = path / self.spp;
         let (ix, iy) = ((px % w) as f64 + rng.uniform(), (px / w) as f64 + rng.uniform());
         let fwd = (self.target - self.eye).normalize();
-        let right = fwd.cross(&Vec3::new(0.0, 0.0, 1.0)).normalize();
-        let up = right.cross(&fwd);
+        let right = fwd.cross(Vec3::new(0.0, 0.0, 1.0)).normalize();
+        let up = right.cross(fwd);
         let th = (0.5 * self.vfov).to_radians().tan();
         let asp = w as f64 / h as f64;
         let mut d = (fwd + right * ((2.0 * ix / w as f64 - 1.0) * th * asp)
@@ -674,8 +673,8 @@ impl VolumeScene {
                 let x = o + d * t;
                 // NEE with the phase function.
                 let u = [rng.uniform(), rng.uniform(), rng.uniform()];
-                if let Some((dl, dist, pl, i)) = sample_light(&self.lights, x, u) {
-                    if !self.occluded_floor(x, dl, dist) {
+                if let Some((dl, dist, pl, i)) = sample_light(&self.lights, x, u)
+                    && !self.occluded_floor(x, dl, dist) {
                         let mut tev = Vec::new();
                         let tt = match self.medium.density.span(x, dl) {
                             Some((a, b)) => {
@@ -688,7 +687,7 @@ impl VolumeScene {
                             }
                             None => 1.0,
                         };
-                        let ph = hg(d.dot(&dl), self.medium.g);
+                        let ph = hg(d.dot(dl), self.medium.g);
                         let c = beta * ph * tt * self.lights[i].le(lambda) / pl * mis(pl, ph);
                         l += c;
                         if recording {
@@ -697,9 +696,8 @@ impl VolumeScene {
                             }
                         }
                     }
-                }
                 let nd = hg_sample(d, self.medium.g, rng.uniform(), rng.uniform());
-                last_pdf = Some(hg(d.dot(&nd), self.medium.g));
+                last_pdf = Some(hg(d.dot(nd), self.medium.g));
                 d = nd;
                 o = x;
                 continue;
@@ -717,7 +715,7 @@ impl VolumeScene {
                 let rho = lift(self.floor.unwrap(), lambda);
                 let u = [rng.uniform(), rng.uniform(), rng.uniform()];
                 if let Some((dl, dist, pl, i)) = sample_light(&self.lights, x, u) {
-                    let c0 = dl.dot(&n);
+                    let c0 = dl.dot(n);
                     if c0 > 0.0 {
                         let mut tev = Vec::new();
                         let tt = match self.medium.density.span(x, dl) {
@@ -837,7 +835,7 @@ fn sample_light(lights: &[Light], x: Point3, u: [f64; 3]) -> Option<(Vec3, f64, 
     let dv = p - x;
     let d2 = dv.norm_squared();
     let d = dv / d2.sqrt();
-    let cl = -d.dot(&q.normal());
+    let cl = -d.dot(q.normal());
     if cl <= 0.0 {
         return None;
     }
@@ -849,7 +847,7 @@ fn light_pdf(lights: &[Light], o: Point3, d: Vec3) -> (f64, f64) {
     let mut best = (f64::INFINITY, 0.0);
     for q in lights {
         if let Some(t) = q.hit(o, d, best.0) {
-            let cl = -d.dot(&q.normal());
+            let cl = -d.dot(q.normal());
             best = (t, t * t / (cl * q.area() * n));
         }
     }

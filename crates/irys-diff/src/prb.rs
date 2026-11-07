@@ -283,7 +283,7 @@ impl Env {
     pub fn radiance(&self, d: Vec3, lambda_nm: f64) -> f64 {
         let tint = 1.0 + 0.4 * (550.0 - lambda_nm) / 200.0;
         tint * self.sky * (0.15 + 0.25 * d.z.max(0.0))
-            + self.sun_radiance * (self.kappa * (d.dot(&self.sun) - 1.0)).exp()
+            + self.sun_radiance * (self.kappa * (d.dot(self.sun) - 1.0)).exp()
     }
 
     /// The share [`Env::sample`] sends at the sun lobe: the fixed one, or
@@ -336,7 +336,7 @@ impl Env {
     pub fn pdf(&self, d: Vec3) -> f64 {
         let k = self.kappa;
         let vmf = k / (2.0 * std::f64::consts::PI * (1.0 - (-2.0 * k).exp()))
-            * (k * (d.dot(&self.sun) - 1.0)).exp();
+            * (k * (d.dot(self.sun) - 1.0)).exp();
         let pick = self.sun_pick();
         pick * vmf + (1.0 - pick) / (4.0 * std::f64::consts::PI)
     }
@@ -375,7 +375,7 @@ impl Lights {
         }
         let areas: Vec<f64> = tris
             .iter()
-            .map(|t| 0.5 * (t[1] - t[0]).cross(&(t[2] - t[0])).norm())
+            .map(|t| 0.5 * (t[1] - t[0]).cross(t[2] - t[0]).norm())
             .collect();
         let area: f64 = areas.iter().sum();
         let mut acc = 0.0;
@@ -409,7 +409,7 @@ impl Lights {
         let p = Point3::from(
             t[0].coords() * b0 + t[1].coords() * b1 + t[2].coords() * (1.0 - b0 - b1),
         );
-        (p, (t[1] - t[0]).cross(&(t[2] - t[0])).normalize())
+        (p, (t[1] - t[0]).cross(t[2] - t[0]).normalize())
     }
 }
 
@@ -817,8 +817,8 @@ impl Scene {
             })
             .collect();
         let forward = (target - eye).normalize();
-        let right = forward.cross(&Vec3::new(0.0, 0.0, 1.0)).normalize();
-        let up = right.cross(&forward);
+        let right = forward.cross(Vec3::new(0.0, 0.0, 1.0)).normalize();
+        let up = right.cross(forward);
         let lights = Lights::gather(&blas, &placements);
         Self {
             blas,
@@ -933,7 +933,7 @@ impl Scene {
         }
         let dir = v / dist;
         // One-sided: only a point whose front faces `x` sends light.
-        let cos_l = -n.dot(&dir);
+        let cos_l = -n.dot(dir);
         let pdf = (1.0 - pe) * d2 / (self.lights.area * cos_l);
         (cos_l > 0.0 && pdf.is_finite()).then_some(LightDraw {
             dir,
@@ -1076,11 +1076,11 @@ impl Scene {
     /// Jacobian of that map; `None` behind the eye.
     pub fn project(&self, p: Point3) -> Option<([f64; 2], [Vec3; 2])> {
         let d = p - self.eye;
-        let z = d.dot(&self.forward);
+        let z = d.dot(self.forward);
         if z <= 0.0 {
             return None;
         }
-        let (a, b) = (d.dot(&self.right), d.dot(&self.up));
+        let (a, b) = (d.dot(self.right), d.dot(self.up));
         let (w, h) = (self.size.0 as f64, self.size.1 as f64);
         let kx = w / (2.0 * self.tan_half * w / h);
         let ky = h / (2.0 * self.tan_half);
@@ -1529,9 +1529,9 @@ fn trace(
                 // A black, one-sided emitter: collect Le from its front and
                 // stop. Against NEE, the light strategy's pdf of this hit is
                 // the area pick's, in solid angle.
-                if nrm.dot(&d) < 0.0 {
+                if nrm.dot(d) < 0.0 {
                     let w = if scene.nee && p.prev_pdf > 0.0 {
-                        mis(p.prev_pdf, scene.light_pdf_emitter(ih.hit.t, nrm.dot(&d)))
+                        mis(p.prev_pdf, scene.light_pdf_emitter(ih.hit.t, nrm.dot(d)))
                     } else {
                         1.0
                     };
@@ -1547,7 +1547,7 @@ fn trace(
                 p.alive = false;
                 continue;
             }
-            if nrm.dot(&d) > 0.0 {
+            if nrm.dot(d) > 0.0 {
                 nrm = -nrm; // two-sided: shade the side the ray came from
             }
             let wo = -d;
@@ -1561,7 +1561,7 @@ fn trace(
                 let Some(ld) = scene.sample_light(origin, u) else {
                     return (Vec3::zeros(), 0.0, 0.0, false, false);
                 };
-                let cos = ld.dir.dot(&nrm);
+                let cos = ld.dir.dot(nrm);
                 let lit = cos > 0.0
                     && !scene.tlas.occluded_range(
                         &Ray::new(origin, ld.dir),
@@ -1619,12 +1619,12 @@ fn trace(
             // The hero alone picks the direction. GGX's sampling does not
             // depend on λ, so every wavelength's pdf is the hero's and the
             // hero-wavelength MIS weight reduces to `f_k cos / p`.
-            let lo = [wo.dot(&t), wo.dot(&b), wo.dot(&nrm)];
+            let lo = [wo.dot(t), wo.dot(b), wo.dot(nrm)];
             let alpha = scene.frozen_alpha.unwrap_or(theta[0]);
             if let Some((dir, cos, pl, true, emitter)) = nee
                 && lo[2] > 0.0
             {
-                let li = [dir.dot(&t), dir.dot(&b), cos];
+                let li = [dir.dot(t), dir.dot(b), cos];
                 let mut h = [0.0; 3];
                 for w in 0..nw {
                     h = lane(&mut cols, lanes + i * nw + w, li, lo, p.lambda[w]);

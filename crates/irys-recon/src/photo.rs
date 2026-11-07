@@ -100,7 +100,7 @@ impl Camera {
         let d = p - self.eye();
         let row = |i: usize| Vec3::new(self.r[i][0], self.r[i][1], self.r[i][2]);
         let (r0, r1, r2) = (row(0), row(1), row(2));
-        let (a, b, z) = (r0.dot(&d), r1.dot(&d), r2.dot(&d));
+        let (a, b, z) = (r0.dot(d), r1.dot(d), r2.dot(d));
         if z <= 1e-6 {
             return None;
         }
@@ -213,7 +213,7 @@ pub fn surf(m: &Posed, cam: &Camera, keys: &[Vec3; look::KEY], ao: &[Vec3; look:
     let (kind, n, pt) = match hit {
         Some(h) if h.t < t_table => {
             let mut n = *h.normal.as_ref();
-            if n.dot(&d) > 0.0 {
+            if n.dot(d) > 0.0 {
                 n = -n;
             }
             (1u8, n, h.point)
@@ -369,7 +369,7 @@ fn primary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, n: usize, seed: u6
         if len < 1e-9 {
             continue;
         }
-        let (za, zb) = ((pa - eye).dot(&fwd), (pb - eye).dot(&fwd));
+        let (za, zb) = ((pa - eye).dot(fwd), (pb - eye).dot(fwd));
         pieces.push(Piece { ci, sa, sb, za, zb, t0, t1, we: len * c.weight });
     }
     if pieces.is_empty() || n == 0 {
@@ -406,7 +406,7 @@ fn primary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, n: usize, seed: u6
             let wn: Vec<f64> = (0..np)
                 .map(|j| {
                     let vv = vel[c.a][j] * (1.0 - t3) + vel[c.b][j] * t3;
-                    scale * (nrm[0] * jp[0].dot(&vv) + nrm[1] * jp[1].dot(&vv))
+                    scale * (nrm[0] * jp[0].dot(vv) + nrm[1] * jp[1].dot(vv))
                 })
                 .collect();
             let e = jac::EPS_PX;
@@ -414,22 +414,21 @@ fn primary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, n: usize, seed: u6
             let outer = [s[0] + e * nrm[0], s[1] + e * nrm[1]];
             // Ownership: the inner ray must land on the owner's plane.
             let fnrm = jac::face_normal(p, &t[c.tri]).normalize();
-            let plane_c = fnrm.dot(&p[c.a].coords());
+            let plane_c = fnrm.dot(p[c.a].coords());
             let hi = m.bvh.trace_closest(&Ray::new(eye, cam.dir(inner[0], inner[1])))?;
-            if (fnrm.dot(&hi.point.coords()) - plane_c).abs() > 1e-2 {
+            if (fnrm.dot(hi.point.coords()) - plane_c).abs() > 1e-2 {
                 return None;
             }
-            if let Some(ho) = m.bvh.trace_closest(&Ray::new(eye, cam.dir(outer[0], outer[1]))) {
-                if (ho.point - x).norm() < 2e-2 {
+            if let Some(ho) = m.bvh.trace_closest(&Ray::new(eye, cam.dir(outer[0], outer[1])))
+                && (ho.point - x).norm() < 2e-2 {
                     let view = (eye - x).normalize();
-                    let fo = ho.normal.as_ref().dot(&view).abs();
-                    let fi = fnrm.dot(&view).abs();
+                    let fo = ho.normal.as_ref().dot(view).abs();
+                    let fi = fnrm.dot(view).abs();
                     let tie = (fo - fi).abs() < 1e-9;
                     if fo > fi + 1e-9 || (tie && jac::key(ho.normal.as_ref()) > jac::key(&fnrm)) {
                         return None;
                     }
                 }
-            }
             let (fi, _) = shade_at(m, cam, &v.look, &keys, &ao, inner[0], inner[1]);
             let (fo, out_part) = shade_at(m, cam, &v.look, &keys, &ao, outer[0], outer[1]);
             let px = (s[1].floor().clamp(0.0, h as f64 - 1.0) as usize) * w + s[0].floor().clamp(0.0, w as f64 - 1.0) as usize;
@@ -493,7 +492,7 @@ fn secondary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, per_dir: usize, 
                 let lit: Vec<bool> = fs.iter().map(|&(ti, ..)| normals[ti].dot(l) > 0.0).collect();
                 let (ti, a, b) = fs[0];
                 let ok = match fs.len() {
-                    2 => lit[0] != lit[1] && normals[fs[0].0].normalize().dot(&normals[fs[1].0].normalize()) < 1.0 - 1e-7,
+                    2 => lit[0] != lit[1] && normals[fs[0].0].normalize().dot(normals[fs[1].0].normalize()) < 1.0 - 1e-7,
                     _ => lit[0],
                 };
                 let _ = ti;
@@ -542,8 +541,8 @@ fn secondary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, per_dir: usize, 
                     return None;
                 }
                 let e3 = (p[b] - p[a]).normalize();
-                let es = e3 - *l * (mnorm.dot(&e3) / ml);
-                let tau = [jp[0].dot(&es), jp[1].dot(&es)];
+                let es = e3 - *l * (mnorm.dot(e3) / ml);
+                let tau = [jp[0].dot(es), jp[1].dot(es)];
                 let tl = tau[0].hypot(tau[1]);
                 if tl < 1e-9 {
                     return None;
@@ -560,8 +559,8 @@ fn secondary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, per_dir: usize, 
                 let wn: Vec<f64> = (0..np)
                     .map(|j| {
                         let vv = vel[a][j] * (1.0 - u2) + vel[b][j] * u2;
-                        let ds = vv - *l * (mnorm.dot(&vv) / ml);
-                        scale * df * (ns[0] * jp[0].dot(&ds) + ns[1] * jp[1].dot(&ds))
+                        let ds = vv - *l * (mnorm.dot(vv) / ml);
+                        scale * df * (ns[0] * jp[0].dot(ds) + ns[1] * jp[1].dot(ds))
                     })
                     .collect();
                 let _ = (len, kd);
@@ -678,11 +677,10 @@ pub fn init_bases(target: &crate::fit::Target, rig: &Rig) -> Vec<Program> {
     let mut pts = Vec::new();
     for (vi, v) in rig.views.iter().enumerate() {
         for p in 0..w * h {
-            if target.mask[vi][p] > 0.5 && target.w(vi, p) > 0.0 {
-                if let Some(q) = v.cam.on_table((p % w) as f64 + 0.5, (p / w) as f64 + 0.5) {
+            if target.mask[vi][p] > 0.5 && target.w(vi, p) > 0.0
+                && let Some(q) = v.cam.on_table((p % w) as f64 + 0.5, (p / w) as f64 + 0.5) {
                     pts.push(q);
                 }
-            }
         }
     }
     if pts.len() < 10 {

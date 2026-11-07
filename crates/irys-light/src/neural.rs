@@ -260,7 +260,7 @@ impl Weights {
             return Err(WeightsError::Shape("zero hidden channels".into()));
         }
         let data: Vec<f32> = bytes[24..]
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let me = Self { hidden, data };

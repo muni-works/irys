@@ -202,13 +202,13 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Imported, String> {
             let (pos, surface) = match k {
                 Kind::Emitter(l, back) => {
                     if back {
-                        for t in idx.chunks_exact_mut(3) {
+                        for t in idx.as_chunks_mut::<3>().0 {
                             t.swap(1, 2);
                         }
                     }
                     let s = scale_for(l);
                     let mut out = Vec::with_capacity(idx.len());
-                    for t in idx.chunks_exact(3) {
+                    for t in idx.as_chunks::<3>().0 {
                         let tri = shrink([pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize]], s);
                         out.extend(tri);
                     }
@@ -308,7 +308,7 @@ pub fn load(dir: &Path, opts: &Options) -> Result<Imported, String> {
                 let ring: Vec<Point3> = ring.iter().map(|p| c + (p - c) * s).collect();
                 for i in 1..ring.len() - 1 {
                     let mut t = [ring[0], ring[i], ring[i + 1]];
-                    if (t[1] - t[0]).cross(&(t[2] - t[0])).dot(&n) < 0.0 {
+                    if (t[1] - t[0]).cross(t[2] - t[0]).dot(n) < 0.0 {
                         t.swap(1, 2);
                     }
                     lpos.extend(t);

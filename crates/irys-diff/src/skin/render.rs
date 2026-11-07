@@ -95,14 +95,14 @@ impl Light {
         tint: [f64; 3],
     ) -> Self {
         let n = (toward - center).normalize();
-        let mut u = n.cross(&Vec3::new(0.0, 0.0, 1.0));
+        let mut u = n.cross(Vec3::new(0.0, 0.0, 1.0));
         if u.norm() < 1e-6 {
             u = Vec3::new(1.0, 0.0, 0.0);
         }
         let u = u.normalize();
-        let v = u.cross(&n).normalize();
+        let v = u.cross(n).normalize();
         // u × v must be n.
-        let (u, v) = if u.cross(&v).dot(&n) > 0.0 {
+        let (u, v) = if u.cross(v).dot(n) > 0.0 {
             (u, v)
         } else {
             (v, u)
@@ -118,12 +118,12 @@ impl Light {
 
     /// Unit normal (the emitting side).
     pub fn normal(&self) -> Vec3 {
-        self.u.cross(&self.v).normalize()
+        self.u.cross(self.v).normalize()
     }
 
     /// Area.
     pub fn area(&self) -> f64 {
-        4.0 * self.u.cross(&self.v).norm()
+        4.0 * self.u.cross(self.v).norm()
     }
 
     /// Radiance at `lambda`.
@@ -134,18 +134,18 @@ impl Light {
     /// Ray parameter of a hit on the emitting side, if any, in `(0, tmax)`.
     pub fn hit(&self, o: Point3, d: Vec3, tmax: f64) -> Option<f64> {
         let n = self.normal();
-        let den = d.dot(&n);
+        let den = d.dot(n);
         if den >= 0.0 {
             return None;
         }
-        let t = (self.center - o).dot(&n) / den;
+        let t = (self.center - o).dot(n) / den;
         if !(t > 0.0 && t < tmax) {
             return None;
         }
         let p = o + d * t - self.center;
         let (a, b) = (
-            p.dot(&self.u) / self.u.norm_squared(),
-            p.dot(&self.v) / self.v.norm_squared(),
+            p.dot(self.u) / self.u.norm_squared(),
+            p.dot(self.v) / self.v.norm_squared(),
         );
         (a.abs() <= 1.0 && b.abs() <= 1.0).then_some(t)
     }
@@ -201,8 +201,8 @@ impl Camera {
     /// At `eye` looking at `target`, `+z` up, focused on `target`.
     pub fn look_at(eye: Point3, target: Point3, vfov_deg: f64, aperture: f64) -> Self {
         let forward = (target - eye).normalize();
-        let right = forward.cross(&Vec3::new(0.0, 0.0, 1.0)).normalize();
-        let up = right.cross(&forward);
+        let right = forward.cross(Vec3::new(0.0, 0.0, 1.0)).normalize();
+        let up = right.cross(forward);
         Self {
             eye,
             forward,
@@ -346,8 +346,8 @@ impl Scene {
             let to = l.center - x;
             let d2 = to.norm_squared().max(1e-12);
             let d = to / d2.sqrt();
-            let cr = n.dot(&d).max(0.02);
-            let cl = (-d.dot(&l.normal())).max(0.02);
+            let cr = n.dot(d).max(0.02);
+            let cl = (-d.dot(l.normal())).max(0.02);
             p[i] = l.radiance * l.area() * cr * cl / d2;
             sum += p[i];
         }
@@ -507,7 +507,7 @@ fn effective(mode: Mode, theta: &[f64; PARAMS]) -> [f64; PARAMS] {
 /// The hit's shading, mapped: `(ng, n, uv, k)`.
 fn surface(scene: &Scene, h: &irys_core::Hit, d: Vec3) -> (Vec3, Vec3, [f64; 2], f64) {
     let s = mesh::shade(&scene.mesh, &scene.bvh, h);
-    let flip = if s.ng.dot(&d) > 0.0 { -1.0 } else { 1.0 };
+    let flip = if s.ng.dot(d) > 0.0 { -1.0 } else { 1.0 };
     let ng = s.ng * flip;
     let mut s2 = s;
     s2.ns = s.ns * flip;
@@ -518,7 +518,7 @@ fn surface(scene: &Scene, h: &irys_core::Hit, d: Vec3) -> (Vec3, Vec3, [f64; 2],
     };
     // A shading normal facing away from the viewer is replaced by the
     // geometric one.
-    if n.dot(&(-d)) <= 1e-4 {
+    if n.dot(-d) <= 1e-4 {
         n = ng;
     }
     let k = scene.spec_gain * scene.spec.sample(s.uv[0], s.uv[1])[0];
@@ -547,8 +547,8 @@ fn sample_light(scene: &Scene, x: Point3, n: Vec3, u: [f64; 3]) -> Option<(usize
     let to = y - x;
     let dist = to.norm();
     let wi = to / dist;
-    let cl = -wi.dot(&l.normal());
-    if cl <= 0.0 || wi.dot(&n) <= 0.0 {
+    let cl = -wi.dot(l.normal());
+    if cl <= 0.0 || wi.dot(n) <= 0.0 {
         return None;
     }
     Some((i, wi, dist, p[i] * dist * dist / (cl * l.area())))
@@ -558,7 +558,7 @@ fn sample_light(scene: &Scene, x: Point3, n: Vec3, u: [f64; 3]) -> Option<(usize
 /// at distance `t`.
 fn light_pdf(scene: &Scene, x: Point3, n: Vec3, i: usize, d: Vec3, t: f64) -> f64 {
     let l = &scene.lights[i];
-    let cos = -d.dot(&l.normal());
+    let cos = -d.dot(l.normal());
     if cos <= 0.0 {
         return 0.0;
     }
@@ -619,7 +619,7 @@ pub fn trace_path(
         let wo = -d;
         let origin = offset(h.point, ng, ray.origin, h.t);
         let (t, b) = mesh::basis(n);
-        let local = |v: Vec3| [v.dot(&t), v.dot(&b), v.dot(&n)];
+        let local = |v: Vec3| [v.dot(t), v.dot(b), v.dot(n)];
         let lo = local(wo);
         let co = lo[2].max(1e-6);
         let pr = p_reflect(co, kspec);
@@ -646,7 +646,7 @@ pub fn trace_path(
         // 1. NEE.
         let u3 = [rng.uniform(), rng.uniform(), rng.uniform()];
         if let Some((i, wi, dist, pl)) = sample_light(scene, origin, n, u3)
-            && wi.dot(&ng) > 0.0
+            && wi.dot(ng) > 0.0
             && !scene.occluded(origin, wi, dist)
         {
             let li = local(wi);
@@ -683,7 +683,7 @@ pub fn trace_path(
                 break;
             }
             let wi = t * li[0] + b * li[1] + n * li[2];
-            if wi.dot(&ng) <= 0.0 {
+            if wi.dot(ng) <= 0.0 {
                 break;
             }
             let cols = spec_cols(li, lo, kspec);
@@ -757,18 +757,18 @@ pub fn trace_path(
                 // The exit lobe shades with the smooth normal (the faceted
                 // geometric one shows the mesh); it must agree in side.
                 let sm = mesh::shade(&scene.mesh, &scene.bvh, eh);
-                let mut ns = if sm.ng.dot(&ne) < 0.0 { -sm.ns } else { sm.ns };
-                if ns.dot(&ne) <= 0.0 {
+                let mut ns = if sm.ng.dot(ne) < 0.0 { -sm.ns } else { sm.ns };
+                if ns.dot(ne) <= 0.0 {
                     ns = ne;
                 }
                 exit_at = Some((xo, ne, ns));
                 // 4. The exit's NEE, this wavelength only.
                 let u3 = [rng.uniform(), rng.uniform(), rng.uniform()];
                 if let Some((i, wi, dist, pl)) = sample_light(scene, xo, ns, u3)
-                    && wi.dot(&ne) > 0.0
+                    && wi.dot(ne) > 0.0
                     && !scene.occluded(xo, wi, dist)
                 {
-                    let ci = wi.dot(&ns);
+                    let ci = wi.dot(ns);
                     let w = mis(pl, ci / PI);
                     rad[k] += tp[k] * wk.weight / PI * ci * scene.lights[i].le(lam[k]) * w / pl;
                 }
@@ -805,7 +805,7 @@ pub fn trace_path(
         }
         let (u1, u2) = (rng.uniform(), rng.uniform());
         let (wi, cz) = cosine(ns, u1, u2);
-        if wi.dot(&ne) <= 0.0 {
+        if wi.dot(ne) <= 0.0 {
             break;
         }
         prev = (xo, ns, cz / PI);
@@ -973,9 +973,7 @@ impl Adjoints {
         for chunk in spec.chunks(n) {
             let mut cols = vec![vec![1.0; n]; SPEC_COLUMNS];
             let mut df = vec![0.0; n];
-            for c in &mut cols[4] {
-                *c = 0.0;
-            }
+            cols[4].fill(0.0);
             for (j, r) in chunk.iter().enumerate() {
                 for (k, col) in cols.iter_mut().enumerate() {
                     col[j] = r.cols[k];
@@ -995,9 +993,7 @@ impl Adjoints {
         for chunk in med.chunks(n) {
             let mut cols = vec![vec![0.0; n]; MEDIUM_COLUMNS];
             let mut dl = vec![0.0; n];
-            for c in &mut cols[7] {
-                *c = 1.0;
-            }
+            cols[7].fill(1.0);
             for (j, r) in chunk.iter().enumerate() {
                 for (k, col) in cols.iter_mut().enumerate() {
                     col[j] = r.cols[k];

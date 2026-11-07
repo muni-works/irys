@@ -445,13 +445,13 @@ impl Geometry for Strands {
         let t_ax = ax / len;
         let d = *ray.direction;
         let oc = ray.origin - a;
-        let dp = d - t_ax * d.dot(&t_ax);
-        let op = oc - t_ax * oc.dot(&t_ax);
+        let dp = d - t_ax * d.dot(t_ax);
+        let op = oc - t_ax * oc.dot(t_ax);
         let qa = dp.norm_squared();
         if qa < 1e-18 {
             return None;
         }
-        let qb = 2.0 * dp.dot(&op);
+        let qb = 2.0 * dp.dot(op);
         let qc = op.norm_squared() - r * r;
         let disc = qb * qb - 4.0 * qa * qc;
         if disc < 0.0 {
@@ -463,7 +463,7 @@ impl Geometry for Strands {
                 continue;
             }
             let p = ray.origin + d * t;
-            let s = (p - a).dot(&t_ax);
+            let s = (p - a).dot(t_ax);
             if s < 0.0 || s > len {
                 continue;
             }
@@ -518,7 +518,7 @@ impl HairScene {
     fn scalp_t(&self, o: Point3, d: Vec3) -> Option<f64> {
         let (c, r, _) = self.scalp?;
         let oc = o - c;
-        let b = oc.dot(&d);
+        let b = oc.dot(d);
         let q = oc.norm_squared() - r * r;
         let disc = b * b - q;
         if disc < 0.0 {
@@ -533,20 +533,18 @@ impl HairScene {
         if let Some(h) = self.bvh.trace_closest_range(&Ray::new(o, d), 1e-7, f64::INFINITY) {
             best = Some((h.t, Surf::Hair(h)));
         }
-        if let Some(t) = self.scalp_t(o, d) {
-            if best.as_ref().is_none_or(|b| t < b.0) {
+        if let Some(t) = self.scalp_t(o, d)
+            && best.as_ref().is_none_or(|b| t < b.0) {
                 let x = o + d * t;
                 let n = (x - self.scalp.unwrap().0).normalize();
                 best = Some((t, Surf::Scalp(x, n)));
             }
-        }
         let tb = best.as_ref().map_or(f64::INFINITY, |b| b.0);
         for (i, q) in self.lights.iter().enumerate() {
-            if let Some(t) = q.hit(o, d, tb) {
-                if best.as_ref().is_none_or(|b| t < b.0) {
+            if let Some(t) = q.hit(o, d, tb)
+                && best.as_ref().is_none_or(|b| t < b.0) {
                     best = Some((t, Surf::Light(i)));
                 }
-            }
         }
         best
     }
@@ -567,14 +565,14 @@ impl HairScene {
         let dv = p - x;
         let d2 = dv.norm_squared();
         let d = dv / d2.sqrt();
-        let cl = -d.dot(&q.normal());
+        let cl = -d.dot(q.normal());
         (cl > 0.0).then(|| (d, d2.sqrt(), d2 / (cl * q.area() * n as f64), i))
     }
 
     fn light_pdf(&self, x: Point3, d: Vec3, i: usize, t: f64) -> f64 {
         let q = &self.lights[i];
         let _ = x;
-        t * t / (-d.dot(&q.normal()) * q.area() * self.lights.len() as f64)
+        t * t / (-d.dot(q.normal()) * q.area() * self.lights.len() as f64)
     }
 
     /// One path; `rec` gets `(columns, δf/δL)` per hair lane.
@@ -592,8 +590,8 @@ impl HairScene {
         let px = path / self.spp;
         let (ix, iy) = ((px % w) as f64 + rng.uniform(), (px / w) as f64 + rng.uniform());
         let fwd = (self.target - self.eye).normalize();
-        let right = fwd.cross(&Vec3::new(0.0, 0.0, 1.0)).normalize();
-        let up = right.cross(&fwd);
+        let right = fwd.cross(Vec3::new(0.0, 0.0, 1.0)).normalize();
+        let up = right.cross(fwd);
         let th = (0.5 * self.vfov).to_radians().tan();
         let asp = w as f64 / h as f64;
         let mut d = (fwd + right * ((2.0 * ix / w as f64 - 1.0) * th * asp)
@@ -621,7 +619,7 @@ impl HairScene {
                     let rho = super::openpbr::lift(self.scalp.unwrap().2, lambda);
                     let un = [rng.uniform(), rng.uniform(), rng.uniform()];
                     if let Some((dl, dist, pl, i)) = self.sample_light(x, un) {
-                        let c = dl.dot(&n);
+                        let c = dl.dot(n);
                         if c > 0.0 && self.visible(x + n * 1e-6, dl, dist) {
                             l += beta * rho / PI * c * self.lights[i].le(lambda) / pl * mis(pl, c / PI);
                         }
@@ -636,23 +634,23 @@ impl HairScene {
                 Surf::Hair(hit) => {
                     let x = hit.point;
                     let tx = self.bvh.geometry().tangent(hit.prim as usize);
-                    let mut z = -(d - tx * d.dot(&tx));
+                    let mut z = -(d - tx * d.dot(tx));
                     if z.norm() < 1e-9 {
                         break;
                     }
                     z = z.normalize();
-                    let y = z.cross(&tx);
+                    let y = z.cross(tx);
                     let r = self.bvh.geometry().segs[hit.prim as usize].2;
                     // The offset across the fibre as seen from the ray.
-                    let hh = (*hit.normal).dot(&y).clamp(-1.0, 1.0);
-                    let loc = |v: Vec3| [v.dot(&tx), v.dot(&y), v.dot(&z)];
+                    let hh = (*hit.normal).dot(y).clamp(-1.0, 1.0);
+                    let loc = |v: Vec3| [v.dot(tx), v.dot(y), v.dot(z)];
                     let wo = loc(-d);
                     let bc = Bcsdf::new(&self.fiber, hh);
                     let ap_s = bc.ap(wo, lambda, &ts);
                     let un = [rng.uniform(), rng.uniform(), rng.uniform()];
                     let off = *hit.normal * (2.0 * r);
                     if let Some((dl, dist, pl, i)) = self.sample_light(x, un) {
-                        let side = if dl.dot(&hit.normal) > 0.0 { off } else { -off };
+                        let side = if dl.dot(hit.normal) > 0.0 { off } else { -off };
                         if self.visible(x + side, dl, dist) {
                             let wi = loc(dl);
                             let cols = bc.columns(wo, wi, lambda);
@@ -678,7 +676,7 @@ impl HairScene {
                     }
                     beta *= f / pdf;
                     d = (tx * wi[0] + y * wi[1] + z * wi[2]).normalize();
-                    o = x + if d.dot(&hit.normal) > 0.0 { off } else { -off };
+                    o = x + if d.dot(hit.normal) > 0.0 { off } else { -off };
                     last_pdf = Some(pdf);
                 }
             }

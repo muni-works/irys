@@ -75,7 +75,7 @@ impl Sample {
     }
 
     pub fn linear(&self) -> Vec<[f64; 3]> {
-        self.rgb.chunks_exact(3).map(|c| [lin(c[0]), lin(c[1]), lin(c[2])]).collect()
+        self.rgb.as_chunks::<3>().0.iter().map(|c| [lin(c[0]), lin(c[1]), lin(c[2])]).collect()
     }
 }
 
@@ -106,10 +106,10 @@ pub fn read_shard(path: &Path) -> std::io::Result<Vec<Sample>> {
         f.read_exact(&mut rgb)?;
         let mut b = vec![0u8; n * 2];
         f.read_exact(&mut b)?;
-        let inst = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let inst = b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         let mut b = vec![0u8; n * 4];
         f.read_exact(&mut b)?;
-        let depth = b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let depth = b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         s.rgb = rgb;
         s.inst = inst;
         s.depth = depth;
@@ -211,14 +211,13 @@ pub fn targets(s: &Sample, batch: usize) -> Targets {
             t.w_pix[at(0)] = 1.0 / (nb * (W * H) as f64) * 4.0;
             t.t_pix[at(3)] = (s.depth[k].max(1.0) as f64 / 1000.0).ln();
             t.w_pix[at(3)] = 0.5 / (nb * (W * H) as f64);
-            if fg {
-                if let Some(c) = centres[id as usize] {
+            if fg
+                && let Some(c) = centres[id as usize] {
                     t.t_pix[at(1)] = (c[0] - (x as f64 + 0.5)) / PS as f64;
                     t.t_pix[at(2)] = (c[1] - (y as f64 + 0.5)) / PS as f64;
                     t.w_pix[at(1)] = 0.5 / (nb * n_fg);
                     t.w_pix[at(2)] = 0.5 / (nb * n_fg);
                 }
-            }
         }
     }
     // Centre heat and attributes.

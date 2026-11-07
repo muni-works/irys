@@ -550,7 +550,7 @@ pub struct ResidentScene {
 
 impl ResidentScene {
     fn build(ctx: &GpuContext, scene: SceneRef<'_>, width: u32, height: u32) -> Self {
-        let mut lights = at_least_one(&scene.lights);
+        let mut lights = at_least_one(scene.lights);
         pack_light_power_table(&mut lights);
         let mut me = Self {
             geometry: scene
@@ -562,7 +562,7 @@ impl ResidentScene {
             materials: Slab::new(
                 ctx,
                 "Resident Materials",
-                bytemuck::cast_slice(&at_least_one::<GpuMaterial>(&scene.materials)),
+                bytemuck::cast_slice(&at_least_one::<GpuMaterial>(scene.materials)),
             ),
             lights: Slab::new(ctx, "Resident Area Lights", bytemuck::cast_slice(&lights)),
             env: EnvTextures::new(ctx, scene),
@@ -628,9 +628,9 @@ impl ResidentScene {
         stale |= self.materials.write(
             ctx,
             "Resident Materials",
-            bytemuck::cast_slice(&at_least_one::<GpuMaterial>(&scene.materials)),
+            bytemuck::cast_slice(&at_least_one::<GpuMaterial>(scene.materials)),
         );
-        stale |= self.set_lights_inner(ctx, &scene.lights);
+        stale |= self.set_lights_inner(ctx, scene.lights);
 
         // The environment is an image, not a placement: only a different one
         // costs an upload.

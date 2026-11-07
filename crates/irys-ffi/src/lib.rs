@@ -137,7 +137,7 @@ pub unsafe extern "C" fn irys_scene_load(
             ),
         };
         scene.size = size;
-        let cloud = ply.map(|p| irys_light::PlyCloud::load(p)).transpose()?;
+        let cloud = ply.map(irys_light::PlyCloud::load).transpose()?;
         let look = GpuLook::with_splats(c.ctx, &scene, cloud.as_ref()).ok_or("no ray queries")?;
         Ok(IrysScene { look, camera: scene.camera, targets: HashMap::new() })
     })();

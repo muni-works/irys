@@ -202,11 +202,10 @@ pub fn canon_offset(cam: &Cam) -> [f64; 2] {
 pub fn class_of(p: &Proposal, f: Family) -> Class {
     let mut best = (f64::NEG_INFINITY, Class::Bracket);
     for (i, &q) in p.cls.iter().enumerate() {
-        if let Some(c) = Class::from_index(i) {
-            if c.family() == f && q > best.0 {
+        if let Some(c) = Class::from_index(i)
+            && c.family() == f && q > best.0 {
                 best = (q, c);
             }
-        }
     }
     best.1
 }
@@ -305,12 +304,11 @@ pub fn gauge_scale(objs: &[Object], probs: &[f64]) -> (f64, Vec<usize>) {
     let mut logs = Vec::new();
     let mut who = Vec::new();
     for (i, o) in objs.iter().enumerate() {
-        if let Some((k, mm)) = o.class.gauge() {
-            if o.class.family() == o.family && probs[i] > 0.6 {
+        if let Some((k, mm)) = o.class.gauge()
+            && o.class.family() == o.family && probs[i] > 0.6 {
                 logs.push((mm / o.params[k]).ln());
                 who.push(i);
             }
-        }
     }
     if logs.is_empty() {
         return (1.0, who);

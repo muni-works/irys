@@ -199,7 +199,7 @@ impl Swatch {
         let dv = p - x;
         let d2 = dv.norm_squared();
         let d = dv / d2.sqrt();
-        let cl = -d.dot(&l.normal());
+        let cl = -d.dot(l.normal());
         if cl <= 0.0 {
             return None;
         }
@@ -213,7 +213,7 @@ impl Swatch {
         let mut best = (f64::INFINITY, 0.0);
         for l in &self.lights {
             if let Some(t) = l.hit(x, d, best.0) {
-                let cl = -d.dot(&l.normal());
+                let cl = -d.dot(l.normal());
                 best = (t, t * t / (cl * l.area() * n));
             }
         }
@@ -251,7 +251,7 @@ impl Swatch {
         let mut last_pdf: Option<f64> = None; // None: the camera
         for _ in 0..self.depth {
             // Sphere, then lights.
-            let b = o.coords().dot(&d);
+            let b = o.coords().dot(d);
             let c = o.coords().norm_squared() - 1.0;
             let disc = b * b - c;
             let mut ts = f64::INFINITY;
@@ -285,14 +285,14 @@ impl Swatch {
             }
             let x = o + d * ts;
             let n_out = x.coords().normalize();
-            let inside = d.dot(&n_out) > 0.0;
+            let inside = d.dot(n_out) > 0.0;
             if inside && mat.transmission_depth > 0.0 {
                 let tc = super::openpbr::lift(mat.transmission_color, lambda).max(1e-6);
                 beta *= (tc.ln() / mat.transmission_depth * ts).exp();
             }
             let n = if inside { -n_out } else { n_out };
             let (tu, tv) = basis(n);
-            let local = |v: Vec3| [v.dot(&tu), v.dot(&tv), v.dot(&n)];
+            let local = |v: Vec3| [v.dot(tu), v.dot(tv), v.dot(n)];
             let world = |v: [f64; 3]| tu * v[0] + tv * v[1] + n * v[2];
             let wo = local(-d);
             let at = At::new(&mat, lambda, inside);
@@ -305,8 +305,8 @@ impl Swatch {
             }
             // Light sample.
             let un = [rng.uniform(), rng.uniform(), rng.uniform()];
-            if !inside {
-                if let Some((dl, _, pl, li)) = self.light_sample(x, un) {
+            if !inside
+                && let Some((dl, _, pl, li)) = self.light_sample(x, un) {
                     let wi = local(dl);
                     if wi[2] > 0.0 {
                         let cols = at.columns(Kind::Reflect, wo, wi);
@@ -320,7 +320,6 @@ impl Swatch {
                         l += cl;
                     }
                 }
-            }
             let us = [rng.uniform(), rng.uniform(), rng.uniform()];
             match sat.sample(&lw, wo, us) {
                 None => {
@@ -373,7 +372,7 @@ impl Swatch {
                     let ne = xe.coords().normalize();
                     let un = [rng.uniform(), rng.uniform(), rng.uniform()];
                     if let Some((dl, _, pl, li)) = self.light_sample(xe, un) {
-                        let c = dl.dot(&ne);
+                        let c = dl.dot(ne);
                         if c > 0.0 {
                             let pb = c / PI;
                             l += beta * c / PI * self.lights[li as usize].le(lambda) / pl

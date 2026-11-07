@@ -106,8 +106,8 @@ impl Surf {
 pub fn key_dirs(l: &Look) -> [Vec3; KEY] {
     let c = Vec3::new(l.key_dir[0], l.key_dir[1], l.key_dir[2]).normalize();
     let a = if c.z.abs() < 0.9 { Vec3::new(0.0, 0.0, 1.0) } else { Vec3::new(1.0, 0.0, 0.0) };
-    let t = c.cross(&a).normalize();
-    let b = c.cross(&t);
+    let t = c.cross(a).normalize();
+    let b = c.cross(t);
     let mut out = [c; KEY];
     for (k, o) in out.iter_mut().enumerate().skip(1) {
         let phi = std::f64::consts::TAU * (k - 1) as f64 / (KEY - 1) as f64;
@@ -130,8 +130,8 @@ pub fn ao_dirs() -> [Vec3; AO] {
 /// A frame about `n`: `(t, b)`.
 pub fn frame(n: Vec3) -> (Vec3, Vec3) {
     let a = if n.z.abs() < 0.9 { Vec3::new(0.0, 0.0, 1.0) } else { Vec3::new(1.0, 0.0, 0.0) };
-    let t = n.cross(&a).normalize();
-    (t, n.cross(&t))
+    let t = n.cross(a).normalize();
+    (t, n.cross(t))
 }
 
 fn schlick(c: f64, ior: f64) -> f64 {
@@ -141,18 +141,18 @@ fn schlick(c: f64, ior: f64) -> f64 {
 
 /// GGX dielectric specular `f · cos θ_l · π` for unit `n`, `v`, `l`.
 fn ggx(n: Vec3, v: Vec3, l: Vec3, rough: f64, ior: f64) -> f64 {
-    let (nl, nv) = (n.dot(&l), n.dot(&v));
+    let (nl, nv) = (n.dot(l), n.dot(v));
     if nl <= 0.0 || nv <= 0.0 {
         return 0.0;
     }
     let h = (v + l).normalize();
-    let nh = n.dot(&h).max(0.0);
+    let nh = n.dot(h).max(0.0);
     let a = (rough * rough).max(1e-3);
     let a2 = a * a;
     let d = a2 / (std::f64::consts::PI * (nh * nh * (a2 - 1.0) + 1.0).powi(2));
     let lam = |c: f64| 0.5 * (-1.0 + (1.0 + a2 * (1.0 - c * c) / (c * c)).sqrt());
     let g = 1.0 / (1.0 + lam(nl) + lam(nv));
-    let f = schlick(v.dot(&h), ior);
+    let f = schlick(v.dot(h), ior);
     std::f64::consts::PI * d * g * f / (4.0 * nv)
 }
 
@@ -165,7 +165,7 @@ pub fn basis(s: &Surf, l: &Look, keys: &[Vec3; KEY]) -> ([f64; 10], [f64; 10]) {
     let mut sp = [0.0; 10];
     match s.kind {
         1 => {
-            let nv = s.n.dot(&s.v).max(0.0);
+            let nv = s.n.dot(s.v).max(0.0);
             let kd = 1.0 - schlick(nv, l.ior);
             let y = sh_basis(s.n);
             for i in 0..9 {

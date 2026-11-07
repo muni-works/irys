@@ -159,8 +159,8 @@ pub fn jacobian(o: &Object, i: usize, cam: &Cam, model: &[[f64; 3]], caster: &Ca
             continue;
         }
         // Primary edge.
-        if primary {
-            if let (Some((sa, da)), Some((sb, db))) = (project_d(cam, p[a], &vel[a]), project_d(cam, p[b], &vel[b])) {
+        if primary
+            && let (Some((sa, da)), Some((sb, db))) = (project_d(cam, p[a], &vel[a]), project_d(cam, p[b], &vel[b])) {
                 let e = [sb[0] - sa[0], sb[1] - sa[1]];
                 let len = e[0].hypot(e[1]);
                 if len > 1e-6 {
@@ -201,7 +201,6 @@ pub fn jacobian(o: &Object, i: usize, cam: &Cam, model: &[[f64; 3]], caster: &Ca
                     }
                 }
             }
-        }
         // Shadow edge on the plane.
         if shadow {
             let sh = |x: [f64; 3], v: &[[f64; 3]; NV]| -> ([f64; 3], [[f64; 3]; NV]) {

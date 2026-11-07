@@ -336,7 +336,7 @@ fn read_f32(path: &Path, n: usize) -> Result<Vec<[f32; 3]>, String> {
     if b.len() != n * 12 {
         return Err(format!("{}: {} bytes, expected {}", path.display(), b.len(), n * 12));
     }
-    Ok(b.chunks_exact(12)
+    Ok(b.as_chunks::<12>().0.iter()
         .map(|c| {
             let g = |i: usize| f32::from_le_bytes([c[i], c[i + 1], c[i + 2], c[i + 3]]);
             [g(0), g(4), g(8)]
