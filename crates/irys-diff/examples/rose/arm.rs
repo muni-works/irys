@@ -114,7 +114,7 @@ fn parse(src: &str) -> Vec<Expr> {
     out
 }
 
-fn head(e: &Expr) -> Option<(&str, &[Expr])> {
+pub fn head(e: &Expr) -> Option<(&str, &[Expr])> {
     match e {
         Expr::List(v) => match v.first() {
             Some(Expr::Sym(s)) => Some((s.as_str(), &v[1..])),
@@ -124,7 +124,7 @@ fn head(e: &Expr) -> Option<(&str, &[Expr])> {
     }
 }
 
-fn sym(e: &Expr) -> &str {
+pub fn sym(e: &Expr) -> &str {
     match e {
         Expr::Sym(s) => s.trim_start_matches('"'),
         _ => panic!("loon: expected a name, got {e:?}"),
@@ -207,7 +207,7 @@ const ACT_SEG: u32 = 64;
 
 /// "Every helper takes a normal axis in its name (-x/-y/-z). u/v are the two
 /// in-plane axes in x<y<z order": `(n, u, v)` → world.
-fn place(axis: usize, p: [f64; 3]) -> [f64; 3] {
+pub fn place(axis: usize, p: [f64; 3]) -> [f64; 3] {
     let (u, v) = match axis {
         0 => (1, 2),
         1 => (0, 2),
@@ -265,7 +265,7 @@ fn act(axis: usize, [d, lo, hi, cu, cv]: [f64; 5]) -> Solid {
     cyl(axis, d / 2.0, hi - lo, ACT_SEG).translate(a[0], a[1], a[2])
 }
 
-fn axis_of(name: &str) -> usize {
+pub fn axis_of(name: &str) -> usize {
     match name.as_bytes().last() {
         Some(b'x') => 0,
         Some(b'y') => 1,
@@ -273,14 +273,14 @@ fn axis_of(name: &str) -> usize {
     }
 }
 
-fn num(e: &Expr) -> f64 {
+pub fn num(e: &Expr) -> f64 {
     match e {
         Expr::Num(x) => *x,
         _ => panic!("loon: expected a number, got {e:?}"),
     }
 }
 
-fn nums<const N: usize>(a: &[Expr]) -> [f64; N] {
+pub fn nums<const N: usize>(a: &[Expr]) -> [f64; N] {
     let v: Vec<f64> = a.iter().map(num).collect();
     v.try_into()
         .unwrap_or_else(|v| panic!("loon: {N} numbers, got {v:?}"))
@@ -288,7 +288,7 @@ fn nums<const N: usize>(a: &[Expr]) -> [f64; N] {
 
 /// `[sketch ox oy oz  xx xy xz  yx yy yz  #[segments]]`, segments
 /// `[line x0 y0 x1 y1]` and `[arc x0 y0 x1 y1 cx cy ccw]`.
-fn sketch(a: &[Expr]) -> SketchProfile {
+pub fn sketch(a: &[Expr]) -> SketchProfile {
     let o: [f64; 9] = nums(&a[..9]);
     let Expr::List(segs) = &a[9] else {
         panic!("sketch: segments")

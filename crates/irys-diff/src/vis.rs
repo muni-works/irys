@@ -435,6 +435,10 @@ pub struct EdgeSamples {
     pixel: Vec<usize>,
     /// Per sample, per parameter: `v_n · Σℓw / (w_e n)`.
     weight: Vec<Vec<f64>>,
+    /// Per sample, where on the mesh it landed: placement, the edge's two
+    /// vertex indices in that placement's tree, and the edge parameter `v`
+    /// of the material point (`(1 − v)·a + v·b`). `None` if not visible.
+    site: Vec<Option<(usize, u32, u32, f64)>>,
     /// Screen length of every candidate edge in the frame, pixels.
     pub total_len: f64,
     /// Of it, the length of silhouettes and boundaries (importance 1).
@@ -495,6 +499,7 @@ impl EdgeSamples {
     pub(crate) fn from_parts(pixel: Vec<usize>, weight: Vec<Vec<f64>>, visible: usize) -> Self {
         Self {
             points: Vec::new(),
+            site: vec![None; pixel.len()],
             pixel,
             weight,
             total_len: 0.0,
@@ -770,6 +775,7 @@ impl EdgeSamples {
             points: Vec::with_capacity(2 * n),
             pixel: Vec::with_capacity(n),
             weight: Vec::with_capacity(n),
+            site: Vec::with_capacity(n),
             total_len: total,
             silhouette_len: sil,
             segments: segs.len(),
@@ -785,6 +791,7 @@ impl EdgeSamples {
                 let y = (s[1].floor().clamp(0.0, h - 1.0)) as usize;
                 o.pixel.push(y * scene.size.0 + x);
                 o.weight.push(wt);
+                o.site.push(None);
             };
             // One generator per sample (phase 2e: the device draws the
             // same `u` in parallel).
@@ -886,8 +893,69 @@ impl EdgeSamples {
                 .map(|v| (v[0] * nrm[0] + v[1] * nrm[1]) * wtotal / (seg.w * n as f64))
                 .collect();
             put(&mut out, s, nrm, wt);
+            *out.site.last_mut().unwrap() = Some((seg.k, tri[seg.e], tri[(seg.e + 1) % 3], v));
         }
         out
+    }
+
+    /// Edge samples for per-vertex gradients: the edges of the placements
+    /// `moving` are candidates, and the "parameters" are a unit world-space
+    /// translation of the material point (x, y, z), so
+    /// [`EdgeSamples::vertex_gradient`] can split each sample's worth onto
+    /// the edge's two vertices. This is the cotangent a mesh-node seam (a
+    /// CAD kernel's `∂x/∂θ`) pulls back.
+    pub fn for_vertices(
+        scene: &Scene,
+        edges: &Edges,
+        moving: &[usize],
+        n: usize,
+        seed: u64,
+        vis: Option<&Visibility>,
+    ) -> Self {
+        let vel = |_mi: usize, _xl: Point3, _x: Point3, jac: [Vec3; 2]| {
+            vec![
+                [jac[0].x, jac[1].x],
+                [jac[0].y, jac[1].y],
+                [jac[0].z, jac[1].z],
+            ]
+        };
+        Self::build(scene, edges, moving, &vel, 3, n, seed, true, vis)
+    }
+
+    /// `∂ℒ/∂X_i` (world space) for every vertex of placement `k`'s tree,
+    /// `n_vertices` long, from samples drawn by [`EdgeSamples::for_vertices`]
+    /// and the pairs' traced `L`, as [`EdgeSamples::gradient`] takes them.
+    pub fn vertex_gradient(
+        &self,
+        scene: &Scene,
+        seed: u64,
+        l: &[f64],
+        d_img: &[f64],
+        k: usize,
+        n_vertices: usize,
+    ) -> Vec<Vec3> {
+        let nw = scene.wavelengths;
+        assert_eq!(l.len(), 2 * self.len() * nw, "L of the points frame");
+        let mut g = vec![Vec3::new(0.0, 0.0, 0.0); n_vertices];
+        for (i, ((&px, wt), site)) in self.pixel.iter().zip(&self.weight).zip(&self.site).enumerate() {
+            let Some((sk, a, b, v)) = *site else { continue };
+            if sk != k || wt.len() != 3 {
+                continue;
+            }
+            let lam: [f64; HERO] = wavelengths(Rng::new(seed, i as u64).uniform(), nw);
+            let mut s = 0.0;
+            for c in 0..nw {
+                let d = l[2 * i * nw + c] - l[(2 * i + 1) * nw + c];
+                let hw = hero_weight(lam[c]);
+                for ch in 0..3 {
+                    s += d * hw[ch] as f64 / nw as f64 * d_img[px * 3 + ch];
+                }
+            }
+            let gx = Vec3::new(wt[0], wt[1], wt[2]) * s;
+            g[a as usize] = g[a as usize] + gx * (1.0 - v);
+            g[b as usize] = g[b as usize] + gx * v;
+        }
+        g
     }
 
     /// Per sample, per parameter, what its pair's difference is worth.
@@ -1170,6 +1238,7 @@ impl EdgeSamples {
             points: Vec::with_capacity(2 * n),
             pixel: Vec::with_capacity(n),
             weight: Vec::with_capacity(n),
+            site: Vec::with_capacity(n),
             total_len: total,
             silhouette_len: 0.0,
             segments: proj.len(),
@@ -1185,6 +1254,7 @@ impl EdgeSamples {
                 let y = (s[1].floor().clamp(0.0, h - 1.0)) as usize;
                 o.pixel.push(y * scene.size.0 + x);
                 o.weight.push(wt);
+                o.site.push(None);
             };
             if proj.is_empty() {
                 put(&mut out, [0.0, 0.0], [1.0, 0.0], vec![0.0; np]);
