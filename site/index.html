@@ -211,8 +211,8 @@ a.crate-tag { align-self: flex-start; font-family: var(--mono); font-size: var(-
   <div class="container">
     <div class="pills"><span class="pill">spectral</span><span class="pill">differentiable</span><span class="pill">Rust</span><span class="pill">Metal + Vulkan</span><span class="pill">Apache-2.0</span></div>
     <h1>irys<span class="dot">.</span></h1>
-    <p class="hero-claim">Render a scene. Get the gradient. <span class="sub">irys is a spectral path tracer that tells you how to change a material, a pose or a CAD dimension to match an image.</span></p>
-    <p class="hero-note">It runs on the GPU through wgpu, checks itself against an f64 CPU reference, and replays the forward pass bit for bit, so a seed gives the same gradient on every run.</p>
+    <p class="hero-claim">Render a scene. Get the gradient. <span class="sub">irys is a spectral path tracer that looks at your image and says which way to nudge the material, the pose or the CAD dimension.</span></p>
+    <p class="hero-note">It runs on the GPU through wgpu, double-checks itself in f64 on the CPU, and replays every path bit for bit. Same seed, same gradient, every time. No vibes.</p>
     <div class="hero-actions">
       <a class="btn primary" href="#start">cargo add irys-render</a>
       <a class="btn" href="https://github.com/muni-works/irys">GitHub</a>
@@ -229,16 +229,16 @@ a.crate-tag { align-self: flex-start; font-family: var(--mono); font-size: var(-
 
 <main>
   <section id="live">
-    <div class="container"><h2>Run it here.</h2>
-      <p class="lead">These are irys compiled to WebAssembly, running in your browser on the CPU. Each step renders the scene, scores it against the target, replays the paths for the gradient and moves the parameters.</p></div>
+    <div class="container"><h2>Go on, poke it.</h2>
+      <p class="lead">This is real irys, compiled to WebAssembly and running on your CPU right now. Each step renders, compares with the target, replays the light for the gradient, and takes a step. Then does it again.</p></div>
     <div class="container-wide">
       <div class="examples-grid">
         <figure class="ex" data-demo="splat">
           <div class="ex-view"><figure><canvas width="48" height="48"></canvas><span>irys</span></figure><figure><canvas class="tgt" width="48" height="48"></canvas><span>target</span></figure></div>
           <figcaption class="ex-meta">
             <div class="ex-head"><a class="crate-tag" href="https://github.com/muni-works/irys/tree/main/crates/irys-diff">irys-diff</a><a class="ex-name" href="https://github.com/muni-works/irys/blob/main/crates/irys-wasm/src/lib.rs">splat_fit</a></div>
-            <p class="ex-desc">A bush of 900 Gaussian splats, path traced on a floor under the sky. irys turns it to autumn by fitting every splat's colour and opacity to the target, 3 600 parameters at once.</p>
-            <p class="ex-use"><b>For</b>Editing a captured splat scene and keeping its lighting physical.</p>
+            <p class="ex-desc">A bush of 900 Gaussian splats, path traced under the sky. irys fast-forwards it to autumn by fitting every splat's colour and opacity at once. That's 3 600 knobs, turned by gradient, not by hand.</p>
+            <p class="ex-use"><b>For</b>Editing a captured splat scene without breaking the lighting.</p>
             <div class="ex-ctl"><button class="go">Fit</button></div>
             <dl class="ro"><div class="hot"><dt>step</dt><dd data-r="it">0</dd></div><div><dt>parameters</dt><dd>3 600</dd></div><div><dt>loss</dt><dd data-r="loss">–</dd></div></dl>
           </figcaption>
@@ -247,8 +247,8 @@ a.crate-tag { align-self: flex-start; font-family: var(--mono); font-size: var(-
           <div class="ex-view"><figure><canvas width="32" height="32"></canvas><span>irys</span></figure><figure><canvas class="tgt" width="32" height="32"></canvas><span>target</span></figure></div>
           <figcaption class="ex-meta">
             <div class="ex-head"><a class="crate-tag" href="https://github.com/muni-works/irys/tree/main/crates/irys-diff">irys-diff</a><a class="ex-name" href="https://github.com/muni-works/irys/blob/main/crates/irys-wasm/src/lib.rs">paint_fit</a></div>
-            <p class="ex-desc">A room lit by one area light. irys recovers the paint, a three-band spectral albedo, through every bounce of light between the walls.</p>
-            <p class="ex-use"><b>For</b>Measuring surface colour when the light around it is not white.</p>
+            <p class="ex-desc">One room, one lamp, light bouncing off every wall. irys works out what colour the walls were painted, as a three-band spectrum, without asking the painter.</p>
+            <p class="ex-use"><b>For</b>Measuring colour when the lighting is lying to you.</p>
             <div class="ex-ctl"><button data-p="teal" aria-pressed="true">teal</button><button data-p="terracotta">terracotta</button><button data-p="lilac">lilac</button><button class="go">Fit</button></div>
             <dl class="ro"><div class="hot"><dt>step</dt><dd data-r="it">0</dd></div><div><dt>bands b g r</dt><dd data-r="bands">0.50 0.50 0.50</dd></div><div><dt>loss</dt><dd data-r="loss">–</dd></div></dl>
           </figcaption>
@@ -257,21 +257,21 @@ a.crate-tag { align-self: flex-start; font-family: var(--mono); font-size: var(-
           <div class="ex-view one"><figure><canvas width="64" height="64"></canvas><span>spectral, 4 wavelengths per path</span></figure></div>
           <figcaption class="ex-meta">
             <div class="ex-head"><a class="crate-tag" href="https://github.com/muni-works/irys/tree/main/crates/irys-diff">irys-diff</a><a class="ex-name" href="https://github.com/muni-works/irys/blob/main/crates/irys-wasm/src/lib.rs">room</a></div>
-            <p class="ex-desc">The same room, path traced with next-event estimation and MIS, one frame at a time. Repaint it and the image starts over.</p>
-            <p class="ex-use"><b>For</b>Seeing the light the paint fit has to explain.</p>
+            <p class="ex-desc">The same room, path traced one frame at a time with next-event estimation and MIS. Repaint it and watch the noise settle again.</p>
+            <p class="ex-use"><b>For</b>Staring at. It is quite relaxing.</p>
             <div class="ex-ctl"><button data-p="teal" aria-pressed="true">teal</button><button data-p="terracotta">terracotta</button><button data-p="lilac">lilac</button></div>
             <dl class="ro"><div class="hot"><dt>frames</dt><dd data-r="it">0</dd></div><div><dt>paths / px</dt><dd data-r="spp">0</dd></div><div><dt>ms / frame</dt><dd data-r="ms">–</dd></div></dl>
           </figcaption>
         </figure>
       </div>
-      <p class="small">The browser runs irys on one CPU core in f64, so these are small and noisy; natively the same fits run on the GPU. The metal material's demos wait on a fix in tang's interpreter, which spawns a thread the browser cannot give it.</p>
+      <p class="small">Your browser gives irys one CPU core and f64 math, so these are small and grainy. The real thing runs on a GPU. Metal demos are coming once tang's interpreter stops asking the browser for a thread it does not have.</p>
     </div>
   </section>
 
   <section>
     <div class="container">
-      <p class="big-claim">Material gradients <em>7 to 26 times faster</em> than Mitsuba 3.</p>
-      <p class="lead">Same machine, same scenes, and both renderers checked against their own central differences. We show where irys loses, too.</p>
+      <p class="big-claim">Gradients <em>7 to 26 times faster</em> than Mitsuba 3.</p>
+      <p class="lead">Same machine, same scenes, both renderers checked against their own finite differences. And yes, we show where irys loses. Cycles is very good at its job.</p>
       <div class="proof">
         <div class="proof-item lit"><span class="proof-val">7&ndash;26&times;</span><span class="proof-label">faster material gradients than Mitsuba 3 at equal variance</span></div>
         <div class="proof-item"><span class="proof-val">1.5&ndash;5.6&times;</span><span class="proof-label">lower error than Cycles at equal time, on irys's three benchmark scenes</span></div>
@@ -294,51 +294,51 @@ a.crate-tag { align-self: flex-start; font-family: var(--mono); font-size: var(-
   </section>
 
   <section>
-    <div class="container"><h2>What you can do with it.</h2>
-      <p class="lead">Each of these runs today, from the examples and tests in the repository.</p></div>
+    <div class="container"><h2>Things irys can do for you.</h2>
+      <p class="lead">All of these run today, from examples and tests in the repo. No roadmap slides.</p></div>
     <div class="container-wide">
       <div class="cards">
         <div class="card">
           <div class="pair"><figure><img src="/fit-start.jpg" alt="The fit's starting point, a rough grey ball" loading="lazy"><span>step 1</span></figure><figure><img src="/fit-target.jpg" alt="The target, a glossy gold ball" loading="lazy"><span>target</span></figure></div>
-          <div class="card-body"><h3>Fit a material to an image.</h3>
-          <p>Start from a rough grey ball. After <b>60 gradient steps, 5 s on the GPU</b>, irys has the target's roughness within 0.012 and its spectral colour within 0.006.</p></div>
+          <div class="card-body"><h3>Copy a material from a picture.</h3>
+          <p>Start with a sad grey ball. <b>60 steps and 5 seconds on the GPU</b> later it's gold, with the target's roughness within 0.012 and its colour within 0.006.</p></div>
         </div>
         <div class="card">
           <img src="/phase2d-rose.jpg" alt="The rose robot rendered by irys" loading="lazy" style="object-position:50% 30%">
-          <div class="card-body"><h3>Read a robot's pose from pixels.</h3>
-          <p>Three joint angles of a 2.4 M-triangle arm, recovered to <b>0.07&deg;</b> from a start 13 to 23&deg; away. The silhouette, the shading and the shadow on the floor all feed the gradient.</p></div>
+          <div class="card-body"><h3>Ask a photo how the robot is standing.</h3>
+          <p>Three joint angles of a 2.4 M-triangle arm, recovered to <b>0.07&deg;</b> from a guess 13 to 23&deg; off. The outline, the shading and even the shadow on the floor all chip in.</p></div>
         </div>
         <div class="card">
           <div class="big">1e-15<small>agreement with vcad's own forward-mode derivative</small></div>
-          <div class="card-body"><h3>Optimise a CAD dimension.</h3>
-          <p>irys puts an image gradient on every mesh vertex, and <a href="https://vcad.io">vcad</a> pulls it back to the diameter of a bearing bore in one reverse pass. No step size to tune.</p></div>
+          <div class="card-body"><h3>Differentiate a hole.</h3>
+          <p>irys puts a gradient on every mesh vertex and <a href="https://vcad.io">vcad</a> turns it into d(loss)/d(bore diameter) in one reverse pass. No finite-difference step to babysit.</p></div>
         </div>
         <div class="card">
           <img src="/phase2b-beauty.jpg" alt="A gold ball beside a bush of Gaussian splats on a checker floor" loading="lazy">
-          <div class="card-body"><h3>Fit diffuse colours and splats.</h3>
-          <p>The albedo of every diffuse surface and each Gaussian splat's colour and opacity are differentiable on CPU and GPU, under a sky, a sun and area lights. GPU matches the f64 reference to <b>5e-5</b>.</p></div>
+          <div class="card-body"><h3>Splats and plain old paint, too.</h3>
+          <p>Diffuse colour and every Gaussian splat's colour and opacity are differentiable on CPU and GPU, under sky, sun or area lights. The GPU agrees with the f64 reference to <b>5e-5</b>.</p></div>
         </div>
       </div>
     </div>
   </section>
 
   <section>
-    <div class="container"><h2>Beauty frames from the same renderer.</h2>
-      <p class="lead">Spectral, four wavelengths per path, with OpenPBR materials, volumes, skin and hair, and scenes imported from Blender.</p></div>
+    <div class="container"><h2>It also just makes nice pictures.</h2>
+      <p class="lead">Spectral, four wavelengths per path, OpenPBR materials, volumes, skin, hair, and scenes straight out of Blender.</p></div>
     <div class="container-wide">
       <div class="gallery">
         <figure><img src="/demos-classroom.jpg" alt="The classroom scene rendered by irys" loading="lazy"><figcaption class="fig-cap">classroom, Christophe Seux, CC0</figcaption></figure>
         <figure><img src="/demos-pavilion.jpg" alt="The Barcelona Pavilion rendered by irys" loading="lazy"><figcaption class="fig-cap">Barcelona Pavilion, eMirage, CC-BY</figcaption></figure>
         <figure><img src="/look2-head-hair-3q.jpg" alt="A scanned head with skin and 1 million hair segments" loading="lazy"><figcaption class="fig-cap">Lee Perry-Smith by Infinite-Realities, CC BY 3.0</figcaption></figure>
       </div>
-      <p class="small">1080p Blender scenes at 4096 spp with no denoiser. Cycles is 2 to 3 times faster per sample on these.</p>
+      <p class="small">1080p, 4096 samples per pixel, no denoiser. Honesty corner: Cycles renders these 2 to 3 times faster per sample.</p>
     </div>
   </section>
 
   <section>
     <div class="container">
       <h2>Ten lines to a gradient.</h2>
-      <p class="lead">From <code>examples/fit.rs</code>: render, score against a target, and get the derivative of the loss for every material parameter.</p>
+      <p class="lead">From <code>examples/fit.rs</code>. Render, compare, get a gradient for every material parameter, repeat until gold.</p>
 <pre><span class="c">// irys-diff, from a clone of the repository</span>
 use irys_diff::prb::{self, Kernels, L2, Scene};
 
@@ -356,12 +356,12 @@ for it in 1..=60u64 {
 
   <section>
     <div class="container">
-      <h2>Why you can trust the gradient.</h2>
-      <p class="lead">When a fit fails to converge, you need to know whether it is your problem or the renderer's.</p>
+      <h2>Why the gradient is not lying.</h2>
+      <p class="lead">When a fit won't converge, you want to know it's your bug, not the renderer's.</p>
       <div class="trust">
-        <div><h3>Exact replay</h3><p>The backward pass regenerates the forward pass's paths: <b>65 536 of 65 536</b> lanes bit-identical, and two runs give identical gradients.</p></div>
-        <div><h3>An f64 reference</h3><p>Every material is one <a href="https://tang.toys">tang</a> graph, lowered to the GPU and run in f64 on the CPU. GPU gradients agree to <b>3.5e-4</b>.</p></div>
-        <div><h3>Metal and Vulkan</h3><p>Developed on Apple silicon. The full test suite also passes on an <b>NVIDIA RTX 3090</b> through Vulkan.</p></div>
+        <div><h3>It remembers exactly</h3><p>The backward pass regenerates the forward pass's paths: <b>65 536 of 65 536</b> lanes bit-identical, and two runs give identical gradients.</p></div>
+        <div><h3>It checks its work</h3><p>Every material is one <a href="https://tang.toys">tang</a> graph, lowered to the GPU and run in f64 on the CPU. GPU gradients agree to <b>3.5e-4</b>.</p></div>
+        <div><h3>It travels</h3><p>Developed on Apple silicon. The full test suite also passes on an <b>NVIDIA RTX 3090</b> through Vulkan.</p></div>
       </div>
       <p class="small">Replay is exact per device and driver; across GPUs, results agree to f32 precision. irys owns no geometry. Implement the <code>Geometry</code> trait and irys computes the light. It renders for vcad, kosm, ipse, phyz and muni.</p>
     </div>
@@ -369,7 +369,7 @@ for it in 1..=60u64 {
 
   <section id="start">
     <div class="container prose">
-      <h2>Quick start.</h2>
+      <h2>Get it.</h2>
       <p class="lead">The renderer is on crates.io as <code>irys-render</code>. Code still imports it as <code>irys</code>.</p>
 <pre>cargo add irys-render                 <span class="c"># CPU</span>
 cargo add irys-render --features gpu  <span class="c"># with the wgpu tier</span></pre>
