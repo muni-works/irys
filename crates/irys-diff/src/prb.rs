@@ -545,6 +545,13 @@ pub struct Scene {
     pub wavelengths: usize,
     /// The floor's (grey, θ-free) albedo.
     pub floor_albedo: f64,
+    /// When set, every diffuse surface's albedo is a spectrum, three hats
+    /// over the band like the conductor's F0: at wavelength `λ` a diffuse
+    /// vertex has albedo `placement · checker · Σ_k b_k(λ) d_k`, and PRB
+    /// differentiates the image with respect to `d` ([`gradient_diffuse`]).
+    /// `None` is the grey [`Scene::floor_albedo`], bit for bit. Russian
+    /// roulette's proxy keeps the grey albedo, so the decision stays θ-free.
+    pub diffuse_bands: Option<[f64; 3]>,
     /// When set, diffuse surfaces are a checker of this square size, the
     /// odd squares at [`CHECKER_DARK`] of the albedo.
     pub floor_checker: Option<f64>,
@@ -830,6 +837,7 @@ impl Scene {
             depth: 4,
             wavelengths: HERO,
             floor_albedo: 0.5,
+            diffuse_bands: None,
             floor_checker: None,
             frozen_alpha: None,
             nee: false,
@@ -1400,6 +1408,7 @@ fn trace(
     k: &mut Kernels,
     replay: Option<(&[f64], &[f64])>,
     grad: &mut [f64; PARAMS],
+    dgrad: &mut [f64; 3],
 ) -> (Vec<f64>, Stats) {
     let n = scene.paths();
     let nw = scene.wavelengths;
@@ -1578,7 +1587,12 @@ fn trace(
                 }
             };
             if scene.surface(&ih) == Surface::Diffuse {
-                // Lambertian: cosine sampling, weight = albedo. θ-free.
+                // Lambertian: cosine sampling, weight = albedo. With
+                // `diffuse_bands` the albedo is a spectrum in `d`, linear,
+                // so PRB's `∂ log f / ∂d_k` is `b_k(λ) / Σ b d` and every
+                // light this vertex passes on (its NEE and all later
+                // vertices) carries `f` once: `δd_k += δL (L − L⁻) b_k / A`,
+                // with `L⁻` the radiance before the vertex.
                 let place = &scene.placements[ih.payload];
                 let albedo = place.albedo
                     * if place.checker {
@@ -1586,10 +1600,28 @@ fn trace(
                     } else {
                         scene.floor_albedo
                     };
+                let mut alb = [albedo; HERO];
+                if let Some(d) = scene.diffuse_bands {
+                    let base = albedo / scene.floor_albedo;
+                    for k in 0..nw {
+                        let bw = band_weights(p.lambda[k]);
+                        let a = bw[0] * d[0] + bw[1] * d[1] + bw[2] * d[2];
+                        alb[k] = base * a;
+                        if let Some((l, dl)) = replay
+                            && a != 0.0
+                        {
+                            let j = i * nw + k;
+                            let s = dl[j] * (l[j] - p.radiance[k]) / a;
+                            for (g, b) in dgrad.iter_mut().zip(bw) {
+                                *g += s * b;
+                            }
+                        }
+                    }
+                }
                 if let Some((dir, cos, pl, true, emitter)) = nee {
                     let w = mis(pl, cos / std::f64::consts::PI);
                     for k in 0..nw {
-                        p.radiance[k] += p.throughput[k] * albedo / std::f64::consts::PI
+                        p.radiance[k] += p.throughput[k] * alb[k] / std::f64::consts::PI
                             * cos
                             * le(dir, emitter, p.lambda[k])
                             * w
@@ -1607,8 +1639,8 @@ fn trace(
                 let (r, phi) = (u1.sqrt(), 2.0 * std::f64::consts::PI * u2);
                 let cz = (1.0 - u1).max(0.0).sqrt();
                 let wi = t * (r * phi.cos()) + b * (r * phi.sin()) + nrm * cz;
-                for tp in &mut p.throughput[..nw] {
-                    *tp *= albedo / q;
+                for (tp, a) in p.throughput[..nw].iter_mut().zip(alb) {
+                    *tp *= a / q;
                 }
                 p.prev_pdf = cz / std::f64::consts::PI;
                 p.ray = Ray::new(origin, wi);
@@ -1732,7 +1764,7 @@ pub fn forward(
     seed: u64,
     k: &mut Kernels,
 ) -> (Vec<f64>, Stats) {
-    trace(scene, theta, seed, k, None, &mut [0.0; PARAMS])
+    trace(scene, theta, seed, k, None, &mut [0.0; PARAMS], &mut [0.0; 3])
 }
 
 /// The replay pass alone: `δθ` given the forward pass's `l` and the loss
@@ -1746,9 +1778,24 @@ pub fn replay(
     l: &[f64],
     dl: &[f64],
 ) -> ([f64; PARAMS], Vec<f64>, Stats) {
-    let mut grad = [0.0; PARAMS];
-    let (l2, stats) = trace(scene, theta, seed, k, Some((l, dl)), &mut grad);
+    let (grad, _, l2, stats) = replay_diffuse(scene, theta, seed, k, l, dl);
     (grad, l2, stats)
+}
+
+/// [`replay`], also returning `δd`: the derivative with respect to
+/// [`Scene::diffuse_bands`] (zero when it is `None`).
+pub fn replay_diffuse(
+    scene: &Scene,
+    theta: &[f64; PARAMS],
+    seed: u64,
+    k: &mut Kernels,
+    l: &[f64],
+    dl: &[f64],
+) -> ([f64; PARAMS], [f64; 3], Vec<f64>, Stats) {
+    let mut grad = [0.0; PARAMS];
+    let mut dgrad = [0.0; 3];
+    let (l2, stats) = trace(scene, theta, seed, k, Some((l, dl)), &mut grad, &mut dgrad);
+    (grad, dgrad, l2, stats)
 }
 
 /// Linear-sRGB image (`w·h·3`, row-major) from per-lane `L`.
@@ -1845,6 +1892,27 @@ pub fn gradient(
     let dl = lane_adjoint(scene, adjoint, &d_img);
     let (grad, _, _) = replay(scene, theta, adjoint, k, &l, &dl);
     (value, grad)
+}
+
+/// [`gradient`], also returning `∂loss/∂d` for [`Scene::diffuse_bands`].
+pub fn gradient_diffuse(
+    scene: &Scene,
+    theta: &[f64; PARAMS],
+    seeds: (u64, u64),
+    k: &mut Kernels,
+    loss: &impl Loss,
+) -> (f64, [f64; PARAMS], [f64; 3]) {
+    let (primal, adjoint) = seeds;
+    let (l, _) = forward(scene, theta, primal, k);
+    let (value, d_img) = loss.eval(&image(scene, primal, &l));
+    let l = if adjoint == primal {
+        l
+    } else {
+        forward(scene, theta, adjoint, k).0
+    };
+    let dl = lane_adjoint(scene, adjoint, &d_img);
+    let (grad, dgrad, _, _) = replay_diffuse(scene, theta, adjoint, k, &l, &dl);
+    (value, grad, dgrad)
 }
 
 /// The loss adjoint per lane of the frame drawn with `seed`, from the
