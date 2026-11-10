@@ -128,6 +128,14 @@ pre .c { color: var(--muted); }
 .links { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 @media (max-width: 640px) { .links { grid-template-columns: 1fr; } }
 .links a { display: block; margin: 0; padding: 14px 16px; background: var(--surface); color: var(--fg); }
+.links a .lv { display: block; height: 140px; margin: -14px -16px 14px; background: var(--bg) center / cover no-repeat; }
+.links a .lv.mascot { background-size: contain; background-color: #15110d; }
+.links a .lv.logo { display: grid; place-items: center; background: #15110d; color: var(--brand); }
+.links a .lv.logo svg { width: 110px; height: auto; }
+.links a .lv.term { padding: 18px 16px; background: #0b0907; }
+.links a .lv.term code { font-family: var(--mono); font-size: 12px; line-height: 1.8; color: #e8e1d2; }
+.links a .lv.term em { font-style: normal; color: #ff2bd6; }
+.links a:hover .lv { filter: brightness(1.1); }
 .links a b { display: block; font-family: var(--mono); font-weight: 500; color: var(--flame-ink); }
 .links a span { font-size: var(--s-sm); color: var(--muted); }
 .links a:hover, .links a:hover b, .links a:hover span { background: var(--flame-ink); color: var(--on-flame); }
@@ -359,7 +367,7 @@ for it in 1..=60u64 {
 
   <section>
     <div class="container">
-      <h2>Why the gradient is not lying.</h2>
+      <h2>How you know the gradient is right.</h2>
       <p class="lead">When a fit won't converge, you want to know it's your bug, not the renderer's.</p>
       <div class="trust">
         <div><h3>It remembers exactly</h3><p>The backward pass regenerates the forward pass's paths: <b>65 536 of 65 536</b> lanes bit-identical, and two runs give identical gradients.</p></div>
@@ -397,12 +405,12 @@ cargo test -p irys</pre>
     <div class="container-wide">
       <p class="label-caps">Read and build on it</p>
       <div class="links">
-        <a href="https://muni.works/research/irys"><b>paper</b><span>Differentiable Rendering with Exact Replay</span></a>
-        <a href="https://github.com/muni-works/irys"><b>github</b><span>Source, examples and the design log</span></a>
-        <a href="https://vcad.io"><b>vcad</b><span>CAD you can take the derivative of</span></a>
-        <a href="https://tang.toys"><b>tang</b><span>The tensor compiler irys writes its materials in</span></a>
-        <a href="https://muni.works/research"><b>research</b><span>Papers on irys and the work built on it</span></a>
-        <a href="https://muni.works"><b>muni.works</b><span>Municipal Robotics</span></a>
+        <a href="https://muni.works/research/irys"><i class="lv" style="background-image:url(/cover.jpg)"></i><b>paper</b><span>Differentiable Rendering with Exact Replay</span></a>
+        <a href="https://github.com/muni-works/irys"><i class="lv term"><code>$ git clone muni-works/irys<br>$ cargo run --example fit<br><em>roughness 0.700 → 0.188</em></code></i><b>github</b><span>Source, examples and the design log</span></a>
+        <a href="https://vcad.io"><i class="lv" style="background-image:url(/link-vcad.jpg)"></i><b>vcad</b><span>CAD you can take the derivative of</span></a>
+        <a href="https://tang.toys"><i class="lv mascot" style="background-image:url(/link-tang.svg)"></i><b>tang</b><span>The tensor compiler irys writes its materials in</span></a>
+        <a href="https://muni.works/research"><i class="lv" style="background-image:url(/link-research.jpg)"></i><b>research</b><span>Papers on irys and what's built on it, like CAD from photos</span></a>
+        <a href="https://muni.works"><i class="lv logo"><svg viewBox="-60 -60 880 400" fill="none"><g stroke="currentColor" stroke-width="40" stroke-linecap="round" stroke-linejoin="round" fill="none"> <path d="M 20 240 L 20 100 C 20 50, 80 50, 100 50 C 140 50, 160 70, 160 100"/> <path d="M 160 240 L 160 100"/> <path d="M 160 100 C 160 50, 220 50, 240 50 C 280 50, 300 70, 300 100 L 300 240 C 300 270, 330 280, 370 280 C 410 280, 440 270, 440 240 L 440 100"/> <path d="M 440 100 C 440 50, 500 50, 520 50 C 560 50, 600 70, 600 100 L 600 240 C 600 270, 630 280, 670 280 C 710 280, 740 270, 740 240 L 740 100"/> </g></svg></i><b>muni.works</b><span>Municipal Robotics</span></a>
       </div>
     </div>
   </section>
