@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>irys - differentiable spectral path tracing</title>
+<meta name="description" content="irys is an open-source spectral path tracer in Rust. It renders on the GPU, keeps an f64 CPU reference, and returns gradients of an image with respect to materials, poses and CAD dimensions, with a replay that reproduces the forward pass bit for bit.">
+<meta property="og:title" content="irys">
+<meta property="og:description" content="A spectral path tracer in Rust that tells you how the image changes when the scene does.">
+<meta property="og:image" content="/cover.jpg">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Serif:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #faf9f7;
+  --fg: #1a1a1a;
+  --fg-muted: #555;
+  --fg-faint: #8a8a8a;
+  --accent: #c2410c;
+  --code-bg: #f0efed;
+  --border: #e0dfdd;
+  --mono: 'IBM Plex Mono', 'Menlo', monospace;
+  --serif: 'IBM Plex Serif', 'Georgia', serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141414;
+    --fg: #e8e6e3;
+    --fg-muted: #a8a6a3;
+    --fg-faint: #77756f;
+    --accent: #f97316;
+    --code-bg: #1e1e1e;
+    --border: #2c2c2c;
+  }
+}
+
+html { font-size: 18px; -webkit-font-smoothing: antialiased; }
+body { background: var(--bg); color: var(--fg); font-family: var(--serif); line-height: 1.7; }
+::selection { background: var(--accent); color: white; }
+a { color: inherit; text-decoration-color: var(--fg-faint); text-underline-offset: 3px; }
+a:hover { color: var(--accent); text-decoration-color: var(--accent); }
+
+.container { max-width: 680px; margin: 0 auto; padding: 0 24px; }
+.container-wide { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+/* ---- Top bar ---- */
+.topbar { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; font-family: var(--mono); font-size: 0.75rem; color: var(--fg-faint); }
+.topbar a { text-decoration: none; }
+.topbar nav { display: flex; gap: 20px; }
+
+/* ---- Hero ---- */
+.hero { padding: 72px 0 40px; }
+.wordmark { font-family: var(--mono); font-size: 4.5rem; font-weight: 600; letter-spacing: -0.03em; line-height: 1; margin-bottom: 20px; }
+.tagline { font-size: 1.35rem; color: var(--fg-muted); line-height: 1.5; margin-bottom: 8px; }
+.tagline-sub { font-family: var(--mono); font-size: 0.8rem; color: var(--fg-faint); letter-spacing: 0.04em; margin-bottom: 36px; }
+.actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.install { display: inline-block; font-family: var(--mono); font-size: 0.85rem; background: var(--fg); color: var(--bg); padding: 10px 20px; border: none; cursor: pointer; transition: background 0.15s; text-decoration: none; }
+.install:hover { background: var(--accent); color: white; }
+.ghost { font-family: var(--mono); font-size: 0.85rem; padding: 9px 18px; border: 1px solid var(--border); text-decoration: none; }
+
+figure { margin: 0; }
+figure img { display: block; width: 100%; height: auto; background: var(--code-bg); }
+figcaption { font-family: var(--mono); font-size: 0.7rem; color: var(--fg-faint); line-height: 1.6; margin-top: 10px; }
+.hero-figure { margin-top: 8px; }
+
+/* ---- Sections ---- */
+section { padding: 72px 0; }
+section + section { border-top: 1px solid var(--border); }
+.section-label { font-family: var(--mono); font-size: 0.8rem; font-weight: 500; color: var(--fg-faint); letter-spacing: 0.05em; text-transform: uppercase; margin-bottom: 20px; }
+h3 { font-size: 1.3rem; font-weight: 500; line-height: 1.35; margin-bottom: 16px; }
+p { margin-bottom: 1.2em; }
+p:last-child { margin-bottom: 0; }
+.pitch p { font-size: 1.05rem; }
+code { font-family: var(--mono); font-size: 0.85em; background: var(--code-bg); padding: 1px 5px; }
+
+.feature { display: grid; grid-template-columns: 1fr 1fr; gap: 48px; align-items: start; }
+.feature.text-only { grid-template-columns: 1fr; max-width: 680px; }
+
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--border); border: 1px solid var(--border); margin: 28px 0 0; }
+.stat { background: var(--bg); padding: 16px 18px; }
+.stat b { display: block; font-family: var(--mono); font-size: 1.15rem; font-weight: 500; line-height: 1.3; }
+.stat span { display: block; font-size: 0.78rem; color: var(--fg-muted); line-height: 1.5; margin-top: 4px; }
+
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 20px; }
+th, td { text-align: left; padding: 8px 10px 8px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { font-family: var(--mono); font-size: 0.7rem; font-weight: 500; color: var(--fg-faint); text-transform: uppercase; letter-spacing: 0.04em; }
+td.num { font-family: var(--mono); font-size: 0.8rem; text-align: right; white-space: nowrap; padding-right: 0; }
+
+.limits li { margin: 0 0 0.8em 1.2em; }
+
+pre { font-family: var(--mono); font-size: 0.75rem; line-height: 1.65; background: var(--code-bg); padding: 22px 26px; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+pre .cm { color: var(--fg-faint); font-style: italic; }
+.note { font-size: 0.85rem; color: var(--fg-muted); margin-top: 16px; }
+
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+
+.family { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--border); border: 1px solid var(--border); }
+.family a { background: var(--bg); padding: 18px 20px; text-decoration: none; display: block; }
+.family a b { font-family: var(--mono); font-weight: 500; display: block; }
+.family a span { font-size: 0.82rem; color: var(--fg-muted); }
+.family a:hover b { color: var(--accent); }
+
+footer { border-top: 1px solid var(--border); padding: 32px 0 48px; }
+.footer-inner { display: flex; flex-wrap: wrap; gap: 24px; font-family: var(--mono); font-size: 0.75rem; color: var(--fg-faint); }
+.footer-inner a { text-decoration: none; }
+.footer-inner .right { margin-left: auto; }
+
+@media (max-width: 760px) {
+  html { font-size: 16px; }
+  .wordmark { font-size: 3.4rem; }
+  .hero { padding: 40px 0 24px; }
+  section { padding: 52px 0; }
+  .feature, .grid2 { grid-template-columns: 1fr; gap: 28px; }
+  .stats { grid-template-columns: 1fr; }
+  td.num { white-space: normal; }
+  .family { grid-template-columns: 1fr; }
+  .topbar nav { gap: 14px; }
+  pre { padding: 18px 16px; font-size: 0.7rem; }
+  .footer-inner .right { margin-left: 0; }
+}
+</style>
+</head>
+<body>
+
+<div class="container-wide">
+  <div class="topbar">
+    <a href="https://muni.works">muni.works</a>
+    <nav>
+      <a href="https://muni.works/research/irys">paper</a>
+      <a href="#start">start</a>
+      <a href="https://github.com/muni-works/irys">github</a>
+    </nav>
+  </div>
+</div>
+
+<header class="hero">
+  <div class="container">
+    <div class="wordmark">irys</div>
+    <div class="tagline">A spectral path tracer in Rust that tells you how the image changes when the scene does.</div>
+    <div class="tagline-sub">GPU and f64 CPU tiers. Bit-exact replay. Apache-2.0.</div>
+    <div class="actions">
+      <a class="install" href="#start">git clone muni-works/irys</a>
+      <a class="ghost" href="https://muni.works/research/irys">Read the paper</a>
+    </div>
+  </div>
+  <div class="container-wide">
+    <figure class="hero-figure" style="margin-top:56px">
+      <img src="/cover.jpg" width="2400" height="1350" alt="The rose robot standing in the Barcelona Pavilion, rendered by irys">
+      <figcaption>The rose robot in the Barcelona Pavilion, rendered by irys. Pavilion scene by eMirage, CC-BY.</figcaption>
+    </figure>
+  </div>
+</header>
+
+<section class="pitch">
+  <div class="container">
+    <p>
+      A renderer turns a scene into an image. A differentiable renderer also
+      says how the image would change if the scene did: if a material were
+      rougher, a joint turned further, or a bore were a tenth of a millimetre
+      wider. Optimisers consume that answer, so an error in it does not show as
+      a wrong pixel. It shows as a fit that does not converge.
+    </p>
+    <p>
+      irys computes those derivatives by path replay. Its replay regenerates
+      the forward pass's paths bit for bit, and every gradient has an f64
+      reference to check it against. A gradient test that fails therefore
+      points to a bug, not to noise or rounding.
+    </p>
+    <p>
+      irys owns no geometry. You implement the <code>Geometry</code> trait
+      (bounds and ray intersection) and irys does the light. It is the renderer
+      for vcad, kosm, ipse, phyz and muni.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="container-wide feature">
+    <div>
+      <h2 class="section-label">Spectral path tracing on the GPU</h2>
+      <h3>One renderer from a CPU path tracer to a wgpu compute tier.</h3>
+      <p>
+        irys traces spectra, not RGB. Each path carries four wavelengths, and at
+        equal paths that cuts per-pixel colour noise 28.7 times. The CPU tracer
+        covers BVH and TLAS scenes, analytic primitives, triangle meshes,
+        heightfields, Gaussian splats and caustics. The GPU tier runs a WGSL
+        integrator on wgpu 30.
+      </p>
+      <p>
+        An OpenPBR scene kernel handles volumes, skin and hair, and an importer
+        reads scenes exported from Blender. These beauty frames are 1920 by
+        1080 at 4096 samples per pixel, with no denoiser.
+      </p>
+      <p class="note">
+        Cycles is 2 to 3 times faster per sample on these two scenes. At equal
+        time, irys met its target against Cycles on one of three test scenes
+        and was 1.23 to 1.27 times behind on the other two.
+      </p>
+    </div>
+    <div class="grid2" style="grid-template-columns:1fr">
+      <figure>
+        <img src="/demos-classroom.jpg" width="1600" height="900" loading="lazy" alt="The classroom scene rendered by irys">
+        <figcaption>classroom, Christophe Seux, CC0. 663 s on Apple silicon.</figcaption>
+      </figure>
+      <figure>
+        <img src="/demos-pavilion.jpg" width="1600" height="900" loading="lazy" alt="The Barcelona Pavilion scene rendered by irys">
+        <figcaption>Barcelona Pavilion, eMirage, CC-BY. 834 s, 54.9 M placed triangles.</figcaption>
+      </figure>
+    </div>
+  </div>
+  <div class="container-wide" style="margin-top:40px">
+    <figure>
+      <img src="/demos-pavilion-vs-cycles.jpg" width="2880" height="540" loading="lazy" alt="The pavilion rendered by irys and by Cycles side by side">
+      <figcaption>The pavilion, irys beside Blender Cycles at the same sample count. Details in docs/design.md.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section>
+  <div class="container feature text-only">
+    <div>
+      <h2 class="section-label">Differentiable rendering with exact replay</h2>
+      <h3>The backward pass redraws the forward pass, bit for bit.</h3>
+      <p>
+        irys runs path replay backpropagation on a GPU wavefront, with
+        next-event estimation and multiple importance sampling. Replay stores
+        nothing per vertex: it regenerates each path from its seed through the
+        same pipelines. Three choices make that regeneration exact. An integer
+        SplitMix64 built from 16-bit limbs gives the GPU the CPU's random
+        stream. Reductions run in a fixed order with no float atomics. The BVH
+        walk depends only on the ray.
+      </p>
+      <p>
+        Memory scales with paths, not depth. A path costs 63 f64 words at depth
+        2 and at depth 8 alike, and a 1024 by 1024 frame at 4 samples per pixel
+        replays bit for bit in nine chunks.
+      </p>
+      <div class="stats">
+        <div class="stat"><b>65 536</b><span>of 65 536 lanes where replay matches the forward radiance bit for bit</span></div>
+        <div class="stat"><b>7.5 ms</b><span>GPU gradient of a 96&times;96, 8 spp frame at depth 4 (116 to 129 ms on the CPU)</span></div>
+        <div class="stat"><b>3.5e-4</b><span>worst relative error of a GPU f32 gradient against the f64 reference</span></div>
+      </div>
+      <p class="note">
+        Replay is bit-exact per device and driver. Another GPU or compiler may
+        round differently and then agrees with the CPU reference to f32
+        precision. Timings are from one Apple M-series machine through Metal.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="container feature text-only">
+    <div>
+      <h2 class="section-label">An f64 reference from the same source</h2>
+      <h3>Write a material once. Run it on the GPU and check it in f64.</h3>
+      <p>
+        Each BSDF is a graph in the <a href="https://tang.toys">tang</a> tensor
+        compiler. tang lowers it to an evaluation program and an adjoint, emits
+        WGSL for the GPU, and runs the same graph in f64 on the CPU. That
+        separates three sources of error that are otherwise tangled together:
+        estimator bias, device rounding and Monte Carlo noise.
+      </p>
+      <table>
+        <thead><tr><th>Check</th><th style="text-align:right">Relative error</th></tr></thead>
+        <tbody>
+          <tr><td>CPU f64 gradient vs central differences, fixed random numbers</td><td class="num">1.6e-10 to 1.9e-9</td></tr>
+          <tr><td>same, with next-event estimation</td><td class="num">&le; 3.1e-9</td></tr>
+          <tr><td>GPU f32 vs CPU f64, loss</td><td class="num">5.8e-7</td></tr>
+          <tr><td>GPU f32 vs CPU f64, worst parameter gradient</td><td class="num">3.5e-4</td></tr>
+        </tbody>
+      </table>
+      <p class="note">
+        The differentiable material today is a GGX conductor with a three-band
+        spectral Fresnel. irys does not differentiate diffuse surfaces, the
+        environment or Gaussian splats, and the environment is the only light.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="container-wide feature">
+    <div>
+      <h2 class="section-label">Pose gradients through instanced CAD</h2>
+      <h3>Move a joint, and the gradient sees the silhouette, the shading and the shadow move.</h3>
+      <p>
+        A scene is a two-level BVH of CAD parts and their instances. irys samples
+        primary edges for silhouettes and creases, differentiates the interior
+        by forward-mode duals with frames attached to each moving part, and
+        samples secondary edges so that shadows and reflections contribute.
+        The same machinery differentiates a seven-parameter camera.
+      </p>
+      <p>
+        On the rose robot, 2.4 million triangles tessellated by vcad, a fit of
+        the arm recovers three joint angles to within 0.07 degrees from a start
+        13 to 23 degrees away, on a synthetic target. On the arm over a floor,
+        the shadow carries about 15% of the gradient; with secondary edges the
+        gradient agrees with central differences within 1.1 standard errors.
+      </p>
+    </div>
+    <div>
+      <figure>
+        <img src="/phase2d-rose.jpg" width="768" height="768" loading="lazy" alt="The rose robot rendered by irys">
+        <figcaption>The rose robot, 768&sup2; at 256 spp in 4.1 s.</figcaption>
+      </figure>
+    </div>
+  </div>
+  <div class="container-wide" style="margin-top:32px">
+    <figure>
+      <img src="/phase2d-fit.jpg" width="1152" height="246" loading="lazy" alt="Frames from the pose fit of the rose arm, from the start pose to the target">
+      <figcaption>The arm's pose fit, start to target. docs/design.md, phase 2d.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section>
+  <div class="container feature text-only">
+    <div>
+      <h2 class="section-label">From pixels to CAD dimensions</h2>
+      <h3>The derivative of an image with respect to a part's dimension.</h3>
+      <p>
+        irys computes an image gradient on every vertex of a mesh.
+        <a href="https://vcad.io">vcad</a>'s BRep kernel takes that gradient on
+        its frozen tessellation and pulls it back to a CAD parameter in one
+        reverse pass. The shared benchmark is a robot shoulder plate with a
+        49 mm bearing bore, and the parameter is the bore diameter.
+      </p>
+      <table>
+        <thead><tr><th>Path to dL/d&theta;</th><th style="text-align:right">Value</th><th style="text-align:right">vs pullback</th></tr></thead>
+        <tbody>
+          <tr><td>vcad pullback of the irys gradient</td><td class="num">40.16864 &plusmn; 0.0226</td><td class="num"></td></tr>
+          <tr><td>vcad forward mode</td><td class="num">40.16864</td><td class="num">1.06e-15</td></tr>
+          <tr><td>finite-difference render, h = 0.1 mm</td><td class="num">40.0144</td><td class="num">3.85e-3</td></tr>
+        </tbody>
+      </table>
+      <p class="note">
+        The pullback has no step size. It is exact for the frozen mesh, and the
+        irys edge sampling error is its only noise. Recovering editable CAD
+        from photographs is built on irys and covered in a companion paper,
+        <i>Seeing Is Measuring</i>.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section id="start">
+  <div class="container">
+    <h2 class="section-label">Quick start</h2>
+    <p>
+      Requires Rust 1.95 or newer and a C compiler on your PATH. The first
+      build fetches tang from git and is slow. irys is not on crates.io (the
+      <code>irys</code> crate there is an unrelated project), so depend on it
+      by git.
+    </p>
+<pre>git clone https://github.com/muni-works/irys
+cd irys
+
+<span class="cm"># CPU only: fit a ball's roughness and colour to one target image</span>
+<span class="cm"># by path replay. Writes target.ppm, iter_NNN.ppm and loss.csv.</span>
+cargo run --release -p irys-diff --example fit -- out/fit
+
+<span class="cm"># The same fit on the GPU wavefront.</span>
+cargo run --release -p irys-diff --features gpu --example fit_gpu -- out/fit_gpu
+
+<span class="cm"># Tests. GPU tests skip when there is no adapter.</span>
+cargo test -p irys</pre>
+    <p class="note">
+      Everything is version 0.1.0 and the API is not stable. The core crates
+      are the most settled; <code>irys-diff</code> and the crates built on it
+      are research code. The GPU wavefront uses wgpu's experimental ray
+      queries, and every recorded run is on Apple silicon with Metal.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <h2 class="section-label">Limits</h2>
+    <ul class="limits">
+      <li>Replay is bit-exact per device and driver, not across them.</li>
+      <li>Splats and diffuse surfaces are rendered but not differentiated.</li>
+      <li>Only the environment emits light in the differentiable path: a sky and a sun lobe.</li>
+      <li>Poses move parts rigidly. Shape changes enter only through the vcad pullback.</li>
+      <li>All recorded timings are from one Apple M-series machine through Metal.</li>
+    </ul>
+    <p class="note">The paper's numbers trace to <code>data/measured.tsv</code>, each row naming its test and commit, and to the dated build log in <a href="https://github.com/muni-works/irys/blob/main/docs/design.md">docs/design.md</a>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container-wide">
+    <h2 class="section-label">Read and build on it</h2>
+    <div class="family">
+      <a href="https://muni.works/research/irys"><b>paper</b><span>Differentiable Rendering with Exact Replay</span></a>
+      <a href="https://github.com/muni-works/irys"><b>github</b><span>Source, examples and the design log</span></a>
+      <a href="https://vcad.io"><b>vcad</b><span>CAD you can take the derivative of</span></a>
+      <a href="https://tang.toys"><b>tang</b><span>The tensor compiler irys writes its materials in</span></a>
+      <a href="https://muni.works/research"><b>research</b><span>Papers on irys and the work built on it</span></a>
+      <a href="https://muni.works"><b>muni.works</b><span>Municipal Robotics</span></a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container-wide footer-inner">
+    <a href="https://github.com/muni-works/irys">GitHub</a>
+    <a href="https://muni.works/research/irys">Paper</a>
+    <span>Apache-2.0</span>
+    <a class="right" href="https://muni.works">Municipal Robotics</a>
+  </div>
+</footer>
+
+</body>
+</html>

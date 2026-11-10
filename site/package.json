@@ -1,0 +1,15 @@
+{
+  "name": "@irys/landing",
+  "version": "0.1.0",
+  "private": true,
+  "description": "irys landing page, static and framework-free",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 4174 --strictPort",
+    "build": "vite build",
+    "preview": "vite preview --port 4174 --strictPort"
+  },
+  "devDependencies": {
+    "vite": "^6.3.5"
+  }
+}
