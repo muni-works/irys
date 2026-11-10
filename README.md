@@ -93,9 +93,9 @@ cargo run --release -p irys-splat --example splat_train -- \
 `scripts/bench.sh` runs the benchmark against Cycles and needs Blender.
 
 The `rose`, `rose_check` and `rose_fit` examples in `irys-diff` read CAD from
-the `rose` repository (`$ROSE`, or `~/Developer/rose`). That repository is
-private, so these examples cannot be run from a public clone. Their results
-are in the figures below and in [docs/design.md](docs/design.md).
+the [rose](https://github.com/muni-works/rose) repository: clone it and point
+`$ROSE` at it (the default is `~/Developer/rose`). Their results are in the
+figures below and in [docs/design.md](docs/design.md).
 
 ## Status and limits
 
@@ -150,9 +150,8 @@ robot-arm shoulder plate, takes the gradient of an image loss on every mesh
 node by edge sampling, and vcad pulls that back to a CAD parameter (the
 bearing bore diameter). The benchmark is the `rose_brep` example in
 `irys-diff`. It is not on `main` yet: it is at commit `103e3da` on the
-branch `claude/irys-release-readiness-1db58e`. It reads the plate from the
-private `rose` repository, so it needs assets that are not public and
-outside readers cannot run it.
+branch `claude/irys-release-readiness-1db58e`. It reads the plate from
+[rose](https://github.com/muni-works/rose) at commit `832192f`.
 
 ## License
 
