@@ -93,8 +93,10 @@ cargo run --release -p irys-splat --example splat_train -- \
 `scripts/bench.sh` runs the benchmark against Cycles and needs Blender.
 
 The `rose`, `rose_check` and `rose_fit` examples in `irys-diff` read CAD from
-the [rose](https://github.com/muni-works/rose) repository: clone it and point
-`$ROSE` at it (the default is `~/Developer/rose`). Their results are in the
+the [rose](https://github.com/muni-works/rose) repository's older full-size
+model (`full/cad/rose-full.loon`), which is no longer on rose's `main`: clone rose,
+check out the tag `pre-restructure`, and point `$ROSE` at it (the default is
+`~/Developer/rose`). Their results are in the
 figures below and in [docs/design.md](docs/design.md).
 
 ## Status and limits
