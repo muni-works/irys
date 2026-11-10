@@ -175,16 +175,26 @@ pre .c { color: var(--muted); }
 <main>
   <section>
     <div class="container prose">
-      <h2>Every gradient has a reference.</h2>
-      <p class="lead">A differentiable renderer says how each pixel would change if a material, a pose or a dimension changed. Optimisers consume that answer, so an error in it does not show as a wrong pixel. It shows as a fit that does not converge.</p>
-      <p>irys computes those derivatives by path replay. The replay regenerates the forward pass's paths exactly, and every gradient has an f64 reference to check it against. A gradient test that fails therefore points to a bug, not to noise or rounding.</p>
-      <p>irys owns no geometry. You implement the <code>Geometry</code> trait (bounds and ray intersection), and irys computes the lighting. It is the renderer for vcad, kosm, ipse, phyz and muni.</p>
+      <h2>How irys compares.</h2>
+      <p class="lead">Measured against Mitsuba 3 for gradients and Blender Cycles for rendering, each on the same Apple silicon machine and the same scenes as irys.</p>
       <div class="proof">
-        <div class="proof-item lit"><span class="proof-val">65 536</span><span class="proof-label">of 65 536 lanes where replay matches the forward radiance bit for bit</span></div>
-        <div class="proof-item"><span class="proof-val">7.5<small> ms</small></span><span class="proof-label">GPU gradient of a 96&times;96, 8 spp frame at depth 4, against 116 to 129 ms on the CPU</span></div>
-        <div class="proof-item"><span class="proof-val">3.5e-4</span><span class="proof-label">worst relative error of a GPU f32 gradient against the f64 reference</span></div>
-        <div class="proof-item"><span class="proof-val">1.06e-15</span><span class="proof-label">pullback to a CAD dimension against vcad's forward mode</span></div>
+        <div class="proof-item lit"><span class="proof-val">7&ndash;26&times;</span><span class="proof-label">faster material gradients than Mitsuba 3 at equal variance</span></div>
+        <div class="proof-item"><span class="proof-val">1.5&ndash;5.6&times;</span><span class="proof-label">lower error than Cycles at equal time, on irys's three benchmark scenes</span></div>
+        <div class="proof-item"><span class="proof-val">65 536</span><span class="proof-label">of 65 536 lanes where replay matches the forward pass bit for bit</span></div>
+        <div class="proof-item"><span class="proof-val">63<small> words</small></span><span class="proof-label">of memory per path at depth 2 and depth 8 alike</span></div>
       </div>
+      <div class="tbl" style="margin-top:2.5rem"><table>
+        <thead><tr><th>Comparison</th><th class="v">Result</th></tr></thead>
+        <tbody>
+          <tr><td>Material gradient vs Mitsuba 3 <code>prb</code>, time to equal variance, M4 Max</td><td class="v">irys 7.0&ndash;25.5&times; faster</td></tr>
+          <tr><td>Pose gradient vs Mitsuba 3 <code>prb_projective</code></td><td class="v">no claim</td></tr>
+          <tr><td>Equal-time error vs Cycles: pair, room and cornell, 9 budgets</td><td class="v">irys lower at all 9</td></tr>
+          <tr><td>Equal-time error vs Cycles: Blender's classroom</td><td class="v">0.89 to 2.75&times; Cycles</td></tr>
+          <tr><td>Equal-time error vs Cycles: Barcelona Pavilion, clamped</td><td class="v">14&ndash;17&times; Cycles</td></tr>
+        </tbody>
+      </table></div>
+      <p class="small">Both renderers match their own central differences on the material gradient. On the robot arm, Mitsuba's pose gradient converged to a value its own central differences reject, so irys makes no pose comparison. The Cycles wins use irys's opt-in sun sampling share and scenes lit by a sky and sun. On Blender's demo files with full materials, Cycles is 2 to 3 times faster per sample and wins at all but the smallest budget. Sources: <code>bench/mitsuba</code> and the speed rounds in <a href="https://github.com/muni-works/irys/blob/main/docs/design.md">docs/design.md</a>.</p>
+      <p>irys owns no geometry. You implement the <code>Geometry</code> trait (bounds and ray intersection), and irys computes the lighting. It is the renderer for vcad, kosm, ipse, phyz and muni.</p>
     </div>
   </section>
 
@@ -215,7 +225,7 @@ pre .c { color: var(--muted); }
       </figure>
     </div>
     <div class="container"><div class="step-body">
-      <p class="small">Cycles is 2 to 3 times faster per sample on these two scenes. At equal time, irys met its target against Cycles on one of three test scenes and was 1.23 to 1.27 times behind on the other two.</p>
+      <p class="small">Cycles is 2 to 3 times faster per sample on these two scenes, and irys has no denoiser on this path.</p>
     </div></div>
   </section>
 

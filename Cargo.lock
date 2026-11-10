@@ -1015,18 +1015,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "irys"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "irys-core",
- "irys-gpu",
- "irys-light",
- "irys-prims",
- "pollster",
-]
-
-[[package]]
 name = "irys-bench"
 version = "0.1.0"
 dependencies = [
@@ -1149,6 +1137,18 @@ dependencies = [
  "tang",
  "tang-compile",
  "tang-expr",
+]
+
+[[package]]
+name = "irys-render"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "irys-core",
+ "irys-gpu",
+ "irys-light",
+ "irys-prims",
+ "pollster",
 ]
 
 [[package]]
@@ -1364,7 +1364,7 @@ dependencies = [
 name = "kosm-render"
 version = "0.2.1"
 dependencies = [
- "irys",
+ "irys-render",
 ]
 
 [[package]]
