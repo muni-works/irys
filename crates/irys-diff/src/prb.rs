@@ -109,6 +109,67 @@ impl Rng {
     }
 }
 
+/// The derivatives beyond the conductor's `θ`: the diffuse bands and, per
+/// splat, `(∂/∂dc_r, ∂/∂dc_g, ∂/∂dc_b, ∂/∂opacity)`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Extra {
+    /// `∂/∂d` for [`Scene::diffuse_bands`].
+    pub diffuse: [f64; 3],
+    /// Per splat, when [`Scene::splat_grad`] is on; empty otherwise.
+    pub splats: Vec<[f64; 4]>,
+}
+
+/// One splat a segment crossed, in compositing order.
+struct SplatHit {
+    index: u32,
+    alpha: f32,
+    colour: [f32; 3],
+    /// Transmittance in front of it.
+    t: f32,
+}
+
+/// [`splats::composite`], step for step (the same f32 operations, so the
+/// segment is identical), also listing the splats it crossed.
+fn composite_hits(
+    bvh: &Bvh<Splats>,
+    ray: &Ray,
+    t_min: f64,
+    t_max: f64,
+    hits: &mut Vec<SplatHit>,
+) -> splats::SplatSegment {
+    hits.clear();
+    let mut seg = splats::SplatSegment::default();
+    if bvh.geometry().is_empty() {
+        return seg;
+    }
+    let dir = ray.direction;
+    for hit in bvh.trace(ray) {
+        if hit.t <= t_min {
+            continue;
+        }
+        if hit.t >= t_max {
+            break;
+        }
+        let (i, alpha) = splats::unpack_payload(hit.payload);
+        let alpha = alpha.clamp(0.0, 1.0);
+        if alpha <= 0.0 {
+            continue;
+        }
+        let c = bvh.geometry().colour(i as usize, dir);
+        hits.push(SplatHit { index: i, alpha, colour: c, t: seg.transmittance });
+        let w = seg.transmittance * alpha;
+        for ch in 0..3 {
+            seg.radiance[ch] += w * c[ch];
+        }
+        seg.transmittance *= 1.0 - alpha;
+        if seg.transmittance <= 1e-4 {
+            seg.transmittance = 0.0;
+            break;
+        }
+    }
+    seg
+}
+
 /// What an opaque primitive is made of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
@@ -552,6 +613,10 @@ pub struct Scene {
     /// `None` is the grey [`Scene::floor_albedo`], bit for bit. Russian
     /// roulette's proxy keeps the grey albedo, so the decision stays θ-free.
     pub diffuse_bands: Option<[f64; 3]>,
+    /// Differentiate the splats: each splat's DC colour (RGB) and base
+    /// opacity ([`gradient_splats`]). Off, the splat walk is the plain
+    /// compositor's.
+    pub splat_grad: bool,
     /// When set, diffuse surfaces are a checker of this square size, the
     /// odd squares at [`CHECKER_DARK`] of the albedo.
     pub floor_checker: Option<f64>,
@@ -838,6 +903,7 @@ impl Scene {
             wavelengths: HERO,
             floor_albedo: 0.5,
             diffuse_bands: None,
+            splat_grad: false,
             floor_checker: None,
             frozen_alpha: None,
             nee: false,
@@ -1408,8 +1474,15 @@ fn trace(
     k: &mut Kernels,
     replay: Option<(&[f64], &[f64])>,
     grad: &mut [f64; PARAMS],
-    dgrad: &mut [f64; 3],
+    extra: &mut Extra,
 ) -> (Vec<f64>, Stats) {
+    let dgrad = &mut extra.diffuse;
+    let splat_grad = scene.splat_grad && replay.is_some();
+    if splat_grad {
+        let n = scene.splats.as_ref().map_or(0, |b| b.geometry().len());
+        extra.splats = vec![[0.0; 4]; n];
+    }
+    let mut shits: Vec<SplatHit> = Vec::new();
     let n = scene.paths();
     let nw = scene.wavelengths;
     assert!((1..=HERO).contains(&nw), "wavelengths {nw}");
@@ -1505,12 +1578,50 @@ fn trace(
             // Splats in front of the surface (or of the sky): emissive and
             // absorbing, composited front to back, θ-free.
             if let Some(cloud) = &scene.splats {
-                let seg = splats::composite(
-                    cloud,
-                    &p.ray,
-                    1e-6,
-                    hit.as_ref().map_or(f64::INFINITY, |h| h.hit.t),
-                );
+                let t_max = hit.as_ref().map_or(f64::INFINITY, |h| h.hit.t);
+                let seg = if splat_grad {
+                    composite_hits(cloud, &p.ray, 1e-6, t_max, &mut shits)
+                } else {
+                    splats::composite(cloud, &p.ray, 1e-6, t_max)
+                };
+                if splat_grad && let Some((l, dl)) = replay {
+                    // Per lane: the light from beyond the segment is
+                    // R = L − L⁻ − τ E. Splat s adds τ T_s α_s c_s and
+                    // scales everything behind it by 1 − α_s, so
+                    // ∂L/∂α_s = τ T_s c_s − (E_behind_s + R) / (1 − α_s),
+                    // ∂L/∂dc = τ T_s α_s SH_C0 b(λ) where c is unclamped.
+                    for k in 0..nw {
+                        let j = i * nw + k;
+                        if dl[j] == 0.0 {
+                            continue;
+                        }
+                        let lam = p.lambda[k];
+                        let bw = band_weights(lam);
+                        let basis = [bw[2], bw[1], bw[0]]; // r, g, b
+                        let tau = p.throughput[k];
+                        let e_seg = splat_radiance(seg.radiance, lam);
+                        let r = l[j] - p.radiance[k] - tau * e_seg;
+                        let mut behind = 0.0;
+                        for h in shits.iter().rev() {
+                            let (a, t) = (h.alpha as f64, h.t as f64);
+                            let cs = splat_radiance(h.colour, lam);
+                            let g = &mut extra.splats[h.index as usize];
+                            for ch in 0..3 {
+                                if h.colour[ch] > 0.0 {
+                                    g[ch] += dl[j] * tau * t * a * splats::SH_C0 as f64 * basis[ch];
+                                }
+                            }
+                            if a < 1.0 {
+                                let o = cloud.geometry().opacity(h.index as usize) as f64;
+                                let d_alpha = tau * t * cs - (behind + r) / (1.0 - a);
+                                if o > 0.0 {
+                                    g[3] += dl[j] * d_alpha * a / o;
+                                }
+                            }
+                            behind += tau * t * a * cs;
+                        }
+                    }
+                }
                 for w in 0..nw {
                     p.radiance[w] += p.throughput[w] * splat_radiance(seg.radiance, p.lambda[w]);
                     p.throughput[w] *= seg.transmittance as f64;
@@ -1764,7 +1875,7 @@ pub fn forward(
     seed: u64,
     k: &mut Kernels,
 ) -> (Vec<f64>, Stats) {
-    trace(scene, theta, seed, k, None, &mut [0.0; PARAMS], &mut [0.0; 3])
+    trace(scene, theta, seed, k, None, &mut [0.0; PARAMS], &mut Extra::default())
 }
 
 /// The replay pass alone: `δθ` given the forward pass's `l` and the loss
@@ -1792,10 +1903,23 @@ pub fn replay_diffuse(
     l: &[f64],
     dl: &[f64],
 ) -> ([f64; PARAMS], [f64; 3], Vec<f64>, Stats) {
+    let (grad, extra, l2, stats) = replay_extra(scene, theta, seed, k, l, dl);
+    (grad, extra.diffuse, l2, stats)
+}
+
+/// [`replay`], also returning every derivative beyond `θ` ([`Extra`]).
+pub fn replay_extra(
+    scene: &Scene,
+    theta: &[f64; PARAMS],
+    seed: u64,
+    k: &mut Kernels,
+    l: &[f64],
+    dl: &[f64],
+) -> ([f64; PARAMS], Extra, Vec<f64>, Stats) {
     let mut grad = [0.0; PARAMS];
-    let mut dgrad = [0.0; 3];
-    let (l2, stats) = trace(scene, theta, seed, k, Some((l, dl)), &mut grad, &mut dgrad);
-    (grad, dgrad, l2, stats)
+    let mut extra = Extra::default();
+    let (l2, stats) = trace(scene, theta, seed, k, Some((l, dl)), &mut grad, &mut extra);
+    (grad, extra, l2, stats)
 }
 
 /// Linear-sRGB image (`w·h·3`, row-major) from per-lane `L`.
@@ -1892,6 +2016,28 @@ pub fn gradient(
     let dl = lane_adjoint(scene, adjoint, &d_img);
     let (grad, _, _) = replay(scene, theta, adjoint, k, &l, &dl);
     (value, grad)
+}
+
+/// [`gradient`], also returning the splats' derivatives
+/// ([`Scene::splat_grad`]) and the diffuse bands'.
+pub fn gradient_splats(
+    scene: &Scene,
+    theta: &[f64; PARAMS],
+    seeds: (u64, u64),
+    k: &mut Kernels,
+    loss: &impl Loss,
+) -> (f64, [f64; PARAMS], Extra) {
+    let (primal, adjoint) = seeds;
+    let (l, _) = forward(scene, theta, primal, k);
+    let (value, d_img) = loss.eval(&image(scene, primal, &l));
+    let l = if adjoint == primal {
+        l
+    } else {
+        forward(scene, theta, adjoint, k).0
+    };
+    let dl = lane_adjoint(scene, adjoint, &d_img);
+    let (grad, extra, _, _) = replay_extra(scene, theta, adjoint, k, &l, &dl);
+    (value, grad, extra)
 }
 
 /// [`gradient`], also returning `∂loss/∂d` for [`Scene::diffuse_bands`].
