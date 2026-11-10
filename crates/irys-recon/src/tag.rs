@@ -315,11 +315,10 @@ fn detect_polarity(img: &Grey, lin: &Grey, tag_mm: f64) -> Vec<TagObs> {
                         let i = if wind { (rot + 4 - k) % 4 } else { (rot + k) % 4 };
                         c[k] = q[i];
                     }
-                    if let Some((id, ham)) = decode_with(img, &c, &fam, tag_mm) {
-                        if best.as_ref().is_none_or(|b| ham < b.1) {
+                    if let Some((id, ham)) = decode_with(img, &c, &fam, tag_mm)
+                        && best.as_ref().is_none_or(|b| ham < b.1) {
                             best = Some((id, ham, c));
                         }
-                    }
                 }
             }
             let Some((id, ham, c)) = best else { continue };
@@ -527,8 +526,8 @@ pub fn solve_camera(obs: &TagObs, tag_mm: f64, f0: f64, f_sigma: f64, cx: f64, c
             };
             let d: [f64; 7] = std::array::from_fn(|i| dx[i]);
             let (p2, f2) = step(&pose, f, &d);
-            if let Some(r2) = resid(&p2, f2) {
-                if cost(&r2) < cost(&cur) {
+            if let Some(r2) = resid(&p2, f2)
+                && cost(&r2) < cost(&cur) {
                     let rel = (cost(&cur) - cost(&r2)) / cost(&cur).max(1e-30);
                     pose = p2;
                     f = f2;
@@ -537,7 +536,6 @@ pub fn solve_camera(obs: &TagObs, tag_mm: f64, f0: f64, f_sigma: f64, cx: f64, c
                     improved = rel > 1e-12;
                     break;
                 }
-            }
             mu *= 10.0;
         }
         if !improved {

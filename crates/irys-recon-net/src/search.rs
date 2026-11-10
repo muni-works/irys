@@ -22,7 +22,7 @@ use irys_core::{Bvh, TriMesh};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::render::{Caster, Compare, TABLE, appearance, blas};
+use crate::render::{Caster, Compare, appearance, blas};
 use crate::scene::{self, Cam, Family, Object, mesh_fast as mesh, param_used};
 
 /// What one search sees.
@@ -467,11 +467,10 @@ pub fn baseline_candidates(blob: &[usize], size: (usize, usize), cam: &Cam) -> V
     let y_lo = ys[ys.len() * 3 / 4];
     for &k in blob {
         let (x, y) = (k % w, k / w);
-        if y >= y_lo {
-            if let Some(p) = cam.on_plane(x as f64 + 0.5, y as f64 + 0.5) {
+        if y >= y_lo
+            && let Some(p) = cam.on_plane(x as f64 + 0.5, y as f64 + 0.5) {
                 pts.push(p);
             }
-        }
     }
     let all: Vec<[f64; 2]> = blob.iter().filter_map(|&k| cam.on_plane((k % w) as f64 + 0.5, (k / w) as f64 + 0.5)).collect();
     if pts.is_empty() || all.is_empty() {

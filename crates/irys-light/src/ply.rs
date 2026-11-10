@@ -208,7 +208,7 @@ impl PlyCloud {
                     r.read_exact(b).map_err(|e| format!("ply: truncated ({e})"))?;
                     for v in b.chunks_exact(stride_b) {
                         if all_f32 {
-                            for (k, x) in v.chunks_exact(4).enumerate() {
+                            for (k, x) in v.as_chunks::<4>().0.iter().enumerate() {
                                 row[k] = f32::from_le_bytes([x[0], x[1], x[2], x[3]]);
                             }
                         } else {

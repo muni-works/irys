@@ -194,7 +194,7 @@ impl Runner {
     fn render(&mut self, spp: usize, seed0: u64) -> (Vec<f32>, f64) {
         let (restir, guide) = (self.has("restir"), self.has("guide"));
         let call = spp.min(self.call_max);
-        assert!(spp % call == 0, "spp {spp} is not a multiple of {call}");
+        assert!(spp.is_multiple_of(call), "spp {spp} is not a multiple of {call}");
         let (name, w, h, ctx) = (self.name.clone(), self.w, self.h, self.ctx);
         let features: Vec<&str> = self.features.iter().map(String::as_str).collect();
         let (b, g) = self.wf.entry(call).or_insert_with(|| {

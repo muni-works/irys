@@ -1053,7 +1053,9 @@ dependencies = [
  "tang-compile",
  "tang-expr",
  "vcad",
- "vcad-kernel",
+ "vcad-kernel 0.10.0",
+ "vcad-kernel 0.11.0",
+ "vcad-kernel-diff",
 ]
 
 [[package]]
@@ -1115,8 +1117,8 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
- "vcad-ir",
- "vcad-kernel",
+ "vcad-ir 0.10.0",
+ "vcad-kernel 0.10.0",
  "vcad-kernel-export",
 ]
 
@@ -1353,8 +1355,7 @@ dependencies = [
 [[package]]
 name = "kosm-render"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f34e90e3f7552416125f7652e504526e79269fb7b9c1abe4db1b68396ffae87"
+source = "git+https://github.com/ecto/kosm?rev=59b1d03ec45cf9e9a04ccbbbef0bcc06d8f559d4#59b1d03ec45cf9e9a04ccbbbef0bcc06d8f559d4"
 dependencies = [
  "rayon",
  "tang",
@@ -2496,6 +2497,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "stepperoni"
+version = "0.1.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2799,8 +2808,8 @@ dependencies = [
  "tang",
  "thiserror 2.0.21",
  "toml",
- "vcad-ir",
- "vcad-kernel",
+ "vcad-ir 0.10.0",
+ "vcad-kernel 0.10.0",
  "vcad-kernel-export",
 ]
 
@@ -2812,7 +2821,7 @@ checksum = "554e6a7f7645aa91e4f28c3dae8963a54d84ddac16b1c404be91c618200c54f0"
 dependencies = [
  "geo",
  "thiserror 2.0.21",
- "vcad-ir",
+ "vcad-ir 0.10.0",
 ]
 
 [[package]]
@@ -2823,7 +2832,17 @@ checksum = "5084f04cb0ebbebe3ebafbacec4f9fc119b4cc449b6dfc6401301523a9c48cc1"
 dependencies = [
  "serde",
  "serde_json",
- "vcad-tool-derive",
+ "vcad-tool-derive 0.10.0",
+]
+
+[[package]]
+name = "vcad-ir"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "serde",
+ "serde_json",
+ "vcad-tool-derive 0.11.0",
 ]
 
 [[package]]
@@ -2835,37 +2854,64 @@ dependencies = [
  "serde",
  "vcad-kernel-acoustics",
  "vcad-kernel-antenna",
- "vcad-kernel-booleans",
+ "vcad-kernel-booleans 0.10.0",
  "vcad-kernel-calibration",
- "vcad-kernel-cam",
- "vcad-kernel-constraints",
- "vcad-kernel-cost",
- "vcad-kernel-dfm",
+ "vcad-kernel-cam 0.10.0",
+ "vcad-kernel-constraints 0.10.0",
+ "vcad-kernel-cost 0.10.0",
+ "vcad-kernel-dfm 0.10.0",
  "vcad-kernel-em",
  "vcad-kernel-enclosure",
  "vcad-kernel-fea",
- "vcad-kernel-fillet",
+ "vcad-kernel-fillet 0.10.0",
  "vcad-kernel-flow",
- "vcad-kernel-geom",
- "vcad-kernel-math",
- "vcad-kernel-naming",
+ "vcad-kernel-geom 0.10.0",
+ "vcad-kernel-math 0.10.0",
+ "vcad-kernel-naming 0.10.0",
  "vcad-kernel-neutronics",
  "vcad-kernel-particle",
  "vcad-kernel-photonics",
- "vcad-kernel-primitives",
+ "vcad-kernel-primitives 0.10.0",
  "vcad-kernel-qcd",
- "vcad-kernel-sheet",
- "vcad-kernel-shell",
- "vcad-kernel-sketch",
- "vcad-kernel-step",
- "vcad-kernel-stocksim",
- "vcad-kernel-sweep",
- "vcad-kernel-tessellate",
- "vcad-kernel-text",
+ "vcad-kernel-sheet 0.10.0",
+ "vcad-kernel-shell 0.10.0",
+ "vcad-kernel-sketch 0.10.0",
+ "vcad-kernel-step 0.10.0",
+ "vcad-kernel-stocksim 0.10.0",
+ "vcad-kernel-sweep 0.10.0",
+ "vcad-kernel-tessellate 0.10.0",
+ "vcad-kernel-text 0.10.0",
  "vcad-kernel-thermal",
  "vcad-kernel-tolerance",
- "vcad-kernel-topo",
+ "vcad-kernel-topo 0.10.0",
  "vcad-kernel-topopt",
+]
+
+[[package]]
+name = "vcad-kernel"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "serde",
+ "vcad-kernel-booleans 0.11.0",
+ "vcad-kernel-cam 0.11.0",
+ "vcad-kernel-constraints 0.11.0",
+ "vcad-kernel-cost 0.11.0",
+ "vcad-kernel-dfm 0.11.0",
+ "vcad-kernel-fillet 0.11.0",
+ "vcad-kernel-geom 0.11.0",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-naming 0.11.0",
+ "vcad-kernel-primitives 0.11.0",
+ "vcad-kernel-sheet 0.11.0",
+ "vcad-kernel-shell 0.11.0",
+ "vcad-kernel-sketch 0.11.0",
+ "vcad-kernel-step 0.11.0",
+ "vcad-kernel-stocksim 0.11.0",
+ "vcad-kernel-sweep 0.11.0",
+ "vcad-kernel-tessellate 0.11.0",
+ "vcad-kernel-text 0.11.0",
+ "vcad-kernel-topo 0.11.0",
 ]
 
 [[package]]
@@ -2875,7 +2921,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c5c1f5813e3d19b69b05d30fce46a4fd2be70376978ce27c36070b70d9d255e"
 dependencies = [
  "serde",
- "vcad-receipt",
+ "vcad-receipt 0.10.0",
 ]
 
 [[package]]
@@ -2885,7 +2931,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e74699ad56880e95e3ed6def9ed68f221e9dd6977be4d1a78d3b7b861e2727d"
 dependencies = [
  "serde",
- "vcad-receipt",
+ "vcad-receipt 0.10.0",
 ]
 
 [[package]]
@@ -2895,7 +2941,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830058bb200a56453ec360806f6587326d686e6c62f03d6037433540deb8e170"
 dependencies = [
  "serde",
- "vcad-receipt",
+ "vcad-receipt 0.10.0",
 ]
 
 [[package]]
@@ -2905,11 +2951,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "243c7e55e64bb705fe1d83803a7c84e49eb9c9992e2fc2b0b11478d1e9c99f17"
 dependencies = [
  "rayon",
- "vcad-kernel-geom",
- "vcad-kernel-math",
- "vcad-kernel-primitives",
- "vcad-kernel-tessellate",
- "vcad-kernel-topo",
+ "vcad-kernel-geom 0.10.0",
+ "vcad-kernel-math 0.10.0",
+ "vcad-kernel-primitives 0.10.0",
+ "vcad-kernel-tessellate 0.10.0",
+ "vcad-kernel-topo 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-booleans"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "rayon",
+ "vcad-kernel-geom 0.11.0",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-primitives 0.11.0",
+ "vcad-kernel-tessellate 0.11.0",
+ "vcad-kernel-topo 0.11.0",
 ]
 
 [[package]]
@@ -2934,7 +2993,20 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "vcad-kernel-math",
+ "vcad-kernel-math 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-cam"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "geo",
+ "geo-clipper",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "vcad-kernel-math 0.11.0",
 ]
 
 [[package]]
@@ -2948,8 +3020,22 @@ dependencies = [
  "tang-expr",
  "tang-la",
  "thiserror 2.0.21",
- "vcad-kernel-math",
- "vcad-kernel-sketch",
+ "vcad-kernel-math 0.10.0",
+ "vcad-kernel-sketch 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-constraints"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "slotmap",
+ "tang",
+ "tang-expr",
+ "tang-la",
+ "thiserror 2.0.21",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-sketch 0.11.0",
 ]
 
 [[package]]
@@ -2957,6 +3043,15 @@ name = "vcad-kernel-cost"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "efa25e3d46cd425d9322d6c715d00bc399a9398d6ac5e3bae01854f8969358c9"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "vcad-kernel-cost"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
 dependencies = [
  "serde",
  "serde_json",
@@ -2972,14 +3067,47 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "toml",
- "vcad-ir",
- "vcad-kernel-cost",
- "vcad-kernel-geom",
- "vcad-kernel-math",
- "vcad-kernel-primitives",
- "vcad-kernel-raytrace",
- "vcad-kernel-tessellate",
- "vcad-kernel-topo",
+ "vcad-ir 0.10.0",
+ "vcad-kernel-cost 0.10.0",
+ "vcad-kernel-geom 0.10.0",
+ "vcad-kernel-math 0.10.0",
+ "vcad-kernel-primitives 0.10.0",
+ "vcad-kernel-raytrace 0.10.0",
+ "vcad-kernel-tessellate 0.10.0",
+ "vcad-kernel-topo 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-dfm"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "toml",
+ "vcad-ir 0.11.0",
+ "vcad-kernel-cost 0.11.0",
+ "vcad-kernel-geom 0.11.0",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-primitives 0.11.0",
+ "vcad-kernel-raytrace 0.11.0",
+ "vcad-kernel-tessellate 0.11.0",
+ "vcad-kernel-topo 0.11.0",
+]
+
+[[package]]
+name = "vcad-kernel-diff"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "tang",
+ "vcad-kernel-geom 0.11.0",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-nurbs 0.11.0",
+ "vcad-kernel-primitives 0.11.0",
+ "vcad-kernel-tessellate 0.11.0",
+ "vcad-kernel-topo 0.11.0",
 ]
 
 [[package]]
@@ -2989,7 +3117,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84f3553b3546af516fd21425adfdb8f334c042320293b6f332e0e7fba8809ff8"
 dependencies = [
  "serde",
- "vcad-receipt",
+ "vcad-receipt 0.10.0",
 ]
 
 [[package]]
@@ -3019,8 +3147,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba75bd2d427601c29d81bc918da44e784e446851efa4292b6d33f4f9393eb7da"
 dependencies = [
  "serde",
- "vcad-kernel-tessellate",
- "vcad-receipt",
+ "vcad-kernel-tessellate 0.10.0",
+ "vcad-receipt 0.10.0",
 ]
 
 [[package]]
@@ -3029,11 +3157,23 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b41b0e4ce860dcd9f5db429f44801efe0a5744d77ccd27eaebba160f62742bf0"
 dependencies = [
- "vcad-kernel-geom",
- "vcad-kernel-math",
- "vcad-kernel-nurbs",
- "vcad-kernel-primitives",
- "vcad-kernel-topo",
+ "vcad-kernel-geom 0.10.0",
+ "vcad-kernel-math 0.10.0",
+ "vcad-kernel-nurbs 0.10.0",
+ "vcad-kernel-primitives 0.10.0",
+ "vcad-kernel-topo 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-fillet"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "vcad-kernel-geom 0.11.0",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-nurbs 0.11.0",
+ "vcad-kernel-primitives 0.11.0",
+ "vcad-kernel-topo 0.11.0",
 ]
 
 [[package]]
@@ -3045,7 +3185,7 @@ dependencies = [
  "serde",
  "vcad-kernel-adjoint",
  "vcad-kernel-thermal",
- "vcad-receipt",
+ "vcad-receipt 0.10.0",
 ]
 
 [[package]]
@@ -3055,7 +3195,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e644f69de0cdc1a5206e962d0f5228557eb22ab533f0015c41a0b444f522982b"
 dependencies = [
  "tang",
- "vcad-kernel-math",
+ "vcad-kernel-math 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-geom"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "tang",
+ "vcad-kernel-math 0.11.0",
 ]
 
 [[package]]
@@ -3068,15 +3217,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "vcad-kernel-math"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "tang",
+]
+
+[[package]]
 name = "vcad-kernel-naming"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4d8cc94b1ddac39b9299d33e05092e877f33058ced05e460488a5ebf57a57f0"
 dependencies = [
- "vcad-kernel-geom",
- "vcad-kernel-math",
- "vcad-kernel-primitives",
- "vcad-kernel-topo",
+ "vcad-kernel-geom 0.10.0",
+ "vcad-kernel-math 0.10.0",
+ "vcad-kernel-primitives 0.10.0",
+ "vcad-kernel-topo 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-naming"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "vcad-kernel-geom 0.11.0",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-primitives 0.11.0",
+ "vcad-kernel-topo 0.11.0",
 ]
 
 [[package]]
@@ -3086,7 +3254,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42d113ee27bb8b41063c3da5b743ce12df45f5cbaf48334c5c10d53238497c28"
 dependencies = [
  "serde",
- "vcad-receipt",
+ "vcad-receipt 0.10.0",
 ]
 
 [[package]]
@@ -3096,8 +3264,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ade3700c0c18267e9743bcfceca55e32d1137ea61f833723d688960288b0d360"
 dependencies = [
  "tang",
- "vcad-kernel-geom",
- "vcad-kernel-math",
+ "vcad-kernel-geom 0.10.0",
+ "vcad-kernel-math 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-nurbs"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "tang",
+ "vcad-kernel-geom 0.11.0",
+ "vcad-kernel-math 0.11.0",
 ]
 
 [[package]]
@@ -3107,7 +3285,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12f9e726437990f3df1076dbce8ccafe788b102e0da69cf7810103127a5cb2af"
 dependencies = [
  "serde",
- "vcad-receipt",
+ "vcad-receipt 0.10.0",
 ]
 
 [[package]]
@@ -3118,7 +3296,7 @@ checksum = "534b02f442e56e6ba0f7e638e7ff979d909eada1bfd3be8a053719e4be693e5e"
 dependencies = [
  "serde",
  "vcad-gdsii",
- "vcad-receipt",
+ "vcad-receipt 0.10.0",
 ]
 
 [[package]]
@@ -3127,9 +3305,19 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46f7a1259f7433df55e7460277e92f1cbc7088b9721cb2a9835432ed7e226482"
 dependencies = [
- "vcad-kernel-geom",
- "vcad-kernel-math",
- "vcad-kernel-topo",
+ "vcad-kernel-geom 0.10.0",
+ "vcad-kernel-math 0.10.0",
+ "vcad-kernel-topo 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-primitives"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "vcad-kernel-geom 0.11.0",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-topo 0.11.0",
 ]
 
 [[package]]
@@ -3154,13 +3342,37 @@ dependencies = [
  "smallvec",
  "tang",
  "thiserror 2.0.21",
- "vcad-ir",
- "vcad-kernel-booleans",
- "vcad-kernel-geom",
- "vcad-kernel-math",
- "vcad-kernel-primitives",
- "vcad-kernel-tessellate",
- "vcad-kernel-topo",
+ "vcad-ir 0.10.0",
+ "vcad-kernel-booleans 0.10.0",
+ "vcad-kernel-geom 0.10.0",
+ "vcad-kernel-math 0.10.0",
+ "vcad-kernel-primitives 0.10.0",
+ "vcad-kernel-tessellate 0.10.0",
+ "vcad-kernel-topo 0.10.0",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "vcad-kernel-raytrace"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "bytemuck",
+ "js-sys",
+ "kosm-render 0.2.0",
+ "rayon",
+ "smallvec",
+ "tang",
+ "thiserror 2.0.21",
+ "vcad-ir 0.11.0",
+ "vcad-kernel-booleans 0.11.0",
+ "vcad-kernel-geom 0.11.0",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-primitives 0.11.0",
+ "vcad-kernel-tessellate 0.11.0",
+ "vcad-kernel-topo 0.11.0",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -3174,8 +3386,19 @@ checksum = "336ef04236dd4e1e721e7602564cbd1842e3ef0eb166033073e2b545eaac230b"
 dependencies = [
  "serde",
  "serde_json",
- "vcad-kernel-math",
- "vcad-receipt",
+ "vcad-kernel-math 0.10.0",
+ "vcad-receipt 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-sheet"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "serde",
+ "serde_json",
+ "vcad-kernel-math 0.11.0",
+ "vcad-receipt 0.11.0",
 ]
 
 [[package]]
@@ -3184,11 +3407,23 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e83be33852e494ed714fa938cd6e191e6fc3761b7cc41ab36f8390af6f86323e"
 dependencies = [
- "vcad-kernel-geom",
- "vcad-kernel-math",
- "vcad-kernel-primitives",
- "vcad-kernel-tessellate",
- "vcad-kernel-topo",
+ "vcad-kernel-geom 0.10.0",
+ "vcad-kernel-math 0.10.0",
+ "vcad-kernel-primitives 0.10.0",
+ "vcad-kernel-tessellate 0.10.0",
+ "vcad-kernel-topo 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-shell"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "vcad-kernel-geom 0.11.0",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-primitives 0.11.0",
+ "vcad-kernel-tessellate 0.11.0",
+ "vcad-kernel-topo 0.11.0",
 ]
 
 [[package]]
@@ -3198,10 +3433,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "303d403dc48b60c15fa78e229d8c367d715c5e580485958bd56dd5d9a6026c75"
 dependencies = [
  "thiserror 2.0.21",
- "vcad-kernel-geom",
- "vcad-kernel-math",
- "vcad-kernel-primitives",
- "vcad-kernel-topo",
+ "vcad-kernel-geom 0.10.0",
+ "vcad-kernel-math 0.10.0",
+ "vcad-kernel-primitives 0.10.0",
+ "vcad-kernel-topo 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-sketch"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "thiserror 2.0.21",
+ "vcad-kernel-geom 0.11.0",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-primitives 0.11.0",
+ "vcad-kernel-topo 0.11.0",
 ]
 
 [[package]]
@@ -3210,13 +3457,27 @@ version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e897e80f2bde8c5e3433d9213b41c4664da0b3a35e45657872fb72dfe4b7977"
 dependencies = [
- "stepperoni",
+ "stepperoni 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.21",
- "vcad-kernel-geom",
- "vcad-kernel-math",
- "vcad-kernel-nurbs",
- "vcad-kernel-primitives",
- "vcad-kernel-topo",
+ "vcad-kernel-geom 0.10.0",
+ "vcad-kernel-math 0.10.0",
+ "vcad-kernel-nurbs 0.10.0",
+ "vcad-kernel-primitives 0.10.0",
+ "vcad-kernel-topo 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-step"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "stepperoni 0.1.0 (git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77)",
+ "thiserror 2.0.21",
+ "vcad-kernel-geom 0.11.0",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-nurbs 0.11.0",
+ "vcad-kernel-primitives 0.11.0",
+ "vcad-kernel-topo 0.11.0",
 ]
 
 [[package]]
@@ -3228,8 +3489,20 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "vcad-kernel-cam",
- "vcad-kernel-math",
+ "vcad-kernel-cam 0.10.0",
+ "vcad-kernel-math 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-stocksim"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "vcad-kernel-cam 0.11.0",
+ "vcad-kernel-math 0.11.0",
 ]
 
 [[package]]
@@ -3240,11 +3513,25 @@ checksum = "1933fbb53b4fc87c60efa662b75549ad0250e475d2d59d3197ed5176ff149b09"
 dependencies = [
  "rustc-hash 1.1.0",
  "thiserror 2.0.21",
- "vcad-kernel-geom",
- "vcad-kernel-math",
- "vcad-kernel-primitives",
- "vcad-kernel-sketch",
- "vcad-kernel-topo",
+ "vcad-kernel-geom 0.10.0",
+ "vcad-kernel-math 0.10.0",
+ "vcad-kernel-primitives 0.10.0",
+ "vcad-kernel-sketch 0.10.0",
+ "vcad-kernel-topo 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-sweep"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "rustc-hash 1.1.0",
+ "thiserror 2.0.21",
+ "vcad-kernel-geom 0.11.0",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-primitives 0.11.0",
+ "vcad-kernel-sketch 0.11.0",
+ "vcad-kernel-topo 0.11.0",
 ]
 
 [[package]]
@@ -3257,10 +3544,25 @@ dependencies = [
  "serde",
  "serde_json",
  "tang",
- "vcad-kernel-geom",
- "vcad-kernel-math",
- "vcad-kernel-primitives",
- "vcad-kernel-topo",
+ "vcad-kernel-geom 0.10.0",
+ "vcad-kernel-math 0.10.0",
+ "vcad-kernel-primitives 0.10.0",
+ "vcad-kernel-topo 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-tessellate"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "earcutr",
+ "serde",
+ "serde_json",
+ "tang",
+ "vcad-kernel-geom 0.11.0",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-primitives 0.11.0",
+ "vcad-kernel-topo 0.11.0",
 ]
 
 [[package]]
@@ -3271,8 +3573,19 @@ checksum = "d4a6b9be856f57403b0f82a65b15d1eef861e09df8f80127eb48127e2de377f3"
 dependencies = [
  "thiserror 2.0.21",
  "ttf-parser",
- "vcad-kernel-math",
- "vcad-kernel-sketch",
+ "vcad-kernel-math 0.10.0",
+ "vcad-kernel-sketch 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-text"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "thiserror 2.0.21",
+ "ttf-parser",
+ "vcad-kernel-math 0.11.0",
+ "vcad-kernel-sketch 0.11.0",
 ]
 
 [[package]]
@@ -3282,7 +3595,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b672ee5fe0406e5ba9dabc209e99dad22b9f5e43f2393a62eda0653c3574d18"
 dependencies = [
  "serde",
- "vcad-receipt",
+ "vcad-receipt 0.10.0",
 ]
 
 [[package]]
@@ -3293,7 +3606,7 @@ checksum = "5ec19a855222b7ea2546d1fed3c458e57bbd1aec383a2d8997bac4498977f99e"
 dependencies = [
  "serde",
  "vcad-kernel-adjoint",
- "vcad-receipt",
+ "vcad-receipt 0.10.0",
 ]
 
 [[package]]
@@ -3303,7 +3616,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ccb839ee0efb80e7343449442d0806ae057beb076da0a88da55b03ae6f879eb"
 dependencies = [
  "slotmap",
- "vcad-kernel-math",
+ "vcad-kernel-math 0.10.0",
+]
+
+[[package]]
+name = "vcad-kernel-topo"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "slotmap",
+ "vcad-kernel-math 0.11.0",
 ]
 
 [[package]]
@@ -3313,7 +3635,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16e9abab273ae85a4683e7a62aab3ecb7b65f7e56f0da1b1647bfc686150cc77"
 dependencies = [
  "serde",
- "vcad-kernel-tessellate",
+ "vcad-kernel-tessellate 0.10.0",
 ]
 
 [[package]]
@@ -3327,10 +3649,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "vcad-receipt"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "vcad-tool-derive"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c0486d0c026fc694ca273466f775d3d76fa035df59bfbd298fd536d51870b44"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "vcad-tool-derive"
+version = "0.11.0"
+source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
 dependencies = [
  "proc-macro2",
  "quote",

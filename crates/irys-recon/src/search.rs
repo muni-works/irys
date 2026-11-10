@@ -864,17 +864,15 @@ pub fn recover(
             let mut q = beam[0].0.prog.clone();
             q.features.extend(by_group.values().map(|(_, f)| f.clone()));
             let why = format!("combine the best of {} blobs", by_group.len());
-            if q.valid() {
-                if let Ok(f) = fitters[0].fit(&q, &fit::short()) {
-                    if degenerate(&f.prog).is_none() {
+            if q.valid()
+                && let Ok(f) = fitters[0].fit(&q, &fit::short())
+                    && degenerate(&f.prog).is_none() {
                         iters += f.iters;
                         evals += f.evals;
                         let s = mdl::score(&f);
                         trace.push(Step { round, why, program: f.prog.to_text(), score: Some(s), accepted: false });
                         fresh.push((f, s, trace.len() - 1));
                     }
-                }
-            }
         }
         for (f, s, _) in &fresh {
             pool.push((*s, round, f.clone()));
@@ -893,11 +891,10 @@ pub fn recover(
             if !seen.insert(key(&f.prog)) {
                 continue;
             }
-            if let Some(ti) = ti {
-                if beam.is_empty() {
+            if let Some(ti) = ti
+                && beam.is_empty() {
                     trace[ti].accepted = true;
                 }
-            }
             beam.push((f, s));
         }
         let new: Vec<String> = beam.iter().map(|(f, _)| key(&f.prog)).collect();

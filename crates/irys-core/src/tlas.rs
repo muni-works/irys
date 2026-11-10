@@ -293,12 +293,11 @@ impl<G: Geometry> Tlas<G> {
             TlasNode::Leaf { instances, .. } => {
                 for &i in instances {
                     let inst = &self.instances[i as usize];
-                    if let Some(found) = inst.trace_closest(ray, t_min, *best_t) {
-                        if found.hit.t < *best_t {
+                    if let Some(found) = inst.trace_closest(ray, t_min, *best_t)
+                        && found.hit.t < *best_t {
                             *best_t = found.hit.t;
                             *best = Some(found);
                         }
-                    }
                 }
             }
             TlasNode::Internal { left, right, .. } => {

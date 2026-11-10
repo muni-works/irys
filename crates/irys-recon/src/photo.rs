@@ -29,9 +29,11 @@
 //!   fixed pixel, `∂L/∂n · (ẑ × n)`, by a difference of the closed form
 //!   (translations on the plane change no normal).
 //!
-//! What is left out is the derivative of the ambient occlusion with the
-//! geometry (smooth and small; the forward-difference columns of v0, which
-//! carried it, are kept behind [`Rig::fd_occluded`]).
+//! - **ambient-occlusion edges** ([`ao_edges`]): the AO's fixed directions
+//!   on upward-facing receivers, each treated as a directional light.
+//!
+//! The forward-difference columns of v0 for the occluded parameters are
+//! kept behind [`Rig::fd_occluded`].
 
 use std::sync::Arc;
 
@@ -100,7 +102,7 @@ impl Camera {
         let d = p - self.eye();
         let row = |i: usize| Vec3::new(self.r[i][0], self.r[i][1], self.r[i][2]);
         let (r0, r1, r2) = (row(0), row(1), row(2));
-        let (a, b, z) = (r0.dot(&d), r1.dot(&d), r2.dot(&d));
+        let (a, b, z) = (r0.dot(d), r1.dot(d), r2.dot(d));
         if z <= 1e-6 {
             return None;
         }
@@ -145,6 +147,8 @@ pub struct Rig {
     pub secondary: bool,
     /// Secondary edge samples per key direction.
     pub shadow_samples: usize,
+    /// The ambient occlusion's boundary term ([`ao_edges`]).
+    pub ao_edges: bool,
 }
 
 impl Rig {
@@ -213,7 +217,7 @@ pub fn surf(m: &Posed, cam: &Camera, keys: &[Vec3; look::KEY], ao: &[Vec3; look:
     let (kind, n, pt) = match hit {
         Some(h) if h.t < t_table => {
             let mut n = *h.normal.as_ref();
-            if n.dot(&d) > 0.0 {
+            if n.dot(d) > 0.0 {
                 n = -n;
             }
             (1u8, n, h.point)
@@ -369,7 +373,7 @@ fn primary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, n: usize, seed: u6
         if len < 1e-9 {
             continue;
         }
-        let (za, zb) = ((pa - eye).dot(&fwd), (pb - eye).dot(&fwd));
+        let (za, zb) = ((pa - eye).dot(fwd), (pb - eye).dot(fwd));
         pieces.push(Piece { ci, sa, sb, za, zb, t0, t1, we: len * c.weight });
     }
     if pieces.is_empty() || n == 0 {
@@ -406,7 +410,7 @@ fn primary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, n: usize, seed: u6
             let wn: Vec<f64> = (0..np)
                 .map(|j| {
                     let vv = vel[c.a][j] * (1.0 - t3) + vel[c.b][j] * t3;
-                    scale * (nrm[0] * jp[0].dot(&vv) + nrm[1] * jp[1].dot(&vv))
+                    scale * (nrm[0] * jp[0].dot(vv) + nrm[1] * jp[1].dot(vv))
                 })
                 .collect();
             let e = jac::EPS_PX;
@@ -414,22 +418,21 @@ fn primary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, n: usize, seed: u6
             let outer = [s[0] + e * nrm[0], s[1] + e * nrm[1]];
             // Ownership: the inner ray must land on the owner's plane.
             let fnrm = jac::face_normal(p, &t[c.tri]).normalize();
-            let plane_c = fnrm.dot(&p[c.a].coords());
+            let plane_c = fnrm.dot(p[c.a].coords());
             let hi = m.bvh.trace_closest(&Ray::new(eye, cam.dir(inner[0], inner[1])))?;
-            if (fnrm.dot(&hi.point.coords()) - plane_c).abs() > 1e-2 {
+            if (fnrm.dot(hi.point.coords()) - plane_c).abs() > 1e-2 {
                 return None;
             }
-            if let Some(ho) = m.bvh.trace_closest(&Ray::new(eye, cam.dir(outer[0], outer[1]))) {
-                if (ho.point - x).norm() < 2e-2 {
+            if let Some(ho) = m.bvh.trace_closest(&Ray::new(eye, cam.dir(outer[0], outer[1])))
+                && (ho.point - x).norm() < 2e-2 {
                     let view = (eye - x).normalize();
-                    let fo = ho.normal.as_ref().dot(&view).abs();
-                    let fi = fnrm.dot(&view).abs();
+                    let fo = ho.normal.as_ref().dot(view).abs();
+                    let fi = fnrm.dot(view).abs();
                     let tie = (fo - fi).abs() < 1e-9;
                     if fo > fi + 1e-9 || (tie && jac::key(ho.normal.as_ref()) > jac::key(&fnrm)) {
                         return None;
                     }
                 }
-            }
             let (fi, _) = shade_at(m, cam, &v.look, &keys, &ao, inner[0], inner[1]);
             let (fo, out_part) = shade_at(m, cam, &v.look, &keys, &ao, outer[0], outer[1]);
             let px = (s[1].floor().clamp(0.0, h as f64 - 1.0) as usize) * w + s[0].floor().clamp(0.0, w as f64 - 1.0) as usize;
@@ -446,6 +449,33 @@ fn primary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, n: usize, seed: u6
 
 /// The key's shadow edges (see the module docs).
 fn secondary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, per_dir: usize, seed: u64, out: &mut ViewJac) {
+    let keys = look::key_dirs(&v.look);
+    shadow_edges(m, v, vel, np, &keys, None, per_dir, seed, out);
+}
+
+/// The ambient occlusion's boundary term. [`surf`]'s AO is [`look::AO`]
+/// fixed directions in the receiver's frame, so on a flat receiver of
+/// normal `n` they are fixed world directions, each a directional light of
+/// weight `1 / AO`: the derivative is [`shadow_edges`] for each of them,
+/// kept to receivers of that normal. The receivers covered are the
+/// upward-facing ones (the table, top faces, counterbore floors): those
+/// carry the sky-occlusion of every hole, pocket and boss, and they are
+/// where the camera, above the tag plane, sees AO. Curved receivers (bore
+/// walls) are left out.
+fn ao_edges(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, per_dir: usize, seed: u64, out: &mut ViewJac) {
+    let up = Vec3::new(0.0, 0.0, 1.0);
+    let (tt, bb) = look::frame(up);
+    let dirs: Vec<Vec3> = look::ao_dirs().iter().map(|a| tt * a.x + bb * a.y + up * a.z).collect();
+    shadow_edges(m, v, vel, np, &dirs, Some(up), per_dir, seed ^ 0xa0, out);
+}
+
+/// Directional shadow edges: for each direction `l` in `dirs`, the part's
+/// silhouette edges seen along `l`, pushed along `−l` to their receivers;
+/// with `recv`, only receivers of that normal count. The receiver may move
+/// too (a counterbore floor with its depth): its normal speed enters the
+/// shadow point's motion, `dS = v − l (m·(v − v_r)) / (m·l)`.
+#[allow(clippy::too_many_arguments)]
+fn shadow_edges(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, dirs: &[Vec3], recv: Option<Vec3>, per_dir: usize, seed: u64, out: &mut ViewJac) {
     use std::collections::HashMap;
     let cam = &v.cam;
     let (w, h) = cam.size;
@@ -481,7 +511,7 @@ fn secondary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, per_dir: usize, 
     let mut list: Vec<_> = edges.into_iter().collect();
     list.sort_by_key(|(k, _)| *k);
     let mut rng = Mix(seed ^ 0x5ad0_77ed);
-    for (kd, l) in keys.iter().enumerate() {
+    for (kd, l) in dirs.iter().enumerate() {
         if l.z <= 0.05 {
             continue;
         }
@@ -493,7 +523,7 @@ fn secondary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, per_dir: usize, 
                 let lit: Vec<bool> = fs.iter().map(|&(ti, ..)| normals[ti].dot(l) > 0.0).collect();
                 let (ti, a, b) = fs[0];
                 let ok = match fs.len() {
-                    2 => lit[0] != lit[1] && normals[fs[0].0].normalize().dot(&normals[fs[1].0].normalize()) < 1.0 - 1e-7,
+                    2 => lit[0] != lit[1] && normals[fs[0].0].normalize().dot(normals[fs[1].0].normalize()) < 1.0 - 1e-7,
                     _ => lit[0],
                 };
                 let _ = ti;
@@ -522,11 +552,34 @@ fn secondary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, per_dir: usize, 
                 let back = -*l;
                 let ray = Ray::new(x + back * 1e-3, back);
                 let t_table = if back.z < -1e-9 { -(x.z) / back.z } else { f64::INFINITY };
-                let (s_pt, mnorm) = match m.bvh.trace_closest(&ray) {
-                    Some(hh) if hh.t < t_table => (hh.point, *hh.normal.as_ref()),
-                    _ if t_table.is_finite() => (x + back * t_table, Vec3::new(0.0, 0.0, 1.0)),
+                let (s_pt, mut mnorm, vr) = match m.bvh.trace_closest(&ray) {
+                    Some(hh) if hh.t < t_table => {
+                        // The receiver's own motion, interpolated over its triangle.
+                        let tri = m.t[hh.prim as usize];
+                        let (bu, bv) = (hh.uv.x, hh.uv.y);
+                        let wts = [1.0 - bu - bv, bu, bv];
+                        let vr: Vec<Vec3> = (0..np)
+                            .map(|j| (0..3).fold(Vec3::new(0.0, 0.0, 0.0), |acc, c| acc + vel[tri[c] as usize][j] * wts[c]))
+                            .collect();
+                        (hh.point, *hh.normal.as_ref(), vr)
+                    }
+                    _ if t_table.is_finite() => (x + back * t_table, Vec3::new(0.0, 0.0, 1.0), vec![Vec3::new(0.0, 0.0, 0.0); np]),
                     _ => return None,
                 };
+                // A receiver touching its own casting edge (the plate's
+                // bottom edges on the table) puts the shadow edge on the
+                // geometric edge, which the primary term already counts.
+                if (s_pt - x).norm() < 0.05 {
+                    return None;
+                }
+                if mnorm.dot(l) < 0.0 {
+                    mnorm = -mnorm;
+                }
+                if let Some(nr) = recv {
+                    if mnorm.dot(nr) < 0.999 {
+                        return None;
+                    }
+                }
                 let ml = mnorm.dot(l);
                 if ml.abs() < 1e-3 {
                     return None;
@@ -542,8 +595,8 @@ fn secondary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, per_dir: usize, 
                     return None;
                 }
                 let e3 = (p[b] - p[a]).normalize();
-                let es = e3 - *l * (mnorm.dot(&e3) / ml);
-                let tau = [jp[0].dot(&es), jp[1].dot(&es)];
+                let es = e3 - *l * (mnorm.dot(e3) / ml);
+                let tau = [jp[0].dot(es), jp[1].dot(es)];
                 let tl = tau[0].hypot(tau[1]);
                 if tl < 1e-9 {
                     return None;
@@ -560,8 +613,8 @@ fn secondary(m: &Posed, v: &View, vel: &[Vec<Vec3>], np: usize, per_dir: usize, 
                 let wn: Vec<f64> = (0..np)
                     .map(|j| {
                         let vv = vel[a][j] * (1.0 - u2) + vel[b][j] * u2;
-                        let ds = vv - *l * (mnorm.dot(&vv) / ml);
-                        scale * df * (ns[0] * jp[0].dot(&ds) + ns[1] * jp[1].dot(&ds))
+                        let ds = vv - *l * (mnorm.dot(vv - vr[j]) / ml);
+                        scale * df * (ns[0] * jp[0].dot(ds) + ns[1] * jp[1].dot(ds))
                     })
                     .collect();
                 let _ = (len, kd);
@@ -593,6 +646,9 @@ pub fn eval(prog: &Program, rig: &Rig, edge_samples: usize, seed: u64, jac: bool
             primary(&m, v, &vel, np, edge_samples, s + 17, &mut j);
             if rig.secondary {
                 secondary(&m, v, &vel, np, rig.shadow_samples, s + 29, &mut j);
+            }
+            if rig.ao_edges {
+                ao_edges(&m, v, &vel, np, rig.shadow_samples, s + 43, &mut j);
             }
             if let Some(c) = yaw_col {
                 for px in 0..npx {
@@ -678,11 +734,10 @@ pub fn init_bases(target: &crate::fit::Target, rig: &Rig) -> Vec<Program> {
     let mut pts = Vec::new();
     for (vi, v) in rig.views.iter().enumerate() {
         for p in 0..w * h {
-            if target.mask[vi][p] > 0.5 && target.w(vi, p) > 0.0 {
-                if let Some(q) = v.cam.on_table((p % w) as f64 + 0.5, (p / w) as f64 + 0.5) {
+            if target.mask[vi][p] > 0.5 && target.w(vi, p) > 0.0
+                && let Some(q) = v.cam.on_table((p % w) as f64 + 0.5, (p / w) as f64 + 0.5) {
                     pts.push(q);
                 }
-            }
         }
     }
     if pts.len() < 10 {

@@ -38,7 +38,7 @@ pub fn sampler_shader() -> String {
         "const BLUE_NOISE_MASK: array<u32, {words}> = array<u32, {words}>("
     )
     .unwrap();
-    for (i, w) in mask.chunks_exact(4).enumerate() {
+    for (i, w) in mask.as_chunks::<4>().0.iter().enumerate() {
         if i % 8 == 0 {
             out.push('\n');
         }

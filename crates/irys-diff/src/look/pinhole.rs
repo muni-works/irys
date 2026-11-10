@@ -40,11 +40,10 @@ impl Pinhole {
         if k.len() != 9 {
             return Err("camera_info: k is not 3 × 3".into());
         }
-        if let Some(d) = v["d"].as_array() {
-            if d.iter().any(|x| x.as_f64().unwrap_or(1.0) != 0.0) {
+        if let Some(d) = v["d"].as_array()
+            && d.iter().any(|x| x.as_f64().unwrap_or(1.0) != 0.0) {
                 return Err("camera_info: distortion is not supported".into());
             }
-        }
         Ok(Self {
             width: v["width"].as_u64().ok_or("camera_info: no width")? as usize,
             height: v["height"].as_u64().ok_or("camera_info: no height")? as usize,

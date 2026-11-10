@@ -32,7 +32,7 @@ pub fn fresnel<S: Scalar>(n1: S, n2: S, cos_i: S, cos_t: S) -> S {
 /// [`fresnel`] wants next), or `None` on total internal reflection.
 pub fn refract<S: Scalar>(d: Vec3<S>, n: Vec3<S>, n1: S, n2: S) -> Option<(Vec3<S>, S, S)> {
     let eta = n1 / n2;
-    let cos_i = -d.dot(&n);
+    let cos_i = -d.dot(n);
     let k = S::ONE - eta * eta * (S::ONE - cos_i * cos_i);
     if k < S::ZERO {
         return None;
@@ -43,7 +43,7 @@ pub fn refract<S: Scalar>(d: Vec3<S>, n: Vec3<S>, n1: S, n2: S) -> Option<(Vec3<
 
 /// Mirror `d` about a unit normal `n`.
 pub fn reflect<S: Scalar>(d: Vec3<S>, n: Vec3<S>) -> Vec3<S> {
-    d - n * (S::TWO * d.dot(&n))
+    d - n * (S::TWO * d.dot(n))
 }
 
 /// N-BK7 Sellmeier coefficients (Schott datasheet): the dispersion *shape*.

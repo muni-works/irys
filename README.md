@@ -130,9 +130,16 @@ is a specification of which irys has built only the M1 prerequisites, and
 - ReSTIR PT/GRIS and a neural radiance cache were not built. ReSTIR DI and
   path guiding are GPU only, and ReSTIR DI measured as a net loss once the
   Sobol sampler was on.
-- Against Cycles at equal time, the phase 3 gate was met on one of three
-  test scenes; on the other two irys was 1.23 to 1.27 times behind at the
-  largest budget (design.md, roadmap table).
+- Against Cycles at equal time, irys has 1.5 to 5.6 times lower error at
+  every budget on its three benchmark scenes (pair, room, cornell), with the
+  opt-in sun sampling share (design.md, speed round 3). On Blender's demo
+  files with full materials Cycles wins: irys's error is 0.89 to 2.75 times
+  Cycles' on the classroom and 14 to 17 times on the clamped pavilion, and
+  Cycles is 2 to 3 times faster per sample (design.md, phase 5, round 4).
+- Against Mitsuba 3 on the same M4 Max and scenes, irys's material gradient
+  reaches equal variance 7 to 26 times sooner; both match their own central
+  differences. Mitsuba's pose gradient converged to a biased value on the
+  arm scene, so there is no pose comparison (`bench/mitsuba`, design.md).
 - The GPU wavefront in `irys-diff` uses wgpu's experimental ray queries.
   Development and all recorded timings are on Apple silicon with Metal.
   The docs record no runs on other backends.
@@ -162,8 +169,7 @@ The two share one benchmark: irys renders vcad's frozen-plan mesh of a
 robot-arm shoulder plate, takes the gradient of an image loss on every mesh
 node by edge sampling, and vcad pulls that back to a CAD parameter (the
 bearing bore diameter). The benchmark is the `rose_brep` example in
-`irys-diff`. It is not on `main` yet: it is at commit `103e3da` on the
-branch `claude/irys-release-readiness-1db58e`. It reads the plate from
+`irys-diff` (added in commit `103e3da`). It reads the plate from
 [rose](https://github.com/muni-works/rose) at commit `832192f`.
 
 ## License

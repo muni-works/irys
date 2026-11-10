@@ -85,7 +85,7 @@ impl GpuLook {
             .map(|c| {
                 let b = &bytes[c * per_b as usize..(c + 1) * per_b as usize];
                 let acc: &[f32] = bytemuck::cast_slice(&b[..acc_b as usize]);
-                let rgb = acc.chunks_exact(4).flat_map(|p| [p[0] * inv, p[1] * inv, p[2] * inv]).collect();
+                let rgb = acc.as_chunks::<4>().0.iter().flat_map(|p| [p[0] * inv, p[1] * inv, p[2] * inv]).collect();
                 let spectrum = if spectrum {
                     let sp: &[f32] = bytemuck::cast_slice(&b[acc_b as usize..]);
                     let per_bin = (pixels as f64 * o.spp as f64 * 4.0) / bins as f64;

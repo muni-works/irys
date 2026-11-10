@@ -1601,6 +1601,10 @@ pub struct GpuEdges {
     np: u32,
     policy: u32,
     moving: Vec<usize>,
+    mover_slots: Vec<u32>,
+    /// Diagnostics (2f): draw so that [`GpuEdges::draws`] can read back
+    /// where every sample landed; the weights are then not computed.
+    pub debug: bool,
     /// What the last draw cost.
     pub timing: EdgeTiming,
 }
@@ -1786,6 +1790,8 @@ impl GpuEdges {
             np: np as u32,
             policy: front_only as u32,
             moving: moving.to_vec(),
+            debug: false,
+            mover_slots: movers.iter().map(|m| m.slot_base).collect(),
             timing: EdgeTiming::default(),
         }
     }
@@ -1855,7 +1861,7 @@ impl GpuEdges {
                 policy: self.policy,
                 blocks: self.blocks,
                 eps_px: crate::vis::EPS_PX as f32,
-                _p: [0; 3],
+                _p: [self.debug as u32, 0, 0],
             }),
         );
         let host = t0.elapsed();
@@ -1894,10 +1900,32 @@ impl GpuEdges {
         crate::vis::EdgeSamples::from_parts(pixel, weight, visible)
     }
 
+    /// After a [`GpuEdges::debug`] draw: per sample, where it landed as a
+    /// [`crate::vis::Draw`] (`None`: no candidate), and the device's verdict
+    /// on it — 1 visible, or why its ownership test refused it: -1/-2/-3/-4
+    /// the ray test (miss, another instance, a non-coplanar triangle, off
+    /// the plane), -5 behind the eye, -6 hidden by a surface in front.
+    pub fn draws(&self, gp: &GpuPrb) -> Vec<(Option<crate::vis::Draw>, i32)> {
+        assert!(self.debug && self.np >= 2, "a debug draw, two lanes at least");
+        let stride = 2 + self.np as usize;
+        gp.read(&self.smp, self.n as usize * stride)
+            .chunks_exact(stride)
+            .map(|s| {
+                if s[1] == 0.0 {
+                    return (None, 0);
+                }
+                let si = s[2].to_bits() as usize;
+                let mi = self.mover_slots.iter().rposition(|&b| b as usize <= si).unwrap();
+                let local = si - self.mover_slots[mi] as usize;
+                (Some((mi, local / 3, local % 3, s[3] as f64)), s[1] as i32)
+            })
+            .collect()
+    }
+
     /// The device's points, as camera-plane pairs (for tests).
     pub fn points(&self, gp: &GpuPrb) -> Vec<[f64; 2]> {
         gp.read(&self.pts, 2 * self.n as usize * 2)
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|p| [p[0] as f64, p[1] as f64])
             .collect()
     }

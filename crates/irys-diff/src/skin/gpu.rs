@@ -407,7 +407,7 @@ impl GpuSkin {
         }
         let acc = self.read(&self.accum, self.pixels * 4);
         let img = acc
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .flat_map(|p| [p[0], p[1], p[2]])
             .collect();
         let l = if lanes {

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use irys_core::{Bvh, Instance, Point3, Ray, Tlas, TriMesh, Vec3};
 
-use crate::scene::{Cam, Object, Scene, Tris, mesh};
+use crate::scene::{Cam, Object, Tris, mesh};
 
 /// Per-pixel labels.
 #[derive(Debug, Clone)]
@@ -73,8 +73,8 @@ impl Caster {
         let along = d[0] * f[0] + d[1] * f[1] + d[2] * f[2];
         let ray = Ray::new(Point3::new(cam.eye[0], cam.eye[1], cam.eye[2]), Vec3::new(d[0], d[1], d[2]));
         let t_plane = if d[2] < -1e-9 { -cam.eye[2] / d[2] } else { f64::INFINITY };
-        if let Some(h) = self.tlas.trace_closest(&ray) {
-            if h.hit.t < t_plane {
+        if let Some(h) = self.tlas.trace_closest(&ray)
+            && h.hit.t < t_plane {
                 let n = h.hit.normal;
                 let mut n = [n.x, n.y, n.z];
                 if n[0] * d[0] + n[1] * d[1] + n[2] * d[2] > 0.0 {
@@ -82,7 +82,6 @@ impl Caster {
                 }
                 return (h.payload as u16, h.hit.t * along, n);
             }
-        }
         if t_plane.is_finite() { (TABLE, t_plane * along, [0.0, 0.0, 1.0]) } else { (BACKDROP, 1e5, [0.0, 0.0, 1.0]) }
     }
 

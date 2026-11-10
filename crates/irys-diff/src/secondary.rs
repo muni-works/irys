@@ -255,7 +255,7 @@ impl Secondary {
                     t.apply_vec(&Vec3::new(0.0, 1.0, 0.0)),
                     t.apply_vec(&Vec3::new(0.0, 0.0, 1.0)),
                 ];
-                let det = v[0].dot(&v[1].cross(&v[2])).abs();
+                let det = v[0].dot(v[1].cross(v[2])).abs();
                 (t.inverse(), det.cbrt().max(1e-300))
             })
             .unzip();
@@ -363,7 +363,7 @@ impl Secondary {
         let facing = |tri: usize| {
             let p0 = place.to_world.apply_point(&pos[tris[tri][0] as usize]);
             let nw = place.to_world.apply_normal(&normal[tri]);
-            nw.dot(&(x - p0)) / (nw.norm() * (x - p0).norm()).max(1e-300)
+            nw.dot(x - p0) / (nw.norm() * (x - p0).norm()).max(1e-300)
         };
         let range = nd.a as usize..(nd.a + nd.n) as usize;
         let mut lw = vec![[0.0f64; 3]; range.len()];
@@ -372,7 +372,7 @@ impl Secondary {
             let t = tris[tri];
             let a = place.to_world.apply_point(&pos[t[e] as usize]);
             let b = place.to_world.apply_point(&pos[t[(e + 1) % 3] as usize]);
-            if n.dot(&(a - x)) <= 0.0 && n.dot(&(b - x)) <= 0.0 {
+            if n.dot(a - x) <= 0.0 && n.dot(b - x) <= 0.0 {
                 continue;
             }
             let fa = facing(tri);
@@ -480,7 +480,7 @@ pub struct Lobes {
 }
 
 fn angle(a: Vec3, b: Vec3) -> f64 {
-    a.dot(&b).clamp(-1.0, 1.0).acos()
+    a.dot(b).clamp(-1.0, 1.0).acos()
 }
 
 impl Lobes {

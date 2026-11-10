@@ -54,6 +54,10 @@ use irys_light::spectrum::hero_weight;
 
 use crate::prb::{HERO, Rng, Scene, wavelengths};
 
+/// Where an edge sampler landed: (moving instance, triangle, edge, the
+/// edge's parameter), for [`EdgeSamples::at_draws`].
+pub type Draw = (usize, usize, usize, f64);
+
 /// The half-width of an edge sample, in pixels: the two rays leave the
 /// camera this far either side of the edge. Small against a pixel, large
 /// against the device's f32 camera plane.
@@ -117,7 +121,7 @@ impl Pinhole {
     /// [`Scene::project`] through this pinhole, without the Jacobian.
     pub fn project(&self, size: (usize, usize), p: Point3) -> Option<[f64; 2]> {
         let d = p - self.eye;
-        let z = d.dot(&self.forward);
+        let z = d.dot(self.forward);
         if z <= 0.0 {
             return None;
         }
@@ -125,8 +129,8 @@ impl Pinhole {
         let kx = w / (2.0 * self.tan_half * w / h);
         let ky = h / (2.0 * self.tan_half);
         Some([
-            d.dot(&self.right) / z * kx + w / 2.0,
-            h / 2.0 - d.dot(&self.up) / z * ky,
+            d.dot(self.right) / z * kx + w / 2.0,
+            h / 2.0 - d.dot(self.up) / z * ky,
         ])
     }
 }
@@ -230,7 +234,7 @@ impl Edges {
                 .iter()
                 .map(|t| {
                     let [a, b, c] = t.map(|i| pos[i as usize]);
-                    (b - a).cross(&(c - a))
+                    (b - a).cross(c - a)
                 })
                 .collect();
             let mut map: std::collections::HashMap<_, Vec<(usize, usize)>> =
@@ -250,7 +254,7 @@ impl Edges {
                     let (n0, n1) = (normal[t0], normal[t1]);
                     let (l0, l1) = (n0.norm(), n1.norm());
                     if l0 > 0.0 && l1 > 0.0 {
-                        let c = n0.dot(&n1) / (l0 * l1);
+                        let c = n0.dot(n1) / (l0 * l1);
                         let (a, b) = if c > 1.0 - 1e-10 {
                             (FLAT, FLAT)
                         } else {
@@ -323,7 +327,7 @@ impl Visibility {
                 let r = Ray::new(eye, fwd + right * sx + up * sy);
                 if let Some(hit) = scene.tlas().trace_closest_range(&r, 0.0, f64::INFINITY) {
                     id[y * w + x] = hit.payload as u32;
-                    depth[y * w + x] = (hit.hit.point - eye).dot(&fwd);
+                    depth[y * w + x] = (hit.hit.point - eye).dot(fwd);
                 }
             }
         }
@@ -435,6 +439,10 @@ pub struct EdgeSamples {
     pixel: Vec<usize>,
     /// Per sample, per parameter: `v_n · Σℓw / (w_e n)`.
     weight: Vec<Vec<f64>>,
+    /// Per sample, where on the mesh it landed: placement, the edge's two
+    /// vertex indices in that placement's tree, and the edge parameter `v`
+    /// of the material point (`(1 − v)·a + v·b`). `None` if not visible.
+    site: Vec<Option<(usize, u32, u32, f64)>>,
     /// Screen length of every candidate edge in the frame, pixels.
     pub total_len: f64,
     /// Of it, the length of silhouettes and boundaries (importance 1).
@@ -495,6 +503,7 @@ impl EdgeSamples {
     pub(crate) fn from_parts(pixel: Vec<usize>, weight: Vec<Vec<f64>>, visible: usize) -> Self {
         Self {
             points: Vec::new(),
+            site: vec![None; pixel.len()],
             pixel,
             weight,
             total_len: 0.0,
@@ -526,7 +535,7 @@ impl EdgeSamples {
         seed: u64,
         vis: Option<&Visibility>,
     ) -> Self {
-        Self::for_rig(scene, edges, rig, phi, n, seed, vis.is_some(), vis)
+        Self::for_rig(scene, edges, rig, phi, n, seed, vis.is_some(), vis, None)
     }
 
     /// 2e's front-only silhouettes without an ID buffer (what the device
@@ -540,7 +549,25 @@ impl EdgeSamples {
         seed: u64,
         front_only: bool,
     ) -> Self {
-        Self::for_rig(scene, edges, rig, phi, n, seed, front_only, None)
+        Self::for_rig(scene, edges, rig, phi, n, seed, front_only, None, None)
+    }
+
+    /// [`EdgeSamples::with_policy`] at given draws instead of its own: per
+    /// sample, the (moving instance, triangle, edge, edge parameter) the
+    /// sampler landed on, or `None` for no sample — what
+    /// [`crate::gpu::GpuEdges::draws`] reads back. The weights assume
+    /// [`EdgeSamples::with_policy`]'s density, so a sampler's draws scored
+    /// here are scored exactly as the host would have scored them (2f: the
+    /// device sampler's per-sample check).
+    pub fn at_draws(
+        scene: &Scene,
+        edges: &Edges,
+        rig: &Rig,
+        phi: &[f64],
+        draws: &[Option<Draw>],
+        front_only: bool,
+    ) -> Self {
+        Self::for_rig(scene, edges, rig, phi, draws.len(), 0, front_only, None, Some(draws))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -553,6 +580,7 @@ impl EdgeSamples {
         seed: u64,
         front_only: bool,
         vis: Option<&Visibility>,
+        draws: Option<&[Option<Draw>]>,
     ) -> Self {
         let np = phi.len();
         // ± RIG_H placements per parameter, for the edges' velocities.
@@ -571,7 +599,7 @@ impl EdgeSamples {
                 .iter()
                 .map(|[p, q]| {
                     let dx = (p[mi].apply_point(&xl) - q[mi].apply_point(&xl)) / (2.0 * RIG_H);
-                    [jac[0].dot(&dx), jac[1].dot(&dx)]
+                    [jac[0].dot(dx), jac[1].dot(dx)]
                 })
                 .collect::<Vec<_>>()
         };
@@ -585,6 +613,7 @@ impl EdgeSamples {
             seed,
             front_only,
             vis,
+            draws,
         )
     }
 
@@ -621,7 +650,7 @@ impl EdgeSamples {
                 .collect::<Vec<_>>()
         };
         let all: Vec<usize> = (0..scene.placements().len()).collect();
-        Self::build(scene, edges, &all, &vel, c.len(), n, seed, true, None)
+        Self::build(scene, edges, &all, &vel, c.len(), n, seed, true, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -635,6 +664,7 @@ impl EdgeSamples {
         seed: u64,
         front_only: bool,
         vis: Option<&Visibility>,
+        draws: Option<&[Option<Draw>]>,
     ) -> Self {
         let (w, h) = (scene.size.0 as f64, scene.size.1 as f64);
         let mut segs = Vec::new();
@@ -652,7 +682,7 @@ impl EdgeSamples {
             let facing = |tri: usize| {
                 let x = place.to_world.apply_point(&pos[tris[tri][0] as usize]);
                 let n = place.to_world.apply_normal(&normal[tri]);
-                n.dot(&(eye - x)) / (n.norm() * (eye - x).norm()).max(1e-300)
+                n.dot(eye - x) / (n.norm() * (eye - x).norm()).max(1e-300)
             };
             let front = |tri: usize| facing(tri) > 0.0;
             for (tri, t) in tris.iter().enumerate() {
@@ -662,7 +692,7 @@ impl EdgeSamples {
                     .collect();
                 let pz: Vec<Option<([f64; 2], f64)>> = wp
                     .iter()
-                    .map(|&x| scene.project(x).map(|p| (p.0, (x - eye).dot(&fwd))))
+                    .map(|&x| scene.project(x).map(|p| (p.0, (x - eye).dot(fwd))))
                     .collect();
                 if pz.iter().all(Option::is_none) {
                     continue;
@@ -770,11 +800,16 @@ impl EdgeSamples {
             points: Vec::with_capacity(2 * n),
             pixel: Vec::with_capacity(n),
             weight: Vec::with_capacity(n),
+            site: Vec::with_capacity(n),
             total_len: total,
             silhouette_len: sil,
             segments: segs.len(),
             visible: 0,
             halved: 0,
+        };
+        let seg_of: std::collections::HashMap<(usize, usize, usize), usize> = match draws {
+            Some(_) => segs.iter().enumerate().map(|(i, sg)| ((sg.mi, sg.tri, sg.e), i)).collect(),
+            None => Default::default(),
         };
         for i in 0..n {
             let put = |o: &mut Self, s: [f64; 2], nrm: [f64; 2], wt: Vec<f64>| {
@@ -785,6 +820,7 @@ impl EdgeSamples {
                 let y = (s[1].floor().clamp(0.0, h - 1.0)) as usize;
                 o.pixel.push(y * scene.size.0 + x);
                 o.weight.push(wt);
+                o.site.push(None);
             };
             // One generator per sample (phase 2e: the device draws the
             // same `u` in parallel).
@@ -794,11 +830,22 @@ impl EdgeSamples {
                 put(&mut out, [0.0, 0.0], [1.0, 0.0], vec![0.0; np]);
                 continue;
             }
-            let si = cum.partition_point(|&c| c <= u).min(segs.len() - 1);
-            let seg = &segs[si];
-            let start = if si == 0 { 0.0 } else { cum[si - 1] };
-            let frac = ((u - start) / (cum[si] - start)).clamp(0.0, 1.0);
-            let t = seg.t0 + frac * (seg.t1 - seg.t0);
+            let (seg, t) = match draws {
+                None => {
+                    let si = cum.partition_point(|&c| c <= u).min(segs.len() - 1);
+                    let seg = &segs[si];
+                    let start = if si == 0 { 0.0 } else { cum[si - 1] };
+                    let frac = ((u - start) / (cum[si] - start)).clamp(0.0, 1.0);
+                    (seg, seg.t0 + frac * (seg.t1 - seg.t0))
+                }
+                Some(d) => match d[i].and_then(|(mi, tri, e, t)| seg_of.get(&(mi, tri, e)).map(|&si| (&segs[si], t))) {
+                    Some(st) => st,
+                    None => {
+                        put(&mut out, [0.0, 0.0], [1.0, 0.0], vec![0.0; np]);
+                        continue;
+                    }
+                },
+            };
             let d = [seg.pb[0] - seg.pa[0], seg.pb[1] - seg.pa[1]];
             let s = [seg.pa[0] + t * d[0], seg.pa[1] + t * d[1]];
             let dl = d[0].hypot(d[1]);
@@ -823,7 +870,7 @@ impl EdgeSamples {
             let r = fwd + right * sx + up * sy;
             let e = b - a;
             let w0 = eye - a;
-            let (aa, bb, cc, dd, ee) = (r.dot(&r), r.dot(&e), e.dot(&e), r.dot(&w0), e.dot(&w0));
+            let (aa, bb, cc, dd, ee) = (r.dot(r), r.dot(e), e.dot(e), r.dot(w0), e.dot(w0));
             let den = aa * cc - bb * bb;
             let v = if den.abs() > 0.0 {
                 ((aa * ee - bb * dd) / den).clamp(0.0, 1.0)
@@ -867,7 +914,7 @@ impl EdgeSamples {
                     && lh > 0.0
                     && nt.dot(nh) / (ln * lh) > 1.0 - 1e-6
                     && local.is_some_and(|q| {
-                        (nt / ln).dot(&(q - la)).abs() < 1e-4 * (lb - la).norm().max(1e-9)
+                        (nt / ln).dot(q - la).abs() < 1e-4 * (lb - la).norm().max(1e-9)
                     })
             });
             let (Some(jac), true) = (jac, own) else {
@@ -886,8 +933,74 @@ impl EdgeSamples {
                 .map(|v| (v[0] * nrm[0] + v[1] * nrm[1]) * wtotal / (seg.w * n as f64))
                 .collect();
             put(&mut out, s, nrm, wt);
+            *out.site.last_mut().unwrap() = Some((seg.k, tri[seg.e], tri[(seg.e + 1) % 3], v));
         }
         out
+    }
+
+    /// Edge samples for per-vertex gradients: the edges of the placements
+    /// `moving` are candidates, and the "parameters" are a unit world-space
+    /// translation of the material point (x, y, z), so
+    /// [`EdgeSamples::vertex_gradient`] can split each sample's worth onto
+    /// the edge's two vertices. This is the cotangent a mesh-node seam (a
+    /// CAD kernel's `∂x/∂θ`) pulls back.
+    pub fn for_vertices(
+        scene: &Scene,
+        edges: &Edges,
+        moving: &[usize],
+        n: usize,
+        seed: u64,
+        vis: Option<&Visibility>,
+    ) -> Self {
+        let vel = |_mi: usize, _xl: Point3, _x: Point3, jac: [Vec3; 2]| {
+            vec![
+                [jac[0].x, jac[1].x],
+                [jac[0].y, jac[1].y],
+                [jac[0].z, jac[1].z],
+            ]
+        };
+        Self::build(scene, edges, moving, &vel, 3, n, seed, true, vis, None)
+    }
+
+    /// `∂ℒ/∂X_i` (world space) for every vertex of placement `k`'s tree,
+    /// `n_vertices` long, from samples drawn by [`EdgeSamples::for_vertices`]
+    /// and the pairs' traced `L`, as [`EdgeSamples::gradient`] takes them.
+    pub fn vertex_gradient(
+        &self,
+        scene: &Scene,
+        seed: u64,
+        l: &[f64],
+        d_img: &[f64],
+        k: usize,
+        n_vertices: usize,
+    ) -> Vec<Vec3> {
+        let nw = scene.wavelengths;
+        assert_eq!(l.len(), 2 * self.len() * nw, "L of the points frame");
+        let mut g = vec![Vec3::new(0.0, 0.0, 0.0); n_vertices];
+        for (i, ((&px, wt), site)) in self.pixel.iter().zip(&self.weight).zip(&self.site).enumerate() {
+            let Some((sk, a, b, v)) = *site else { continue };
+            if sk != k || wt.len() != 3 {
+                continue;
+            }
+            let lam: [f64; HERO] = wavelengths(Rng::new(seed, i as u64).uniform(), nw);
+            let mut s = 0.0;
+            for c in 0..nw {
+                let d = l[2 * i * nw + c] - l[(2 * i + 1) * nw + c];
+                let hw = hero_weight(lam[c]);
+                for ch in 0..3 {
+                    s += d * hw[ch] as f64 / nw as f64 * d_img[px * 3 + ch];
+                }
+            }
+            let gx = Vec3::new(wt[0], wt[1], wt[2]) * s;
+            g[a as usize] = g[a as usize] + gx * (1.0 - v);
+            g[b as usize] = g[b as usize] + gx * v;
+        }
+        g
+    }
+
+    /// Each sample's pixel.
+    pub fn pixels(&self) -> &[usize] {
+        &self.pixel
     }
 
     /// Per sample, per parameter, what its pair's difference is worth.
@@ -1034,20 +1147,20 @@ fn tri_world(scene: &Scene, k: usize, t: usize, place: Option<&Transform>) -> [P
 /// interval overlap on the planes' common line).
 pub fn tri_tri(ta: [Point3; 3], tb: [Point3; 3]) -> Option<(Point3, Point3)> {
     let plane = |t: &[Point3; 3]| {
-        let n = (t[1] - t[0]).cross(&(t[2] - t[0]));
+        let n = (t[1] - t[0]).cross(t[2] - t[0]);
         let l = n.norm();
-        (l > 0.0).then(|| (n / l, n.dot(&t[0].coords()) / l))
+        (l > 0.0).then(|| (n / l, n.dot(t[0].coords()) / l))
     };
     let (na, da) = plane(&ta)?;
     let (nb, db) = plane(&tb)?;
-    let dir = na.cross(&nb);
+    let dir = na.cross(nb);
     if dir.norm() < 1e-9 {
         return None;
     }
     let dir = dir.normalize();
     // The part of `t` on the other plane, as an interval along `dir`.
     let clip = |t: &[Point3; 3], n: Vec3, d: f64| -> Option<(f64, f64, Point3, Point3)> {
-        let s: Vec<f64> = t.iter().map(|p| n.dot(&p.coords()) - d).collect();
+        let s: Vec<f64> = t.iter().map(|p| n.dot(p.coords()) - d).collect();
         let mut pts = Vec::new();
         for i in 0..3 {
             let j = (i + 1) % 3;
@@ -1060,7 +1173,7 @@ pub fn tri_tri(ta: [Point3; 3], tb: [Point3; 3]) -> Option<(Point3, Point3)> {
             return None;
         }
         let (p, q) = (pts[0], pts[1]);
-        let (u, v) = (dir.dot(&p.coords()), dir.dot(&q.coords()));
+        let (u, v) = (dir.dot(p.coords()), dir.dot(q.coords()));
         Some(if u <= v { (u, v, p, q) } else { (v, u, q, p) })
     };
     let (a0, a1, pa0, pa1) = clip(&ta, nb, db)?;
@@ -1170,6 +1283,7 @@ impl EdgeSamples {
             points: Vec::with_capacity(2 * n),
             pixel: Vec::with_capacity(n),
             weight: Vec::with_capacity(n),
+            site: Vec::with_capacity(n),
             total_len: total,
             silhouette_len: 0.0,
             segments: proj.len(),
@@ -1185,6 +1299,7 @@ impl EdgeSamples {
                 let y = (s[1].floor().clamp(0.0, h - 1.0)) as usize;
                 o.pixel.push(y * scene.size.0 + x);
                 o.weight.push(wt);
+                o.site.push(None);
             };
             if proj.is_empty() {
                 put(&mut out, [0.0, 0.0], [1.0, 0.0], vec![0.0; np]);
@@ -1207,7 +1322,7 @@ impl EdgeSamples {
             let r = fwd + right * sx + up * sy;
             let e = sg.b - sg.a;
             let w0 = eye - sg.a;
-            let (aa, bb, cc, dd, ee) = (r.dot(&r), r.dot(&e), e.dot(&e), r.dot(&w0), e.dot(&w0));
+            let (aa, bb, cc, dd, ee) = (r.dot(r), r.dot(e), e.dot(e), r.dot(w0), e.dot(w0));
             let den = aa * cc - bb * bb;
             let v = if den.abs() > 0.0 { ((aa * ee - bb * dd) / den).clamp(0.0, 1.0) } else { t };
             let x = sg.a + e * v;
@@ -1238,17 +1353,17 @@ impl EdgeSamples {
             let line_at = |j: usize, side: usize| -> Option<Point3> {
                 let ta = tri_world(scene, sg.ka, sg.ta, placement(sg.ka, j, side));
                 let tb = tri_world(scene, sg.kb, sg.tb, placement(sg.kb, j, side));
-                let n1 = (ta[1] - ta[0]).cross(&(ta[2] - ta[0])).normalize();
-                let n2 = (tb[1] - tb[0]).cross(&(tb[2] - tb[0])).normalize();
-                let dir = n1.cross(&n2);
+                let n1 = (ta[1] - ta[0]).cross(ta[2] - ta[0]).normalize();
+                let n2 = (tb[1] - tb[0]).cross(tb[2] - tb[0]).normalize();
+                let dir = n1.cross(n2);
                 let l2 = dir.norm_squared();
                 if l2 < 1e-18 {
                     return None;
                 }
                 // Point on both planes nearest x: x minus its plane
                 // offsets, solved in the planes' normal space.
-                let (d1, d2) = (n1.dot(&(x - ta[0])), n2.dot(&(x - tb[0])));
-                let c = n1.dot(&n2);
+                let (d1, d2) = (n1.dot(x - ta[0]), n2.dot(x - tb[0]));
+                let c = n1.dot(n2);
                 let det = 1.0 - c * c;
                 let (g1, g2) = ((d1 - c * d2) / det, (d2 - c * d1) / det);
                 Some(x - n1 * g1 - n2 * g2)
@@ -1257,7 +1372,7 @@ impl EdgeSamples {
                 .map(|j| match (line_at(j, 0), line_at(j, 1)) {
                     (Some(p), Some(q)) => {
                         let dx = (p - q) / (2.0 * RIG_H);
-                        let vel = [jac[0].dot(&dx), jac[1].dot(&dx)];
+                        let vel = [jac[0].dot(dx), jac[1].dot(dx)];
                         (vel[0] * nrm[0] + vel[1] * nrm[1]) * total / n as f64
                     }
                     _ => 0.0,

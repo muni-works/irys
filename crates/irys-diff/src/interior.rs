@@ -728,7 +728,7 @@ fn walk(
         let origin = xh + n.s(D::c(eps));
         let nee = scene.nee.then(|| {
             let dir = env.sample([rng.uniform(), rng.uniform(), rng.uniform()]);
-            let cos = dir.dot(&nv);
+            let cos = dir.dot(nv);
             let lit = cos > 0.0
                 && !scene
                     .tlas()
@@ -958,7 +958,7 @@ fn warp_nee(
                         let a = place.to_world.apply_point(&m.positions()[tri[e] as usize]);
                         let bp = place.to_world.apply_point(&m.positions()[tri[(e + 1) % 3] as usize]);
                         let ab = bp - a;
-                        let s = ((x - a).dot(&ab) / ab.norm_squared().max(1e-300)).clamp(0.0, 1.0);
+                        let s = ((x - a).dot(ab) / ab.norm_squared().max(1e-300)).clamp(0.0, 1.0);
                         bk = bk.min((x - (a + ab * s)).norm() / tt);
                     }
                     let bk = bk.min(b_miss);
@@ -968,7 +968,7 @@ fn warp_nee(
                             (0..np)
                                 .map(|j| {
                                     let dv = xp.d(j) - o.d(j);
-                                    (dv - wk * wk.dot(&dv)) / tt
+                                    (dv - wk * wk.dot(dv)) / tt
                                 })
                                 .collect()
                         }
@@ -986,7 +986,7 @@ fn warp_nee(
         num.iter()
             .map(|v| {
                 let u = *v / den.max(1e-300);
-                u - w * w.dot(&u)
+                u - w * w.dot(u)
             })
             .collect()
     };
@@ -1000,7 +1000,7 @@ fn warp_nee(
             field((dir - e * h).normalize()),
         );
         for j in 0..np {
-            div[j] += (up[j] - um[j]).dot(&e) / (2.0 * h);
+            div[j] += (up[j] - um[j]).dot(e) / (2.0 * h);
         }
     }
     (u0, div)
@@ -1106,7 +1106,7 @@ fn secondary_edge(
         kappa: env.kappa,
         mirror: (!vx.diffuse).then(|| {
             let wo = vx.tt.v() * vx.lo[0].v + vx.bb.v() * vx.lo[1].v + nv * vx.lo[2].v;
-            (nv * (2.0 * wo.dot(&nv)) - wo, vx.alpha)
+            (nv * (2.0 * wo.dot(nv)) - wo, vx.alpha)
         }),
     };
     let Some(pk) = call
@@ -1122,18 +1122,18 @@ fn secondary_edge(
         return;
     }
     let w0 = rv / r;
-    let cos = w0.dot(&nv);
+    let cos = w0.dot(nv);
     if cos <= 0.0 {
         return;
     }
     let te = (pk.b - pk.a).normalize();
-    let tproj = te - w0 * w0.dot(&te);
+    let tproj = te - w0 * w0.dot(te);
     let m = tproj.norm() / r;
     if m <= 0.0 {
         return;
     }
-    let mut nrm = w0.cross(&tproj).normalize();
-    if nrm.dot(&(pk.c - p)) > 0.0 {
+    let mut nrm = w0.cross(tproj).normalize();
+    if nrm.dot(pk.c - p) > 0.0 {
         nrm = -nrm;
     }
     let side = |s: f64| (w0 + nrm * (s * EPS_DIR)).normalize();
@@ -1165,7 +1165,7 @@ fn secondary_edge(
             && lh > 0.0
             && nt.dot(nh) / (ln * lh) > 1.0 - 1e-6
             && local.is_some_and(|q| {
-                (nt / ln).dot(&(q - pk.la)).abs() < 1e-4 * (pk.lb - pk.la).norm().max(1e-9)
+                (nt / ln).dot(q - pk.la).abs() < 1e-4 * (pk.lb - pk.la).norm().max(1e-9)
             })
     });
     if !own {
@@ -1181,13 +1181,13 @@ fn secondary_edge(
     let vel: Vec<f64> = (0..np)
         .map(|j| {
             let dv = xp.d(j) - vx.o.d(j);
-            let dv = dv - w0 * w0.dot(&dv);
-            nrm.dot(&dv) / r
+            let dv = dv - w0 * w0.dot(dv);
+            nrm.dot(dv) / r
         })
         .collect();
     // The BSDF sampler's direction velocity at the `u` that draws `w0`.
     let lo_v = [vx.lo[0].v, vx.lo[1].v, vx.lo[2].v];
-    let li_v = [w0.dot(&vx.t0), w0.dot(&vx.b0), cos];
+    let li_v = [w0.dot(vx.t0), w0.dot(vx.b0), cos];
     let bsdf_dir: Option<V3> = if vx.diffuse {
         Some(vx.tt.s(D::c(li_v[0])) + vx.bb.s(D::c(li_v[1])) + vx.n.s(D::c(li_v[2])))
     } else if lo_v[2] > 0.0 {
@@ -1199,7 +1199,7 @@ fn secondary_edge(
         None
     };
     let vel_b: Vec<f64> = match &bsdf_dir {
-        Some(dd) => (0..np).map(|j| vel[j] - nrm.dot(&dd.d(j))).collect(),
+        Some(dd) => (0..np).map(|j| vel[j] - nrm.dot(dd.d(j))).collect(),
         None => vel.clone(),
     };
     // g, and the two strategies' pdfs, at `w0`.

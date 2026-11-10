@@ -252,11 +252,10 @@ pub fn parse_hdr(bytes: &[u8]) -> Result<EnvMap, String> {
         if s.starts_with("#?") {
             saw_magic = true;
         }
-        if let Some(fmt) = s.strip_prefix("FORMAT=") {
-            if fmt.trim() != "32-bit_rle_rgbe" {
+        if let Some(fmt) = s.strip_prefix("FORMAT=")
+            && fmt.trim() != "32-bit_rle_rgbe" {
                 return Err(format!("unsupported Radiance FORMAT={fmt}"));
             }
-        }
     }
     if !saw_magic {
         return Err("not a Radiance file (no #? magic)".into());

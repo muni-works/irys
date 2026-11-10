@@ -31,10 +31,10 @@ pub fn mesh(solid: &Solid) -> (Vec<Point3>, Vec<[u32; 3]>) {
     let m = solid.to_mesh(crate::dsl::SEGMENTS);
     let p = m
         .vertices
-        .chunks_exact(3)
+        .as_chunks::<3>().0.iter()
         .map(|v| Point3::new(v[0] as f64, v[1] as f64, v[2] as f64))
         .collect();
-    let t = m.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+    let t = m.indices.as_chunks::<3>().0.iter().map(|t| [t[0], t[1], t[2]]).collect();
     (p, t)
 }
 
@@ -76,7 +76,7 @@ impl Carrier {
     fn on(&self, p: Point3) -> bool {
         match self {
             Carrier::Plane { n, o, lo, hi, ring, .. } => {
-                if (n.dot(&p.coords()) - o).abs() > TOL {
+                if (n.dot(p.coords()) - o).abs() > TOL {
                     return false;
                 }
                 let q = [p.x, p.y, p.z];

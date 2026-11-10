@@ -993,7 +993,7 @@ pub(crate) fn subsurface_walk(
         for c in 0..3 {
             weight[c] *= sigma_s[c] * (-sigma_t[c] * t).exp() / pdf;
         }
-        pos = pos + dir * t;
+        pos += dir * t;
         // Henyey–Greenstein, sampled exactly, so `f / pdf` is 1 and the phase
         // function costs the walk nothing but a direction. At `g = 0` the
         // cosine drawn is `1 - 2u`, uniform on the sphere — the same

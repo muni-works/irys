@@ -55,3 +55,14 @@ pub fn ball(size: usize, spp: usize, mode: Mode) -> Scene {
 
 /// Uniform chromophores: θ₀, θ₁ are the fractions themselves.
 pub const THETA: [f64; PARAMS] = [0.03, 0.02, 1.0, 0.35, 0.6];
+
+/// One number the paper quotes, as `PAPER\t<key>\t<value>` on stderr, for
+/// the repro script that regenerates `data/measured.tsv`.
+pub fn paper(key: &str, v: f64) {
+    eprintln!("PAPER\t{key}\t{v:e}");
+}
+
+/// A count the paper quotes, printed plain.
+pub fn paper_n(key: &str, n: usize) {
+    eprintln!("PAPER\t{key}\t{n}");
+}

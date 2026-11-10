@@ -470,8 +470,8 @@ impl GpuHair {
         let (dev, queue) = (&self.ctx.device, &self.ctx.queue);
         let ts = scene.sampler.unwrap_or(*theta);
         let fwd = (scene.target - scene.eye).normalize();
-        let right = fwd.cross(&irys_core::Vec3::new(0.0, 0.0, 1.0)).normalize();
-        let up = right.cross(&fwd);
+        let right = fwd.cross(irys_core::Vec3::new(0.0, 0.0, 1.0)).normalize();
+        let up = right.cross(fwd);
         let v4 = |x: f64, y: f64, z: f64, w: f64| [x as f32, y as f32, z as f32, w as f32];
         let mut lights = [GpuLight::zeroed(); 4];
         for (g, l) in lights.iter_mut().zip(&scene.lights) {

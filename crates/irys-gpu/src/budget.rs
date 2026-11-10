@@ -296,7 +296,7 @@ impl RayTracePipeline {
                 filtered_reprojected: 0,
             };
             ctx.queue.write_buffer(
-                &hist.params_buffer(),
+                hist.params_buffer(),
                 PARAM_STRIDE * BUDGET_SLOT as u64,
                 bytemuck::bytes_of(&p),
             );
@@ -319,8 +319,8 @@ impl RayTracePipeline {
             hist,
             raw,
             guides,
-            &hist.scratch_a_buffer(),
-            &hist.scratch_b_buffer(),
+            hist.scratch_a_buffer(),
+            hist.scratch_b_buffer(),
             None,
             "Sample Budget Bind Group",
         );

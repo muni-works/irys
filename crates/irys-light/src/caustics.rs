@@ -297,7 +297,7 @@ impl CausticMap {
             return out;
         }
         let (uh, vh) = (u.normalize(), v.normalize());
-        let n = uh.cross(&vh).normalize();
+        let n = uh.cross(vh).normalize();
         for j in 0..nv {
             let t = (j as f64 + 0.5) / nv as f64 * h_m;
             for i in 0..nu {
@@ -682,7 +682,7 @@ impl CausticPack {
         }
         let mut bounds_min = [f32::INFINITY; 3];
         let mut bounds_max = [f32::NEG_INFINITY; 3];
-        for ph in photons.chunks_exact(12) {
+        for ph in photons.as_chunks::<12>().0 {
             for k in 0..3 {
                 bounds_min[k] = bounds_min[k].min(ph[k] - radius);
                 bounds_max[k] = bounds_max[k].max(ph[k] + radius);

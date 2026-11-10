@@ -266,8 +266,8 @@ impl<G: Geometry> Scene<G> {
         }
 
         for (i, l) in self.lights.iter().enumerate() {
-            if let Some(t) = l.intersect(ray) {
-                if t < best_t {
+            if let Some(t) = l.intersect(ray)
+                && t < best_t {
                     best_t = t;
                     landing = Landing::Light {
                         emission: l.emission,
@@ -276,7 +276,6 @@ impl<G: Geometry> Scene<G> {
                         point: ray.at(t),
                     };
                 }
-            }
         }
 
         landing
@@ -501,8 +500,8 @@ impl<G: Geometry> Scene<G> {
                 if cos_light > 1e-9 && cos_exit > 0.0 {
                     let light_pdf =
                         pick_pdf * (dist * dist / (cos_light * light.area())) as f32;
-                    if light_pdf.is_finite() && light_pdf > 0.0 {
-                        if let Some(tr) =
+                    if light_pdf.is_finite() && light_pdf > 0.0
+                        && let Some(tr) =
                             self.shadow_transmittance(accel, p + n * 1e-5, wi, dist)
                         {
                             let f = cos_exit as f32 * inv_pi;
@@ -512,7 +511,6 @@ impl<G: Geometry> Scene<G> {
                                 scale3(mul3(mul3(tr, light.emission), [f; 3]), w / light_pdf),
                             );
                         }
-                    }
                 }
             }
         }
@@ -520,30 +518,28 @@ impl<G: Geometry> Scene<G> {
         // The environment, when it is importance-sampled at all.
         if let Some((wi, li, env_pdf)) = self.env.sample(rng.f64(), rng.f64()) {
             let cos_exit = wi.dot(n);
-            if env_pdf.is_finite() && env_pdf > 0.0 && max3(li) > 0.0 && cos_exit > 0.0 {
-                if let Some(tr) =
+            if env_pdf.is_finite() && env_pdf > 0.0 && max3(li) > 0.0 && cos_exit > 0.0
+                && let Some(tr) =
                     self.shadow_transmittance(accel, p + n * 1e-5, wi, f64::INFINITY)
                 {
                     let f = cos_exit as f32 * inv_pi;
                     let w = power_heuristic(env_pdf, f);
                     sum = add3(sum, scale3(mul3(mul3(tr, li), [f; 3]), w / env_pdf));
                 }
-            }
         }
 
         // The sun disc.
         if let Some(sun) = &self.sun {
             let (wi, li, sun_pdf) = sun.sample(rng.f64(), rng.f64());
             let cos_exit = wi.dot(n);
-            if sun_pdf.is_finite() && sun_pdf > 0.0 && max3(li) > 0.0 && cos_exit > 0.0 {
-                if let Some(tr) =
+            if sun_pdf.is_finite() && sun_pdf > 0.0 && max3(li) > 0.0 && cos_exit > 0.0
+                && let Some(tr) =
                     self.shadow_transmittance(accel, p + n * 1e-5, wi, f64::INFINITY)
                 {
                     let f = cos_exit as f32 * inv_pi;
                     let w = power_heuristic(sun_pdf, f);
                     sum = add3(sum, scale3(mul3(mul3(tr, li), [f; 3]), w / sun_pdf));
                 }
-            }
         }
 
         sum

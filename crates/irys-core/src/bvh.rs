@@ -248,12 +248,10 @@ impl<G: Geometry> Bvh<G> {
                     if let Some(hit) = self
                         .geom
                         .intersect(ray, prim as usize, t_min, f64::INFINITY)
-                    {
-                        if hit.t < *closest_t {
+                        && hit.t < *closest_t {
                             *closest_t = hit.t;
                             *closest = Some(hit);
                         }
-                    }
                 }
             }
             BvhNode::Internal { left, right, .. } => {
