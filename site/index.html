@@ -260,7 +260,7 @@ pre .c { color: var(--muted); }
             <tr><td>GPU f32 vs CPU f64, worst parameter gradient</td><td class="v">3.5e-4</td></tr>
           </tbody>
         </table></div>
-        <p class="small">What irys differentiates today: a GGX conductor with a three-band spectral Fresnel, lit only by the environment (a sky and a sun lobe). It renders diffuse surfaces and Gaussian splats but does not differentiate them.</p>
+        <p class="small">What irys differentiates: a GGX conductor's roughness and three-band spectral Fresnel, the spectral albedo of every diffuse surface, and each Gaussian splat's colour and opacity, under a sky, a sun and area emitters. On the GPU, the diffuse gradient matches the f64 reference to 2.4e-6 and the splat gradient to 5e-5, with replay still bit-identical.</p>
       </div>
     </div>
   </section>
@@ -330,7 +330,7 @@ cargo run --release -p irys-diff --features gpu --example fit_gpu -- out/fit_gpu
 
 <span class="c"># Tests. GPU tests skip when there is no adapter.</span>
 cargo test -p irys</pre>
-      <p class="small">The <code>irys</code> crate on crates.io is an unrelated project. Everything is version 0.1.0 and the API is not stable. The core crates are the most settled; <code>irys-diff</code> and the crates built on it are research code. The GPU wavefront uses wgpu's experimental ray queries, and every recorded run is on Apple silicon with Metal.</p>
+      <p class="small">The <code>irys</code> crate on crates.io is an unrelated project. Everything is version 0.1.0 and the API is not stable. The core crates are the most settled; <code>irys-diff</code> and the crates built on it are research code. Timings are recorded on Apple silicon with Metal; the test suite also passes on an NVIDIA RTX 3090 through Vulkan.</p>
     </div>
   </section>
 

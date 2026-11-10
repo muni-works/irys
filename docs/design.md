@@ -2653,6 +2653,54 @@ Next: the arm with Mitsuba's own shapes replacing the PLYs, and a Mitsuba
 issue with the arm scene if it reproduces there; then the comparison at the
 fit's size (192²) where Mitsuba's per-call overhead amortises.
 
+## The paper's limits, overcome (2026-11-10)
+
+The irys paper lists three limits: diffuse surfaces and splats are not
+differentiated, only the environment emits light, and the GPU tier had
+run only on Metal. This section removes the first two and the last; replay
+stays bit-exact per device and driver, which is the one left.
+
+**Vulkan.** On an RTX 3090 (driver 580) building `bounce` faulted inside
+the driver and lost the device, after which every pipeline was invalid with
+no error reported. The Sobol byte tables were a WGSL module-constant array
+indexed at run time, which naga lowers to a per-invocation local copy. They
+now live in the `qtab` storage buffer (`SOBOL_OFF`, `QKEY_OFF`), the same
+words. A second bug only Vulkan showed: f32 rounding could put a sampled
+wavelength on the lower edge of a zero-mass bin, pdf 0, one NaN pixel in
+192 frames of Sobol + spectral; `spec_pdf` now takes the bin below.
+
+**Emitters** were already in (phase 3): `Surface::Emitter`, NEE and MIS on
+both tiers. Their gates now also pass on Vulkan (phase3, 16/16).
+
+**Diffuse albedo** (`Scene::diffuse_bands`, three hats like F0). Lambertian
+`f` is linear in the bands, so a diffuse vertex adds
+`δL (L − L⁻) b_k / A` to `δd_k`, `L⁻` the radiance before the vertex,
+whatever light strategy runs there. GPU: a per-path `vec4` summed in bounce
+order, paths added on the host in index order. Roulette keeps the grey
+proxy, so it stays detached.
+
+**Splats** (`Scene::splat_grad`): each splat's DC colour and base opacity.
+Colour is linear; opacity also scales everything behind it, so with
+`R = L − L⁻ − τE` the light beyond the segment,
+`∂L/∂α_s = τ T_s c_s − (E_behind_s + R) / (1 − α_s)`. GPU: the replay walks
+the segment twice and writes one record per splat crossed (256 per path
+slot, overflow counted); the host adds them after each chunk in path,
+bounce and compositing order. No float atomics anywhere.
+
+| Gate (RTX 3090, Vulkan) | Result |
+|---|---|
+| diffuse: CPU f64 vs central differences, Cornell + NEE + emitter | 6.0e-10, 6.3e-10, 1.0e-9 |
+| diffuse: GPU f32 vs CPU f64 | 4.9e-7, 1.0e-6, 2.4e-6; θ ≤ 2.6e-6 |
+| diffuse: replay | 65 536 / 65 536 lanes bit-identical, two replays equal |
+| splats: CPU f64 vs central differences (f32 parameters, h 3e-3) | worst 5.1e-4 (colours ~1e-5) |
+| splats: GPU f32 vs CPU f64, 16 largest | 5.0e-5, 0 records dropped |
+| splats: replay | 65 536 / 65 536 lanes bit-identical, two replays equal |
+| full `irys-diff --features gpu` suite | all pass but `look_hair_gpu` (2 tests, look renderer) |
+
+Open: the look kernel still has constant Sobol tables, and its hair tests
+fail on Vulkan; splat records go through the host, which bounds a replay's
+splat crossings per path at 256.
+
 ## Open questions
 
 - **Name.** `irys` is a placeholder; check crates.io before step 4.

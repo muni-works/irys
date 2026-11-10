@@ -13,9 +13,11 @@ What works today:
 - A spectral CPU path tracer over any `Geometry`: BVH and TLAS, analytic
   primitives, triangle meshes, heightfields, Gaussian splats, caustics.
 - A GPU tier with a WGSL integrator, temporal history and denoisers.
-- Inverse rendering in `irys-diff`: path replay backprop for material
-  parameters on the CPU and on a GPU wavefront, and edge-sampled visibility
-  gradients for instance pose and per-vertex position.
+- Inverse rendering in `irys-diff`: path replay backprop on the CPU and on
+  a GPU wavefront, for a GGX conductor's roughness and spectral F0, every
+  diffuse surface's spectral albedo, and each Gaussian splat's colour and
+  opacity, under the sky, a sun and area emitters; and edge-sampled
+  visibility gradients for instance pose and per-vertex position.
 - An OpenPBR scene kernel with volumes, skin and hair, and an importer for
   scenes exported from Blender.
 - Research built on top: a 3D Gaussian splat trainer, and image-to-CAD
@@ -140,9 +142,13 @@ is a specification of which irys has built only the M1 prerequisites, and
   reaches equal variance 7 to 26 times sooner; both match their own central
   differences. Mitsuba's pose gradient converged to a biased value on the
   arm scene, so there is no pose comparison (`bench/mitsuba`, design.md).
-- The GPU wavefront in `irys-diff` uses wgpu's experimental ray queries.
-  Development and all recorded timings are on Apple silicon with Metal.
-  The docs record no runs on other backends.
+- The GPU wavefront in `irys-diff` uses wgpu's experimental ray queries
+  where the device has them. Development and all recorded timings are on
+  Apple silicon with Metal. The `irys-diff` test suite also passes on an
+  NVIDIA RTX 3090 through Vulkan (2026-11-10), except two hair tests of the
+  look renderer (`look_hair_gpu`), which is not on the differentiable path.
+- Replay is bit-exact per device and driver: another GPU rounds f32
+  differently and agrees with the f64 reference to f32 precision.
 - Image to CAD: on synthetic renders the v0 gate passes 17 of 20 parts
   (topology right and every dimension within 0.5 mm). From one synthetic
   phone photo with a tag, v1 passes 2 of 20 at 0.5 mm and 6 of 20 at 1 mm.
