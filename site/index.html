@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>irys - differentiable spectral path tracing</title>
+<meta name="description" content="irys is an open-source spectral path tracer in Rust. It renders on the GPU, keeps an f64 CPU reference, and returns gradients of an image with respect to materials, poses and CAD dimensions, with a replay that reproduces the forward pass bit for bit.">
+<meta property="og:title" content="irys">
+<meta property="og:description" content="A spectral path tracer in Rust that tells you how the image changes when the scene does.">
+<meta property="og:image" content="/cover.jpg">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="/theme.js"></script>
+<style>
+/* muni "Pilot Light" treatment, as on tang.toys, phyz.dev, vcad.io and ribt.dev: warm paper by day,
+   warm black by night, one flame per page. tang's is safety orange, phyz's electric blue, vcad's coral,
+   ribt's violet, frog's green. irys's is magenta, the one neon left on the wheel. */
+:root {
+  --track: 0.12em;
+  --s-xs: 10.5px; --s-sm: 12.5px; --s-body: 15px; --s-md: 17px; --s-lg: 21px; --s-xl: 26px; --s-display: 96px;
+  --sans: "IBM Plex Sans", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  --bg: #ffffff; --fg: #1c1917; --muted: #8a7658;
+  --surface: #faf7f1; --raised: #ffffff; --border: #cfc4b2; --border-muted: #e6dfd3;
+  --flame: #ff2bd6;
+  --flame-ink: #b0128f;
+  --on-flame: #ffffff;
+  --brand: color-mix(in oklab, #ff5f00 80%, #000);
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0b0907; --fg: #e8e1d2; --muted: #a08d70;
+  --surface: #15110d; --raised: #1e1813; --border: #4a3a2a; --border-muted: #2a2119;
+  --flame-ink: #ff2bd6; --on-flame: #0b0907; --brand: #ff5f00; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0b0907; --fg: #e8e1d2; --muted: #a08d70;
+  --surface: #15110d; --raised: #1e1813; --border: #4a3a2a; --border-muted: #2a2119;
+  --flame-ink: #ff2bd6; --on-flame: #0b0907; --brand: #ff5f00; color-scheme: dark }
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { -webkit-font-smoothing: antialiased; scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+body { background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: var(--s-body); line-height: 1.62; font-variant-numeric: tabular-nums; }
+::selection { background: var(--flame-ink); color: var(--on-flame); }
+code, pre { font-family: var(--mono); }
+:focus-visible { outline: 2px solid var(--flame-ink); outline-offset: 2px; }
+
+.container { max-width: 760px; margin: 0 auto; padding-left: max(24px, env(safe-area-inset-left, 0px)); padding-right: max(24px, env(safe-area-inset-right, 0px)); }
+.container-wide { max-width: 1120px; margin: 0 auto; padding-left: max(24px, env(safe-area-inset-left, 0px)); padding-right: max(24px, env(safe-area-inset-right, 0px)); }
+
+a, a:visited { color: var(--flame-ink); text-decoration: none; padding: 0 2px; margin: 0 -2px; transition: background .12s, color .12s; }
+a:hover { background: var(--flame-ink); color: var(--on-flame); }
+
+#theme-toggle { position: fixed; top: calc(16px + env(safe-area-inset-top, 0px)); right: max(16px, env(safe-area-inset-right, 0px)); z-index: 50;
+  width: 36px; height: 36px; display: grid; place-items: center; border: 0; background: var(--surface); color: var(--fg); cursor: pointer; }
+#theme-toggle:hover { color: var(--flame-ink); }
+#theme-toggle svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; }
+
+.topnav { position: absolute; top: 24px; left: 0; right: 0; }
+.topnav .container { display: flex; gap: 22px; justify-content: flex-end; padding-right: 72px; }
+.topnav a { font-family: var(--mono); font-size: var(--s-xs); font-weight: 500; letter-spacing: var(--track); text-transform: uppercase; color: var(--muted); }
+.topnav a:hover { color: var(--on-flame); }
+
+.pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.pill { --pill: var(--flame); --ink: color-mix(in oklab, var(--pill) 55%, #000); display: inline-block; padding: 3px 9px; font-family: var(--mono); font-size: var(--s-xs); font-weight: 500; color: var(--ink); background: color-mix(in oklab, var(--pill) 16%, transparent); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .pill { --ink: var(--pill); background: color-mix(in oklab, var(--pill) 12%, transparent); } }
+:root[data-theme="dark"] .pill { --ink: var(--pill); background: color-mix(in oklab, var(--pill) 12%, transparent); }
+
+.hero { position: relative; padding-block: clamp(6rem, 12vw, 9rem) clamp(3rem, 6vw, 4rem); }
+.hero .pills { margin-bottom: 1.75rem; }
+.hero h1 { font-size: clamp(64px, 18vw, var(--s-display)); line-height: .9; font-weight: 600; letter-spacing: -0.045em; margin-bottom: 1.4rem; }
+.hero h1 .dot { color: var(--flame-ink); }
+.hero-claim { font-size: var(--s-xl); font-weight: 600; line-height: 1.25; letter-spacing: -0.01em; max-width: 28ch; text-wrap: balance; margin-bottom: 1rem; }
+.hero-claim .sub { color: var(--muted); font-weight: 500; }
+.hero-note { color: var(--muted); max-width: 56ch; margin-bottom: 2rem; }
+.hero-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+a.btn { display: inline-flex; align-items: center; height: 40px; padding: 0 14px; margin: 0; background: var(--surface); color: var(--fg); font-size: var(--s-sm); }
+a.btn.primary { background: var(--flame-ink); color: var(--on-flame); font-weight: 500; }
+a.btn:hover { background: var(--flame-ink); color: var(--on-flame); }
+a.btn.primary:hover { background: var(--fg); color: var(--bg); }
+.hero-fig { margin-top: 3.5rem; }
+
+figure img { display: block; width: 100%; height: auto; background: var(--surface); }
+.fig-cap { font-size: var(--s-sm); color: var(--muted); margin-top: .85rem; line-height: 1.6; }
+.fig-n { font-weight: 600; font-size: var(--s-xs); color: var(--fg); margin-right: .7em; }
+
+section { padding-block: clamp(3.5rem, 8vw, 5.5rem); }
+h2 { font-size: var(--s-xl); line-height: 1.2; font-weight: 600; letter-spacing: -0.02em; margin-bottom: .75rem; text-wrap: balance; }
+.lead { max-width: 58ch; margin-bottom: 2rem; color: var(--muted); font-size: var(--s-md); }
+.prose p { max-width: 62ch; margin-bottom: 1rem; }
+.small { font-size: var(--s-sm); color: var(--muted); max-width: 64ch; margin-top: 1rem; }
+.label-caps { font-family: var(--mono); font-size: var(--s-xs); font-weight: 500; letter-spacing: var(--track); text-transform: uppercase; color: var(--muted); margin-bottom: .9rem; }
+
+.step-head { display: grid; grid-template-columns: 44px 1fr; gap: 0 14px; align-items: baseline; margin-bottom: 1.5rem; }
+.step-n { font-family: var(--mono); font-size: var(--s-xl); font-weight: 500; color: var(--flame-ink); line-height: 1.2; }
+.step-head h2 { margin-bottom: .5rem; }
+.step-head p { color: var(--muted); max-width: 58ch; }
+.step-body { padding-left: 58px; }
+@media (max-width: 560px) { .step-head { grid-template-columns: 1fr; } .step-body { padding-left: 0; } }
+
+.duo { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 640px) { .duo { grid-template-columns: 1fr; } }
+
+.proof { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0 1.25rem; margin: 2rem 0 0; }
+@media (max-width: 640px) { .proof { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.75rem 1.25rem; } }
+.proof-item { display: flex; flex-direction: column; gap: 6px; padding-left: 12px; border-left: 0.5px solid var(--border); }
+.proof-val { font-family: var(--mono); font-size: var(--s-xl); font-weight: 500; line-height: 1.1; }
+.proof-val small { font-size: var(--s-sm); color: var(--muted); }
+.proof-item.lit { border-left: 2px solid var(--flame-ink); }
+.proof-item.lit .proof-val { color: var(--flame-ink); }
+.proof-label { font-size: var(--s-sm); color: var(--muted); line-height: 1.5; }
+
+.tbl { overflow-x: auto; margin: 1.25rem 0; }
+table { border-collapse: collapse; width: 100%; font-size: var(--s-sm); }
+th, td { text-align: left; padding: 9px 14px; vertical-align: top; }
+th { font-weight: 500; color: var(--muted); }
+tbody tr:nth-child(odd) { background: var(--surface); }
+td.v { font-family: var(--mono); text-align: right; white-space: nowrap; }
+th.v { text-align: right; }
+@media (max-width: 560px) { th, td { padding: 8px 6px; } td.v { white-space: normal; } }
+
+pre { padding: 18px 20px; background: var(--surface); overflow-x: auto; font-size: 13px; line-height: 1.75; }
+pre .c { color: var(--muted); }
+
+.prov { border-left: 2px solid var(--flame-ink); padding-left: 22px; }
+.prov ul { list-style: none; display: grid; gap: .6rem; max-width: 62ch; }
+
+.links { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 640px) { .links { grid-template-columns: 1fr; } }
+.links a { display: block; margin: 0; padding: 14px 16px; background: var(--surface); color: var(--fg); }
+.links a .lv { display: block; height: 140px; margin: -14px -16px 14px; background: var(--bg) center / cover no-repeat; }
+.links a .lv.mascot { background-size: contain; background-color: #15110d; }
+.links a .lv.logo { display: grid; place-items: center; background: #15110d; color: var(--brand); }
+.links a .lv.logo svg { width: 110px; height: auto; }
+.links a .lv.term { padding: 18px 16px; background: #0b0907; }
+.links a .lv.term code { font-family: var(--mono); font-size: 12px; line-height: 1.8; color: #e8e1d2; }
+.links a .lv.term em { font-style: normal; color: #ff2bd6; }
+.links a:hover .lv { filter: brightness(1.1); }
+.links a b { display: block; font-family: var(--mono); font-weight: 500; color: var(--flame-ink); }
+.links a span { font-size: var(--s-sm); color: var(--muted); }
+.links a:hover, .links a:hover b, .links a:hover span { background: var(--flame-ink); color: var(--on-flame); }
+
+.site-foot { text-align: center; padding-block: clamp(4rem, 9vw, 7rem) 4rem; padding-left: 16px; padding-right: 16px; color: var(--muted); font-size: var(--s-sm); }
+.foot-logo, .foot-logo:visited { display: inline-block; color: var(--brand); margin: 0 0 1.25rem; padding: 0; transition: opacity .2s; }
+.foot-logo:hover { background: none; color: var(--brand); opacity: .8; }
+.foot-logo svg { width: 96px; height: auto; display: block; }
+.site-foot p { margin: 0 auto .6rem; max-width: 52ch; }
+.foot-links { display: flex; justify-content: center; flex-wrap: wrap; gap: .6rem; }
+
+.cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+@media (max-width: 760px) { .cards { grid-template-columns: 1fr; } }
+.card { background: var(--surface); display: flex; flex-direction: column; }
+.card img { display: block; width: 100%; height: 220px; object-fit: cover; background: var(--bg); }
+.card .big { height: 220px; display: grid; place-items: center; font-family: var(--mono); font-size: 44px; font-weight: 500; color: var(--flame-ink); background: var(--bg); letter-spacing: -0.02em; }
+.card .big small { display: block; font-size: var(--s-sm); color: var(--muted); text-align: center; letter-spacing: 0; margin-top: 6px; font-weight: 400; }
+.card-body { padding: 18px 20px 22px; }
+.card h3 { font-size: var(--s-lg); font-weight: 600; letter-spacing: -0.01em; line-height: 1.25; margin-bottom: .5rem; }
+.card p { color: var(--muted); font-size: var(--s-body); }
+.card p b { color: var(--fg); font-weight: 600; }
+.gallery { display: grid; grid-template-columns: 1.4fr 1.4fr 1fr; gap: 12px; }
+@media (max-width: 760px) { .gallery { grid-template-columns: 1fr; } }
+.gallery img { height: 300px; object-fit: cover; }
+@media (max-width: 760px) { .gallery img { height: auto; } }
+.trust { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 1.5rem; margin-top: 1.5rem; }
+@media (max-width: 760px) { .trust { grid-template-columns: 1fr; gap: 1.5rem; } }
+.trust h3 { font-size: var(--s-md); font-weight: 600; margin-bottom: .35rem; }
+.trust p { color: var(--muted); font-size: var(--s-sm); }
+.trust b { font-family: var(--mono); font-weight: 500; color: var(--flame-ink); }
+.big-claim { font-size: clamp(30px, 5vw, 44px); line-height: 1.1; font-weight: 600; letter-spacing: -0.03em; margin-bottom: 1rem; max-width: 20ch; text-wrap: balance; }
+.big-claim em { font-style: normal; color: var(--flame-ink); }
+details { margin-top: 1.5rem; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; background: var(--bg); }
+.pair figure { position: relative; }
+.pair img { height: 220px; object-fit: cover; image-rendering: auto; }
+.pair span { position: absolute; left: 8px; bottom: 6px; font-family: var(--mono); font-size: var(--s-xs); color: #fff; background: rgba(0,0,0,.45); padding: 1px 6px; }
+details summary { cursor: pointer; font-family: var(--mono); font-size: var(--s-sm); color: var(--flame-ink); }
+
+.examples-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 48px 32px; max-width: 920px; margin: 0 auto; }
+@media (max-width: 1100px) { .examples-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 680px) { .examples-grid { grid-template-columns: 1fr; } }
+.ex { display: flex; flex-direction: column; margin: 0; }
+.ex-view { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; background: var(--surface); }
+.ex-view.one { grid-template-columns: 1fr; }
+.ex-view figure { position: relative; margin: 0; }
+.ex-view canvas { display: block; width: 100%; aspect-ratio: 1; background: #000; image-rendering: auto; }
+.ex-view span { position: absolute; left: 6px; bottom: 6px; font-family: var(--mono); font-size: var(--s-xs); color: #fff; background: rgba(0,0,0,.5); padding: 1px 6px; }
+.ex-meta { padding-top: 14px; }
+.ex-head { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
+a.crate-tag { align-self: flex-start; font-family: var(--mono); font-size: var(--s-xs); color: var(--muted); }
+.ex-name { font-family: var(--mono); font-size: var(--s-sm); font-weight: 500; color: var(--fg); }
+.ex-desc { font-size: var(--s-sm); color: var(--muted); line-height: 1.55; }
+.ex-use { font-size: var(--s-sm); color: var(--fg); line-height: 1.55; margin-top: 8px; }
+.ex-use b { font-family: var(--mono); font-size: 10px; font-weight: 500; letter-spacing: var(--track); text-transform: uppercase; color: var(--muted); margin-right: 8px; }
+.ex-ctl { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 12px; }
+.ex-ctl button { font: inherit; font-family: var(--mono); font-size: var(--s-xs); border: 0; padding: 5px 10px; cursor: pointer; background: var(--surface); color: var(--fg); }
+.ex-ctl button[aria-pressed="true"] { background: color-mix(in oklab, var(--flame) 18%, transparent); color: var(--flame-ink); }
+.ex-ctl button.go { background: var(--flame-ink); color: var(--on-flame); font-weight: 500; }
+.ex-ctl button:hover { background: var(--flame-ink); color: var(--on-flame); }
+.ex-ctl input[type=range] { flex: 1; min-width: 100px; accent-color: var(--flame); }
+.ro { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 12px; margin-top: 12px; }
+.ro dt { font-family: var(--mono); font-size: 10px; font-weight: 500; letter-spacing: var(--track); text-transform: uppercase; color: var(--muted); }
+.ro dd { font-family: var(--mono); font-size: var(--s-sm); font-weight: 500; color: var(--fg); margin: 0; }
+.ro .hot dd { color: var(--flame-ink); }
+</style>
+</head>
+<body>
+
+<button id="theme-toggle" type="button" aria-label="Toggle light and dark"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 2.5a5.5 5.5 0 0 0 0 11z" fill="currentColor"/></svg></button>
+
+
+<header class="hero">
+  <div class="container">
+    <div class="pills"><span class="pill">spectral</span><span class="pill">differentiable</span><span class="pill">Rust</span><span class="pill">Metal + Vulkan</span><span class="pill">Apache-2.0</span></div>
+    <h1>irys<span class="dot">.</span></h1>
+    <p class="hero-claim">Render a scene. Get the gradient. <span class="sub">irys is a spectral path tracer that looks at your image and says which way to nudge the material, the pose or the CAD dimension.</span></p>
+    <p class="hero-note">It runs on the GPU through wgpu, double-checks itself in f64 on the CPU, and replays every path bit for bit. Same seed, same gradient, every time. No vibes.</p>
+    <div class="hero-actions">
+      <a class="btn primary" href="#start">cargo add irys-render</a>
+      <a class="btn" href="https://github.com/muni-works/irys">GitHub</a>
+      <a class="btn" href="https://muni.works/research/irys">Read the paper</a>
+    </div>
+  </div>
+  <div class="container-wide">
+    <figure class="hero-fig">
+      <img src="/cover.jpg" width="2400" height="1350" alt="The rose robot standing in the Barcelona Pavilion, rendered by irys">
+      <figcaption class="fig-cap">The rose robot in the Barcelona Pavilion, rendered by irys. Pavilion scene by eMirage, CC-BY.</figcaption>
+    </figure>
+  </div>
+</header>
+
+<main>
+  <section id="live">
+    <div class="container"><h2>Go on, poke it.</h2>
+      <p class="lead">This is real irys, compiled to WebAssembly and running on your CPU right now. Each step renders, compares with the target, replays the light for the gradient, and takes a step. Then does it again.</p></div>
+    <div class="container-wide">
+      <div class="examples-grid">
+        <figure class="ex" data-demo="material">
+          <div class="ex-view"><figure><canvas width="32" height="32"></canvas><span>irys</span></figure><figure><canvas class="tgt" width="32" height="32"></canvas><span>target</span></figure></div>
+          <figcaption class="ex-meta">
+            <div class="ex-head"><a class="crate-tag" href="https://github.com/muni-works/irys/tree/main/crates/irys-diff">irys-diff</a><a class="ex-name" href="https://github.com/muni-works/irys/blob/main/crates/irys-diff/examples/fit.rs">material_fit</a></div>
+            <p class="ex-desc">A sad grey ball looks at a picture of a metal one and works out its roughness and its colour at 450, 550 and 650 nm. The material is a tang graph, run by tang's interpreter right here in your tab.</p>
+            <p class="ex-use"><b>For</b>Matching a material to a photo of the real part.</p>
+            <div class="ex-ctl"><button data-m="gold" aria-pressed="true">gold</button><button data-m="copper">copper</button><button data-m="silver">silver</button><button class="go">Fit</button></div>
+            <dl class="ro"><div class="hot"><dt>step</dt><dd data-r="it">0</dd></div><div><dt>roughness</dt><dd data-r="rough">0.70</dd></div><div><dt>loss</dt><dd data-r="loss">–</dd></div></dl>
+          </figcaption>
+        </figure>
+        <figure class="ex" data-demo="splat">
+          <div class="ex-view"><figure><canvas width="48" height="48"></canvas><span>irys</span></figure><figure><canvas class="tgt" width="48" height="48"></canvas><span>target</span></figure></div>
+          <figcaption class="ex-meta">
+            <div class="ex-head"><a class="crate-tag" href="https://github.com/muni-works/irys/tree/main/crates/irys-diff">irys-diff</a><a class="ex-name" href="https://github.com/muni-works/irys/blob/main/crates/irys-wasm/src/lib.rs">splat_fit</a></div>
+            <p class="ex-desc">A bush of 900 Gaussian splats, path traced under the sky. irys fast-forwards it to autumn by fitting every splat's colour and opacity at once. That's 3 600 knobs, turned by gradient, not by hand.</p>
+            <p class="ex-use"><b>For</b>Editing a captured splat scene without breaking the lighting.</p>
+            <div class="ex-ctl"><button class="go">Fit</button></div>
+            <dl class="ro"><div class="hot"><dt>step</dt><dd data-r="it">0</dd></div><div><dt>parameters</dt><dd>3 600</dd></div><div><dt>loss</dt><dd data-r="loss">–</dd></div></dl>
+          </figcaption>
+        </figure>
+        <figure class="ex" data-demo="paint">
+          <div class="ex-view"><figure><canvas width="32" height="32"></canvas><span>irys</span></figure><figure><canvas class="tgt" width="32" height="32"></canvas><span>target</span></figure></div>
+          <figcaption class="ex-meta">
+            <div class="ex-head"><a class="crate-tag" href="https://github.com/muni-works/irys/tree/main/crates/irys-diff">irys-diff</a><a class="ex-name" href="https://github.com/muni-works/irys/blob/main/crates/irys-wasm/src/lib.rs">paint_fit</a></div>
+            <p class="ex-desc">One room, one lamp, light bouncing off every wall. irys works out what colour the walls were painted, as a three-band spectrum, without asking the painter.</p>
+            <p class="ex-use"><b>For</b>Measuring colour when the lighting is lying to you.</p>
+            <div class="ex-ctl"><button data-p="teal" aria-pressed="true">teal</button><button data-p="terracotta">terracotta</button><button data-p="lilac">lilac</button><button class="go">Fit</button></div>
+            <dl class="ro"><div class="hot"><dt>step</dt><dd data-r="it">0</dd></div><div><dt>bands b g r</dt><dd data-r="bands">0.50 0.50 0.50</dd></div><div><dt>loss</dt><dd data-r="loss">–</dd></div></dl>
+          </figcaption>
+        </figure>
+        <figure class="ex" data-demo="render">
+          <div class="ex-view one"><figure><canvas width="64" height="64"></canvas><span>spectral, 4 wavelengths per path</span></figure></div>
+          <figcaption class="ex-meta">
+            <div class="ex-head"><a class="crate-tag" href="https://github.com/muni-works/irys/tree/main/crates/irys-diff">irys-diff</a><a class="ex-name" href="https://github.com/muni-works/irys/blob/main/crates/irys-wasm/src/lib.rs">room</a></div>
+            <p class="ex-desc">The same room, path traced one frame at a time with next-event estimation and MIS. Repaint it and watch the noise settle again.</p>
+            <p class="ex-use"><b>For</b>Staring at. It is quite relaxing.</p>
+            <div class="ex-ctl"><button data-p="teal" aria-pressed="true">teal</button><button data-p="terracotta">terracotta</button><button data-p="lilac">lilac</button></div>
+            <dl class="ro"><div class="hot"><dt>frames</dt><dd data-r="it">0</dd></div><div><dt>paths / px</dt><dd data-r="spp">0</dd></div><div><dt>ms / frame</dt><dd data-r="ms">–</dd></div></dl>
+          </figcaption>
+        </figure>
+      </div>
+      <p class="small">Your browser gives irys one CPU core and f64 math, so these are small and grainy. The real thing runs on a GPU.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="container">
+      <p class="big-claim">Gradients <em>7 to 26 times faster</em> than Mitsuba 3.</p>
+      <p class="lead">Same machine, same scenes, both renderers checked against their own finite differences. And yes, we show where irys loses. Cycles is very good at its job.</p>
+      <div class="proof">
+        <div class="proof-item lit"><span class="proof-val">7&ndash;26&times;</span><span class="proof-label">faster material gradients than Mitsuba 3 at equal variance</span></div>
+        <div class="proof-item"><span class="proof-val">1.5&ndash;5.6&times;</span><span class="proof-label">lower error than Cycles at equal time, on irys's three benchmark scenes</span></div>
+        <div class="proof-item"><span class="proof-val">0.07&deg;</span><span class="proof-label">worst error on three robot joint angles recovered from one image, starting 13 to 23&deg; off</span></div>
+        <div class="proof-item"><span class="proof-val">15&ndash;17&times;</span><span class="proof-label">faster gradients on the GPU than on irys's own CPU tier, same frame</span></div>
+      </div>
+      <details><summary>Every benchmark, wins and losses</summary><div class="tbl" style="margin-top:1rem"><table>
+        <thead><tr><th>Comparison</th><th class="v">Result</th></tr></thead>
+        <tbody>
+          <tr><td>Material gradient vs Mitsuba 3 <code>prb</code>, time to equal variance, M4 Max</td><td class="v">irys 7.0&ndash;25.5&times; faster</td></tr>
+          <tr><td>Pose gradient vs Mitsuba 3 <code>prb_projective</code></td><td class="v">no claim</td></tr>
+          <tr><td>Equal-time error vs Cycles: pair, room and cornell, 9 budgets</td><td class="v">irys lower at all 9</td></tr>
+          <tr><td>Equal-time error vs Cycles: Blender's classroom</td><td class="v">0.89 to 2.75&times; Cycles</td></tr>
+          <tr><td>Equal-time error vs Cycles: Barcelona Pavilion, clamped</td><td class="v">14&ndash;17&times; Cycles</td></tr>
+        </tbody>
+      </table></div>
+      <p class="small">Both renderers match their own central differences on the material gradient. On the robot arm, Mitsuba's pose gradient converged to a value its own central differences reject, so irys makes no pose comparison. The Cycles wins use irys's sun sampling setting, which is off by default, on scenes lit by a sky and sun. On Blender's demo files with full materials, Cycles is 2 to 3 times faster per sample and wins at all but the smallest budget. Sources: <code>bench/mitsuba</code> and the speed rounds in <a href="https://github.com/muni-works/irys/blob/main/docs/design.md">docs/design.md</a>.</p></details>
+      
+    </div>
+  </section>
+
+  <section>
+    <div class="container"><h2>Things irys can do for you.</h2>
+      <p class="lead">All of these run today, from examples and tests in the repo. No roadmap slides.</p></div>
+    <div class="container-wide">
+      <div class="cards">
+        <div class="card">
+          <div class="pair"><figure><img src="/fit-start.jpg" alt="The fit's starting point, a rough grey ball" loading="lazy"><span>step 1</span></figure><figure><img src="/fit-target.jpg" alt="The target, a glossy gold ball" loading="lazy"><span>target</span></figure></div>
+          <div class="card-body"><h3>Copy a material from a picture.</h3>
+          <p>Start with a sad grey ball. <b>60 steps and 5 seconds on the GPU</b> later it's gold, with the target's roughness within 0.012 and its colour within 0.006.</p></div>
+        </div>
+        <div class="card">
+          <img src="/phase2d-rose.jpg" alt="The rose robot rendered by irys" loading="lazy" style="object-position:50% 30%">
+          <div class="card-body"><h3>Ask a photo how the robot is standing.</h3>
+          <p>Three joint angles of a 2.4 M-triangle arm, recovered to <b>0.07&deg;</b> from a guess 13 to 23&deg; off. The outline, the shading and even the shadow on the floor all chip in.</p></div>
+        </div>
+        <div class="card">
+          <img src="/plate.svg" alt="The bearing plate rendered by irys; vcad's frozen mesh fades in over it, and a tick on each bore node shows which way it moves and its share of the gradient" loading="lazy" style="object-fit:contain;background:#0b0907">
+          <div class="card-body"><h3>Differentiate a hole.</h3>
+          <p>irys puts a gradient on every mesh vertex and <a href="https://vcad.io">vcad</a> turns it into d(loss)/d(bore diameter) in one reverse pass. No finite-difference step to babysit. It matches vcad's own forward mode to <b>1e-15</b>.</p></div>
+        </div>
+        <div class="card">
+          <img src="/phase2b-beauty.jpg" alt="A gold ball beside a bush of Gaussian splats on a checker floor" loading="lazy">
+          <div class="card-body"><h3>Splats and plain old paint, too.</h3>
+          <p>Diffuse colour and every Gaussian splat's colour and opacity are differentiable on CPU and GPU, under sky, sun or area lights. The GPU agrees with the f64 reference to <b>5e-5</b>.</p></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="container"><h2>It also just makes nice pictures.</h2>
+      <p class="lead">Spectral, four wavelengths per path, OpenPBR materials, volumes, skin, hair, and scenes straight out of Blender.</p></div>
+    <div class="container-wide">
+      <div class="gallery">
+        <figure><img src="/demos-classroom.jpg" alt="The classroom scene rendered by irys" loading="lazy"><figcaption class="fig-cap">classroom, Christophe Seux, CC0</figcaption></figure>
+        <figure><img src="/demos-pavilion.jpg" alt="The Barcelona Pavilion rendered by irys" loading="lazy"><figcaption class="fig-cap">Barcelona Pavilion, eMirage, CC-BY</figcaption></figure>
+        <figure><img src="/look2-head-hair-3q.jpg" alt="A scanned head with skin and 1 million hair segments" loading="lazy"><figcaption class="fig-cap">Lee Perry-Smith by Infinite-Realities, CC BY 3.0</figcaption></figure>
+      </div>
+      <p class="small">1080p, 4096 samples per pixel, no denoiser. Honesty corner: Cycles renders these 2 to 3 times faster per sample.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="container">
+      <h2>Ten lines to a gradient.</h2>
+      <p class="lead">From <code>examples/fit.rs</code>. Render, compare, get a gradient for every material parameter, repeat until gold.</p>
+<pre><span class="c">// irys-diff, from a clone of the repository</span>
+use irys_diff::prb::{self, Kernels, L2, Scene};
+
+let scene = Scene::new(96, 96, 8);            <span class="c">// a ball on a floor, 8 spp</span>
+let mut k = Kernels::new(scene.lanes(), true);
+let mut theta = [0.7, 0.5, 0.5, 0.5];        <span class="c">// roughness, F0 at 450 / 550 / 650 nm</span>
+
+for it in 1..=60u64 {
+    let seeds = (2 * it, 2 * it + 1);
+    let (loss, grad) = prb::gradient(&amp;scene, &amp;theta, seeds, &amp;mut k, &amp;L2(&amp;target));
+    <span class="c">// step theta with Adam, as the example does</span>
+}</pre>
+    </div>
+  </section>
+
+  <section>
+    <div class="container">
+      <h2>How you know the gradient is right.</h2>
+      <p class="lead">When a fit won't converge, you want to know it's your bug, not the renderer's.</p>
+      <div class="trust">
+        <div><h3>It remembers exactly</h3><p>The backward pass regenerates the forward pass's paths: <b>65 536 of 65 536</b> lanes bit-identical, and two runs give identical gradients.</p></div>
+        <div><h3>It checks its work</h3><p>Every material is one <a href="https://tang.toys">tang</a> graph, lowered to the GPU and run in f64 on the CPU. GPU gradients agree to <b>3.5e-4</b>.</p></div>
+        <div><h3>It travels</h3><p>Developed on Apple silicon. The full test suite also passes on an <b>NVIDIA RTX 3090</b> through Vulkan.</p></div>
+      </div>
+      <p class="small">Replay is exact per device and driver; across GPUs, results agree to f32 precision. irys owns no geometry. Implement the <code>Geometry</code> trait and irys computes the light. It renders for vcad, kosm, ipse, phyz and muni.</p>
+    </div>
+  </section>
+
+  <section id="start">
+    <div class="container prose">
+      <h2>Get it.</h2>
+      <p class="lead">The renderer is on crates.io as <code>irys-render</code>. Code still imports it as <code>irys</code>.</p>
+<pre>cargo add irys-render                 <span class="c"># CPU</span>
+cargo add irys-render --features gpu  <span class="c"># with the wgpu tier</span></pre>
+      <p>The differentiable crates are not published yet, so run them from a clone. That needs Rust 1.95 or newer and a C compiler on your PATH, and the first build fetches tang from git.</p>
+<pre>git clone https://github.com/muni-works/irys
+cd irys
+
+<span class="c"># CPU only: fit a ball's roughness and colour to one target image</span>
+<span class="c"># by path replay. Writes target.ppm, iter_NNN.ppm and loss.csv.</span>
+cargo run --release -p irys-diff --example fit -- out/fit
+
+<span class="c"># The same fit on the GPU wavefront.</span>
+cargo run --release -p irys-diff --features gpu --example fit_gpu -- out/fit_gpu
+
+<span class="c"># Tests. GPU tests skip when there is no adapter.</span>
+cargo test -p irys</pre>
+      <p class="small">The <code>irys</code> crate on crates.io is an unrelated project. Everything is version 0.1.0 and the API is not stable. The core crates are the most settled; <code>irys-diff</code> and the crates built on it are research code. All timings come from Apple silicon with Metal. The test suite also passes on an NVIDIA RTX 3090 through Vulkan.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="container-wide">
+      <p class="label-caps">Read and build on it</p>
+      <div class="links">
+        <a href="https://muni.works/research/irys"><i class="lv" style="background-image:url(/cover.jpg)"></i><b>paper</b><span>Differentiable Rendering with Exact Replay</span></a>
+        <a href="https://github.com/muni-works/irys"><i class="lv term"><code>$ git clone muni-works/irys<br>$ cargo run --example fit<br><em>roughness 0.700 → 0.188</em></code></i><b>github</b><span>Source, examples and the design log</span></a>
+        <a href="https://vcad.io"><i class="lv" style="background-image:url(/link-vcad.jpg)"></i><b>vcad</b><span>CAD you can take the derivative of</span></a>
+        <a href="https://tang.toys"><i class="lv mascot" style="background-image:url(/link-tang.svg)"></i><b>tang</b><span>The tensor compiler irys writes its materials in</span></a>
+        <a href="https://muni.works/research"><i class="lv" style="background-image:url(/link-research.jpg)"></i><b>research</b><span>Papers on irys and what's built on it, like CAD from photos</span></a>
+        <a href="https://muni.works"><i class="lv logo"><svg viewBox="-60 -60 880 400" fill="none"><g stroke="currentColor" stroke-width="40" stroke-linecap="round" stroke-linejoin="round" fill="none"> <path d="M 20 240 L 20 100 C 20 50, 80 50, 100 50 C 140 50, 160 70, 160 100"/> <path d="M 160 240 L 160 100"/> <path d="M 160 100 C 160 50, 220 50, 240 50 C 280 50, 300 70, 300 100 L 300 240 C 300 270, 330 280, 370 280 C 410 280, 440 270, 440 240 L 440 100"/> <path d="M 440 100 C 440 50, 500 50, 520 50 C 560 50, 600 70, 600 100 L 600 240 C 600 270, 630 280, 670 280 C 710 280, 740 270, 740 240 L 740 100"/> </g></svg></i><b>muni.works</b><span>Municipal Robotics</span></a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="site-foot">
+  <a href="https://muni.works" class="foot-logo" aria-label="Municipal Robotics"><svg viewBox="-60 -60 880 400" fill="none"><g stroke="currentColor" stroke-width="40" stroke-linecap="round" stroke-linejoin="round" fill="none"> <path d="M 20 240 L 20 100 C 20 50, 80 50, 100 50 C 140 50, 160 70, 160 100"/> <path d="M 160 240 L 160 100"/> <path d="M 160 100 C 160 50, 220 50, 240 50 C 280 50, 300 70, 300 100 L 300 240 C 300 270, 330 280, 370 280 C 410 280, 440 270, 440 240 L 440 100"/> <path d="M 440 100 C 440 50, 500 50, 520 50 C 560 50, 600 70, 600 100 L 600 240 C 600 270, 630 280, 670 280 C 710 280, 740 270, 740 240 L 740 100"/> </g></svg></a>
+  <p><a href="https://muni.works">Municipal Robotics</a> builds irys alongside <a href="https://tang.toys">tang</a>, <a href="https://vcad.io">vcad</a> and <a href="https://phyz.dev">phyz</a>.</p>
+  <p class="foot-links"><a href="https://github.com/muni-works/irys">GitHub</a><span>·</span><a href="https://muni.works/research/irys">Paper</a><span>·</span><span>Apache-2.0</span><span>·</span><a href="https://muni.works">muni.works</a></p>
+</footer>
+
+<script type="module">
+const PAINT = { teal: [0.6, 0.55, 0.15], terracotta: [0.2, 0.35, 0.7], lilac: [0.75, 0.5, 0.65] };
+const METAL = { gold: [0.2, 0.34, 0.78, 1.0], copper: [0.3, 0.54, 0.64, 0.95], silver: [0.12, 0.9, 0.91, 0.92] };
+const SIZES = { material: [32, 2, 64], splat: [48, 1, 8], paint: [32, 4, 16], render: [64, 1] };
+const STEPS = { material: 40, splat: 80, paint: 120, render: 400 };
+function draw(canvas, bytes, n) {
+  if (canvas.width !== n) { canvas.width = n; canvas.height = n; }
+  canvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(bytes.buffer || bytes), n, n), 0, 0);
+}
+for (const fig of document.querySelectorAll('[data-demo]')) {
+  const kind = fig.dataset.demo;
+  const [main, tgt] = fig.querySelectorAll('canvas');
+  const r = (k) => fig.querySelector(`[data-r="${k}"]`);
+  const go = fig.querySelector('.go');
+  let worker = null, paint = 'teal', metal = 'gold';
+  const start = (run = true) => {
+    worker?.terminate();
+    worker = new Worker(new URL('/demo-worker.js', location.href), { type: 'module' });
+    const [size, spp, targetSpp] = SIZES[kind];
+    worker.onmessage = (e) => {
+      const m = e.data;
+      if (m.target) draw(tgt, m.target, m.size);
+      if (m.img) draw(main, m.img, m.size);
+      if (m.readyDemo && run) worker.postMessage({ type: 'run', steps: STEPS[kind] });
+      if (m.readyDemo && !run) worker.postMessage({ type: 'run', steps: 1 });
+      if (m.it !== undefined && r('it')) r('it').textContent = m.it;
+      if (m.it !== undefined && r('spp')) r('spp').textContent = m.it * spp;
+      if (m.loss != null) r('loss').textContent = m.loss.toExponential(2);
+      if (m.params && kind === 'paint') r('bands').textContent = m.params.map((x) => x.toFixed(2)).join(' ');
+      if (m.params && kind === 'material') r('rough').textContent = m.params[0].toFixed(3);
+      if (m.ms != null && r('ms')) r('ms').textContent = Math.round(m.ms);
+      if (m.done && go && run) go.textContent = 'Fit again';
+    };
+    const init = { type: 'init', kind, size, spp, targetSpp };
+    if (kind === 'paint') init.truth = PAINT[paint];
+    if (kind === 'material') init.truth = METAL[metal];
+    worker.postMessage(init);
+    if (kind === 'render') worker.postMessage({ type: 'material', values: PAINT[paint] });
+    if (go && run) go.textContent = 'Running';
+  };
+  go?.addEventListener('click', () => start(true));
+  for (const b of fig.querySelectorAll('[data-p]')) b.addEventListener('click', () => {
+    paint = b.dataset.p;
+    fig.querySelectorAll('[data-p]').forEach((x) => x.setAttribute('aria-pressed', x === b));
+    if (kind === 'render' && worker) { worker.postMessage({ type: 'material', values: PAINT[paint] }); worker.postMessage({ type: 'run', steps: STEPS.render }); }
+    else start();
+  });
+  for (const b of fig.querySelectorAll('[data-m]')) b.addEventListener('click', () => {
+    metal = b.dataset.m;
+    fig.querySelectorAll('[data-m]').forEach((x) => x.setAttribute('aria-pressed', x === b));
+    start();
+  });
+  fig._start = start;
+}
+// The render is cheap (a few ms a frame), so it starts with the page; the
+// fits draw their target and first step, and wait for Fit.
+document.querySelector('[data-demo="render"]')._start();
+for (const k of ['material', 'splat', 'paint']) document.querySelector(`[data-demo="${k}"]`)._start(false);
+</script>
+</body>
+</html>

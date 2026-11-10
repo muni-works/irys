@@ -13,9 +13,11 @@ What works today:
 - A spectral CPU path tracer over any `Geometry`: BVH and TLAS, analytic
   primitives, triangle meshes, heightfields, Gaussian splats, caustics.
 - A GPU tier with a WGSL integrator, temporal history and denoisers.
-- Inverse rendering in `irys-diff`: path replay backprop for material
-  parameters on the CPU and on a GPU wavefront, and edge-sampled visibility
-  gradients for instance pose and per-vertex position.
+- Inverse rendering in `irys-diff`: path replay backprop on the CPU and on
+  a GPU wavefront, for a GGX conductor's roughness and spectral F0, every
+  diffuse surface's spectral albedo, and each Gaussian splat's colour and
+  opacity, under the sky, a sun and area emitters; and edge-sampled
+  visibility gradients for instance pose and per-vertex position.
 - An OpenPBR scene kernel with volumes, skin and hair, and an importer for
   scenes exported from Blender.
 - Research built on top: a 3D Gaussian splat trainer, and image-to-CAD
@@ -32,7 +34,7 @@ Everything is version 0.1.0 and the API is not stable. See
 | `irys-prims` | stock `Geometry` implementations: analytic primitives, heightfields |
 | `irys-light` | spectra, optics, environments, the CPU path tracer, caustics, splats |
 | `irys-gpu` | the wgpu 30 compute tier: device, buffers, WGSL integrator, history, denoisers |
-| `irys` | facade over the four crates above; the GPU tier is behind the `gpu` feature |
+| `irys` | facade over the four crates above, published as `irys-render`; the GPU tier is behind the `gpu` feature |
 | `kosm-render` | 0.2.1 compatibility shim that re-exports `irys` under kosm-render's old paths |
 | `irys-diff` | BSDFs as tang IR graphs, path replay backprop on CPU and GPU, visibility gradients, the OpenPBR look. Features: `gpu`, `assets` |
 | `irys-bench` | binary: the equal-time benchmark harness against Blender Cycles |
@@ -46,6 +48,16 @@ for now; build them from this repository. Their tang dependencies all come
 from crates.io, so a project that links them needs no `[patch]`.
 
 ## Quickstart
+
+The renderer crates are on crates.io:
+
+```sh
+cargo add irys-render                 # CPU; code still writes `use irys::...`
+cargo add irys-render --features gpu  # with the wgpu tier
+```
+
+The differentiable crates are not published yet, so the examples below run
+from a clone.
 
 Requires Rust 1.95 or newer. The first build fetches
 [tang](https://github.com/muni-works/tang) from git. The first build of any
@@ -110,8 +122,9 @@ is a specification of which irys has built only the M1 prerequisites, and
 
 - The core crates (`irys-core`, `irys-prims`, `irys-light`, `irys-gpu`,
   `irys`) are the split of kosm-render 0.2 and are the most settled part.
-  They are not published to crates.io; the `irys` crate there is an
-  unrelated project. Depend on this repository by git.
+  They are on crates.io at 0.1.0. The facade is published as `irys-render`
+  because the `irys` name there belongs to an unrelated project; its library
+  is still called `irys`.
 - `irys-diff`, `irys-recon`, `irys-recon-net`, `irys-splat` and `irys-ffi`
   are research code. Expect interfaces to change.
 - The design lists `irys-raster`, `irys-line` and `irys-view` crates. None of
@@ -119,12 +132,22 @@ is a specification of which irys has built only the M1 prerequisites, and
 - ReSTIR PT/GRIS and a neural radiance cache were not built. ReSTIR DI and
   path guiding are GPU only, and ReSTIR DI measured as a net loss once the
   Sobol sampler was on.
-- Against Cycles at equal time, the phase 3 gate was met on one of three
-  test scenes; on the other two irys was 1.23 to 1.27 times behind at the
-  largest budget (design.md, roadmap table).
-- The GPU wavefront in `irys-diff` uses wgpu's experimental ray queries.
-  Development and all recorded timings are on Apple silicon with Metal.
-  The docs record no runs on other backends.
+- Against Cycles at equal time, irys has 1.5 to 5.6 times lower error at
+  every budget on its three benchmark scenes (pair, room, cornell), with the
+  opt-in sun sampling share (design.md, speed round 3). On Blender's demo
+  files with full materials Cycles wins: irys's error is 0.89 to 2.75 times
+  Cycles' on the classroom and 14 to 17 times on the clamped pavilion, and
+  Cycles is 2 to 3 times faster per sample (design.md, phase 5, round 4).
+- Against Mitsuba 3 on the same M4 Max and scenes, irys's material gradient
+  reaches equal variance 7 to 26 times sooner; both match their own central
+  differences. Mitsuba's pose gradient converged to a biased value on the
+  arm scene, so there is no pose comparison (`bench/mitsuba`, design.md).
+- The GPU wavefront in `irys-diff` uses wgpu's experimental ray queries
+  where the device has them. Development and all recorded timings are on
+  Apple silicon with Metal. The `irys-diff` test suite also passes on an
+  NVIDIA RTX 3090 through Vulkan (2026-11-10).
+- Replay is bit-exact per device and driver: another GPU rounds f32
+  differently and agrees with the f64 reference to f32 precision.
 - Image to CAD: on synthetic renders the v0 gate passes 17 of 20 parts
   (topology right and every dimension within 0.5 mm). From one synthetic
   phone photo with a tag, v1 passes 2 of 20 at 0.5 mm and 6 of 20 at 1 mm.

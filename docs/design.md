@@ -1197,7 +1197,9 @@ Deviations:
    the node's size near `x`, or a near-field strategy (edges within a few
    `r` of `x`, by an exact local search), is the next lever; then fewer
    iterations would do.
-2. **`GpuEdges`' remaining bias** on rose (weights on ~8 % of samples).
+2. **`GpuEdges`' remaining bias** on rose (weights on ~8 % of samples). Found
+   (2026-11-07, below): the device's ownership ray slipped past slivers
+   and zero-area CAD fillers; fixed, with a roll residual characterised.
 3. The basin is still ±5° on the elbow; a fit started outside it fails.
    The blur is the only lever measured monotone, and needs the corrected
    gradient (2e's blurred fit had the biased one) — not re-tried here.
@@ -1205,6 +1207,102 @@ Deviations:
    sampled; the camera gate's c2/c3 sit at z −2.6/−2.2.
 5. The secondary term is CPU f64; at 4 samples per vertex it is a quarter
    of an iteration. A device port needs the dual trace first.
+
+### Phase 2f: the device edge sampler's bias, found (2026-11-07)
+
+2f left `GpuEdges` reading 30 % low on rose's arm mask (residual (a)
+above: 1.71e-3 on pitch against CD 2.53e-3, z −8 at 16 seeds; `rose_fit
+--control --check --depth 1 --no-sun --no-secondary --no-curves`,
+`MASK=-1`, `CD_H=0.003`), cause not found. Found, and fixed for the part
+that was a bug.
+
+**How.** Comparing device and host samples by index (2f's `CMP`) cannot
+settle it: the two draws drift apart in `u` (f32 against f64 sums over
+186 450 slots), so sample `i` is rarely the same point (15 of ~6000 within
+0.002 px), and every "differs" count mixes different samples.
+`GpuEdges::debug` now makes the device record where each sample landed
+(slot, `t`), and `EdgeSamples::at_draws` scores those exact draws on the
+host in f64. Same draws, same pair traces, split by who calls a sample
+visible (`CMP` now prints this; 8 seeds, pitch):
+
+| | samples | host Σ | device Σ |
+|---|---|---|---|
+| both visible | 47 226 | 1.679e-3 | 1.679e-3 |
+| host only, device ray missed everything (−1) | 537 | **7.56e-4** | 0 |
+| host only, other refusals (−2, −3, −4) | 561 | 1e-5 | 0 |
+| device only | 1 153 | 0 | 9e-5 |
+
+Where both call a sample visible they agree to four digits, and the host
+evaluating the device's draws is unbiased (2.374e-3 against its own
+2.372e-3): the device's *ownership test* was the whole deficit, and
+within it the 67 samples per frame whose inner ray hit nothing.
+
+**Cause.** Rose's CAD tessellation is full of zero-area filler triangles
+(three collinear points: sides 73.0 + 48.6 = 121.6 mm), long slivers
+(150 × 0.13 mm) and micro-triangles (0.07 mm) — all thinner on screen
+than `ε = 1e-3 px`, so the host's inner point lands past them on a
+coplanar neighbour, which it accepts. The device asked the same question
+with an f32 ray from the eye 1.7 m away, and at those triangles the ray
+slipped through (the neighbour's own edge is within f32's ~1e-4 mm of the
+point) to the sky behind — refusing exactly the silhouette samples with
+the largest jumps. A larger `ε` did not help (0.1 px still missed): it is
+the sliver's neighbourhood, not the offset. (On the way, two wrong leads,
+measured and dropped: f32 cumulative sums, emulated on the host, are
+unbiased; and the refusals are not grazing-angle leaks — the facets face
+the camera at cos 0.6–0.7.)
+
+**Fix** (`gpu/edges.wgsl`, `edge_sample`). Ownership is decided in screen
+space, where projecting a vertex is well conditioned: a test point inside
+the triangle's projection next to the sample (the inner point if it is
+inside, else halfway across the triangle along the same normal), and no
+surface in front of the triangle's depth there (perspective-correct, by
+1/z) whose own projection contains the point. Hits whose triangle does
+not contain it are the same leaks and are stepped over (up to 8); back
+faces never hide anything on a closed solid and are stepped over too. A
+back-facing sampled triangle (the 0.02-importance side of a silhouette)
+keeps the ray test. Two density details, measured neutral on rose but
+right: the weight uses the slot's realised f32 width (`wt[si] − start`)
+over its length rather than `len × importance`, and `u` is one `fma`, on
+the same f32 grid as the sums.
+
+| `--check`, mask, depth 1, sky only | pitch | roll | elbow |
+|---|---|---|---|
+| device before, 16 seeds | 1.76e-3 (z −8) | 2.30e-4 (z −2) | −2.9e-5 (z −3) |
+| **device after, 256 seeds** | **2.580e-3 (z +1)** | 5.50e-4 (z +6) | −1.5e-6 (z −3) |
+| host samples (`EDGE_POLICY=front`), 256 seeds | 2.338e-3 (z −5) | 3.69e-4 (z −1) | −2.5e-5 (z −5) |
+| CD (h 0.003, 16 seeds) | 2.517e-3 | 3.804e-4 | 8.12e-5 |
+
+On the device's own draws, device = host + (5.7 ± 6.9, 7.0 ± 4.2,
+−1.1 ± 4.0)e-5 (64 seeds), the device-only samples; both-visible differ
+by < 2e-6. Full scene (depth 5, sun, NEE, no secondary term, 16 seeds):
+device (z +4, +2, +5), host ID-buffer samples `--vis` (z +2, 0, +4) —
+both short the secondary term there, as 2f measured.
+
+**Test.** `phase2f::gpu_tier::device_ownership_matches_the_host_at_cad_scale`:
+a millimetre arm 1.5 m from the origin, seen from 1.7 m through 11° (rose's
+frame), whose upper link is a CAD-style box (each face fanned from a
+corner over its own number of boundary points: zero-area triangles,
+slivers, T-junctions), four seeds × 16 384 device draws scored on the host:
+host-visible weight the device refuses < 0.05 %, device-only < 1 %,
+both-visible weights within 1 %. The old kernel: 0.17 % refused (fails);
+the new: 0.000 %. The synthetic scene is far milder than rose (0.17 %
+against rose's 30 % of the gradient) — rose's worst triangles are T-junction
+fillers along long straight edges, which no generated box quite matches —
+so the test catches the bug class, with 3× margin, not its size.
+
+What is left, characterised:
+
+1. **Roll reads 45 % high on the device** (5.50e-4 against CD 3.80e-4,
+   z +6 at 256 seeds; 1.7e-4 absolute, 7 % of the gradient's norm). A
+   third of it is the device-only samples (accepted where the host's inner
+   point lands on a non-coplanar neighbour, −3, and refuses); the rest is
+   in the draws' heavy tail (per-seed roll up to 2.2e-3, the host's to
+   1.4e-3). Refusing every back-face sample moves it by nothing (5.61e-4).
+2. **The host is not the reference either**: at 256 seeds its pitch and
+   elbow are z −5. The device and the host now err by similar norms
+   (0.20e-3 and 0.21e-3 of a 2.55e-3 gradient), in different components.
+3. Fits keep `--vis` until both are run against CD on the shaded scene;
+   the device's draws cost 3 ms against the host's 100+.
 
 ## Phase 3: sampling (2026-10-17)
 
@@ -2497,6 +2595,118 @@ Cycles' (0.0035 against 0.0006), and its sample is 2.2–3× slower.
    of pixels trimmed, or several seeds) would make these tables steadier.
 5. The light tree does not include the sun, the world or portals (fixed
    group shares still pick between them).
+
+## Baseline: Mitsuba 3 at equal footing (2026-11-07)
+
+The review's "no external baselines; Mitsuba 3 is the obvious one".
+`bench/mitsuba/` (README, `results.md`, raw CSVs): Mitsuba 3.9.1 on the same
+M4 Max GPU (`metal_ad_spectral`), irys's scenes exported to it
+(`examples/mitsuba_bench.rs`: PLYs, camera, environment, rig), irys's rough
+conductor as a Mitsuba BSDF plugin with the same formulas, irys's sky and sun
+baked to an envmap; each system renders its own 4096-spp target and takes the
+gradient of the same mean-squared loss with decorrelated seeds, and is held
+against its own central differences.
+
+**The reference first.** Central differences of one noisy image's MSE are
+not the gradient either system estimates: `E[(I − T)²] = (E I − T)² + Var I`,
+and `Var I` moves with roughness and pose. Taken that way, both renderers sat
+6–150 % off their references in the same direction. The bench's CD is of
+`mean((I_a − T)(I_b − T))` over two independent renders, unbiased for the
+expected image's loss; against it both are unbiased (material) — a trap
+worth naming in the paper, since a gradient test that uses the naive CD fails
+for a correct renderer.
+
+| material, `Scene::pair` 128², depth 4 + NEE, 64 seeds | irys | Mitsuba `prb` |
+|---|---|---|
+| z against own CD, all θ, 1/4/16 spp | ≤ 1.7 | ≤ 1.5 |
+| ms per gradient, 1 / 4 / 16 spp | 2.7 / 2.7 / 5.5 | 21.0 / 27.5 / 31.2 |
+| relative variance at 16 spp (α, F0×3) | 2.6e-2, 5.9e-5, 7.6e-5, 2.4e-5 | 3.3e-2, 1.3e-4, 3.4e-4, 7.2e-5 |
+| **equal-variance time, Mitsuba / irys** | | **7.0×, 12.6×, 25.5×, 17.0×** |
+
+(An earlier identical run had Mitsuba at 13.8 / 18.2 / 22.3 ms: 4.8–17.6×.)
+The variance gap is mostly light sampling — irys draws the sun lobe exactly,
+Mitsuba importance-samples the baked bitmap — and the time gap is per-call
+overhead as much as throughput (Mitsuba: 16× the samples for 1.5× the time).
+
+**Pose: no valid comparison yet.** On phase 2e's arm (96 × 72, depth 2 +
+NEE) irys's edge + interior gradient matches CD on pitch and yaw (z +0.8,
+−2.6 at 65 536 edge samples / 16 spp) and is 15 % high on the elbow (z +3.3:
+no shadow or reflection edges). Mitsuba's `prb_projective` converges to the
+wrong value (pitch −2.1e-4 at 256 spp against its own CD −6.45e-4, z +13;
+yaw and elbow off the other way), through its boundary term (its continuous
+part alone is −8e-6, like irys's interior −2e-5). Ruled out: guiding (none,
+four rounds), `direct_projective`, the Metal backend (LLVM agrees), the BSDF
+plugin (all-diffuse agrees), vertex welding; Mitsuba's CD matches irys's to
+2 %, so the scenes match. `sanity_projective.py`: the same setup reproduces
+CD on a translating box (welded: ratio 0.99–1.03; Mitsuba's own split-seam `cube`:
+1.86×). What breaks it on the arm is not found, so the bench reports
+Mitsuba's pose numbers as measured and claims nothing from them; 260–340 ms
+per Mitsuba pose gradient against irys's 8.6–60 ms is recorded, not argued.
+
+Mismatches, all documented in the README: spectral sampling and lane→RGB
+weights; the sky's tint approximated by RGB upsampling and the sun lobe
+resampled at 0.18° texels; Mitsuba's diffuse one-sided (closed meshes,
+up-facing floor: no effect); the targets differ by 2.7–2.9 % mean relative
+L1 per pixel. irys's pose interior term is CPU time.
+
+Next: the arm with Mitsuba's own shapes replacing the PLYs, and a Mitsuba
+issue with the arm scene if it reproduces there; then the comparison at the
+fit's size (192²) where Mitsuba's per-call overhead amortises.
+
+## The paper's limits, overcome (2026-11-10)
+
+The irys paper lists three limits: diffuse surfaces and splats are not
+differentiated, only the environment emits light, and the GPU tier had
+run only on Metal. This section removes the first two and the last; replay
+stays bit-exact per device and driver, which is the one left.
+
+**Vulkan.** On an RTX 3090 (driver 580) building `bounce` faulted inside
+the driver and lost the device, after which every pipeline was invalid with
+no error reported. The Sobol byte tables were a WGSL module-constant array
+indexed at run time, which naga lowers to a per-invocation local copy. They
+now live in the `qtab` storage buffer (`SOBOL_OFF`, `QKEY_OFF`), the same
+words. A second bug only Vulkan showed: f32 rounding could put a sampled
+wavelength on the lower edge of a zero-mass bin, pdf 0, one NaN pixel in
+192 frames of Sobol + spectral; `spec_pdf` now takes the bin below.
+
+**Emitters** were already in (phase 3): `Surface::Emitter`, NEE and MIS on
+both tiers. Their gates now also pass on Vulkan (phase3, 16/16).
+
+**Diffuse albedo** (`Scene::diffuse_bands`, three hats like F0). Lambertian
+`f` is linear in the bands, so a diffuse vertex adds
+`δL (L − L⁻) b_k / A` to `δd_k`, `L⁻` the radiance before the vertex,
+whatever light strategy runs there. GPU: a per-path `vec4` summed in bounce
+order, paths added on the host in index order. Roulette keeps the grey
+proxy, so it stays detached.
+
+**Splats** (`Scene::splat_grad`): each splat's DC colour and base opacity.
+Colour is linear; opacity also scales everything behind it, so with
+`R = L − L⁻ − τE` the light beyond the segment,
+`∂L/∂α_s = τ T_s c_s − (E_behind_s + R) / (1 − α_s)`. GPU: the replay walks
+the segment twice and writes one record per splat crossed (256 per path
+slot, overflow counted); the host adds them after each chunk in path,
+bounce and compositing order. No float atomics anywhere.
+
+| Gate (RTX 3090, Vulkan) | Result |
+|---|---|
+| diffuse: CPU f64 vs central differences, Cornell + NEE + emitter | 6.0e-10, 6.3e-10, 1.0e-9 |
+| diffuse: GPU f32 vs CPU f64 | 4.9e-7, 1.0e-6, 2.4e-6; θ ≤ 2.6e-6 |
+| diffuse: replay | 65 536 / 65 536 lanes bit-identical, two replays equal |
+| splats: CPU f64 vs central differences (f32 parameters, h 3e-3) | worst 5.1e-4 (colours ~1e-5) |
+| splats: GPU f32 vs CPU f64, 16 largest | 5.0e-5, 0 records dropped |
+| splats: replay | 65 536 / 65 536 lanes bit-identical, two replays equal |
+| full `irys-diff --features gpu` suite | all pass |
+
+**Hair on Vulkan.** `strand_hit` returned the query's committed
+intersection, which on NVIDIA was a farther fibre for 5 % of hits (same
+fibre 0.9476, gate 0.999) although every candidate passed through the
+loop; Metal agreed either way. It now returns the nearest hit the loop
+kept, and the committed one only for tessellated tubes, whose triangles
+the hardware commits itself: same fibre 1.0000, `look_hair_gpu` 3/3.
+
+Open: the look kernel still has constant Sobol tables (it compiles on
+NVIDIA, unlike `bounce`); splat records go through the host, which bounds
+a replay's splat crossings per path at 256.
 
 ## Open questions
 

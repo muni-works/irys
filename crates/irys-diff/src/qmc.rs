@@ -270,7 +270,14 @@ impl Spectral {
     /// The density at `lambda_nm`, relative to uniform over the band.
     pub fn pdf(&self, lambda_nm: f64) -> f64 {
         let x = (lambda_nm - LAMBDA_MIN_NM) / (LAMBDA_MAX_NM - LAMBDA_MIN_NM);
-        let b = ((x * SPECTRAL_BINS as f64) as usize).min(SPECTRAL_BINS - 1);
+        let mut b = ((x * SPECTRAL_BINS as f64) as usize).min(SPECTRAL_BINS - 1);
+        // `lambda` never lands inside a bin of zero mass, only on its lower
+        // edge by rounding, which is also the top of the bin below. Without
+        // this the f32 tier weighed such a lane by 1/0 (one NaN pixel in
+        // 192 frames of Sobol + spectral on the RTX 3090).
+        if b > 0 && self.cdf[b + 1] == self.cdf[b] {
+            b -= 1;
+        }
         (self.cdf[b + 1] - self.cdf[b]) as f64 * SPECTRAL_BINS as f64
     }
 }

@@ -476,3 +476,188 @@ fn interpenetrating_arm_with_curve_samples() {
         assert!(z.abs() < 3.0, "φ{j}: z {z}");
     }
 }
+
+/// A closed cylinder along `x`, radius `r`, half-length `hl`, `n` side
+/// facets (long, thin and, at the silhouette, edge-on: rose's tubes).
+fn tube(r: f64, hl: f64, n: usize) -> irys_core::TriMesh {
+    let tau = std::f64::consts::TAU;
+    let mut p = Vec::new();
+    for x in [-hl, hl] {
+        for j in 0..n {
+            let a = tau * j as f64 / n as f64;
+            p.push(Point3::new(x, r * a.cos(), r * a.sin()));
+        }
+    }
+    p.push(Point3::new(-hl, 0.0, 0.0));
+    p.push(Point3::new(hl, 0.0, 0.0));
+    let (c0, c1) = (2 * n as u32, 2 * n as u32 + 1);
+    let mut idx = Vec::new();
+    for j in 0..n as u32 {
+        let k = (j + 1) % n as u32;
+        let (a, b, c, d) = (j, k, n as u32 + k, n as u32 + j);
+        idx.extend([a, b, c, a, c, d]);
+        idx.extend([c0, k, j]);
+        idx.extend([c1, n as u32 + j, n as u32 + k]);
+    }
+    irys_core::TriMesh::new(p, Vec::new(), &idx)
+}
+
+const TUBE_N: usize = 192;
+
+/// A box of half-extents `h` tessellated as a CAD kernel does a planar
+/// face: each face's outline carries its own number of points per side
+/// (`k`, `k + 7`, …: T-junctions along every edge of the box, which only
+/// meet in exact arithmetic) and is fanned from one corner — slivers, and zero-area triangles along the two sides through
+/// the fan's corner (three collinear points), which are silhouette
+/// candidates like any other edge.
+fn cad_box(h: [f64; 3], k: usize) -> irys_core::TriMesh {
+    let mut pos: Vec<Point3> = Vec::new();
+    let mut key = std::collections::HashMap::new();
+    let mut id = |p: Point3, pos: &mut Vec<Point3>| -> u32 {
+        let q = [p.x, p.y, p.z].map(|c| (c * 1e6).round() as i64);
+        *key.entry(q).or_insert_with(|| {
+            pos.push(p);
+            pos.len() as u32 - 1
+        })
+    };
+    let mut idx = Vec::new();
+    // Each face: normal axis a, sign sg; u, v the other two axes.
+    for a in 0..3 {
+        for sg in [-1.0, 1.0] {
+            let (u, v) = ((a + 1) % 3, (a + 2) % 3);
+            let corner = |cu: f64, cv: f64| {
+                let mut c = [0.0; 3];
+                c[a] = sg * h[a];
+                c[u] = cu * h[u];
+                c[v] = cv * h[v];
+                Point3::new(c[0], c[1], c[2])
+            };
+            // The outline, counter-clockwise in (u, v), k points per side.
+            let mut ring = Vec::new();
+            let sides = [((-1.0, -1.0), (1.0, -1.0)), ((1.0, -1.0), (1.0, 1.0)), ((1.0, 1.0), (-1.0, 1.0)), ((-1.0, 1.0), (-1.0, -1.0))];
+            let kf = k + 7 * (2 * a + (sg > 0.0) as usize);
+            for ((u0, v0), (u1, v1)) in sides {
+                for i in 0..kf {
+                    let f = i as f64 / kf as f64;
+                    ring.push(id(corner(u0 + f * (u1 - u0), v0 + f * (v1 - v0)), &mut pos));
+                }
+            }
+            for i in 1..ring.len() - 1 {
+                let (p, q) = (ring[i], ring[i + 1]);
+                // Outward: (u, v, a) is right-handed, so ccw faces +a.
+                if sg > 0.0 { idx.extend([ring[0], p, q]); } else { idx.extend([ring[0], q, p]); }
+            }
+        }
+    }
+    irys_core::TriMesh::new(pos, Vec::new(), &idx)
+}
+
+/// Rose's scale: millimetres, a metre and a half from the origin, seen
+/// from 1.7 m through an 11° lens. Two tubes on a shoulder over a post.
+fn mm_tube_arm(w: usize, h: usize) -> (Scene, Rig<'static>) {
+    const SH: [f64; 3] = [120.0, 240.0, 1400.0];
+    let blas = vec![
+        opaque(prb::cuboid(40.0, 40.0, 200.0), Surface::Diffuse),
+        opaque(cad_box([70.0, 22.0, 16.0], 24), Surface::Conductor),
+        opaque(tube(17.0, 60.0, TUBE_N), Surface::Diffuse),
+    ];
+    let placements = vec![
+        Placement::new(0, Transform::translation(SH[0] - 60.0, SH[1] + 70.0, SH[2] - 200.0)).tinted(0.6),
+        Placement::new(1, Transform::identity()),
+        Placement::new(2, Transform::identity()).tinted(0.8),
+    ];
+    let mut s = Scene::instanced(
+        blas,
+        placements,
+        None,
+        (w, h),
+        1,
+        (Point3::new(1074.0, 1526.0, 1021.0), Point3::new(170.0, 235.0, 1390.0)),
+        11.0,
+    );
+    s.depth = 1;
+    let rig = Rig {
+        moving: vec![1, 2],
+        place: Box::new(|p: &[f64]| {
+            let s = Point3::new(SH[0], SH[1], SH[2]);
+            let sh = vis::about(s, Vec3::new(0.0, 0.0, 1.0), p[1]).then(&vis::about(s, Vec3::new(0.0, 1.0, 0.0), p[0]));
+            let e = Point3::new(SH[0] + 150.0, SH[1], SH[2]);
+            let upper = sh.then(&Transform::translation(SH[0] + 72.0, SH[1], SH[2])).then(&Transform::rotation_x(0.35));
+            let fore = sh
+                .then(&vis::about(e, Vec3::new(0.0, 1.0, 0.0), p[2]))
+                .then(&Transform::translation(e.x + 65.0, e.y, e.z))
+                .then(&Transform::rotation_x(-0.5));
+            vec![upper, fore]
+        }),
+    };
+    (s, rig)
+}
+
+#[cfg(feature = "gpu")]
+mod gpu_tier {
+    use super::*;
+    use irys_diff::gpu::{self, GpuEdges, GpuPrb};
+
+    /// 2f residual (a), fixed: on the device's own draws, its f32
+    /// ownership test agrees with the host's f64 one at rose's scale (mm,
+    /// 1.5 m from the origin) on CAD-style tessellation. Before the fix the
+    /// device's inner ray, at a sliver, a zero-area filler triangle or a
+    /// T-junction, missed the surface the host lands on and refused the
+    /// sample: here 0.17 % of the host's weight (0.00 % after), on rose
+    /// the samples with the largest jumps — 30 % of the shoulder pitch's
+    /// arm gradient.
+    #[test]
+    fn device_ownership_matches_the_host_at_cad_scale() {
+        let ctx = match gpu::context() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("no GPU ({e}): skipping");
+                return;
+            }
+        };
+        let (w, h) = (192, 144);
+        let (mut s, rig) = mm_tube_arm(w, h);
+        let phi = [0.25, 0.4, -0.9];
+        rig.pose(&mut s, &phi);
+        let edges = Edges::new(&s);
+        let n = 16384;
+        s.set_points(Some(vec![[0.0, 0.0]; 2 * n]));
+        let gp = GpuPrb::new(ctx, &s);
+        let mut ge = GpuEdges::new(&gp, &s, &edges, &rig.moving, n, 3, true);
+        let (mut lost, mut gained, mut both, mut total) = (0.0, 0.0, 0usize, 0.0);
+        for seed in 0..4 {
+            let dev = ge.sample(&gp, &s, &rig, &phi, 77 + seed);
+            ge.debug = true;
+            let _ = ge.sample(&gp, &s, &rig, &phi, 77 + seed);
+            let draws: Vec<_> = ge.draws(&gp).into_iter().map(|d| d.0).collect();
+            ge.debug = false;
+            let host = vis::EdgeSamples::at_draws(&s, &edges, &rig, &phi, &draws, true);
+            for i in 0..n {
+                let (hw, dw) = (&host.weights()[i], &dev.weights()[i]);
+                let size = |w: &[f64]| w.iter().map(|x| x.abs()).sum::<f64>();
+                let (hv, dv) = (size(hw) > 0.0, size(dw) > 0.0);
+                total += size(hw);
+                match (hv, dv) {
+                    (true, false) => lost += size(hw),
+                    (false, true) => gained += size(dw),
+                    (true, true) => {
+                        both += 1;
+                        assert!(
+                            (size(hw) - size(dw)).abs() <= 1e-2 * size(hw) + 1e-9,
+                            "sample {i}: host {hw:?} device {dw:?}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        eprintln!(
+            "mm CAD arm: {both} samples both visible; host-only {:.3} %, device-only {:.3} % of the host's Σ|w|",
+            100.0 * lost / total,
+            100.0 * gained / total
+        );
+        assert!(both > 4 * 2000, "the arm should be in view ({both})");
+        assert!(lost < 5e-4 * total, "the device refuses {:.3} % of the host's weight", 100.0 * lost / total);
+        assert!(gained < 0.01 * total, "the device adds {:.2} % to the host's weight", 100.0 * gained / total);
+    }
+}

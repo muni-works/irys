@@ -249,6 +249,28 @@ impl Splats {
         self.opacities[i]
     }
 
+    /// Set splat `i`'s base opacity (the parameter a differentiable
+    /// renderer moves; the tree's boxes do not depend on it).
+    pub fn set_opacity(&mut self, i: usize, opacity: f32) {
+        self.opacities[i] = opacity;
+    }
+
+    /// Splat `i`'s DC harmonic, RGB (`[0.5; 3]`-offset colour is
+    /// `0.5 + SH_C0 · dc` before the higher bands). Zero without harmonics.
+    pub fn dc(&self, i: usize) -> [f32; 3] {
+        if self.sh_stride == 0 {
+            [0.0; 3]
+        } else {
+            self.sh[i * self.sh_stride]
+        }
+    }
+
+    /// Set splat `i`'s DC harmonic. Panics on a cloud without harmonics.
+    pub fn set_dc(&mut self, i: usize, dc: [f32; 3]) {
+        assert!(self.sh_stride > 0, "a cloud without harmonics has no DC term");
+        self.sh[i * self.sh_stride] = dc;
+    }
+
     /// The colour of splat `i` seen from direction `dir`.
     ///
     /// `dir` points **from the camera toward the splat** — the ray's own
@@ -374,7 +396,9 @@ fn quat_to_mat3(q: [f32; 4]) -> [[f64; 3]; 3] {
 
 /// Real spherical harmonic normalisation constants, degrees 0 through 3, in
 /// the order the 3DGS reference implementation stores its coefficients.
-const SH_C0: f32 = 0.282_094_79;
+/// The degree-0 harmonic's weight: `∂colour/∂dc` where the colour is not
+/// clamped.
+pub const SH_C0: f32 = 0.282_094_79;
 const SH_C1: f32 = 0.488_602_5;
 const SH_C2: [f32; 5] = [
     1.092_548_4,

@@ -248,6 +248,55 @@ fn ray_dir(q: vec2<f32>) -> vec3<f32> {
     return normalize(params.fwd.xyz + params.right.xyz * q.x + params.up.xyz * q.y);
 }
 
+// Barycentrics of `p` in the screen triangle (a, b, c) (any winding).
+fn bary_px(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, c: vec2<f32>) -> vec3<f32> {
+    let ar = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    if (ar == 0.0) { return vec3<f32>(-1.0); }
+    let la = ((b.x - p.x) * (c.y - p.y) - (b.y - p.y) * (c.x - p.x)) / ar;
+    let lb = ((c.x - p.x) * (a.y - p.y) - (c.y - p.y) * (a.x - p.x)) / ar;
+    return vec3<f32>(la, lb, 1.0 - la - lb);
+}
+
+// Per corner, its distance in pixels from the opposite edge (λ = 1 there),
+// so `λ × margin` is the distance from that edge.
+fn margin_px(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>) -> vec3<f32> {
+    let ar = abs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x));
+    return vec3<f32>(ar / max(length(c - b), 1e-30), ar / max(length(a - c), 1e-30), ar / max(length(b - a), 1e-30));
+}
+
+// A point of instance `k`'s space in the world: the instance record holds
+// world → local rows, inverted here.
+fn inst_world(k: u32, p: vec3<f32>) -> vec3<f32> {
+    let r = params.inst_base + 4u * k;
+    let m0 = geo[r];
+    let m1 = geo[r + 1u];
+    let m2 = geo[r + 2u];
+    let q = p - vec3<f32>(m0.w, m1.w, m2.w);
+    // Rows of A are m0, m1, m2; A⁻¹ = adj(A) / det(A), adj's columns the
+    // rows' cross products.
+    let c0 = cross(m1.xyz, m2.xyz);
+    let c1 = cross(m2.xyz, m0.xyz);
+    let c2 = cross(m0.xyz, m1.xyz);
+    let det = dot(m0.xyz, c0);
+    return (c0 * q.x + c1 * q.y + c2 * q.z) / det;
+}
+
+// The sign of instance `k`'s determinant (a mirror flips the winding).
+fn inst_sign(k: u32) -> f32 {
+    let r = params.inst_base + 4u * k;
+    return sign(dot(geo[r].xyz, cross(geo[r + 1u].xyz, geo[r + 2u].xyz)));
+}
+
+// Diagnostics (`GpuEdges::debug`): why a sample was refused, and which
+// (slot, t) it was, in the weight lanes (which a refused sample leaves 0).
+fn refuse(i: u32, stride: u32, c: f32, si: u32, t: f32) {
+    smp_out[i * stride + 1u] = c;
+    if (ep._p0 != 0u && ep.np >= 2u) {
+        smp_out[i * stride + 2u] = bitcast<f32>(si);
+        smp_out[i * stride + 3u] = t;
+    }
+}
+
 @compute @workgroup_size(64)
 fn edge_sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     let i = flat_e(gid, nwg);
@@ -261,7 +310,13 @@ fn edge_sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
         return;
     }
     var s = erng(i);
-    let u = (f32(i) + rand(&s)) / f32(ep.n) * total;
+    // One rounding (2f): `u` on the same f32 grid as the cumulative sums,
+    // so a slot's chance is its realised width `wt[si] − start` over the
+    // total exactly (`(f32(i) + r) / n × total` put `u` on a grid ~2× as
+    // coarse and not aligned with the sums, which skewed sub-0.01 px
+    // slots: rose's arm read 1.6× high on roll).
+    let step = total / f32(ep.n);
+    let u = fma(f32(i), step, rand(&s) * step);
     // partition_point(c <= u)
     var lo = 0u;
     var hi = ep.slots;
@@ -331,34 +386,109 @@ fn edge_sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     if (abs(den) > 0.0) { v = clamp((aa * ee - bb * dd) / den, 0.0, 1.0); }
     let x = a + ev * v;
     let xl = la + (lb - la) * v;
-    // Ownership: the inner ray lands on this triangle, or a coplanar one
-    // of the same face of the same instance.
+    // Ownership (2f fix): is this triangle the first surface along the
+    // inner ray? At a silhouette the triangle is nearly edge-on, and an f32
+    // ray-triangle test's barycentrics err by ~ulp(|o|)/sin(grazing angle):
+    // the inner ray, 1e-3 px inside the edge, leaked past its own triangle
+    // (or, for a sliver, past the coplanar neighbour the host lands on) to
+    // the sky, another link or the wall behind — on rose, the samples with
+    // the largest jumps — and the device's edge term read 30 % low. Decided
+    // in screen space instead, where projecting a vertex is well
+    // conditioned whatever the angle: a test point inside the triangle's
+    // projection next to the sample, and nothing in front of the
+    // triangle's depth there whose own projection contains it. Hits whose
+    // triangle does not contain the point are the same leaks, stepped over.
     let dir = ray_dir(inner);
-    let hit = intersect(eye, dir, 3.4e38, false);
-    if (hit.prim == NONE || hit.inst != mv.rec) { return; }
-    if (hit.prim != prim) {
-        let nt = cross(lb - la, obj(prim, (e + 2u) % 3u) - la);
-        let nh = cross(obj(hit.prim, 1u) - obj(hit.prim, 0u), obj(hit.prim, 2u) - obj(hit.prim, 0u));
-        let ln = length(nt);
-        let lh = length(nh);
-        // f32 (2f): a sliver's cross product carries its corners' rounding
-        // (~1e-7 of their magnitude over its own size), so the host's
-        // 1e-6 on the cosine and 1e-4 of the edge on the plane distance
-        // refused real coplanar neighbours on rose's mm-scale CAD — 7 % of
-        // its visible samples, a quarter of the shoulder pitch's mask
-        // gradient. Tolerances in units of the coordinates' own rounding.
-        let mag = max(max(abs(la.x), abs(la.y)), max(abs(la.z), 1e-9));
-        let cos_tol = max(1e-6, 64.0 * 1.2e-7 * mag * mag / max(ln * lh, 1e-30) * 4.0);
-        if (!(ln > 0.0 && lh > 0.0 && dot(nt, nh) / (ln * lh) > 1.0 - min(cos_tol, 1e-3))) { return; }
-        let l = to_local(hit.inst, eye, dir);
-        let q = l[0] + l[1] * hit.t;
-        let dtol = max(1e-4 * max(length(lb - la), 1e-9), 64.0 * 1.2e-7 * (mag + length(q)));
-        if (abs(dot(nt / ln, q - la)) >= dtol) { return; }
+    // A back face (2e's 0.02-importance side of a silhouette) is hidden by
+    // its front neighbour a few µm in front at the inner point — closer
+    // than any depth tolerance resolves — so it keeps the ray test, whose
+    // leaks there only refuse what the host would refuse anyway.
+    let own2d = pc3.z > 0.0 && facing(mi, prim) > 0.0;
+    // The test point: the inner point if it is inside the triangle (the
+    // host's own question); if not — a sliver thinner than `eps` on screen
+    // there, or a sample by a sharp corner, where the host asks a coplanar
+    // neighbour — the point halfway across the triangle along the same
+    // normal, which is inside it and as close to the sample.
+    let l0 = vec2<f32>(1.0 - t, t);
+    let l1 = bary_px(sp - nrm, pa, pb, pc).xy;
+    let dlam = l1 - l0;
+    var wpx = 3.4e38;
+    if (dlam.x < 0.0) { wpx = min(wpx, l0.x / -dlam.x); }
+    if (dlam.y < 0.0) { wpx = min(wpx, l0.y / -dlam.y); }
+    let ip = sp - min(ep.eps_px, 0.5 * wpx) * nrm;
+    let idir = ray_dir(screen(ip));
+    if (own2d) {
+        // λ is in the edge's frame (a = corner e); depth by 1/z.
+        let bary = bary_px(ip, pa, pb, pc);
+        let za = project(a).z;
+        let zb = project(b).z;
+        let zt = 1.0 / (bary.x / za + bary.y / zb + bary.z / pc3.z);
+        let tmax = zt * (1.0 - 1e-6) / dot(idir, params.fwd.xyz);
+        var o = eye;
+        var left = tmax;
+        for (var k = 0u; k < 8u; k = k + 1u) {
+            let hh = intersect(o, idir, left, false);
+            if (hh.prim == NONE) { break; }
+            var real = true;
+            if (hh.inst == mv.rec && hh.prim == prim) {
+                real = false;
+            } else if (u32(geo[3u * hh.prim].w) == 0u) {
+                let wa = inst_world(hh.inst, obj(hh.prim, 0u));
+                let wb = inst_world(hh.inst, obj(hh.prim, 1u));
+                let wc = inst_world(hh.inst, obj(hh.prim, 2u));
+                let qa = project(wa);
+                let qb = project(wb);
+                let qc = project(wc);
+                // A back face never hides anything on a closed solid (the
+                // solid's front face is in front of it); the one just
+                // behind a sharp silhouette is within any depth tolerance.
+                let front = dot(cross(wb - wa, wc - wa), eye - wa) * inst_sign(hh.inst) > 0.0;
+                if (!front) {
+                    real = false;
+                } else if (qa.z > 0.0 && qb.z > 0.0 && qc.z > 0.0) {
+                    let l2 = bary_px(ip, qa.xy, qb.xy, qc.xy);
+                    let m2 = margin_px(qa.xy, qb.xy, qc.xy);
+                    let mm = ep.eps_px * 0.25;
+                    real = l2.x * m2.x >= mm && l2.y * m2.y >= mm && l2.z * m2.z >= mm;
+                }
+            }
+            if (real) { refuse(i, stride, -6.0, si, t); return; }
+            let step = hh.t * (1.0 + 1e-6);
+            o = o + idir * step;
+            left = left - step;
+            if (left <= 0.0) { break; }
+        }
+    } else {
+        let hit = intersect(eye, dir, 3.4e38, false);
+        if (hit.prim == NONE) { refuse(i, stride, -1.0, si, t); return; }
+        if (hit.inst != mv.rec) { refuse(i, stride, -2.0, si, t); return; }
+        if (hit.prim != prim) {
+            let nt = cross(lb - la, obj(prim, (e + 2u) % 3u) - la);
+            let nh = cross(obj(hit.prim, 1u) - obj(hit.prim, 0u), obj(hit.prim, 2u) - obj(hit.prim, 0u));
+            let ln = length(nt);
+            let lh = length(nh);
+            // f32 (2f): a sliver's cross product carries its corners' rounding
+            // (~1e-7 of their magnitude over its own size), so the host's
+            // 1e-6 on the cosine and 1e-4 of the edge on the plane distance
+            // refused real coplanar neighbours on rose's mm-scale CAD — 7 % of
+            // its visible samples, a quarter of the shoulder pitch's mask
+            // gradient. Tolerances in units of the coordinates' own rounding.
+            let mag = max(max(abs(la.x), abs(la.y)), max(abs(la.z), 1e-9));
+            let cos_tol = max(1e-6, 64.0 * 1.2e-7 * mag * mag / max(ln * lh, 1e-30) * 4.0);
+            if (!(ln > 0.0 && lh > 0.0 && dot(nt, nh) / (ln * lh) > 1.0 - min(cos_tol, 1e-3))) {
+                refuse(i, stride, -3.0, si, t);
+                return;
+            }
+            let l = to_local(hit.inst, eye, dir);
+            let q = l[0] + l[1] * hit.t;
+            let dtol = max(1e-4 * max(length(lb - la), 1e-9), 64.0 * 1.2e-7 * (mag + length(q)));
+            if (abs(dot(nt / ln, q - la)) >= dtol) { refuse(i, stride, -4.0, si, t); return; }
+        }
     }
     // The pinhole's Jacobian at x.
     let dx = x - eye;
     let z = dot(dx, params.fwd.xyz);
-    if (z <= 0.0) { return; }
+    if (z <= 0.0) { refuse(i, stride, -5.0, si, t); return; }
     let kx = w / (2.0 * params.tan_half * w / h);
     let ky = h / (2.0 * params.tan_half);
     let ax = dot(dx, params.right.xyz);
@@ -366,9 +496,19 @@ fn edge_sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workg
     let jx = (params.right.xyz * z - params.fwd.xyz * ax) * (kx / (z * z));
     let jy = (params.up.xyz * z - params.fwd.xyz * by) * (-ky / (z * z));
     smp_out[i * stride + 1u] = 1.0;
+    if (ep._p0 != 0u && ep.np >= 2u) {
+        smp_out[i * stride + 2u] = bitcast<f32>(si);
+        smp_out[i * stride + 3u] = t;
+        return;
+    }
+    // The density per pixel of edge is the slot's realised width (f32
+    // sums: not exactly `len × importance` for a slot much narrower than
+    // the sums' rounding) over its length, over the total.
+    let wreal = wt[si] - start;
+    let lslot = dl * (r.y - r.x);
     for (var j = 0u; j < ep.np; j = j + 1u) {
         let vel = dworld(mi, j, xl);
         let vn = dot(jx, vel) * nrm.x + dot(jy, vel) * nrm.y;
-        smp_out[i * stride + 2u + j] = vn * total / (r.z * f32(ep.n));
+        smp_out[i * stride + 2u + j] = vn * total * lslot / (wreal * f32(ep.n));
     }
 }

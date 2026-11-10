@@ -54,6 +54,10 @@ use irys_light::spectrum::hero_weight;
 
 use crate::prb::{HERO, Rng, Scene, wavelengths};
 
+/// Where an edge sampler landed: (moving instance, triangle, edge, the
+/// edge's parameter), for [`EdgeSamples::at_draws`].
+pub type Draw = (usize, usize, usize, f64);
+
 /// The half-width of an edge sample, in pixels: the two rays leave the
 /// camera this far either side of the edge. Small against a pixel, large
 /// against the device's f32 camera plane.
@@ -531,7 +535,7 @@ impl EdgeSamples {
         seed: u64,
         vis: Option<&Visibility>,
     ) -> Self {
-        Self::for_rig(scene, edges, rig, phi, n, seed, vis.is_some(), vis)
+        Self::for_rig(scene, edges, rig, phi, n, seed, vis.is_some(), vis, None)
     }
 
     /// 2e's front-only silhouettes without an ID buffer (what the device
@@ -545,7 +549,25 @@ impl EdgeSamples {
         seed: u64,
         front_only: bool,
     ) -> Self {
-        Self::for_rig(scene, edges, rig, phi, n, seed, front_only, None)
+        Self::for_rig(scene, edges, rig, phi, n, seed, front_only, None, None)
+    }
+
+    /// [`EdgeSamples::with_policy`] at given draws instead of its own: per
+    /// sample, the (moving instance, triangle, edge, edge parameter) the
+    /// sampler landed on, or `None` for no sample — what
+    /// [`crate::gpu::GpuEdges::draws`] reads back. The weights assume
+    /// [`EdgeSamples::with_policy`]'s density, so a sampler's draws scored
+    /// here are scored exactly as the host would have scored them (2f: the
+    /// device sampler's per-sample check).
+    pub fn at_draws(
+        scene: &Scene,
+        edges: &Edges,
+        rig: &Rig,
+        phi: &[f64],
+        draws: &[Option<Draw>],
+        front_only: bool,
+    ) -> Self {
+        Self::for_rig(scene, edges, rig, phi, draws.len(), 0, front_only, None, Some(draws))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -558,6 +580,7 @@ impl EdgeSamples {
         seed: u64,
         front_only: bool,
         vis: Option<&Visibility>,
+        draws: Option<&[Option<Draw>]>,
     ) -> Self {
         let np = phi.len();
         // ± RIG_H placements per parameter, for the edges' velocities.
@@ -590,6 +613,7 @@ impl EdgeSamples {
             seed,
             front_only,
             vis,
+            draws,
         )
     }
 
@@ -626,7 +650,7 @@ impl EdgeSamples {
                 .collect::<Vec<_>>()
         };
         let all: Vec<usize> = (0..scene.placements().len()).collect();
-        Self::build(scene, edges, &all, &vel, c.len(), n, seed, true, None)
+        Self::build(scene, edges, &all, &vel, c.len(), n, seed, true, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -640,6 +664,7 @@ impl EdgeSamples {
         seed: u64,
         front_only: bool,
         vis: Option<&Visibility>,
+        draws: Option<&[Option<Draw>]>,
     ) -> Self {
         let (w, h) = (scene.size.0 as f64, scene.size.1 as f64);
         let mut segs = Vec::new();
@@ -782,6 +807,10 @@ impl EdgeSamples {
             visible: 0,
             halved: 0,
         };
+        let seg_of: std::collections::HashMap<(usize, usize, usize), usize> = match draws {
+            Some(_) => segs.iter().enumerate().map(|(i, sg)| ((sg.mi, sg.tri, sg.e), i)).collect(),
+            None => Default::default(),
+        };
         for i in 0..n {
             let put = |o: &mut Self, s: [f64; 2], nrm: [f64; 2], wt: Vec<f64>| {
                 let at = |d: f64| scene.screen(s[0] + d * nrm[0], s[1] + d * nrm[1]);
@@ -801,11 +830,22 @@ impl EdgeSamples {
                 put(&mut out, [0.0, 0.0], [1.0, 0.0], vec![0.0; np]);
                 continue;
             }
-            let si = cum.partition_point(|&c| c <= u).min(segs.len() - 1);
-            let seg = &segs[si];
-            let start = if si == 0 { 0.0 } else { cum[si - 1] };
-            let frac = ((u - start) / (cum[si] - start)).clamp(0.0, 1.0);
-            let t = seg.t0 + frac * (seg.t1 - seg.t0);
+            let (seg, t) = match draws {
+                None => {
+                    let si = cum.partition_point(|&c| c <= u).min(segs.len() - 1);
+                    let seg = &segs[si];
+                    let start = if si == 0 { 0.0 } else { cum[si - 1] };
+                    let frac = ((u - start) / (cum[si] - start)).clamp(0.0, 1.0);
+                    (seg, seg.t0 + frac * (seg.t1 - seg.t0))
+                }
+                Some(d) => match d[i].and_then(|(mi, tri, e, t)| seg_of.get(&(mi, tri, e)).map(|&si| (&segs[si], t))) {
+                    Some(st) => st,
+                    None => {
+                        put(&mut out, [0.0, 0.0], [1.0, 0.0], vec![0.0; np]);
+                        continue;
+                    }
+                },
+            };
             let d = [seg.pb[0] - seg.pa[0], seg.pb[1] - seg.pa[1]];
             let s = [seg.pa[0] + t * d[0], seg.pa[1] + t * d[1]];
             let dl = d[0].hypot(d[1]);
@@ -919,7 +959,7 @@ impl EdgeSamples {
                 [jac[0].z, jac[1].z],
             ]
         };
-        Self::build(scene, edges, moving, &vel, 3, n, seed, true, vis)
+        Self::build(scene, edges, moving, &vel, 3, n, seed, true, vis, None)
     }
 
     /// `∂ℒ/∂X_i` (world space) for every vertex of placement `k`'s tree,
@@ -956,6 +996,11 @@ impl EdgeSamples {
             g[b as usize] = g[b as usize] + gx * v;
         }
         g
+    }
+
+    /// Each sample's pixel.
+    pub fn pixels(&self) -> &[usize] {
+        &self.pixel
     }
 
     /// Per sample, per parameter, what its pair's difference is worth.

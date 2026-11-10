@@ -253,7 +253,12 @@ fn spec_lambda(u: f32) -> f32 {
 
 fn spec_pdf(l: f32) -> f32 {
     if ((P.samp.x & S_SPECTRAL) == 0u) { return 1.0; }
-    let b = min(u32(max((l - 380.0) / 400.0 * 256.0, 0.0)), 255u);
+    var b = min(u32(max((l - 380.0) / 400.0 * 256.0, 0.0)), 255u);
+    // `Spectral::pdf`'s rule: a zero-mass bin is only reached at its lower
+    // edge, by rounding from the bin below.
+    if (b > 0u && SPEC_CDF[b + 1u] == SPEC_CDF[b]) {
+        b = b - 1u;
+    }
     return (SPEC_CDF[b + 1u] - SPEC_CDF[b]) * 256.0;
 }
 

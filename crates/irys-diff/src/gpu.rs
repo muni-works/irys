@@ -83,7 +83,23 @@ pub(crate) fn sobol_const() -> String {
         keys.join(", ")
     )
 }
+/// Where `sampler_tables` puts the Sobol byte tables and scramble keys, as
+/// WGSL constants. The wavefront reads them from the `qtab` storage buffer,
+/// not from module-constant arrays: a large constant array indexed at run
+/// time is lowered to a per-invocation local copy, and inside `bounce` that
+/// made NVIDIA's Vulkan compiler fault and lose the device (RTX 3090, driver
+/// 580). The words are the same, so the stream is unchanged.
+pub(crate) fn sobol_offsets() -> String {
+    let base = 4 * 32 + crate::qmc::Spectral::get().cdf.len();
+    format!(
+        "const SOBOL_OFF: u32 = {base}u;\nconst QKEY_OFF: u32 = {}u;\n",
+        base + crate::qmc::byte_tables().len()
+    )
+}
+
 const PATH_BYTES: u64 = 80;
+/// Splat-gradient records a path slot holds per replay (`Scene::splat_grad`).
+const SPLAT_RECORDS: u32 = 256;
 const WG: u32 = 64;
 
 #[repr(C)]
@@ -126,6 +142,8 @@ struct Params {
     gres2: [u32; 4],
     qmc: [u32; 4],
     rr: [f32; 4],
+    dband: [f32; 4],
+    splat: [u32; 4],
 }
 
 /// The splat compositor's segment start, `EPS / 10` (phase 2b's, unchanged).
@@ -309,6 +327,13 @@ pub struct GpuPrb {
     l: wgpu::Buffer,
     l2: wgpu::Buffer,
     grad: wgpu::Buffer,
+    /// Per path `δd` for [`Scene::diffuse_bands`] (`vec4` each).
+    dalb: wgpu::Buffer,
+    /// Splat-gradient records: index, value, count per path slot.
+    srec: [wgpu::Buffer; 3],
+    /// The splats' gradient summed so far this replay, and records lost to
+    /// a full slot.
+    splat_acc: std::cell::RefCell<(Vec<[f64; 4]>, u64)>,
     target: wgpu::Buffer,
     img: wgpu::Buffer,
     loss: wgpu::Buffer,
@@ -566,6 +591,8 @@ impl Grid {
 fn sampler_tables() -> Vec<u32> {
     let mut t: Vec<u32> = crate::qmc::sobol_matrices().iter().flatten().copied().collect();
     t.extend(crate::qmc::Spectral::get().cdf.iter().map(|c| c.to_bits()));
+    t.extend(crate::qmc::byte_tables());
+    t.extend(crate::qmc::value_keys());
     t
 }
 
@@ -638,6 +665,13 @@ impl GpuPrb {
         let l = storage("l", lane_bytes);
         let l2 = storage("l replayed", lane_bytes);
         let grad = storage("grad", PARAMS as u64 * 4);
+        let dalb = storage("diffuse band grad", scene.paths().max(1) as u64 * 16);
+        let sr = if scene.splat_grad { SPLAT_RECORDS as u64 } else { 1 };
+        let srec = [
+            storage("splat rec index", paths as u64 * sr * 4),
+            storage("splat rec grad", paths as u64 * sr * 16),
+            storage("splat rec count", paths as u64 * 4),
+        ];
         let pixels = (scene.size.0 * scene.size.1) as u64;
         let target = storage("target", pixels * 12);
         let img = storage("image", pixels * 12);
@@ -739,7 +773,7 @@ impl GpuPrb {
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("prb wavefront"),
             source: wgpu::ShaderSource::Wgsl(
-                wavefront_src(accel.is_some(), &format!("{RESTIR}\n{GUIDE}\n{COMPACT}\n{}", sobol_const())).into(),
+                wavefront_src(accel.is_some(), &format!("{RESTIR}\n{GUIDE}\n{COMPACT}\n{}", sobol_offsets())).into(),
             ),
         });
         let pipe = |entry: &str| {
@@ -795,10 +829,17 @@ impl GpuPrb {
             (52, &g_ok),
             (53, &g_rec),
             (54, &g_nrec),
+            (56, &qtab),
             (59, &lane_bits),
             (60, &stage),
             (71, &cold),
             (72, &lams),
+            (10, &l),
+            (11, &dl),
+            (73, &dalb),
+            (74, &srec[0]),
+            (75, &srec[1]),
+            (76, &srec[2]),
         ];
         let mut scatter: Vec<(u32, &wgpu::Buffer)> = vec![
             (0, &params),
@@ -948,6 +989,9 @@ impl GpuPrb {
             l,
             l2,
             grad,
+            dalb,
+            srec,
+            splat_acc: Default::default(),
             target,
             img,
             loss,
@@ -1082,6 +1126,11 @@ impl GpuPrb {
                 Some(r) => [1.0, r.start as f32, r.floor as f32, 0.0],
                 None => [0.0; 4],
             },
+            dband: match scene.diffuse_bands {
+                Some(d) => [d[0] as f32, d[1] as f32, d[2] as f32, 1.0],
+                None => [0.0; 4],
+            },
+            splat: [scene.splat_grad as u32, SPLAT_RECORDS, 0, 0],
             restir: match scene.restir {
                 Some(r) => [
                     (r.neighbours.min(9) << 8) | r.radius.min(255),
@@ -1189,7 +1238,19 @@ impl GpuPrb {
                 0,
                 bytemuck::bytes_of(&self.params(scene, theta, seed, replay, c)),
             );
+            let splats = replay && scene.splat_grad;
+            if splats {
+                let mut enc = self
+                    .ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                enc.clear_buffer(&self.srec[2], 0, None);
+                q.submit([enc.finish()]);
+            }
             q.submit([self.encode_trace(scene, replay)]);
+            if splats {
+                self.gather_splats(scene);
+            }
         }
         if score != Score::None {
             q.submit([self.encode_score(scene, score)]);
@@ -1298,12 +1359,75 @@ impl GpuPrb {
         self.ctx.queue.submit([enc.finish()]);
     }
 
+    /// Add one chunk's splat records into the running sum, path slot by
+    /// path slot, record by record: the CPU reference's order.
+    fn gather_splats(&self, scene: &Scene) {
+        let cap = SPLAT_RECORDS as usize;
+        let n = self.paths as usize;
+        let counts = self.read(&self.srec[2], n);
+        let idx = self.read(&self.srec[0], n * cap);
+        let val = self.read(&self.srec[1], n * cap * 4);
+        let mut acc = self.splat_acc.borrow_mut();
+        let ns = scene.splats().map_or(0, |b| irys_core::Geometry::len(b.geometry()));
+        if acc.0.len() != ns {
+            acc.0 = vec![[0.0; 4]; ns];
+        }
+        for slot in 0..n {
+            let c = counts[slot].to_bits() as usize;
+            if c > cap {
+                acc.1 += (c - cap) as u64;
+            }
+            for r in 0..c.min(cap) {
+                let at = slot * cap + r;
+                let i = idx[at].to_bits() as usize;
+                for k in 0..4 {
+                    acc.0[i][k] += val[at * 4 + k] as f64;
+                }
+            }
+        }
+    }
+
+    /// The splats' gradient from the last replay ([`Scene::splat_grad`]):
+    /// per splat `(∂dc_r, ∂dc_g, ∂dc_b, ∂opacity)`, and how many records a
+    /// full path slot dropped (zero, or the result is incomplete).
+    pub fn splat_grad(&self) -> (Vec<[f64; 4]>, u64) {
+        self.splat_acc.borrow().clone()
+    }
+
+    fn clear_dalb(&self) {
+        *self.splat_acc.borrow_mut() = Default::default();
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.clear_buffer(&self.dalb, 0, None);
+        self.ctx.queue.submit([enc.finish()]);
+    }
+
+    /// `∂loss/∂d` for [`Scene::diffuse_bands`] from the last replay
+    /// ([`replay`](Self::replay) or [`gradient_l2`](Self::gradient_l2)):
+    /// each path's sum, read back and added in path order in f64.
+    pub fn diffuse_grad(&self, scene: &Scene) -> [f64; 3] {
+        let v = self.read(&self.dalb, scene.paths() * 4);
+        let mut g = [0.0f64; 3];
+        for p in v.chunks_exact(4) {
+            for k in 0..3 {
+                g[k] += p[k] as f64;
+            }
+        }
+        g
+    }
+
     /// Chunks a frame is traced in.
     pub fn chunks(&self) -> u32 {
         self.chunks
     }
 
     fn check(&self, scene: &Scene) {
+        assert!(
+            !(scene.diffuse_bands.is_some() && scene.guide.is_some()),
+            "diffuse_bands with path guiding: the guided vertex is not differentiated"
+        );
         assert_eq!(
             scene.lanes(),
             self.lanes,
@@ -1344,6 +1468,7 @@ impl GpuPrb {
         let dl32: Vec<f32> = dl.iter().map(|&x| x as f32).collect();
         q.write_buffer(&self.dl, 0, bytemuck::cast_slice(&dl32));
         q.write_buffer(&self.grad, 0, bytemuck::cast_slice(&[0.0f32; PARAMS]));
+        self.clear_dalb();
         self.run(scene, theta, seed, true, Score::None);
         let g = self.read(&self.grad, PARAMS);
         let l2 = self.read(&self.l2, self.lanes);
@@ -1385,6 +1510,7 @@ impl GpuPrb {
         self.ctx
             .queue
             .write_buffer(&self.grad, 0, bytemuck::cast_slice(&[0.0f32; PARAMS]));
+        self.clear_dalb();
         self.run(scene, theta, adjoint, true, Score::None);
         let out = self.read_many(&[(&self.loss, 1), (&self.grad, PARAMS)]);
         self.timing.replay = t.elapsed();
@@ -1601,6 +1727,10 @@ pub struct GpuEdges {
     np: u32,
     policy: u32,
     moving: Vec<usize>,
+    mover_slots: Vec<u32>,
+    /// Diagnostics (2f): draw so that [`GpuEdges::draws`] can read back
+    /// where every sample landed; the weights are then not computed.
+    pub debug: bool,
     /// What the last draw cost.
     pub timing: EdgeTiming,
 }
@@ -1697,7 +1827,7 @@ impl GpuEdges {
         let params = uni("edge scene params", std::mem::size_of::<Params>() as u64);
         // The edge sampler's visibility stays on the WGSL walk: one eye ray
         // per edge point, not a frame's worth of bounces.
-        let src = wavefront_src(false, &format!("{RESTIR}\n{GUIDE}\n{EDGES}\n{}", sobol_const()));
+        let src = wavefront_src(false, &format!("{RESTIR}\n{GUIDE}\n{EDGES}\n{}", sobol_offsets()));
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("edges"),
             source: wgpu::ShaderSource::Wgsl(src.into()),
@@ -1786,6 +1916,8 @@ impl GpuEdges {
             np: np as u32,
             policy: front_only as u32,
             moving: moving.to_vec(),
+            debug: false,
+            mover_slots: movers.iter().map(|m| m.slot_base).collect(),
             timing: EdgeTiming::default(),
         }
     }
@@ -1855,7 +1987,7 @@ impl GpuEdges {
                 policy: self.policy,
                 blocks: self.blocks,
                 eps_px: crate::vis::EPS_PX as f32,
-                _p: [0; 3],
+                _p: [self.debug as u32, 0, 0],
             }),
         );
         let host = t0.elapsed();
@@ -1892,6 +2024,28 @@ impl GpuEdges {
             device: t1.elapsed(),
         };
         crate::vis::EdgeSamples::from_parts(pixel, weight, visible)
+    }
+
+    /// After a [`GpuEdges::debug`] draw: per sample, where it landed as a
+    /// [`crate::vis::Draw`] (`None`: no candidate), and the device's verdict
+    /// on it — 1 visible, or why its ownership test refused it: -1/-2/-3/-4
+    /// the ray test (miss, another instance, a non-coplanar triangle, off
+    /// the plane), -5 behind the eye, -6 hidden by a surface in front.
+    pub fn draws(&self, gp: &GpuPrb) -> Vec<(Option<crate::vis::Draw>, i32)> {
+        assert!(self.debug && self.np >= 2, "a debug draw, two lanes at least");
+        let stride = 2 + self.np as usize;
+        gp.read(&self.smp, self.n as usize * stride)
+            .chunks_exact(stride)
+            .map(|s| {
+                if s[1] == 0.0 {
+                    return (None, 0);
+                }
+                let si = s[2].to_bits() as usize;
+                let mi = self.mover_slots.iter().rposition(|&b| b as usize <= si).unwrap();
+                let local = si - self.mover_slots[mi] as usize;
+                (Some((mi, local / 3, local % 3, s[3] as f64)), s[1] as i32)
+            })
+            .collect()
     }
 
     /// The device's points, as camera-plane pairs (for tests).
