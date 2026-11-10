@@ -19,6 +19,9 @@ CC-BY; classroom by Christophe Seux, CC0).
 
 Not done:
 
+- crates.io: irys-core, -prims, -light, -gpu and irys-render 0.1.0 are
+  published (2026-11-10). irys-diff and the research crates are not; they
+  wait on tang-compile reaching crates.io.
 - Domain: not chosen. Links on the page are absolute (muni.works, vcad.io,
   tang.toys, github.com/muni-works/irys), so the page works under any host.
 - Deploy: none configured. `dist/` is plain static files.

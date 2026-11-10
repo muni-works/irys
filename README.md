@@ -32,7 +32,7 @@ Everything is version 0.1.0 and the API is not stable. See
 | `irys-prims` | stock `Geometry` implementations: analytic primitives, heightfields |
 | `irys-light` | spectra, optics, environments, the CPU path tracer, caustics, splats |
 | `irys-gpu` | the wgpu 30 compute tier: device, buffers, WGSL integrator, history, denoisers |
-| `irys` | facade over the four crates above; the GPU tier is behind the `gpu` feature |
+| `irys` | facade over the four crates above, published as `irys-render`; the GPU tier is behind the `gpu` feature |
 | `kosm-render` | 0.2.1 compatibility shim that re-exports `irys` under kosm-render's old paths |
 | `irys-diff` | BSDFs as tang IR graphs, path replay backprop on CPU and GPU, visibility gradients, the OpenPBR look. Features: `gpu`, `assets` |
 | `irys-bench` | binary: the equal-time benchmark harness against Blender Cycles |
@@ -46,6 +46,16 @@ they depend on `tang-compile`, which is a git dependency. Build them from
 this repository.
 
 ## Quickstart
+
+The renderer crates are on crates.io:
+
+```sh
+cargo add irys-render                 # CPU; code still writes `use irys::...`
+cargo add irys-render --features gpu  # with the wgpu tier
+```
+
+The differentiable crates are not published yet, so the examples below run
+from a clone.
 
 Requires Rust 1.95 or newer. The first build fetches
 [tang](https://github.com/muni-works/tang) from git. The first build of any
@@ -110,8 +120,9 @@ is a specification of which irys has built only the M1 prerequisites, and
 
 - The core crates (`irys-core`, `irys-prims`, `irys-light`, `irys-gpu`,
   `irys`) are the split of kosm-render 0.2 and are the most settled part.
-  They are not published to crates.io; the `irys` crate there is an
-  unrelated project. Depend on this repository by git.
+  They are on crates.io at 0.1.0. The facade is published as `irys-render`
+  because the `irys` name there belongs to an unrelated project; its library
+  is still called `irys`.
 - `irys-diff`, `irys-recon`, `irys-recon-net`, `irys-splat` and `irys-ffi`
   are research code. Expect interfaces to change.
 - The design lists `irys-raster`, `irys-line` and `irys-view` crates. None of

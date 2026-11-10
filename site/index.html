@@ -159,7 +159,7 @@ pre .c { color: var(--muted); }
     <p class="hero-claim">A spectral path tracer that tells you how the image changes when the scene does. <span class="sub">Its backward pass replays the forward pass bit for bit.</span></p>
     <p class="hero-note">irys renders on the GPU and keeps an f64 CPU reference written from the same material source. It returns gradients of an image loss with respect to materials, instance poses and mesh vertices, and through <a href="https://vcad.io">vcad</a>, with respect to the dimensions of a part.</p>
     <div class="hero-actions">
-      <a class="btn primary" href="#start">Quick start</a>
+      <a class="btn primary" href="#start">cargo add irys-render</a>
       <a class="btn" href="https://muni.works/research/irys">Read the paper</a>
       <a class="btn" href="https://github.com/muni-works/irys">GitHub</a>
     </div>
@@ -304,7 +304,10 @@ pre .c { color: var(--muted); }
   <section id="start">
     <div class="container prose">
       <h2>Quick start.</h2>
-      <p class="lead">Requires Rust 1.95 or newer and a C compiler on your PATH. The first build fetches tang from git and is slow.</p>
+      <p class="lead">The renderer is on crates.io as <code>irys-render</code>. Its library is still called <code>irys</code>.</p>
+<pre>cargo add irys-render                 <span class="c"># CPU</span>
+cargo add irys-render --features gpu  <span class="c"># with the wgpu tier</span></pre>
+      <p>The differentiable crates depend on tang-compile, which is not on crates.io yet, so run them from a clone. That needs Rust 1.95 or newer and a C compiler on your PATH, and the first build fetches tang from git.</p>
 <pre>git clone https://github.com/muni-works/irys
 cd irys
 
@@ -317,7 +320,7 @@ cargo run --release -p irys-diff --features gpu --example fit_gpu -- out/fit_gpu
 
 <span class="c"># Tests. GPU tests skip when there is no adapter.</span>
 cargo test -p irys</pre>
-      <p class="small">irys is not on crates.io yet; the <code>irys</code> crate there is an unrelated project, so depend on this repository by git. Everything is version 0.1.0 and the API is not stable. The core crates are the most settled; <code>irys-diff</code> and the crates built on it are research code. The GPU wavefront uses wgpu's experimental ray queries, and every recorded run is on Apple silicon with Metal.</p>
+      <p class="small">The <code>irys</code> crate on crates.io is an unrelated project. Everything is version 0.1.0 and the API is not stable. The core crates are the most settled; <code>irys-diff</code> and the crates built on it are research code. The GPU wavefront uses wgpu's experimental ray queries, and every recorded run is on Apple silicon with Metal.</p>
     </div>
   </section>
 
