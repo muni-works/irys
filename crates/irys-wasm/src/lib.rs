@@ -1,6 +1,6 @@
 //! The landing page's live demos: irys-diff compiled to wasm, on the CPU in
 //! f64, one gradient step per call. The conductor's material graph runs in
-//! tang's interpreter (single-threaded in wasm since tang `7da2ab65`).
+//! tang's interpreter (single-threaded in wasm since tang-compile 0.1.2).
 //!
 //! Each demo renders, scores against a target the page chose, replays for
 //! the gradient and takes an Adam step. The scored frame and the replayed

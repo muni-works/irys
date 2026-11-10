@@ -22,7 +22,7 @@ wasm-pack build --release --target web --out-dir ../../site/public/pkg
 ```
 
 The metal material's graph runs in tang's interpreter, single-threaded in
-wasm since tang `7da2ab65`, which is the rev irys pins.
+wasm since tang-compile 0.1.2 (from crates.io).
 
 Every number on the page comes from the repository README, `docs/design.md`
 or the paper's `data/measured.tsv`. Images are JPEG copies of PNGs in `docs/`,
