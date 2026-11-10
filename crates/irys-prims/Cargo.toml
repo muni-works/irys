@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "irys: stock Geometry implementations — analytic primitives and heightfields"
+description = "irys: stock Geometry implementations, analytic primitives and heightfields"
 keywords = ["raytracing", "graphics"]
 categories = ["graphics", "rendering"]
 

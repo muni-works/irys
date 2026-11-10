@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "irys: the wgpu compute tier — device, buffers, WGSL integrator, history and denoisers"
+description = "irys: the wgpu compute tier with device, buffers, WGSL integrator, history and denoisers"
 keywords = ["raytracing", "pathtracing", "wgpu", "graphics"]
 categories = ["graphics", "rendering", "rendering::engine"]
 

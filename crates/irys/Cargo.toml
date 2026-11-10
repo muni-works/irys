@@ -1,5 +1,5 @@
 [package]
-name = "irys"
+name = "irys-render"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,6 +11,11 @@ readme = "README.md"
 keywords = ["raytracing", "pathtracing", "renderer", "bvh", "graphics"]
 categories = ["graphics", "rendering", "rendering::engine"]
 exclude = ["out/", "tests/snapshots/"]
+
+# Published as irys-render (the irys name on crates.io belongs to another
+# project); the library keeps its name, so code still writes `use irys::`.
+[lib]
+name = "irys"
 
 [dependencies]
 irys-core.workspace = true
