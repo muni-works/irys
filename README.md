@@ -1,42 +1,138 @@
 # irys
 
-The renderer for vcad, kosm, ipse, phyz and muni. Owns no geometry: clients
-implement `Geometry`, irys does the light.
+irys is a differentiable spectral path tracer written in Rust. It renders on
+the CPU and on the GPU (wgpu 30), and it returns gradients of an image loss
+with respect to materials, instance poses and mesh vertices.
 
-Start with [docs/design.md](docs/design.md).
+irys owns no geometry. Clients implement the `Geometry` trait (bounds and
+ray intersection per primitive) and irys does the light. It is the renderer
+for vcad, kosm, ipse, phyz and muni.
+
+What works today:
+
+- A spectral CPU path tracer over any `Geometry`: BVH and TLAS, analytic
+  primitives, triangle meshes, heightfields, Gaussian splats, caustics.
+- A GPU tier with a WGSL integrator, temporal history and denoisers.
+- Inverse rendering in `irys-diff`: path replay backprop for material
+  parameters on the CPU and on a GPU wavefront, and edge-sampled visibility
+  gradients for instance pose and per-vertex position.
+- An OpenPBR scene kernel with volumes, skin and hair, and an importer for
+  scenes exported from Blender.
+- Research built on top: a 3D Gaussian splat trainer, and image-to-CAD
+  recovery of a vcad program from renders or a photo with an AprilTag.
+
+Everything is version 0.1.0 and the API is not stable. See
+[Status and limits](#status-and-limits).
+
+## Crates
 
 | Crate | What |
 |---|---|
-| `irys-core` | math, rays, `Geometry`, `TriMesh`, BVH/SAH, TLAS, sampler |
-| `irys-prims` | analytic prims, heightfield |
-| `irys-light` | spectrum, optics, env, CPU path tracer, caustics, splats, neural (CPU) |
-| `irys-gpu` | the wgpu 30 tier: context, buffers, WGSL integrator, history, denoiser |
-| `irys` | facade (`use irys::*`), kosm-render 0.2's public paths |
-| `kosm-render` | 0.2.1 re-export shim for kosm |
-| `irys-diff` | research: BSDFs as tang IR graphs, path replay backprop on CPU and a GPU wavefront |
-| `irys-splat` | research: 3DGS trainer on irys's GPU tier (tile rasteriser forward + adjoint) |
-| `irys-recon` | research: image to CAD, recover a vcad program and its dimensions from a photo |
-| `irys-recon-net` | research: learned scene proposer seeding the recon MDL search |
-| `irys-ffi` | C ABI rendering into an IOSurface-backed Metal texture |
-| `irys-bench` | equal-time benchmark against Cycles |
+| `irys-core` | the `Geometry` trait, rays, `TriMesh`, BVH/SAH, TLAS, the blue-noise sampler |
+| `irys-prims` | stock `Geometry` implementations: analytic primitives, heightfields |
+| `irys-light` | spectra, optics, environments, the CPU path tracer, caustics, splats |
+| `irys-gpu` | the wgpu 30 compute tier: device, buffers, WGSL integrator, history, denoisers |
+| `irys` | facade over the four crates above; the GPU tier is behind the `gpu` feature |
+| `kosm-render` | 0.2.1 compatibility shim that re-exports `irys` under kosm-render's old paths |
+| `irys-diff` | BSDFs as tang IR graphs, path replay backprop on CPU and GPU, visibility gradients, the OpenPBR look. Features: `gpu`, `assets` |
+| `irys-bench` | binary: the equal-time benchmark harness against Blender Cycles |
+| `irys-recon` | image to CAD: recover a vcad program and its dimensions from irys renders or a photo; tag36h11 detection |
+| `irys-recon-net` | image to CAD with a learned scene proposer (a tang tensor-IR graph) seeding the search |
+| `irys-splat` | a 3D Gaussian splat trainer on the GPU tier: tile rasteriser forward and adjoint, Adam, densification |
+| `irys-ffi` | a C ABI that renders into an IOSurface-backed Metal texture (Apple only, a spike) |
 
-Research crates are unpublished until tang is on crates.io (it is a git dependency); build them from this repo.
+`irys-diff` and the crates below it in the table are `publish = false`
+for now; build them from this repository. Their tang dependencies all come
+from crates.io, so a project that links them needs no `[patch]`.
 
-Status: phases 0–4b of the design (inverse rendering through 2f, the equal-time benchmark against Cycles, the OpenPBR look with volumes and hair), the belief codec's M1 prerequisites, splat training, and image-to-CAD v0/v1 ([docs/image-to-cad.md](docs/image-to-cad.md)). Highlights: `irys-diff` fits a GGX material's
-roughness and colour by path replay backprop on the GPU, through a TLAS of
-instanced meshes with next-event estimation and MIS, and — phase 2d — the
-*pose* of instances by edge-sampled visibility gradients. The hero is rose
-full's left arm, read from rose's `.loon` CAD and tessellated by vcad: three
-joint angles and the anodised finish recovered together from a target render
-(to 0.06° and 0.005):
+## Quickstart
 
+Requires Rust 1.95 or newer. The first build fetches
+[tang](https://github.com/muni-works/tang) from git. The first build of any
+`irys-diff` example is slow, because its dev-dependencies include vcad.
+
+```sh
+git clone https://github.com/muni-works/irys
+cd irys
+
+# CPU only. Fits a ball's roughness and colour to one target image by path
+# replay backprop and writes target.ppm, iter_NNN.ppm and loss.csv.
+# Needs a C compiler on PATH (irys-diff compiles its kernels to C).
+cargo run --release -p irys-diff --example fit -- out/fit
+
+# The same fit on the GPU wavefront, then in a scene with a mesh floor and splats.
+cargo run --release -p irys-diff --features gpu --example fit_gpu -- out/fit_gpu
+cargo run --release -p irys-diff --features gpu --example fit_scene -- out/fit_scene
+
+# A rover built from vcad parts: render it, then recover its body material.
+cargo run --release -p irys-diff --features gpu --example rover -- out/rover
+
+# Tests. GPU tests skip when there is no adapter.
+cargo test -p irys
+cargo test -p irys-diff --features gpu
 ```
-cargo test -p irys-diff --features gpu            # GPU tests skip without an adapter
-cargo run --release -p irys-diff --features gpu --example rose -- out/rose   # needs ../rose (or $ROSE)
-cargo run --release -p irys-diff --features gpu --example rose_fit -- out/rose_fit
-cargo run -p irys-diff --features gpu --example rover -- out/rover
-cargo run -p irys-diff --features gpu --example fit_scene -- out/fit_scene
+
+Other entry points:
+
+```sh
+# Detect tag36h11 tags in a photo.
+cargo run --release -p irys-recon --example tag_probe -- photo.jpg
+
+# Recover a part from one or more photos taken beside a tag.
+cargo run --release -p irys-recon --example recon_photo -- photo.jpg
+
+# The image-to-CAD v0 gate: 20 random parts recovered from irys renders.
+# Slow: the recorded runs took about 270 to 340 s per part.
+cargo run --release -p irys-recon --example recon_v0
+
+# Train a splat map from posed photos.
+cargo run --release -p irys-splat --example splat_train -- \
+    --images DIR --poses poses.jsonl --camera camera_info.json --out map.ply
 ```
+
+`scripts/bench.sh` runs the benchmark against Cycles and needs Blender.
+
+The `rose`, `rose_check` and `rose_fit` examples in `irys-diff` read CAD from
+the [rose](https://github.com/muni-works/rose) repository's older full-size
+model (`full/cad/rose-full.loon`), which is no longer on rose's `main`: clone rose,
+check out the tag `pre-restructure`, and point `$ROSE` at it (the default is
+`~/Developer/rose`). Their results are in the
+figures below and in [docs/design.md](docs/design.md).
+
+## Status and limits
+
+[docs/design.md](docs/design.md) is the design and a dated build log, one
+section per phase, each with its measurements and its deviations. New
+sections are appended at the end. [docs/image-to-cad.md](docs/image-to-cad.md)
+covers recovery of CAD from images, [docs/belief-codec.md](docs/belief-codec.md)
+is a specification of which irys has built only the M1 prerequisites, and
+[docs/papers.md](docs/papers.md) lists the papers irys implements.
+
+- The core crates (`irys-core`, `irys-prims`, `irys-light`, `irys-gpu`,
+  `irys`) are the split of kosm-render 0.2 and are the most settled part.
+  They are not published to crates.io; the `irys` crate there is an
+  unrelated project. Depend on this repository by git.
+- `irys-diff`, `irys-recon`, `irys-recon-net`, `irys-splat` and `irys-ffi`
+  are research code. Expect interfaces to change.
+- The design lists `irys-raster`, `irys-line` and `irys-view` crates. None of
+  them exists.
+- ReSTIR PT/GRIS and a neural radiance cache were not built. ReSTIR DI and
+  path guiding are GPU only, and ReSTIR DI measured as a net loss once the
+  Sobol sampler was on.
+- Against Cycles at equal time, the phase 3 gate was met on one of three
+  test scenes; on the other two irys was 1.23 to 1.27 times behind at the
+  largest budget (design.md, roadmap table).
+- The GPU wavefront in `irys-diff` uses wgpu's experimental ray queries.
+  Development and all recorded timings are on Apple silicon with Metal.
+  The docs record no runs on other backends.
+- Image to CAD: on synthetic renders the v0 gate passes 17 of 20 parts
+  (topology right and every dimension within 0.5 mm). From one synthetic
+  phone photo with a tag, v1 passes 2 of 20 at 0.5 mm and 6 of 20 at 1 mm.
+  The neural proposer (v2, v3) works on synthetic scenes and mostly does not
+  recover the real desk photo.
+- The pose fit on the rose arm recovers three joint angles to within 0.07
+  degrees from a start about 13 to 23 degrees away, on a synthetic target
+  (design.md, phase 2d).
 
 ![phase 2d rose](docs/phase2d-rose.png)
 
@@ -44,6 +140,19 @@ cargo run -p irys-diff --features gpu --example fit_scene -- out/fit_scene
 
 ![phase 2c rover](docs/phase2c-rover.png)
 
+## Research
+
+Papers about irys and its companion work are published at
+[muni.works/research](https://muni.works/research).
+
+The companion paper for vcad is
+[Exact Gradients Through a BRep Kernel](https://muni.works/research/vcad).
+The two share one benchmark: irys renders vcad's frozen-plan mesh of a
+robot-arm shoulder plate, takes the gradient of an image loss on every mesh
+node by edge sampling, and vcad pulls that back to a CAD parameter (the
+bearing bore diameter). The benchmark is the `rose_brep` example in
+`irys-diff`. It reads the plate from
+[rose](https://github.com/muni-works/rose) at commit `832192f`.
 
 ## License
 
