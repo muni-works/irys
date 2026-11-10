@@ -138,6 +138,34 @@ pre .c { color: var(--muted); }
 .foot-logo svg { width: 96px; height: auto; display: block; }
 .site-foot p { margin: 0 auto .6rem; max-width: 52ch; }
 .foot-links { display: flex; justify-content: center; flex-wrap: wrap; gap: .6rem; }
+
+.cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+@media (max-width: 760px) { .cards { grid-template-columns: 1fr; } }
+.card { background: var(--surface); display: flex; flex-direction: column; }
+.card img { display: block; width: 100%; height: 220px; object-fit: cover; background: var(--bg); }
+.card .big { height: 220px; display: grid; place-items: center; font-family: var(--mono); font-size: 44px; font-weight: 500; color: var(--flame-ink); background: var(--bg); letter-spacing: -0.02em; }
+.card .big small { display: block; font-size: var(--s-sm); color: var(--muted); text-align: center; letter-spacing: 0; margin-top: 6px; font-weight: 400; }
+.card-body { padding: 18px 20px 22px; }
+.card h3 { font-size: var(--s-lg); font-weight: 600; letter-spacing: -0.01em; line-height: 1.25; margin-bottom: .5rem; }
+.card p { color: var(--muted); font-size: var(--s-body); }
+.card p b { color: var(--fg); font-weight: 600; }
+.gallery { display: grid; grid-template-columns: 1.4fr 1.4fr 1fr; gap: 12px; }
+@media (max-width: 760px) { .gallery { grid-template-columns: 1fr; } }
+.gallery img { height: 300px; object-fit: cover; }
+@media (max-width: 760px) { .gallery img { height: auto; } }
+.trust { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 1.5rem; margin-top: 1.5rem; }
+@media (max-width: 760px) { .trust { grid-template-columns: 1fr; gap: 1.5rem; } }
+.trust h3 { font-size: var(--s-md); font-weight: 600; margin-bottom: .35rem; }
+.trust p { color: var(--muted); font-size: var(--s-sm); }
+.trust b { font-family: var(--mono); font-weight: 500; color: var(--flame-ink); }
+.big-claim { font-size: clamp(30px, 5vw, 44px); line-height: 1.1; font-weight: 600; letter-spacing: -0.03em; margin-bottom: 1rem; max-width: 20ch; text-wrap: balance; }
+.big-claim em { font-style: normal; color: var(--flame-ink); }
+details { margin-top: 1.5rem; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; background: var(--bg); }
+.pair figure { position: relative; }
+.pair img { height: 220px; object-fit: cover; image-rendering: auto; }
+.pair span { position: absolute; left: 8px; bottom: 6px; font-family: var(--mono); font-size: var(--s-xs); color: #fff; background: rgba(0,0,0,.45); padding: 1px 6px; }
+details summary { cursor: pointer; font-family: var(--mono); font-size: var(--s-sm); color: var(--flame-ink); }
 </style>
 </head>
 <body>
@@ -154,14 +182,14 @@ pre .c { color: var(--muted); }
 
 <header class="hero">
   <div class="container">
-    <div class="pills"><span class="pill">spectral</span><span class="pill">differentiable</span><span class="pill">Rust + wgpu</span><span class="pill">Apache-2.0</span></div>
+    <div class="pills"><span class="pill">spectral</span><span class="pill">differentiable</span><span class="pill">Rust</span><span class="pill">Metal + Vulkan</span><span class="pill">Apache-2.0</span></div>
     <h1>irys<span class="dot">.</span></h1>
-    <p class="hero-claim">A spectral path tracer that tells you how the image changes when the scene does. <span class="sub">Its backward pass replays the forward pass bit for bit.</span></p>
-    <p class="hero-note">irys renders on the GPU and keeps an f64 CPU reference written from the same material source. It returns gradients of an image loss with respect to materials, instance poses and mesh vertices, and through <a href="https://vcad.io">vcad</a>, with respect to the dimensions of a part.</p>
+    <p class="hero-claim">Render a scene. Get the gradient. <span class="sub">irys is a spectral path tracer that tells you how to change a material, a pose or a CAD dimension to match an image.</span></p>
+    <p class="hero-note">It runs on the GPU through wgpu, checks itself against an f64 CPU reference, and replays the forward pass bit for bit, so a seed gives the same gradient on every run.</p>
     <div class="hero-actions">
       <a class="btn primary" href="#start">cargo add irys-render</a>
-      <a class="btn" href="https://muni.works/research/irys">Read the paper</a>
       <a class="btn" href="https://github.com/muni-works/irys">GitHub</a>
+      <a class="btn" href="https://muni.works/research/irys">Read the paper</a>
     </div>
   </div>
   <div class="container-wide">
@@ -174,16 +202,16 @@ pre .c { color: var(--muted); }
 
 <main>
   <section>
-    <div class="container prose">
-      <h2>How irys compares.</h2>
-      <p class="lead">We measured irys against Mitsuba 3 for gradients and Blender Cycles for rendering, on the same Apple silicon machine and the same scenes.</p>
+    <div class="container">
+      <p class="big-claim">Material gradients <em>7 to 26 times faster</em> than Mitsuba 3.</p>
+      <p class="lead">Same machine, same scenes, and both renderers checked against their own central differences. We show where irys loses, too.</p>
       <div class="proof">
         <div class="proof-item lit"><span class="proof-val">7&ndash;26&times;</span><span class="proof-label">faster material gradients than Mitsuba 3 at equal variance</span></div>
         <div class="proof-item"><span class="proof-val">1.5&ndash;5.6&times;</span><span class="proof-label">lower error than Cycles at equal time, on irys's three benchmark scenes</span></div>
         <div class="proof-item"><span class="proof-val">0.07&deg;</span><span class="proof-label">worst error on three robot joint angles recovered from one image, starting 13 to 23&deg; off</span></div>
         <div class="proof-item"><span class="proof-val">15&ndash;17&times;</span><span class="proof-label">faster gradients on the GPU than on irys's own CPU tier, same frame</span></div>
       </div>
-      <div class="tbl" style="margin-top:2.5rem"><table>
+      <details><summary>Every benchmark, wins and losses</summary><div class="tbl" style="margin-top:1rem"><table>
         <thead><tr><th>Comparison</th><th class="v">Result</th></tr></thead>
         <tbody>
           <tr><td>Material gradient vs Mitsuba 3 <code>prb</code>, time to equal variance, M4 Max</td><td class="v">irys 7.0&ndash;25.5&times; faster</td></tr>
@@ -193,121 +221,82 @@ pre .c { color: var(--muted); }
           <tr><td>Equal-time error vs Cycles: Barcelona Pavilion, clamped</td><td class="v">14&ndash;17&times; Cycles</td></tr>
         </tbody>
       </table></div>
-      <p class="small">Both renderers match their own central differences on the material gradient. On the robot arm, Mitsuba's pose gradient converged to a value its own central differences reject, so irys makes no pose comparison. The Cycles wins use irys's sun sampling setting, which is off by default, on scenes lit by a sky and sun. On Blender's demo files with full materials, Cycles is 2 to 3 times faster per sample and wins at all but the smallest budget. Sources: <code>bench/mitsuba</code> and the speed rounds in <a href="https://github.com/muni-works/irys/blob/main/docs/design.md">docs/design.md</a>.</p>
-      <p>irys owns no geometry. You implement the <code>Geometry</code> trait (bounds and ray intersection), and irys computes the lighting. It is the renderer for vcad, kosm, ipse, phyz and muni.</p>
+      <p class="small">Both renderers match their own central differences on the material gradient. On the robot arm, Mitsuba's pose gradient converged to a value its own central differences reject, so irys makes no pose comparison. The Cycles wins use irys's sun sampling setting, which is off by default, on scenes lit by a sky and sun. On Blender's demo files with full materials, Cycles is 2 to 3 times faster per sample and wins at all but the smallest budget. Sources: <code>bench/mitsuba</code> and the speed rounds in <a href="https://github.com/muni-works/irys/blob/main/docs/design.md">docs/design.md</a>.</p></details>
+      
     </div>
   </section>
 
   <section>
-    <div class="container">
-      <div class="step-head"><span class="step-n">01</span><div>
-        <h2>Spectral path tracing on the GPU.</h2>
-        <p>A CPU path tracer over any geometry, and a compute tier on wgpu.</p>
-      </div></div>
-      <div class="step-body prose">
-        <p>irys traces spectra, not RGB. Each path carries four wavelengths, and at equal paths that cuts per-pixel chroma noise 28.7 times. The CPU tracer covers BVH and TLAS scenes, analytic primitives, triangle meshes, heightfields, Gaussian splats and caustics. The GPU tier runs a WGSL integrator on wgpu 30. An OpenPBR scene kernel handles volumes, skin and hair, and an importer reads scenes exported from Blender.</p>
-      </div>
-    </div>
-    <div class="container-wide" style="margin-top:2rem">
-      <div class="duo">
-        <figure>
-          <img src="/demos-classroom.jpg" width="1600" height="900" loading="lazy" alt="The classroom scene rendered by irys">
-          <figcaption class="fig-cap"><span class="fig-n">FIG 1</span>classroom by Christophe Seux, CC0. 1920&times;1080, 4096 spp, no denoiser, 663 s.</figcaption>
-        </figure>
-        <figure>
-          <img src="/demos-pavilion.jpg" width="1600" height="900" loading="lazy" alt="The Barcelona Pavilion scene rendered by irys">
-          <figcaption class="fig-cap"><span class="fig-n">FIG 2</span>Barcelona Pavilion by eMirage, CC-BY. 54.9 M placed triangles, 834 s.</figcaption>
-        </figure>
-      </div>
-      <figure style="margin-top:1.5rem">
-        <img src="/demos-pavilion-vs-cycles.jpg" width="2880" height="540" loading="lazy" alt="The pavilion rendered by irys and by Cycles side by side">
-        <figcaption class="fig-cap"><span class="fig-n">FIG 3</span>The pavilion, irys beside Blender Cycles at the same sample count.</figcaption>
-      </figure>
-    </div>
-    <div class="container"><div class="step-body">
-      <p class="small">Cycles is 2 to 3 times faster per sample on these two scenes, and irys has no denoiser on this path.</p>
-    </div></div>
-  </section>
-
-  <section>
-    <div class="container">
-      <div class="step-head"><span class="step-n">02</span><div>
-        <h2>Differentiable rendering with exact replay.</h2>
-        <p>The backward pass redraws the forward pass's paths, bit for bit.</p>
-      </div></div>
-      <div class="step-body prose">
-        <p>irys runs path replay backpropagation on a GPU wavefront, with next-event estimation and multiple importance sampling. Replay stores nothing per vertex. It regenerates each path from its seed through the same pipelines. Three choices make that regeneration exact. An integer SplitMix64 built from 16-bit limbs gives the GPU the CPU's random stream. Reductions run in a fixed order with no float atomics. The BVH walk depends only on the ray.</p>
-        <p>Memory scales with paths, not depth. A path costs 63 f64 words at depth 2 and at depth 8 alike, and a 1024&times;1024 frame at 4 spp replays bit for bit in nine chunks.</p>
-        <p class="small">Replay is bit-exact per device and driver. Another GPU or compiler may round differently, and then agrees with the CPU reference to f32 precision. Timings are from one Apple M-series machine through Metal.</p>
+    <div class="container"><h2>What you can do with it.</h2>
+      <p class="lead">Each of these runs today, from the examples and tests in the repository.</p></div>
+    <div class="container-wide">
+      <div class="cards">
+        <div class="card">
+          <div class="pair"><figure><img src="/fit-start.jpg" alt="The fit's starting point, a rough grey ball" loading="lazy"><span>step 1</span></figure><figure><img src="/fit-target.jpg" alt="The target, a glossy gold ball" loading="lazy"><span>target</span></figure></div>
+          <div class="card-body"><h3>Fit a material to an image.</h3>
+          <p>Start from a rough grey ball. After <b>60 gradient steps, 5 s on the GPU</b>, irys has the target's roughness within 0.012 and its spectral colour within 0.006.</p></div>
+        </div>
+        <div class="card">
+          <img src="/phase2d-rose.jpg" alt="The rose robot rendered by irys" loading="lazy" style="object-position:50% 30%">
+          <div class="card-body"><h3>Read a robot's pose from pixels.</h3>
+          <p>Three joint angles of a 2.4 M-triangle arm, recovered to <b>0.07&deg;</b> from a start 13 to 23&deg; away. The silhouette, the shading and the shadow on the floor all feed the gradient.</p></div>
+        </div>
+        <div class="card">
+          <div class="big">1e-15<small>agreement with vcad's own forward-mode derivative</small></div>
+          <div class="card-body"><h3>Optimise a CAD dimension.</h3>
+          <p>irys puts an image gradient on every mesh vertex, and <a href="https://vcad.io">vcad</a> pulls it back to the diameter of a bearing bore in one reverse pass. No step size to tune.</p></div>
+        </div>
+        <div class="card">
+          <img src="/phase2b-beauty.jpg" alt="A gold ball beside a bush of Gaussian splats on a checker floor" loading="lazy">
+          <div class="card-body"><h3>Fit diffuse colours and splats.</h3>
+          <p>The albedo of every diffuse surface and each Gaussian splat's colour and opacity are differentiable on CPU and GPU, under a sky, a sun and area lights. GPU matches the f64 reference to <b>5e-5</b>.</p></div>
+        </div>
       </div>
     </div>
   </section>
 
   <section>
-    <div class="container">
-      <div class="step-head"><span class="step-n">03</span><div>
-        <h2>An f64 reference from the same source.</h2>
-        <p>Write a material once. Run it on the GPU and check it in f64.</p>
-      </div></div>
-      <div class="step-body prose">
-        <p>Each BSDF is a graph in the <a href="https://tang.toys">tang</a> tensor compiler. tang lowers it to an evaluation program and an adjoint, emits WGSL for the GPU, and runs the same graph in f64 on the CPU. Comparing the two tiers separates three sources of error: estimator bias, device rounding and Monte Carlo noise.</p>
-        <div class="tbl"><table>
-          <thead><tr><th>Check</th><th class="v">Relative error</th></tr></thead>
-          <tbody>
-            <tr><td>CPU f64 gradient vs central differences, fixed random numbers</td><td class="v">1.6e-10 to 1.9e-9</td></tr>
-            <tr><td>same, with next-event estimation</td><td class="v">&le; 3.1e-9</td></tr>
-            <tr><td>GPU f32 vs CPU f64, loss</td><td class="v">5.8e-7</td></tr>
-            <tr><td>GPU f32 vs CPU f64, worst parameter gradient</td><td class="v">3.5e-4</td></tr>
-          </tbody>
-        </table></div>
-        <p class="small">What irys differentiates: a GGX conductor's roughness and three-band spectral Fresnel, the spectral albedo of every diffuse surface, and each Gaussian splat's colour and opacity, under a sky, a sun and area emitters. On the GPU, the diffuse gradient matches the f64 reference to 2.4e-6 and the splat gradient to 5e-5, with replay still bit-identical.</p>
+    <div class="container"><h2>Beauty frames from the same renderer.</h2>
+      <p class="lead">Spectral, four wavelengths per path, with OpenPBR materials, volumes, skin and hair, and scenes imported from Blender.</p></div>
+    <div class="container-wide">
+      <div class="gallery">
+        <figure><img src="/demos-classroom.jpg" alt="The classroom scene rendered by irys" loading="lazy"><figcaption class="fig-cap">classroom, Christophe Seux, CC0</figcaption></figure>
+        <figure><img src="/demos-pavilion.jpg" alt="The Barcelona Pavilion rendered by irys" loading="lazy"><figcaption class="fig-cap">Barcelona Pavilion, eMirage, CC-BY</figcaption></figure>
+        <figure><img src="/look2-head-hair-3q.jpg" alt="A scanned head with skin and 1 million hair segments" loading="lazy"><figcaption class="fig-cap">Lee Perry-Smith by Infinite-Realities, CC BY 3.0</figcaption></figure>
       </div>
+      <p class="small">1080p Blender scenes at 4096 spp with no denoiser. Cycles is 2 to 3 times faster per sample on these.</p>
     </div>
   </section>
 
   <section>
     <div class="container">
-      <div class="step-head"><span class="step-n">04</span><div>
-        <h2>Pose gradients through instanced CAD.</h2>
-        <p>When a joint turns, its silhouette, shading and shadow change, and the gradient includes each of them.</p>
-      </div></div>
-      <div class="step-body prose">
-        <p>A scene is a two-level BVH of CAD parts and their instances. irys samples primary edges for silhouettes and creases, differentiates the interior by forward-mode duals with frames attached to each moving part, and samples secondary edges so that shadows and reflections contribute. The same edge sampler and duals also differentiate a seven-parameter camera.</p>
-        <p>On the rose robot, 2.4 million triangles tessellated by vcad, a fit of the arm recovers three joint angles to within 0.07 degrees from a start 13 to 23 degrees away, on a synthetic target. On the arm over a floor, the shadow accounts for about 15% of the gradient. With secondary edges, the gradient agrees with central differences within 1.1 standard errors.</p>
-      </div>
-    </div>
-    <div class="container-wide" style="margin-top:2rem">
-      <div class="duo" style="grid-template-columns:minmax(0,1fr) minmax(0,2fr);align-items:end">
-        <figure>
-          <img src="/phase2d-rose.jpg" width="768" height="768" loading="lazy" alt="The rose robot rendered by irys">
-          <figcaption class="fig-cap"><span class="fig-n">FIG 4</span>rose, 768&sup2; at 256 spp in 4.1 s.</figcaption>
-        </figure>
-        <figure>
-          <img src="/phase2d-fit.jpg" width="1152" height="246" loading="lazy" alt="Frames from the pose fit of the rose arm, from the start pose to the target">
-          <figcaption class="fig-cap"><span class="fig-n">FIG 5</span>The arm's pose fit, start to target.</figcaption>
-        </figure>
-      </div>
+      <h2>Ten lines to a gradient.</h2>
+      <p class="lead">From <code>examples/fit.rs</code>: render, score against a target, and get the derivative of the loss for every material parameter.</p>
+<pre><span class="c">// irys-diff, from a clone of the repository</span>
+use irys_diff::prb::{self, Kernels, L2, Scene};
+
+let scene = Scene::new(96, 96, 8);            <span class="c">// a ball on a floor, 8 spp</span>
+let mut k = Kernels::new(scene.lanes(), true);
+let mut theta = [0.7, 0.5, 0.5, 0.5];        <span class="c">// roughness, F0 at 450 / 550 / 650 nm</span>
+
+for it in 1..=60u64 {
+    let seeds = (2 * it, 2 * it + 1);
+    let (loss, grad) = prb::gradient(&amp;scene, &amp;theta, seeds, &amp;mut k, &amp;L2(&amp;target));
+    <span class="c">// step theta with Adam, as the example does</span>
+}</pre>
     </div>
   </section>
 
   <section>
     <div class="container">
-      <div class="step-head"><span class="step-n">05</span><div>
-        <h2>From pixels to CAD dimensions.</h2>
-        <p>The derivative of an image with respect to a dimension of a part.</p>
-      </div></div>
-      <div class="step-body prose">
-        <p>irys computes an image gradient on every vertex of a mesh. <a href="https://vcad.io">vcad</a>'s BRep kernel takes that gradient on its frozen tessellation and pulls it back to a CAD parameter in one reverse pass. The shared benchmark is a robot shoulder plate with a 49 mm bearing bore, and the parameter is the bore diameter.</p>
-        <div class="tbl"><table>
-          <thead><tr><th>Path to dL/d&theta;</th><th class="v">Value</th><th class="v">vs pullback</th></tr></thead>
-          <tbody>
-            <tr><td>vcad pullback of the irys gradient</td><td class="v">40.16864 &plusmn; 0.0226</td><td class="v"></td></tr>
-            <tr><td>vcad forward mode</td><td class="v">40.16864</td><td class="v">1.06e-15</td></tr>
-            <tr><td>finite-difference render, h = 0.1 mm</td><td class="v">40.0144</td><td class="v">3.85e-3</td></tr>
-          </tbody>
-        </table></div>
-        <p class="small">The pullback has no step size. It is exact for the frozen mesh, and the irys edge sampling error is its only noise. A companion paper, <i>Seeing Is Measuring</i>, uses irys to recover editable CAD from photographs.</p>
+      <h2>Why you can trust the gradient.</h2>
+      <p class="lead">When a fit fails to converge, you need to know whether it is your problem or the renderer's.</p>
+      <div class="trust">
+        <div><h3>Exact replay</h3><p>The backward pass regenerates the forward pass's paths: <b>65 536 of 65 536</b> lanes bit-identical, and two runs give identical gradients.</p></div>
+        <div><h3>An f64 reference</h3><p>Every material is one <a href="https://tang.toys">tang</a> graph, lowered to the GPU and run in f64 on the CPU. GPU gradients agree to <b>3.5e-4</b>.</p></div>
+        <div><h3>Metal and Vulkan</h3><p>Developed on Apple silicon. The full test suite also passes on an <b>NVIDIA RTX 3090</b> through Vulkan.</p></div>
       </div>
+      <p class="small">Replay is exact per device and driver; across GPUs, results agree to f32 precision. irys owns no geometry. Implement the <code>Geometry</code> trait and irys computes the light. It renders for vcad, kosm, ipse, phyz and muni.</p>
     </div>
   </section>
 
@@ -333,7 +322,6 @@ cargo test -p irys</pre>
       <p class="small">The <code>irys</code> crate on crates.io is an unrelated project. Everything is version 0.1.0 and the API is not stable. The core crates are the most settled; <code>irys-diff</code> and the crates built on it are research code. All timings come from Apple silicon with Metal. The test suite also passes on an NVIDIA RTX 3090 through Vulkan.</p>
     </div>
   </section>
-
 
   <section>
     <div class="container-wide">
