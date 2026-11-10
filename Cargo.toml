@@ -35,8 +35,8 @@ rayon = "1"
 # kosm pins — and `[patch.crates-io]` below sends crates.io `tang` and
 # `tang-expr` to that rev, so the graph still holds one `tang`. irys-diff is
 # the only crate that names it; the published crates still resolve `tang = "0.2"`.
-tang-compile = { git = "https://github.com/ecto/tang", rev = "bfc8003" }
-tang-expr = "0.1"
+tang-compile = { git = "https://github.com/ecto/tang", rev = "7da2ab65" }
+tang-expr = "0.2"
 irys-core  = { path = "crates/irys-core", version = "0.1" }
 irys-light = { path = "crates/irys-light", version = "0.1" }
 irys-prims = { path = "crates/irys-prims", version = "0.1" }
@@ -45,8 +45,8 @@ irys       = { package = "irys-render", path = "crates/irys", version = "0.1" }
 
 # One tang: the rev tang-compile is pinned to. Drop with tang-compile's publish.
 [patch.crates-io]
-tang      = { git = "https://github.com/ecto/tang", rev = "bfc8003" }
-tang-expr = { git = "https://github.com/ecto/tang", rev = "bfc8003" }
+tang      = { git = "https://github.com/ecto/tang", rev = "7da2ab65" }
+tang-expr = { git = "https://github.com/ecto/tang", rev = "7da2ab65" }
 # irys-diff's rose_brep example builds vcad 0.11 (d10f279), whose raytracer
 # needs kosm-render ahead of crates.io 0.2.0: the rev vcad itself patches to.
 kosm-render = { git = "https://github.com/ecto/kosm", rev = "59b1d03ec45cf9e9a04ccbbbef0bcc06d8f559d4" }

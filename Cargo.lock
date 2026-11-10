@@ -1061,7 +1061,7 @@ dependencies = [
  "serde_json",
  "tang",
  "tang-compile",
- "tang-expr",
+ "tang-expr 0.2.0",
  "vcad",
  "vcad-kernel 0.10.0",
  "vcad-kernel 0.11.0",
@@ -1148,7 +1148,7 @@ dependencies = [
  "serde_json",
  "tang",
  "tang-compile",
- "tang-expr",
+ "tang-expr 0.2.0",
 ]
 
 [[package]]
@@ -2576,7 +2576,7 @@ dependencies = [
 [[package]]
 name = "tang"
 version = "0.2.1"
-source = "git+https://github.com/ecto/tang?rev=bfc8003#bfc8003b08d29a2bb1f62b00c771d59a2d9fc3bd"
+source = "git+https://github.com/ecto/tang?rev=7da2ab65#7da2ab65a024a2ddd9183c0215ed42f64c64d8f7"
 dependencies = [
  "paste",
  "robust",
@@ -2585,16 +2585,25 @@ dependencies = [
 [[package]]
 name = "tang-compile"
 version = "0.1.0"
-source = "git+https://github.com/ecto/tang?rev=bfc8003#bfc8003b08d29a2bb1f62b00c771d59a2d9fc3bd"
+source = "git+https://github.com/ecto/tang?rev=7da2ab65#7da2ab65a024a2ddd9183c0215ed42f64c64d8f7"
 dependencies = [
  "tang",
- "tang-expr",
+ "tang-expr 0.2.0",
 ]
 
 [[package]]
 name = "tang-expr"
 version = "0.1.1"
-source = "git+https://github.com/ecto/tang?rev=bfc8003#bfc8003b08d29a2bb1f62b00c771d59a2d9fc3bd"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f1fdb85a4a0335eb38eac4635d080d54f2cb093e66ef54ce0c5460d35457e90"
+dependencies = [
+ "tang",
+]
+
+[[package]]
+name = "tang-expr"
+version = "0.2.0"
+source = "git+https://github.com/ecto/tang?rev=7da2ab65#7da2ab65a024a2ddd9183c0215ed42f64c64d8f7"
 dependencies = [
  "tang",
 ]
@@ -3039,7 +3048,7 @@ checksum = "22707aca1db91e2f30f4016f5909b7fcc6ed97653154cc716528e1edee1eec80"
 dependencies = [
  "slotmap",
  "tang",
- "tang-expr",
+ "tang-expr 0.1.1",
  "tang-la",
  "thiserror 2.0.21",
  "vcad-kernel-math 0.10.0",
@@ -3053,7 +3062,7 @@ source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b1
 dependencies = [
  "slotmap",
  "tang",
- "tang-expr",
+ "tang-expr 0.1.1",
  "tang-la",
  "thiserror 2.0.21",
  "vcad-kernel-math 0.11.0",
