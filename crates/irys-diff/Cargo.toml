@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "irys: the kernel contract on CPU — BSDFs as tang IR graphs, path replay backprop"
-publish = false   # tang-compile is a git dependency until it publishes
+publish = false
 
 [dependencies]
 irys-core.workspace = true

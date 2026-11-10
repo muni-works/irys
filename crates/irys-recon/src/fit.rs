@@ -22,6 +22,87 @@ use crate::dsl::Program;
 use crate::jac::ViewJac;
 use crate::model::{Eval, Renderer, Setup};
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// The error a cancelled fit, search or recovery returns.
+pub const CANCELLED: &str = "cancelled";
+
+/// Where a recovery is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Calibrating and framing photo `step` of `of`.
+    Calibrate,
+    /// Fitting the appearance on start `step` of `of`.
+    Appearance,
+    /// Search round `step` of at most `of`.
+    Search,
+    /// Refitting finalist `step` of `of` at full resolution.
+    Finalists,
+    /// The last polish (appearance, geometry, colour).
+    Polish,
+}
+
+/// One progress report.
+#[derive(Debug, Clone)]
+pub struct Progress {
+    /// The stage.
+    pub stage: Stage,
+    /// 1-based step within the stage.
+    pub step: usize,
+    /// Steps in the stage (for [`Stage::Search`], the most there can be).
+    pub of: usize,
+    /// The leading program so far, as text (from the search on).
+    pub program: Option<String>,
+}
+
+/// A cancel flag and a progress callback for a long recovery. Clones share
+/// the flag, so a host keeps one clone and calls [`Hook::cancel`] from any
+/// thread; the fit checks it once per Levenberg–Marquardt iteration and the
+/// search once per round, and each returns `Err(CANCELLED)`.
+#[derive(Clone, Default)]
+pub struct Hook {
+    cancel: Arc<AtomicBool>,
+    report: Option<Arc<dyn Fn(&Progress) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for Hook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hook").field("cancelled", &self.cancelled()).field("report", &self.report.is_some()).finish()
+    }
+}
+
+impl Hook {
+    /// A hook that reports progress to `f` (called from the calling thread
+    /// of [`crate::v1::recover_photos`], between steps).
+    pub fn new(f: impl Fn(&Progress) + Send + Sync + 'static) -> Self {
+        Self { cancel: Arc::default(), report: Some(Arc::new(f)) }
+    }
+
+    /// Ask the recovery to stop.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether [`Hook::cancel`] was called.
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// `Err(CANCELLED)` once cancelled.
+    pub fn check(&self) -> Result<(), String> {
+        if self.cancelled() { Err(CANCELLED.into()) } else { Ok(()) }
+    }
+
+    /// Report a step, then [`Hook::check`].
+    pub fn step(&self, stage: Stage, step: usize, of: usize, program: Option<&Program>) -> Result<(), String> {
+        if let Some(f) = &self.report {
+            f(&Progress { stage, step, of, program: program.map(|p| p.to_text()) });
+        }
+        self.check()
+    }
+}
+
 /// A target as the solver sees it: grey images, a silhouette and its
 /// distance transform per view.
 #[derive(Clone)]
@@ -272,6 +353,8 @@ pub struct Fitter {
     pub sigma2: f64,
     /// v1: Huber threshold in units of σ (`None`: Gaussian, v0).
     pub huber: Option<f64>,
+    /// Cancellation (checked once per iteration of [`Fitter::fit`]).
+    pub hook: Hook,
     renderer: Renderer,
 }
 
@@ -300,18 +383,24 @@ impl Fitter {
         }
         let model = acc / n / 2.0;
         let sigma2 = model * (1.0 + setup.film.spp as f64 / target_spp as f64);
-        Self { setup, target, sigma2, huber: None, renderer }
+        Self { setup, target, sigma2, huber: None, hook: Hook::default(), renderer }
     }
 
     /// With a known noise level (no probe renders).
     pub fn with_sigma2(setup: Setup, target: Target, sigma2: f64) -> Self {
         let renderer = Renderer::new(setup.n_views());
-        Self { setup, target, sigma2, huber: None, renderer }
+        Self { setup, target, sigma2, huber: None, hook: Hook::default(), renderer }
     }
 
     /// The same with Huber's loss at `k` σ.
     pub fn robust(mut self, k: Option<f64>) -> Self {
         self.huber = k;
+        self
+    }
+
+    /// The same, cancellable through `hook`.
+    pub fn hooked(mut self, hook: &Hook) -> Self {
+        self.hook = hook.clone();
         self
     }
 
@@ -411,6 +500,7 @@ impl Fitter {
             let mut mu = 1e-3;
             let mut it = 0;
             while it < level.iters {
+                self.hook.check()?;
                 it += 1;
                 iters += 1;
                 let (a, g) = normal_eq(&lin.j, &lin.r, np);

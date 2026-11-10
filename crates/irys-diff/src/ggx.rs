@@ -101,6 +101,7 @@ impl Graph {
         let param = |k: i64| Arg {
             src: theta,
             view: View {
+                gather: None,
                 guard: false,
                 forms: vec![Form {
                     coefs: vec![0],
@@ -205,6 +206,7 @@ impl LaneAdjoint {
         let param = |k: i64| Arg {
             src: theta,
             view: View {
+                gather: None,
                 guard: false,
                 forms: vec![Form {
                     coefs: vec![0],

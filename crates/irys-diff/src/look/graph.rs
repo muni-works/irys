@@ -133,6 +133,7 @@ impl Stack {
             .map(|k| Arg {
                 src: cols,
                 view: View {
+                    gather: None,
                     guard: false,
                     forms: vec![
                         Form {
@@ -150,6 +151,7 @@ impl Stack {
         args.extend((0..PARAMS as i64).map(|k| Arg {
             src: theta,
             view: View {
+                gather: None,
                 guard: false,
                 forms: vec![Form {
                     coefs: vec![0],

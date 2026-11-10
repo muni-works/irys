@@ -16,7 +16,7 @@
 use std::path::Path;
 
 use crate::dsl::Program;
-use crate::fit::{Fit, Fitter, Level, Target};
+use crate::fit::{Fit, Fitter, Hook, Level, Stage, Target};
 use crate::look::{self, Look};
 use crate::model::Setup;
 use crate::photo::{self, Camera, Rig, View};
@@ -297,6 +297,11 @@ pub struct V1Options {
     pub region: Region,
     /// The chromatic coverage term ([`Target::cov_obs`]).
     pub chroma: bool,
+    /// Cancellation and progress: keep a clone, call [`Hook::cancel`] from
+    /// any thread and [`recover_photos`] returns `Err("cancelled")` within
+    /// one fit iteration (an appearance fit in flight finishes first).
+    /// Replaces [`Options::hook`] of `search`.
+    pub hook: Hook,
 }
 
 impl Default for V1Options {
@@ -312,6 +317,7 @@ impl Default for V1Options {
             ao_edges: true,
             region: Region::default(),
             chroma: true,
+            hook: Hook::default(),
         }
     }
 }
@@ -392,7 +398,9 @@ fn gamma_target(grey: &[f64], g: f64) -> Vec<f64> {
 pub fn recover_photos(photos: &[Photo], o: &V1Options) -> Result<V1, String> {
     let mut calib = Vec::new();
     let mut framed = Vec::new();
-    for p in photos {
+    let hook = &o.hook;
+    for (i, p) in photos.iter().enumerate() {
+        hook.step(Stage::Calibrate, i + 1, photos.len(), None)?;
         let c = calibrate(p, o.tag_mm, o.sensor_w_mm)?;
         let crop = locate(p, &c, &o.region)?;
         framed.push(frame(p, &c, crop, o.film, &o.region)?);
@@ -440,7 +448,9 @@ pub fn recover_photos(photos: &[Photo], o: &V1Options) -> Result<V1, String> {
     let mut best: Option<(f64, Program, Rig, Vec<f64>)> = None;
     let mut tried = Vec::new();
     let mut sref: Option<f64> = None;
-    for start in starts {
+    let n_starts = starts.len();
+    for (i, start) in starts.into_iter().enumerate() {
+        hook.step(Stage::Appearance, i + 1, n_starts, None)?;
         let base = start.clone();
         let mut r = hrig.clone();
         let mut sig = Vec::new();
@@ -454,7 +464,7 @@ pub fn recover_photos(photos: &[Photo], o: &V1Options) -> Result<V1, String> {
             *img = gamma_target(img, r.views[vi].look.gamma);
         }
         let s2 = sig.iter().sum::<f64>() / sig.len() as f64;
-        let mut f = Fitter::with_sigma2(Setup::photo(r.clone(), 6000), ht, s2 * s2).robust(Some(o.huber));
+        let mut f = Fitter::with_sigma2(Setup::photo(r.clone(), 6000), ht, s2 * s2).robust(Some(o.huber)).hooked(hook);
         let Ok(fit) = f.fit(&base, &[Level { sigma: 1.5, lambda: 0.1, iters: 5 }, Level { sigma: 0.0, lambda: 0.0, iters: 5 }]) else { continue };
         // Judge every start at one σ (the first's), so the costs compare.
         let sj = *sref.get_or_insert(s2);
@@ -464,6 +474,7 @@ pub fn recover_photos(photos: &[Photo], o: &V1Options) -> Result<V1, String> {
             best = Some((cost, fit.prog.clone(), r, sig));
         }
     }
+    hook.check()?;
     if dbg {
         eprintln!("starts {tried:?}");
     }
@@ -525,7 +536,9 @@ pub fn recover_photos(photos: &[Photo], o: &V1Options) -> Result<V1, String> {
     so.sigma2 = Some((sh * sh, sf * sf));
     so.huber = Some(o.huber);
     so.base = Some(base.clone());
-    let rec = search::recover(&target, &[], &setup, 0, &mut Algorithmic, &so);
+    so.hook = hook.clone();
+    let rec = search::try_recover(&target, &[], &setup, 0, &mut Algorithmic, &so)?;
+    hook.step(Stage::Polish, 1, 1, Some(&rec.fit.prog))?;
     // Polish: the appearance on the recovered geometry (every knob), then
     // the geometry again under it.
     let mut rig_p = (**setup.photo.as_ref().unwrap()).clone();
@@ -542,8 +555,9 @@ pub fn recover_photos(photos: &[Photo], o: &V1Options) -> Result<V1, String> {
         *img = gamma_target(img, looks2[vi].gamma);
     }
     let setup2 = Setup::photo(rig_p, 40_000);
-    let mut f = Fitter::with_sigma2(setup2.clone(), target2.clone(), sf * sf).robust(Some(o.huber));
+    let mut f = Fitter::with_sigma2(setup2.clone(), target2.clone(), sf * sf).robust(Some(o.huber)).hooked(hook);
     let polished: Option<Fit> = f.fit(&rec.fit.prog, &[Level { sigma: 1.0, lambda: 0.0, iters: 3 }, Level { sigma: 0.0, lambda: 0.0, iters: 8 }]).ok();
+    hook.check()?;
     let mut rec = rec;
     if let Some(pf) = polished {
         let s = crate::mdl::score(&pf);

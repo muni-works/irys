@@ -14,7 +14,8 @@ irys-core.workspace = true
 irys-prims.workspace = true
 irys-light.workspace = true
 irys-diff = { path = "../irys-diff", features = ["assets"] }
-vcad-kernel = "0.10"
+# 0.10 or 0.11: a host on vcad 0.11 (the Mac app) unifies with one `[patch]`.
+vcad-kernel = ">=0.10, <0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
@@ -23,8 +24,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 kornia-apriltag = "0.2"
 kornia-image = "0.2"
 kamadak-exif = "0.6"
-vcad-kernel-export = "0.10"
-vcad-ir = "0.10"
+vcad-kernel-export = ">=0.10, <0.12"
+vcad-ir = ">=0.10, <0.12"
 rayon.workspace = true
 
 [features]
