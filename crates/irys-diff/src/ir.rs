@@ -9,17 +9,22 @@
 //! tang-gpu links wgpu 25 and irys is on 30, so the forty lines live here.
 
 use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
 use std::process::Command;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tang_compile::tensor::c::CProgram;
-use tang_compile::tensor::{Format, Op, TensorGraph, TensorId, numel};
+#[cfg(not(target_arch = "wasm32"))]
+use tang_compile::tensor::Format;
+use tang_compile::tensor::{Op, TensorGraph, TensorId, numel};
 
 type RunFn = unsafe extern "C" fn();
 type PtrFn = unsafe extern "C" fn(i32) -> *mut core::ffi::c_void;
 
 struct Native {
     program: CProgram,
+    #[cfg(not(target_arch = "wasm32"))]
     _lib: libloading::Library,
     run: RunFn,
     input: PtrFn,
@@ -33,6 +38,7 @@ impl Drop for Native {
     }
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 enum Backend {
     Native(Native),
     Interp {
@@ -58,7 +64,7 @@ impl Program {
     /// Native when a C compiler is available (and `IRYS_IR` allows it),
     /// the interpreter otherwise. Inputs start at zero.
     pub fn compile(g: &TensorGraph, outputs: &[TensorId]) -> Self {
-        if !force_interp() {
+        if !force_interp() && cfg!(not(target_arch = "wasm32")) {
             match Self::native(g, outputs) {
                 Ok(p) => return p,
                 Err(e) => eprintln!("irys-diff: no native program ({e}); using the interpreter"),
@@ -82,7 +88,15 @@ impl Program {
         }
     }
 
+    /// The compiled C program, or why there is none. In the browser there
+    /// is no C compiler to call, so the interpreter runs every graph.
+    #[cfg(target_arch = "wasm32")]
+    pub fn native(_g: &TensorGraph, _outputs: &[TensorId]) -> Result<Self, String> {
+        Err("no native programs in wasm".into())
+    }
+
     /// The compiled C program, or why there is none.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn native(g: &TensorGraph, outputs: &[TensorId]) -> Result<Self, String> {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let program = g.to_c(outputs);

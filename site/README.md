@@ -12,6 +12,21 @@ npm run build    # writes dist/
 npm run preview  # serves dist/ on :4174
 ```
 
+The live demos are `crates/irys-wasm` compiled with wasm-pack into
+`public/pkg` (checked in, as phyz.dev does), run in a Web Worker
+(`public/demo-worker.js`). Rebuild them off the Mac:
+
+```sh
+cd crates/irys-wasm
+wasm-pack build --release --target web --out-dir ../../site/public/pkg
+```
+
+Only diffuse and splat demos run in the browser for now: the conductor's
+material graph goes through tang's interpreter, which always spawns a
+thread (`std::thread::scope` in `tang-compile`'s `tensor.rs`), and
+wasm32-unknown-unknown cannot. Skipping the scope when one thread is asked
+for would let the metal demos in.
+
 Every number on the page comes from the repository README, `docs/design.md`
 or the paper's `data/measured.tsv`. Images are JPEG copies of PNGs in `docs/`,
 plus the paper cover (rose robot in the Barcelona Pavilion; scene by eMirage,

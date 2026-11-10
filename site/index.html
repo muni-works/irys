@@ -166,6 +166,33 @@ details { margin-top: 1.5rem; }
 .pair img { height: 220px; object-fit: cover; image-rendering: auto; }
 .pair span { position: absolute; left: 8px; bottom: 6px; font-family: var(--mono); font-size: var(--s-xs); color: #fff; background: rgba(0,0,0,.45); padding: 1px 6px; }
 details summary { cursor: pointer; font-family: var(--mono); font-size: var(--s-sm); color: var(--flame-ink); }
+
+.examples-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 48px 28px; }
+@media (max-width: 1100px) { .examples-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 680px) { .examples-grid { grid-template-columns: 1fr; } }
+.ex { display: flex; flex-direction: column; margin: 0; }
+.ex-view { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; background: var(--surface); }
+.ex-view.one { grid-template-columns: 1fr; }
+.ex-view figure { position: relative; margin: 0; }
+.ex-view canvas { display: block; width: 100%; aspect-ratio: 1; background: #000; image-rendering: auto; }
+.ex-view span { position: absolute; left: 6px; bottom: 6px; font-family: var(--mono); font-size: var(--s-xs); color: #fff; background: rgba(0,0,0,.5); padding: 1px 6px; }
+.ex-meta { padding-top: 14px; }
+.ex-head { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
+a.crate-tag { align-self: flex-start; font-family: var(--mono); font-size: var(--s-xs); color: var(--muted); }
+.ex-name { font-family: var(--mono); font-size: var(--s-sm); font-weight: 500; color: var(--fg); }
+.ex-desc { font-size: var(--s-sm); color: var(--muted); line-height: 1.55; }
+.ex-use { font-size: var(--s-sm); color: var(--fg); line-height: 1.55; margin-top: 8px; }
+.ex-use b { font-family: var(--mono); font-size: 10px; font-weight: 500; letter-spacing: var(--track); text-transform: uppercase; color: var(--muted); margin-right: 8px; }
+.ex-ctl { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 12px; }
+.ex-ctl button { font: inherit; font-family: var(--mono); font-size: var(--s-xs); border: 0; padding: 5px 10px; cursor: pointer; background: var(--surface); color: var(--fg); }
+.ex-ctl button[aria-pressed="true"] { background: color-mix(in oklab, var(--flame) 18%, transparent); color: var(--flame-ink); }
+.ex-ctl button.go { background: var(--flame-ink); color: var(--on-flame); font-weight: 500; }
+.ex-ctl button:hover { background: var(--flame-ink); color: var(--on-flame); }
+.ex-ctl input[type=range] { flex: 1; min-width: 100px; accent-color: var(--flame); }
+.ro { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 12px; margin-top: 12px; }
+.ro dt { font-family: var(--mono); font-size: 10px; font-weight: 500; letter-spacing: var(--track); text-transform: uppercase; color: var(--muted); }
+.ro dd { font-family: var(--mono); font-size: var(--s-sm); font-weight: 500; color: var(--fg); margin: 0; }
+.ro .hot dd { color: var(--flame-ink); }
 </style>
 </head>
 <body>
@@ -201,6 +228,46 @@ details summary { cursor: pointer; font-family: var(--mono); font-size: var(--s-
 </header>
 
 <main>
+  <section id="live">
+    <div class="container"><h2>Run it here.</h2>
+      <p class="lead">These are irys compiled to WebAssembly, running in your browser on the CPU. Each step renders the scene, scores it against the target, replays the paths for the gradient and moves the parameters.</p></div>
+    <div class="container-wide">
+      <div class="examples-grid">
+        <figure class="ex" data-demo="splat">
+          <div class="ex-view"><figure><canvas width="48" height="48"></canvas><span>irys</span></figure><figure><canvas class="tgt" width="48" height="48"></canvas><span>target</span></figure></div>
+          <figcaption class="ex-meta">
+            <div class="ex-head"><a class="crate-tag" href="https://github.com/muni-works/irys/tree/main/crates/irys-diff">irys-diff</a><a class="ex-name" href="https://github.com/muni-works/irys/blob/main/crates/irys-wasm/src/lib.rs">splat_fit</a></div>
+            <p class="ex-desc">A bush of 900 Gaussian splats, path traced on a floor under the sky. irys turns it to autumn by fitting every splat's colour and opacity to the target, 3 600 parameters at once.</p>
+            <p class="ex-use"><b>For</b>Editing a captured splat scene and keeping its lighting physical.</p>
+            <div class="ex-ctl"><button class="go">Fit</button></div>
+            <dl class="ro"><div class="hot"><dt>step</dt><dd data-r="it">0</dd></div><div><dt>parameters</dt><dd>3 600</dd></div><div><dt>loss</dt><dd data-r="loss">–</dd></div></dl>
+          </figcaption>
+        </figure>
+        <figure class="ex" data-demo="paint">
+          <div class="ex-view"><figure><canvas width="32" height="32"></canvas><span>irys</span></figure><figure><canvas class="tgt" width="32" height="32"></canvas><span>target</span></figure></div>
+          <figcaption class="ex-meta">
+            <div class="ex-head"><a class="crate-tag" href="https://github.com/muni-works/irys/tree/main/crates/irys-diff">irys-diff</a><a class="ex-name" href="https://github.com/muni-works/irys/blob/main/crates/irys-wasm/src/lib.rs">paint_fit</a></div>
+            <p class="ex-desc">A room lit by one area light. irys recovers the paint, a three-band spectral albedo, through every bounce of light between the walls.</p>
+            <p class="ex-use"><b>For</b>Measuring surface colour when the light around it is not white.</p>
+            <div class="ex-ctl"><button data-p="teal" aria-pressed="true">teal</button><button data-p="terracotta">terracotta</button><button data-p="lilac">lilac</button><button class="go">Fit</button></div>
+            <dl class="ro"><div class="hot"><dt>step</dt><dd data-r="it">0</dd></div><div><dt>bands b g r</dt><dd data-r="bands">0.50 0.50 0.50</dd></div><div><dt>loss</dt><dd data-r="loss">–</dd></div></dl>
+          </figcaption>
+        </figure>
+        <figure class="ex" data-demo="render">
+          <div class="ex-view one"><figure><canvas width="64" height="64"></canvas><span>spectral, 4 wavelengths per path</span></figure></div>
+          <figcaption class="ex-meta">
+            <div class="ex-head"><a class="crate-tag" href="https://github.com/muni-works/irys/tree/main/crates/irys-diff">irys-diff</a><a class="ex-name" href="https://github.com/muni-works/irys/blob/main/crates/irys-wasm/src/lib.rs">room</a></div>
+            <p class="ex-desc">The same room, path traced with next-event estimation and MIS, one frame at a time. Repaint it and the image starts over.</p>
+            <p class="ex-use"><b>For</b>Seeing the light the paint fit has to explain.</p>
+            <div class="ex-ctl"><button data-p="teal" aria-pressed="true">teal</button><button data-p="terracotta">terracotta</button><button data-p="lilac">lilac</button></div>
+            <dl class="ro"><div class="hot"><dt>frames</dt><dd data-r="it">0</dd></div><div><dt>paths / px</dt><dd data-r="spp">0</dd></div><div><dt>ms / frame</dt><dd data-r="ms">–</dd></div></dl>
+          </figcaption>
+        </figure>
+      </div>
+      <p class="small">The browser runs irys on one CPU core in f64, so these are small and noisy; natively the same fits run on the GPU. The metal material's demos wait on a fix in tang's interpreter, which spawns a thread the browser cannot give it.</p>
+    </div>
+  </section>
+
   <section>
     <div class="container">
       <p class="big-claim">Material gradients <em>7 to 26 times faster</em> than Mitsuba 3.</p>
@@ -344,5 +411,56 @@ cargo test -p irys</pre>
   <p class="foot-links"><a href="https://github.com/muni-works/irys">GitHub</a><span>·</span><a href="https://muni.works/research/irys">Paper</a><span>·</span><span>Apache-2.0</span><span>·</span><a href="https://muni.works">muni.works</a></p>
 </footer>
 
+<script type="module">
+const PAINT = { teal: [0.6, 0.55, 0.15], terracotta: [0.2, 0.35, 0.7], lilac: [0.75, 0.5, 0.65] };
+const SIZES = { splat: [48, 1, 8], paint: [32, 4, 16], render: [64, 1] };
+const STEPS = { splat: 80, paint: 120, render: 400 };
+function draw(canvas, bytes, n) {
+  if (canvas.width !== n) { canvas.width = n; canvas.height = n; }
+  canvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(bytes.buffer || bytes), n, n), 0, 0);
+}
+for (const fig of document.querySelectorAll('[data-demo]')) {
+  const kind = fig.dataset.demo;
+  const [main, tgt] = fig.querySelectorAll('canvas');
+  const r = (k) => fig.querySelector(`[data-r="${k}"]`);
+  const go = fig.querySelector('.go');
+  let worker = null, paint = 'teal';
+  const start = (run = true) => {
+    worker?.terminate();
+    worker = new Worker(new URL('/demo-worker.js', location.href), { type: 'module' });
+    const [size, spp, targetSpp] = SIZES[kind];
+    worker.onmessage = (e) => {
+      const m = e.data;
+      if (m.target) draw(tgt, m.target, m.size);
+      if (m.img) draw(main, m.img, m.size);
+      if (m.readyDemo && run) worker.postMessage({ type: 'run', steps: STEPS[kind] });
+      if (m.readyDemo && !run) worker.postMessage({ type: 'run', steps: 1 });
+      if (m.it !== undefined && r('it')) r('it').textContent = m.it;
+      if (m.it !== undefined && r('spp')) r('spp').textContent = m.it * spp;
+      if (m.loss != null) r('loss').textContent = m.loss.toExponential(2);
+      if (m.params && kind === 'paint') r('bands').textContent = m.params.map((x) => x.toFixed(2)).join(' ');
+      if (m.ms != null && r('ms')) r('ms').textContent = Math.round(m.ms);
+      if (m.done && go && run) go.textContent = 'Fit again';
+    };
+    const init = { type: 'init', kind, size, spp, targetSpp };
+    if (kind === 'paint') init.truth = PAINT[paint];
+    worker.postMessage(init);
+    if (kind === 'render') worker.postMessage({ type: 'material', values: PAINT[paint] });
+    if (go && run) go.textContent = 'Running';
+  };
+  go?.addEventListener('click', () => start(true));
+  for (const b of fig.querySelectorAll('[data-p]')) b.addEventListener('click', () => {
+    paint = b.dataset.p;
+    fig.querySelectorAll('[data-p]').forEach((x) => x.setAttribute('aria-pressed', x === b));
+    if (kind === 'render' && worker) { worker.postMessage({ type: 'material', values: PAINT[paint] }); worker.postMessage({ type: 'run', steps: STEPS.render }); }
+    else start();
+  });
+  fig._start = start;
+}
+// The render is cheap (a few ms a frame), so it starts with the page; the
+// fits draw their target and first step, and wait for Fit.
+document.querySelector('[data-demo="render"]')._start();
+for (const k of ['splat', 'paint']) document.querySelector(`[data-demo="${k}"]`)._start(false);
+</script>
 </body>
 </html>
