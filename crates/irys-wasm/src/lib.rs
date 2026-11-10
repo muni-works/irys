@@ -1,8 +1,6 @@
 //! The landing page's live demos: irys-diff compiled to wasm, on the CPU in
-//! f64, one gradient step per call. Only diffuse surfaces and splats for
-//! now: their adjoints are hand-written, while the conductor's material
-//! graph runs in tang's interpreter, which spawns a thread the browser
-//! cannot give it.
+//! f64, one gradient step per call. The conductor's material graph runs in
+//! tang's interpreter (single-threaded in wasm since tang `7da2ab65`).
 //!
 //! Each demo renders, scores against a target the page chose, replays for
 //! the gradient and takes an Adam step. The scored frame and the replayed
@@ -73,6 +71,60 @@ fn frame(scene: &Scene, theta: &[f64; 4], seed: u64, k: &mut Kernels, target: &[
     let dl = prb::lane_adjoint(scene, a, &d_img);
     let (g, extra, _, _) = prb::replay_extra(scene, theta, a, k, &la, &dl);
     (loss, img, g, extra)
+}
+
+/// Recover a metal ball's roughness and spectral F0 from a target render.
+#[wasm_bindgen]
+pub struct MaterialFit {
+    scene: Scene,
+    k: Kernels,
+    target: Vec<f64>,
+    theta: [f64; 4],
+    adam: Adam<4>,
+    seed: u64,
+    image: Vec<f64>,
+}
+
+#[wasm_bindgen]
+impl MaterialFit {
+    /// `truth = [roughness, F0 blue, F0 green, F0 red]`.
+    #[wasm_bindgen(constructor)]
+    pub fn new(size: usize, spp: usize, target_spp: usize, truth: &[f64]) -> MaterialFit {
+        let mut reference = Scene::new(size, size, target_spp);
+        reference.depth = 2;
+        let mut kr = Kernels::for_scene(&reference, false);
+        let t: [f64; 4] = std::array::from_fn(|i| truth[i]);
+        let target = prb::image(&reference, 1000, &prb::forward(&reference, &t, 1000, &mut kr).0);
+        let mut scene = Scene::new(size, size, spp);
+        scene.depth = 2;
+        let k = Kernels::for_scene(&scene, false);
+        MaterialFit { scene, k, target, theta: [0.7, 0.5, 0.5, 0.5], adam: Adam::new(0.06), seed: 1, image: Vec::new() }
+    }
+
+    /// One Adam step. Returns the loss before it.
+    pub fn step(&mut self) -> f64 {
+        let (loss, img, g, _) = frame(&self.scene, &self.theta, self.seed, &mut self.k, &self.target);
+        // The gradient is noisy at this size: decay the step from 0.06 to
+        // about 0.005 over 40 steps so the fit settles instead of orbiting.
+        self.adam.lr = 0.06 * 0.94f64.powi(self.adam.t);
+        self.adam.step(&mut self.theta, &g, 0.03, 1.0);
+        self.seed += 1;
+        self.image = img;
+        loss
+    }
+
+    /// `[roughness, F0 blue, F0 green, F0 red]`.
+    pub fn theta(&self) -> Vec<f64> {
+        self.theta.to_vec()
+    }
+
+    pub fn image_rgba(&self) -> Vec<u8> {
+        rgba(&self.image)
+    }
+
+    pub fn target_rgba(&self) -> Vec<u8> {
+        rgba(&self.target)
+    }
 }
 
 /// A closed room of diffuse slabs and two boxes under a quad light: no

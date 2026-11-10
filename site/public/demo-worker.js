@@ -1,6 +1,6 @@
 // One irys demo per worker: the wasm runs here so a gradient step (up to a
 // second of interpreter time) never blocks the page.
-import init, { SplatFit, PaintFit, RoomRender } from './pkg/irys_wasm.js';
+import init, { MaterialFit, SplatFit, PaintFit, RoomRender } from './pkg/irys_wasm.js';
 
 let demo = null, kind = null, running = false, left = 0, it = 0, size = 0;
 const ready = init();
@@ -8,6 +8,7 @@ const ready = init();
 function post(extra = {}) {
   const msg = { kind, it, size, img: demo.image_rgba(), ...extra };
   if (kind === 'paint') msg.params = Array.from(demo.bands());
+  if (kind === 'material') msg.params = Array.from(demo.theta());
   postMessage(msg, [msg.img.buffer]);
 }
 
@@ -27,6 +28,7 @@ onmessage = async (e) => {
   if (m.type === 'init') {
     running = false; kind = m.kind; it = 0; size = m.size;
     if (kind === 'splat') demo = new SplatFit(m.size, m.spp, m.targetSpp);
+    if (kind === 'material') demo = new MaterialFit(m.size, m.spp, m.targetSpp, new Float64Array(m.truth));
     if (kind === 'paint') demo = new PaintFit(m.size, m.spp, m.targetSpp, new Float64Array(m.truth));
     if (kind === 'render') demo = new RoomRender(m.size, m.spp);
     if (kind !== 'render') {

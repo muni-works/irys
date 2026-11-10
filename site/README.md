@@ -21,11 +21,8 @@ cd crates/irys-wasm
 wasm-pack build --release --target web --out-dir ../../site/public/pkg
 ```
 
-Only diffuse and splat demos run in the browser for now: the conductor's
-material graph goes through tang's interpreter, which always spawns a
-thread (`std::thread::scope` in `tang-compile`'s `tensor.rs`), and
-wasm32-unknown-unknown cannot. Skipping the scope when one thread is asked
-for would let the metal demos in.
+The metal material's graph runs in tang's interpreter, single-threaded in
+wasm since tang `7da2ab65`, which is the rev irys pins.
 
 Every number on the page comes from the repository README, `docs/design.md`
 or the paper's `data/measured.tsv`. Images are JPEG copies of PNGs in `docs/`,

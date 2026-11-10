@@ -167,7 +167,7 @@ details { margin-top: 1.5rem; }
 .pair span { position: absolute; left: 8px; bottom: 6px; font-family: var(--mono); font-size: var(--s-xs); color: #fff; background: rgba(0,0,0,.45); padding: 1px 6px; }
 details summary { cursor: pointer; font-family: var(--mono); font-size: var(--s-sm); color: var(--flame-ink); }
 
-.examples-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 48px 28px; }
+.examples-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 48px 32px; max-width: 920px; margin: 0 auto; }
 @media (max-width: 1100px) { .examples-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 680px) { .examples-grid { grid-template-columns: 1fr; } }
 .ex { display: flex; flex-direction: column; margin: 0; }
@@ -226,6 +226,16 @@ a.crate-tag { align-self: flex-start; font-family: var(--mono); font-size: var(-
       <p class="lead">This is real irys, compiled to WebAssembly and running on your CPU right now. Each step renders, compares with the target, replays the light for the gradient, and takes a step. Then does it again.</p></div>
     <div class="container-wide">
       <div class="examples-grid">
+        <figure class="ex" data-demo="material">
+          <div class="ex-view"><figure><canvas width="32" height="32"></canvas><span>irys</span></figure><figure><canvas class="tgt" width="32" height="32"></canvas><span>target</span></figure></div>
+          <figcaption class="ex-meta">
+            <div class="ex-head"><a class="crate-tag" href="https://github.com/muni-works/irys/tree/main/crates/irys-diff">irys-diff</a><a class="ex-name" href="https://github.com/muni-works/irys/blob/main/crates/irys-diff/examples/fit.rs">material_fit</a></div>
+            <p class="ex-desc">A sad grey ball looks at a picture of a metal one and works out its roughness and its colour at 450, 550 and 650 nm. The material is a tang graph, run by tang's interpreter right here in your tab.</p>
+            <p class="ex-use"><b>For</b>Matching a material to a photo of the real part.</p>
+            <div class="ex-ctl"><button data-m="gold" aria-pressed="true">gold</button><button data-m="copper">copper</button><button data-m="silver">silver</button><button class="go">Fit</button></div>
+            <dl class="ro"><div class="hot"><dt>step</dt><dd data-r="it">0</dd></div><div><dt>roughness</dt><dd data-r="rough">0.70</dd></div><div><dt>loss</dt><dd data-r="loss">–</dd></div></dl>
+          </figcaption>
+        </figure>
         <figure class="ex" data-demo="splat">
           <div class="ex-view"><figure><canvas width="48" height="48"></canvas><span>irys</span></figure><figure><canvas class="tgt" width="48" height="48"></canvas><span>target</span></figure></div>
           <figcaption class="ex-meta">
@@ -257,7 +267,7 @@ a.crate-tag { align-self: flex-start; font-family: var(--mono); font-size: var(-
           </figcaption>
         </figure>
       </div>
-      <p class="small">Your browser gives irys one CPU core and f64 math, so these are small and grainy. The real thing runs on a GPU. Metal demos are coming once tang's interpreter stops asking the browser for a thread it does not have.</p>
+      <p class="small">Your browser gives irys one CPU core and f64 math, so these are small and grainy. The real thing runs on a GPU.</p>
     </div>
   </section>
 
@@ -302,9 +312,9 @@ a.crate-tag { align-self: flex-start; font-family: var(--mono); font-size: var(-
           <p>Three joint angles of a 2.4 M-triangle arm, recovered to <b>0.07&deg;</b> from a guess 13 to 23&deg; off. The outline, the shading and even the shadow on the floor all chip in.</p></div>
         </div>
         <div class="card">
-          <div class="big">1e-15<small>agreement with vcad's own forward-mode derivative</small></div>
+          <img src="/plate.svg" alt="The bearing plate rendered by irys; vcad's frozen mesh fades in over it, and a tick on each bore node shows which way it moves and its share of the gradient" loading="lazy" style="object-fit:contain;background:#0b0907">
           <div class="card-body"><h3>Differentiate a hole.</h3>
-          <p>irys puts a gradient on every mesh vertex and <a href="https://vcad.io">vcad</a> turns it into d(loss)/d(bore diameter) in one reverse pass. No finite-difference step to babysit.</p></div>
+          <p>irys puts a gradient on every mesh vertex and <a href="https://vcad.io">vcad</a> turns it into d(loss)/d(bore diameter) in one reverse pass. No finite-difference step to babysit. It matches vcad's own forward mode to <b>1e-15</b>.</p></div>
         </div>
         <div class="card">
           <img src="/phase2b-beauty.jpg" alt="A gold ball beside a bush of Gaussian splats on a checker floor" loading="lazy">
@@ -406,8 +416,9 @@ cargo test -p irys</pre>
 
 <script type="module">
 const PAINT = { teal: [0.6, 0.55, 0.15], terracotta: [0.2, 0.35, 0.7], lilac: [0.75, 0.5, 0.65] };
-const SIZES = { splat: [48, 1, 8], paint: [32, 4, 16], render: [64, 1] };
-const STEPS = { splat: 80, paint: 120, render: 400 };
+const METAL = { gold: [0.2, 0.34, 0.78, 1.0], copper: [0.3, 0.54, 0.64, 0.95], silver: [0.12, 0.9, 0.91, 0.92] };
+const SIZES = { material: [32, 2, 64], splat: [48, 1, 8], paint: [32, 4, 16], render: [64, 1] };
+const STEPS = { material: 40, splat: 80, paint: 120, render: 400 };
 function draw(canvas, bytes, n) {
   if (canvas.width !== n) { canvas.width = n; canvas.height = n; }
   canvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(bytes.buffer || bytes), n, n), 0, 0);
@@ -417,7 +428,7 @@ for (const fig of document.querySelectorAll('[data-demo]')) {
   const [main, tgt] = fig.querySelectorAll('canvas');
   const r = (k) => fig.querySelector(`[data-r="${k}"]`);
   const go = fig.querySelector('.go');
-  let worker = null, paint = 'teal';
+  let worker = null, paint = 'teal', metal = 'gold';
   const start = (run = true) => {
     worker?.terminate();
     worker = new Worker(new URL('/demo-worker.js', location.href), { type: 'module' });
@@ -432,11 +443,13 @@ for (const fig of document.querySelectorAll('[data-demo]')) {
       if (m.it !== undefined && r('spp')) r('spp').textContent = m.it * spp;
       if (m.loss != null) r('loss').textContent = m.loss.toExponential(2);
       if (m.params && kind === 'paint') r('bands').textContent = m.params.map((x) => x.toFixed(2)).join(' ');
+      if (m.params && kind === 'material') r('rough').textContent = m.params[0].toFixed(3);
       if (m.ms != null && r('ms')) r('ms').textContent = Math.round(m.ms);
       if (m.done && go && run) go.textContent = 'Fit again';
     };
     const init = { type: 'init', kind, size, spp, targetSpp };
     if (kind === 'paint') init.truth = PAINT[paint];
+    if (kind === 'material') init.truth = METAL[metal];
     worker.postMessage(init);
     if (kind === 'render') worker.postMessage({ type: 'material', values: PAINT[paint] });
     if (go && run) go.textContent = 'Running';
@@ -448,12 +461,17 @@ for (const fig of document.querySelectorAll('[data-demo]')) {
     if (kind === 'render' && worker) { worker.postMessage({ type: 'material', values: PAINT[paint] }); worker.postMessage({ type: 'run', steps: STEPS.render }); }
     else start();
   });
+  for (const b of fig.querySelectorAll('[data-m]')) b.addEventListener('click', () => {
+    metal = b.dataset.m;
+    fig.querySelectorAll('[data-m]').forEach((x) => x.setAttribute('aria-pressed', x === b));
+    start();
+  });
   fig._start = start;
 }
 // The render is cheap (a few ms a frame), so it starts with the page; the
 // fits draw their target and first step, and wait for Fit.
 document.querySelector('[data-demo="render"]')._start();
-for (const k of ['splat', 'paint']) document.querySelector(`[data-demo="${k}"]`)._start(false);
+for (const k of ['material', 'splat', 'paint']) document.querySelector(`[data-demo="${k}"]`)._start(false);
 </script>
 </body>
 </html>

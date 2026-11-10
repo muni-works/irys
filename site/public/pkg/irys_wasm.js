@@ -1,6 +1,74 @@
 /* @ts-self-types="./irys_wasm.d.ts" */
 
 /**
+ * Recover a metal ball's roughness and spectral F0 from a target render.
+ */
+export class MaterialFit {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        MaterialFitFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_materialfit_free(ptr, 0);
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    image_rgba() {
+        const ret = wasm.materialfit_image_rgba(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * `truth = [roughness, F0 blue, F0 green, F0 red]`.
+     * @param {number} size
+     * @param {number} spp
+     * @param {number} target_spp
+     * @param {Float64Array} truth
+     */
+    constructor(size, spp, target_spp, truth) {
+        const ptr0 = passArrayF64ToWasm0(truth, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.materialfit_new(size, spp, target_spp, ptr0, len0);
+        this.__wbg_ptr = ret;
+        MaterialFitFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * One Adam step. Returns the loss before it.
+     * @returns {number}
+     */
+    step() {
+        const ret = wasm.materialfit_step(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {Uint8Array}
+     */
+    target_rgba() {
+        const ret = wasm.materialfit_target_rgba(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * `[roughness, F0 blue, F0 green, F0 red]`.
+     * @returns {Float64Array}
+     */
+    theta() {
+        const ret = wasm.materialfit_theta(this.__wbg_ptr);
+        var v1 = getArrayF64FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 8, 8);
+        return v1;
+    }
+}
+if (Symbol.dispose) MaterialFit.prototype[Symbol.dispose] = MaterialFit.prototype.free;
+
+/**
  * Recover the room's paint, a three-band spectral albedo, from a target.
  */
 export class PaintFit {
@@ -224,6 +292,9 @@ function __wbg_get_imports() {
     };
 }
 
+const MaterialFitFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_materialfit_free(ptr, 1));
 const PaintFitFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_paintfit_free(ptr, 1));

@@ -2,6 +2,28 @@
 /* eslint-disable */
 
 /**
+ * Recover a metal ball's roughness and spectral F0 from a target render.
+ */
+export class MaterialFit {
+    free(): void;
+    [Symbol.dispose](): void;
+    image_rgba(): Uint8Array;
+    /**
+     * `truth = [roughness, F0 blue, F0 green, F0 red]`.
+     */
+    constructor(size: number, spp: number, target_spp: number, truth: Float64Array);
+    /**
+     * One Adam step. Returns the loss before it.
+     */
+    step(): number;
+    target_rgba(): Uint8Array;
+    /**
+     * `[roughness, F0 blue, F0 green, F0 red]`.
+     */
+    theta(): Float64Array;
+}
+
+/**
  * Recover the room's paint, a three-band spectral albedo, from a target.
  */
 export class PaintFit {
@@ -60,9 +82,15 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly __wbg_materialfit_free: (a: number, b: number) => void;
     readonly __wbg_paintfit_free: (a: number, b: number) => void;
     readonly __wbg_roomrender_free: (a: number, b: number) => void;
     readonly __wbg_splatfit_free: (a: number, b: number) => void;
+    readonly materialfit_image_rgba: (a: number) => [number, number];
+    readonly materialfit_new: (a: number, b: number, c: number, d: number, e: number) => number;
+    readonly materialfit_step: (a: number) => number;
+    readonly materialfit_target_rgba: (a: number) => [number, number];
+    readonly materialfit_theta: (a: number) => [number, number];
     readonly paintfit_bands: (a: number) => [number, number];
     readonly paintfit_image_rgba: (a: number) => [number, number];
     readonly paintfit_new: (a: number, b: number, c: number, d: number, e: number) => number;
