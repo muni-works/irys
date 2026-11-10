@@ -260,7 +260,7 @@ pre .c { color: var(--muted); }
             <tr><td>GPU f32 vs CPU f64, worst parameter gradient</td><td class="v">3.5e-4</td></tr>
           </tbody>
         </table></div>
-        <p class="small">The differentiable material today is a GGX conductor with a three-band spectral Fresnel.</p>
+        <p class="small">What irys differentiates today: a GGX conductor with a three-band spectral Fresnel, lit only by the environment (a sky and a sun lobe). It renders diffuse surfaces and Gaussian splats but does not differentiate them.</p>
       </div>
     </div>
   </section>
@@ -334,20 +334,6 @@ cargo test -p irys</pre>
     </div>
   </section>
 
-  <section>
-    <div class="container">
-      <h2>Limits.</h2>
-      <p class="lead">The paper lists these as current limits.</p>
-      <div class="prov"><ul>
-        <li>Replay is bit-exact per device and driver, not across them.</li>
-        <li>irys renders splats and diffuse surfaces but does not differentiate them.</li>
-        <li>In the differentiable path, the only light is the environment, a sky and a sun lobe.</li>
-        <li>Poses move parts rigidly. Shape changes enter only through the vcad pullback.</li>
-        <li>All recorded timings are from one Apple M-series machine through Metal.</li>
-      </ul></div>
-      <p class="small">The paper's numbers trace to its <code>data/measured.tsv</code>, each row naming its test and commit, and to the dated build log in <a href="https://github.com/muni-works/irys/blob/main/docs/design.md">docs/design.md</a>.</p>
-    </div>
-  </section>
 
   <section>
     <div class="container-wide">
