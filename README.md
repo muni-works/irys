@@ -43,9 +43,9 @@ Everything is version 0.1.0 and the API is not stable. See
 | `irys-splat` | a 3D Gaussian splat trainer on the GPU tier: tile rasteriser forward and adjoint, Adam, densification |
 | `irys-ffi` | a C ABI that renders into an IOSurface-backed Metal texture (Apple only, a spike) |
 
-`irys-diff` and the crates below it in the table are `publish = false`:
-they depend on `tang-compile`, which is a git dependency. Build them from
-this repository.
+`irys-diff` and the crates below it in the table are `publish = false`
+for now; build them from this repository. Their tang dependencies all come
+from crates.io, so a project that links them needs no `[patch]`.
 
 ## Quickstart
 
@@ -174,9 +174,9 @@ The two share one benchmark: irys renders vcad's frozen-plan mesh of a
 robot-arm shoulder plate, takes the gradient of an image loss on every mesh
 node by edge sampling, and vcad pulls that back to a CAD parameter (the
 bearing bore diameter). The benchmark is the `rose_brep` example in
-`irys-diff` (added in commit `103e3da`). It reads the plate from
+`irys-diff`. It reads the plate from
 [rose](https://github.com/muni-works/rose) at commit `832192f`.
 
 ## License
 
-Apache-2.0, as declared in the workspace `Cargo.toml`.
+Apache-2.0, see [LICENSE](LICENSE).

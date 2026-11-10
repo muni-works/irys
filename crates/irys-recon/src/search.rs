@@ -32,7 +32,7 @@ use irys_core::{Point3, Ray, Vec3};
 
 use crate::canon;
 use crate::dsl::{Axis, Corner, Feature, Program};
-use crate::fit::{self, Fit, Fitter, Level, Target};
+use crate::fit::{self, Fit, Fitter, Hook, Level, Stage, Target};
 use crate::mdl::{self, Score};
 use crate::model::Setup;
 use crate::render;
@@ -661,11 +661,13 @@ pub struct Options {
     pub refit_look: bool,
     /// Start from this program instead of the silhouettes' box.
     pub base: Option<Program>,
+    /// Cancellation and progress (the default never cancels).
+    pub hook: Hook,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { workers: 8, rounds: 8, beam: 2, finalists: 4, sigma2: None, huber: None, refit_look: true, base: None }
+        Self { workers: 8, rounds: 8, beam: 2, finalists: 4, sigma2: None, huber: None, refit_look: true, base: None, hook: Hook::default() }
     }
 }
 
@@ -745,6 +747,9 @@ fn init_base(target: &Target, setup: &Setup) -> Program {
 /// a beam of [`Options::beam`] states; the best [`Options::finalists`]
 /// distinct programs it saw are refitted and scored at full resolution,
 /// and the lowest description wins.
+///
+/// Panics if the search fails; it cannot be cancelled into a value, so with
+/// a [`Hook`] that may cancel, call [`try_recover`].
 pub fn recover(
     target_full: &Target,
     background_full: &[Vec<f64>],
@@ -753,6 +758,20 @@ pub fn recover(
     proposer: &mut dyn Proposer,
     opts: &Options,
 ) -> Recovery {
+    try_recover(target_full, background_full, setup_full, target_spp, proposer, opts).expect("the search recovers a program")
+}
+
+/// [`recover`], with `Err(`[`fit::CANCELLED`]`)` once [`Options::hook`] is
+/// cancelled (within one Levenberg–Marquardt iteration of every worker).
+pub fn try_recover(
+    target_full: &Target,
+    background_full: &[Vec<f64>],
+    setup_full: &Setup,
+    target_spp: usize,
+    proposer: &mut dyn Proposer,
+    opts: &Options,
+) -> Result<Recovery, String> {
+    let hook = &opts.hook;
     let t0 = Instant::now();
     let photo = setup_full.photo.is_some();
     let (target, mut setup) = if photo {
@@ -777,11 +796,11 @@ pub fn recover(
         None => (Fitter::new(setup.clone(), target.clone(), target_spp, &base).sigma2, f64::NAN),
     };
     let make = |setup: &Setup| -> Vec<Fitter> {
-        (0..opts.workers).map(|_| Fitter::with_sigma2(setup.clone(), target.clone(), sigma2).robust(opts.huber)).collect()
+        (0..opts.workers).map(|_| Fitter::with_sigma2(setup.clone(), target.clone(), sigma2).robust(opts.huber).hooked(hook)).collect()
     };
     let mut fitters = make(&setup);
     let (mut iters, mut evals) = (0usize, 2usize);
-    let mut cur = fitters[0].fit(&base, &fit::schedule()).expect("the base box fits");
+    let mut cur = fitters[0].fit(&base, &fit::schedule()).map_err(|e| if hook.cancelled() { e } else { format!("the base box does not fit: {e}") })?;
     iters += cur.iters;
     evals += cur.evals;
     if photo && opts.refit_look {
@@ -798,6 +817,7 @@ pub fn recover(
     let mut pool: Vec<(Score, usize, Fit)> = Vec::new();
     let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
     for round in 1..=opts.rounds {
+        hook.step(Stage::Search, round, opts.rounds, Some(&beam[0].0.prog))?;
         let mut props: Vec<Proposal> = Vec::new();
         for (bf, bs) in &beam {
             let ctx = Context { fit: bf, score: *bs, target: &target, setup: &setup, history: &trace };
@@ -825,6 +845,8 @@ pub fn recover(
                 all
             })
         };
+        // A cancelled worker's fits are errors, not rejected candidates.
+        hook.check()?;
         let first = trace.len();
         let mut fresh: Vec<(Fit, Score, usize)> = Vec::new();
         for (i, r) in results {
@@ -947,13 +969,14 @@ pub fn recover(
     let levels = [Level { sigma: 1.0, lambda: 0.0, iters: 3 }, Level { sigma: 0.0, lambda: 0.0, iters: 8 }];
     let mut best: Option<(Fit, Score)> = None;
     let mut finals = Vec::new();
-    for prog in &finalists {
-        let mut full = if photo {
+    for (k, prog) in finalists.iter().enumerate() {
+        hook.step(Stage::Finalists, k + 1, finalists.len(), Some(prog))?;
+        let full = if photo {
             Fitter::with_sigma2(setup_full.clone(), target_full.clone(), sigma2_full).robust(opts.huber)
         } else {
             Fitter::new(setup_full.clone(), target_full.clone(), target_spp, prog)
         };
-        let Ok(f) = full.fit(prog, &levels) else { continue };
+        let Ok(f) = full.hooked(hook).fit(prog, &levels) else { continue };
         iters += f.iters;
         evals += f.evals + 2;
         if degenerate(&f.prog).is_some() {
@@ -966,14 +989,18 @@ pub fn recover(
         }
     }
     trace.push(Step { round: usize::MAX, why: format!("finalists at full resolution: {:?}", finals.iter().map(|(p, s)| (p.lines().count(), s.total.round())).collect::<Vec<_>>()), program: String::new(), score: None, accepted: false });
-    let (fit, score) = best.unwrap_or_else(|| {
-        let mut full = Fitter::with_sigma2(setup_full.clone(), target_full.clone(), if photo { sigma2_full } else { sigma2 }).robust(opts.huber);
-        let f = full.fit(&beam[0].0.prog, &levels).expect("the search's winner refits");
-        let s = mdl::score(&f);
-        (f, s)
-    });
+    hook.check()?;
+    let (fit, score) = match best {
+        Some(b) => b,
+        None => {
+            let mut full = Fitter::with_sigma2(setup_full.clone(), target_full.clone(), if photo { sigma2_full } else { sigma2 }).robust(opts.huber).hooked(hook);
+            let f = full.fit(&beam[0].0.prog, &levels).map_err(|e| if hook.cancelled() { e } else { format!("the search's winner does not refit: {e}") })?;
+            let s = mdl::score(&f);
+            (f, s)
+        }
+    };
     let judge = mdl::judge(&fit);
-    Recovery {
+    Ok(Recovery {
         program: canon::canonical(&fit.prog),
         fit,
         score,
@@ -983,7 +1010,7 @@ pub fn recover(
         iters,
         evals,
         seconds: t0.elapsed().as_secs_f64(),
-    }
+    })
 }
 
 /// The photo model's looks refitted (the linear part) on `prog`.
