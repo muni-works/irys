@@ -176,7 +176,7 @@ pre .c { color: var(--muted); }
   <section>
     <div class="container prose">
       <h2>How irys compares.</h2>
-      <p class="lead">Measured against Mitsuba 3 for gradients and Blender Cycles for rendering, each on the same Apple silicon machine and the same scenes as irys.</p>
+      <p class="lead">We measured irys against Mitsuba 3 for gradients and Blender Cycles for rendering, on the same Apple silicon machine and the same scenes.</p>
       <div class="proof">
         <div class="proof-item lit"><span class="proof-val">7&ndash;26&times;</span><span class="proof-label">faster material gradients than Mitsuba 3 at equal variance</span></div>
         <div class="proof-item"><span class="proof-val">1.5&ndash;5.6&times;</span><span class="proof-label">lower error than Cycles at equal time, on irys's three benchmark scenes</span></div>
@@ -193,7 +193,7 @@ pre .c { color: var(--muted); }
           <tr><td>Equal-time error vs Cycles: Barcelona Pavilion, clamped</td><td class="v">14&ndash;17&times; Cycles</td></tr>
         </tbody>
       </table></div>
-      <p class="small">Both renderers match their own central differences on the material gradient. On the robot arm, Mitsuba's pose gradient converged to a value its own central differences reject, so irys makes no pose comparison. The Cycles wins use irys's opt-in sun sampling share and scenes lit by a sky and sun. On Blender's demo files with full materials, Cycles is 2 to 3 times faster per sample and wins at all but the smallest budget. Sources: <code>bench/mitsuba</code> and the speed rounds in <a href="https://github.com/muni-works/irys/blob/main/docs/design.md">docs/design.md</a>.</p>
+      <p class="small">Both renderers match their own central differences on the material gradient. On the robot arm, Mitsuba's pose gradient converged to a value its own central differences reject, so irys makes no pose comparison. The Cycles wins use irys's sun sampling setting, which is off by default, on scenes lit by a sky and sun. On Blender's demo files with full materials, Cycles is 2 to 3 times faster per sample and wins at all but the smallest budget. Sources: <code>bench/mitsuba</code> and the speed rounds in <a href="https://github.com/muni-works/irys/blob/main/docs/design.md">docs/design.md</a>.</p>
       <p>irys owns no geometry. You implement the <code>Geometry</code> trait (bounds and ray intersection), and irys computes the lighting. It is the renderer for vcad, kosm, ipse, phyz and muni.</p>
     </div>
   </section>
@@ -250,7 +250,7 @@ pre .c { color: var(--muted); }
         <p>Write a material once. Run it on the GPU and check it in f64.</p>
       </div></div>
       <div class="step-body prose">
-        <p>Each BSDF is a graph in the <a href="https://tang.toys">tang</a> tensor compiler. tang lowers it to an evaluation program and an adjoint, emits WGSL for the GPU, and runs the same graph in f64 on the CPU. That separates three sources of error that are otherwise tangled together: estimator bias, device rounding and Monte Carlo noise.</p>
+        <p>Each BSDF is a graph in the <a href="https://tang.toys">tang</a> tensor compiler. tang lowers it to an evaluation program and an adjoint, emits WGSL for the GPU, and runs the same graph in f64 on the CPU. Comparing the two tiers separates three sources of error: estimator bias, device rounding and Monte Carlo noise.</p>
         <div class="tbl"><table>
           <thead><tr><th>Check</th><th class="v">Relative error</th></tr></thead>
           <tbody>
@@ -272,8 +272,8 @@ pre .c { color: var(--muted); }
         <p>When a joint turns, its silhouette, shading and shadow change, and the gradient includes each of them.</p>
       </div></div>
       <div class="step-body prose">
-        <p>A scene is a two-level BVH of CAD parts and their instances. irys samples primary edges for silhouettes and creases, differentiates the interior by forward-mode duals with frames attached to each moving part, and samples secondary edges so that shadows and reflections contribute. The same machinery differentiates a seven-parameter camera.</p>
-        <p>On the rose robot, 2.4 million triangles tessellated by vcad, a fit of the arm recovers three joint angles to within 0.07 degrees from a start 13 to 23 degrees away, on a synthetic target. On the arm over a floor, the shadow carries about 15% of the gradient. With secondary edges, the gradient agrees with central differences within 1.1 standard errors.</p>
+        <p>A scene is a two-level BVH of CAD parts and their instances. irys samples primary edges for silhouettes and creases, differentiates the interior by forward-mode duals with frames attached to each moving part, and samples secondary edges so that shadows and reflections contribute. The same edge sampler and duals also differentiate a seven-parameter camera.</p>
+        <p>On the rose robot, 2.4 million triangles tessellated by vcad, a fit of the arm recovers three joint angles to within 0.07 degrees from a start 13 to 23 degrees away, on a synthetic target. On the arm over a floor, the shadow accounts for about 15% of the gradient. With secondary edges, the gradient agrees with central differences within 1.1 standard errors.</p>
       </div>
     </div>
     <div class="container-wide" style="margin-top:2rem">
@@ -314,7 +314,7 @@ pre .c { color: var(--muted); }
   <section id="start">
     <div class="container prose">
       <h2>Quick start.</h2>
-      <p class="lead">The renderer is on crates.io as <code>irys-render</code>. Its library is still called <code>irys</code>.</p>
+      <p class="lead">The renderer is on crates.io as <code>irys-render</code>. Code still imports it as <code>irys</code>.</p>
 <pre>cargo add irys-render                 <span class="c"># CPU</span>
 cargo add irys-render --features gpu  <span class="c"># with the wgpu tier</span></pre>
       <p>The differentiable crates depend on tang-compile, which is not on crates.io yet, so run them from a clone. That needs Rust 1.95 or newer and a C compiler on your PATH, and the first build fetches tang from git.</p>
@@ -330,7 +330,7 @@ cargo run --release -p irys-diff --features gpu --example fit_gpu -- out/fit_gpu
 
 <span class="c"># Tests. GPU tests skip when there is no adapter.</span>
 cargo test -p irys</pre>
-      <p class="small">The <code>irys</code> crate on crates.io is an unrelated project. Everything is version 0.1.0 and the API is not stable. The core crates are the most settled; <code>irys-diff</code> and the crates built on it are research code. Timings are recorded on Apple silicon with Metal; the test suite also passes on an NVIDIA RTX 3090 through Vulkan.</p>
+      <p class="small">The <code>irys</code> crate on crates.io is an unrelated project. Everything is version 0.1.0 and the API is not stable. The core crates are the most settled; <code>irys-diff</code> and the crates built on it are research code. All timings come from Apple silicon with Metal. The test suite also passes on an NVIDIA RTX 3090 through Vulkan.</p>
     </div>
   </section>
 
@@ -352,7 +352,7 @@ cargo test -p irys</pre>
 
 <footer class="site-foot">
   <a href="https://muni.works" class="foot-logo" aria-label="Municipal Robotics"><svg viewBox="-60 -60 880 400" fill="none"><g stroke="currentColor" stroke-width="40" stroke-linecap="round" stroke-linejoin="round" fill="none"> <path d="M 20 240 L 20 100 C 20 50, 80 50, 100 50 C 140 50, 160 70, 160 100"/> <path d="M 160 240 L 160 100"/> <path d="M 160 100 C 160 50, 220 50, 240 50 C 280 50, 300 70, 300 100 L 300 240 C 300 270, 330 280, 370 280 C 410 280, 440 270, 440 240 L 440 100"/> <path d="M 440 100 C 440 50, 500 50, 520 50 C 560 50, 600 70, 600 100 L 600 240 C 600 270, 630 280, 670 280 C 710 280, 740 270, 740 240 L 740 100"/> </g></svg></a>
-  <p>irys is built by <a href="https://muni.works">Municipal Robotics</a> alongside <a href="https://tang.toys">tang</a>, <a href="https://vcad.io">vcad</a> and <a href="https://phyz.dev">phyz</a>.</p>
+  <p><a href="https://muni.works">Municipal Robotics</a> builds irys alongside <a href="https://tang.toys">tang</a>, <a href="https://vcad.io">vcad</a> and <a href="https://phyz.dev">phyz</a>.</p>
   <p class="foot-links"><a href="https://github.com/muni-works/irys">GitHub</a><span>·</span><a href="https://muni.works/research/irys">Paper</a><span>·</span><span>Apache-2.0</span><span>·</span><a href="https://muni.works">muni.works</a></p>
 </footer>
 
