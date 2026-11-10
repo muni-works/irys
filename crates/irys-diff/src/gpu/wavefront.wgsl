@@ -55,6 +55,7 @@ struct Params {
     qmc: vec4<u32>,       // phase 3 sampler: (Sobol on, wavelengths by importance, 0, 0)
     rr: vec4<f32>,        // phase 3 Russian roulette: (on, first vertex, survival floor, 0)
     dband: vec4<f32>,     // `Scene::diffuse_bands`: (d0, d1, d2, on)
+    splat: vec4<u32>,     // `Scene::splat_grad`: (on, records per path, 0, 0)
 }
 
 const NONE: u32 = 0xffffffffu;
@@ -128,6 +129,15 @@ struct Path {
 // summed over its vertices in bounce order during the replay; the host
 // sums paths in index order. No atomics, so the replay stays exact.
 @group(0) @binding(73) var<storage, read_write> dalb: array<vec4<f32>>;
+// Splat gradients (`Scene::splat_grad`), replay only: per path slot up to
+// `params.splat.y` records, one per splat a segment crossed, in bounce
+// then compositing order — the splat's index and its (∂dc_r, ∂dc_g, ∂dc_b,
+// ∂opacity), already weighted by δL and summed over the path's lanes. The
+// host adds them in path order after each chunk; a count past the
+// capacity is reported, never wrapped.
+@group(0) @binding(74) var<storage, read_write> srec_i: array<u32>;
+@group(0) @binding(75) var<storage, read_write> srec_g: array<vec4<f32>>;
+@group(0) @binding(76) var<storage, read_write> srec_n: array<u32>;
 // Speed piece 2, lane compaction (`compact.wgsl`): `bounce` stages a
 // conductor vertex's two lane groups here — (cos_i, cos_o, cos_h, o·h) for
 // the BSDF sample, then for the light sample — and says which it wrote in
@@ -604,7 +614,22 @@ struct Segment {
 // after the last one composited", each a full walk of the splat tree that
 // keeps a sorted K-buffer and culls boxes beyond its last entry once full.
 fn composite(o: vec3<f32>, d: vec3<f32>, tmin: f32, tmax: f32) -> Segment {
+    let z = vec4<f32>(0.0);
+    return composite_x(o, d, tmin, tmax, false, 0u, z, z, z, z, z);
+}
+
+// The compositor, and with `grad` its replay: the same walk, the same
+// arithmetic for the segment, and per splat crossed a record of
+// `prb.rs`'s derivative — ∂L/∂α_s = τ T_s c_s − (E − E_≤s + R) / (1 − α_s)
+// and ∂L/∂dc = τ T_s α_s SH_C0 b(λ) — with E the segment's emission and
+// R the light beyond it per lane, from a first, plain walk.
+fn composite_x(
+    o: vec3<f32>, d: vec3<f32>, tmin: f32, tmax: f32,
+    grad: bool, slot: u32, lam: vec4<f32>, tau: vec4<f32>, dl: vec4<f32>,
+    e_seg: vec4<f32>, r_beyond: vec4<f32>,
+) -> Segment {
     var seg = Segment(vec3<f32>(0.0), 1.0);
+    var e_incl = vec4<f32>(0.0);
     if (params.splat_root == NONE) { return seg; }
     let inv = 1.0 / d;
     var t0 = tmin;
@@ -661,6 +686,29 @@ fn composite(o: vec3<f32>, d: vec3<f32>, tmin: f32, tmax: f32) -> Segment {
         for (var k = 0u; k < cnt; k = k + 1u) {
             let alpha = clamp(ka[k], 0.0, 1.0);
             let c = geo[params.splat_base + 4u * ki[k] + 3u].xyz;
+            if (grad && alpha > 0.0) {
+                let op = geo[params.splat_base + 4u * ki[k]].w;
+                var g = vec4<f32>(0.0);
+                for (var w = 0u; w < params.nw; w = w + 1u) {
+                    let bw = band_weights(lam[w]);
+                    let cs = splat_lambda(c, lam[w]);
+                    let e = tau[w] * seg.tr * alpha * cs;
+                    e_incl[w] = e_incl[w] + e;
+                    let s = dl[w] * tau[w] * seg.tr * alpha * 0.28209479;
+                    let basis = vec3<f32>(bw.z, bw.y, bw.x);
+                    g = g + vec4<f32>(select(vec3<f32>(0.0), s * basis, c > vec3<f32>(0.0)), 0.0);
+                    if (alpha < 1.0 && op > 0.0) {
+                        let da = tau[w] * seg.tr * cs - (e_seg[w] - e_incl[w] + r_beyond[w]) / (1.0 - alpha);
+                        g.w = g.w + dl[w] * da * alpha / op;
+                    }
+                }
+                let n = srec_n[slot];
+                if (n < params.splat.y) {
+                    srec_i[slot * params.splat.y + n] = ki[k];
+                    srec_g[slot * params.splat.y + n] = g;
+                }
+                srec_n[slot] = n + 1u;
+            }
             seg.rad = seg.rad + seg.tr * alpha * c;
             seg.tr = seg.tr * (1.0 - alpha);
             if (seg.tr <= 1e-4) {
@@ -982,6 +1030,21 @@ fn bounce_at(i: u32, last: bool) {
     let hit = intersect(o, d, 3.4e38, false);
     if (params.splat_root != NONE) {
         let seg = composite(o, d, params.eps * 0.1, hit.t);
+        if (params.splat.x != 0u && params.replay != 0u) {
+            let g = params.base + i;
+            var tau = vec4<f32>(0.0);
+            var dlv = vec4<f32>(0.0);
+            var es = vec4<f32>(0.0);
+            var rb = vec4<f32>(0.0);
+            for (var k = 0u; k < params.nw; k = k + 1u) {
+                let fj = g * params.nw + k;
+                tau[k] = p.tp[k];
+                dlv[k] = dl_in[fj];
+                es[k] = p.tp[k] * splat_lambda(seg.rad, lam[k]);
+                rb[k] = l_in[fj] - p.rad[k] - es[k];
+            }
+            _ = composite_x(o, d, params.eps * 0.1, hit.t, true, i, lam, tau, dlv, es, rb);
+        }
         for (var k = 0u; k < params.nw; k = k + 1u) {
             p.rad[k] = p.rad[k] + p.tp[k] * splat_lambda(seg.rad, lam[k]);
             p.tp[k] = p.tp[k] * seg.tr;

@@ -98,6 +98,8 @@ pub(crate) fn sobol_offsets() -> String {
 }
 
 const PATH_BYTES: u64 = 80;
+/// Splat-gradient records a path slot holds per replay (`Scene::splat_grad`).
+const SPLAT_RECORDS: u32 = 256;
 const WG: u32 = 64;
 
 #[repr(C)]
@@ -141,6 +143,7 @@ struct Params {
     qmc: [u32; 4],
     rr: [f32; 4],
     dband: [f32; 4],
+    splat: [u32; 4],
 }
 
 /// The splat compositor's segment start, `EPS / 10` (phase 2b's, unchanged).
@@ -326,6 +329,11 @@ pub struct GpuPrb {
     grad: wgpu::Buffer,
     /// Per path `δd` for [`Scene::diffuse_bands`] (`vec4` each).
     dalb: wgpu::Buffer,
+    /// Splat-gradient records: index, value, count per path slot.
+    srec: [wgpu::Buffer; 3],
+    /// The splats' gradient summed so far this replay, and records lost to
+    /// a full slot.
+    splat_acc: std::cell::RefCell<(Vec<[f64; 4]>, u64)>,
     target: wgpu::Buffer,
     img: wgpu::Buffer,
     loss: wgpu::Buffer,
@@ -658,6 +666,12 @@ impl GpuPrb {
         let l2 = storage("l replayed", lane_bytes);
         let grad = storage("grad", PARAMS as u64 * 4);
         let dalb = storage("diffuse band grad", scene.paths().max(1) as u64 * 16);
+        let sr = if scene.splat_grad { SPLAT_RECORDS as u64 } else { 1 };
+        let srec = [
+            storage("splat rec index", paths as u64 * sr * 4),
+            storage("splat rec grad", paths as u64 * sr * 16),
+            storage("splat rec count", paths as u64 * 4),
+        ];
         let pixels = (scene.size.0 * scene.size.1) as u64;
         let target = storage("target", pixels * 12);
         let img = storage("image", pixels * 12);
@@ -823,6 +837,9 @@ impl GpuPrb {
             (10, &l),
             (11, &dl),
             (73, &dalb),
+            (74, &srec[0]),
+            (75, &srec[1]),
+            (76, &srec[2]),
         ];
         let mut scatter: Vec<(u32, &wgpu::Buffer)> = vec![
             (0, &params),
@@ -973,6 +990,8 @@ impl GpuPrb {
             l2,
             grad,
             dalb,
+            srec,
+            splat_acc: Default::default(),
             target,
             img,
             loss,
@@ -1111,6 +1130,7 @@ impl GpuPrb {
                 Some(d) => [d[0] as f32, d[1] as f32, d[2] as f32, 1.0],
                 None => [0.0; 4],
             },
+            splat: [scene.splat_grad as u32, SPLAT_RECORDS, 0, 0],
             restir: match scene.restir {
                 Some(r) => [
                     (r.neighbours.min(9) << 8) | r.radius.min(255),
@@ -1218,7 +1238,19 @@ impl GpuPrb {
                 0,
                 bytemuck::bytes_of(&self.params(scene, theta, seed, replay, c)),
             );
+            let splats = replay && scene.splat_grad;
+            if splats {
+                let mut enc = self
+                    .ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                enc.clear_buffer(&self.srec[2], 0, None);
+                q.submit([enc.finish()]);
+            }
             q.submit([self.encode_trace(scene, replay)]);
+            if splats {
+                self.gather_splats(scene);
+            }
         }
         if score != Score::None {
             q.submit([self.encode_score(scene, score)]);
@@ -1327,7 +1359,43 @@ impl GpuPrb {
         self.ctx.queue.submit([enc.finish()]);
     }
 
+    /// Add one chunk's splat records into the running sum, path slot by
+    /// path slot, record by record: the CPU reference's order.
+    fn gather_splats(&self, scene: &Scene) {
+        let cap = SPLAT_RECORDS as usize;
+        let n = self.paths as usize;
+        let counts = self.read(&self.srec[2], n);
+        let idx = self.read(&self.srec[0], n * cap);
+        let val = self.read(&self.srec[1], n * cap * 4);
+        let mut acc = self.splat_acc.borrow_mut();
+        let ns = scene.splats().map_or(0, |b| irys_core::Geometry::len(b.geometry()));
+        if acc.0.len() != ns {
+            acc.0 = vec![[0.0; 4]; ns];
+        }
+        for slot in 0..n {
+            let c = counts[slot].to_bits() as usize;
+            if c > cap {
+                acc.1 += (c - cap) as u64;
+            }
+            for r in 0..c.min(cap) {
+                let at = slot * cap + r;
+                let i = idx[at].to_bits() as usize;
+                for k in 0..4 {
+                    acc.0[i][k] += val[at * 4 + k] as f64;
+                }
+            }
+        }
+    }
+
+    /// The splats' gradient from the last replay ([`Scene::splat_grad`]):
+    /// per splat `(∂dc_r, ∂dc_g, ∂dc_b, ∂opacity)`, and how many records a
+    /// full path slot dropped (zero, or the result is incomplete).
+    pub fn splat_grad(&self) -> (Vec<[f64; 4]>, u64) {
+        self.splat_acc.borrow().clone()
+    }
+
     fn clear_dalb(&self) {
+        *self.splat_acc.borrow_mut() = Default::default();
         let mut enc = self
             .ctx
             .device

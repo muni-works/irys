@@ -103,3 +103,77 @@ fn splat_cpu_gradient_matches_central_differences() {
     eprintln!("worst rel {worst:.1e}");
     assert!(worst < 1e-3, "worst rel {worst}");
 }
+
+#[cfg(feature = "gpu")]
+mod gpu_tier {
+    use super::*;
+    use irys_diff::gpu::{self, GpuPrb};
+
+    macro_rules! device {
+        () => {
+            match gpu::context() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("no GPU ({e}): skipping");
+                    return;
+                }
+            }
+        };
+    }
+
+    /// GPU f32 splat gradients against the CPU f64 reference, at the
+    /// splats with the largest gradients; no record is dropped.
+    #[test]
+    fn splat_gpu_matches_cpu_f64() {
+        let ctx = device!();
+        let mut scene = garden();
+        let mut k = Kernels::for_scene(&scene, false);
+        let t = target(&mut scene, &mut k);
+        scene.splat_grad = true;
+        let (vc, _, ex) = prb::gradient_splats(&scene, &THETA0, (7, 7), &mut k, &L2(&t));
+        let mut g = GpuPrb::new(ctx, &scene);
+        g.set_target(&t);
+        let (vg, _) = g.gradient_l2(&scene, &THETA0, (7, 7));
+        let (sg, dropped) = g.splat_grad();
+        eprintln!("loss gpu {vg:.6e} cpu {vc:.6e}; records dropped {dropped}");
+        assert_eq!(dropped, 0);
+        assert!(rel(vg, vc) < 1e-2);
+        let mut order: Vec<usize> = (0..ex.splats.len()).collect();
+        order.sort_by(|&a, &b| ex.splats[b][3].abs().total_cmp(&ex.splats[a][3].abs()));
+        let mut worst = 0.0f64;
+        for &i in order.iter().take(16) {
+            for p in 0..4 {
+                let e = rel(sg[i][p], ex.splats[i][p]);
+                worst = worst.max(e);
+            }
+            eprintln!("splat {i}: gpu {:+.4e} {:+.4e} {:+.4e} {:+.4e}  cpu {:+.4e} {:+.4e} {:+.4e} {:+.4e}",
+                sg[i][0], sg[i][1], sg[i][2], sg[i][3], ex.splats[i][0], ex.splats[i][1], ex.splats[i][2], ex.splats[i][3]);
+        }
+        eprintln!("worst rel over the 16 largest: {worst:.1e}");
+        assert!(worst < 2e-2, "worst {worst}");
+    }
+
+    /// With splat gradients on, the replay is bit-exact and two replays
+    /// give bitwise-identical splat gradients.
+    #[test]
+    fn splat_replay_is_bit_exact() {
+        let ctx = device!();
+        let mut scene = Scene::garden(64, 64, 4);
+        scene.depth = 4;
+        scene.splat_grad = true;
+        let mut g = GpuPrb::new(ctx, &scene);
+        let l = g.forward(&scene, &THETA0, 11);
+        let dl = vec![1.0; l.len()];
+        let (_, l2) = g.replay(&scene, &THETA0, 11, &dl);
+        let (s1, d1) = g.splat_grad();
+        let (_, _) = g.replay(&scene, &THETA0, 11, &dl);
+        let (s2, _) = g.splat_grad();
+        assert_eq!(d1, 0, "records dropped");
+        let b = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(b(&l), b(&l2), "replay L differs");
+        let flat = |s: &[[f64; 4]]| s.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(flat(&s1), flat(&s2));
+        eprintln!("{} of {} lanes bit-identical; {} splats with a gradient",
+            l.len(), l.len(), s1.iter().filter(|g| g.iter().any(|x| *x != 0.0)).count());
+    }
+}
