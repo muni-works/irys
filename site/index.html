@@ -175,10 +175,10 @@ pre .c { color: var(--muted); }
 <main>
   <section>
     <div class="container prose">
-      <h2>A gradient you can check.</h2>
+      <h2>Every gradient has a reference.</h2>
       <p class="lead">A differentiable renderer says how each pixel would change if a material, a pose or a dimension changed. Optimisers consume that answer, so an error in it does not show as a wrong pixel. It shows as a fit that does not converge.</p>
       <p>irys computes those derivatives by path replay. The replay regenerates the forward pass's paths exactly, and every gradient has an f64 reference to check it against. A gradient test that fails therefore points to a bug, not to noise or rounding.</p>
-      <p>irys owns no geometry. You implement the <code>Geometry</code> trait (bounds and ray intersection) and irys does the light. It is the renderer for vcad, kosm, ipse, phyz and muni.</p>
+      <p>irys owns no geometry. You implement the <code>Geometry</code> trait (bounds and ray intersection), and irys computes the lighting. It is the renderer for vcad, kosm, ipse, phyz and muni.</p>
       <div class="proof">
         <div class="proof-item lit"><span class="proof-val">65 536</span><span class="proof-label">of 65 536 lanes where replay matches the forward radiance bit for bit</span></div>
         <div class="proof-item"><span class="proof-val">7.5<small> ms</small></span><span class="proof-label">GPU gradient of a 96&times;96, 8 spp frame at depth 4, against 116 to 129 ms on the CPU</span></div>
@@ -192,7 +192,7 @@ pre .c { color: var(--muted); }
     <div class="container">
       <div class="step-head"><span class="step-n">01</span><div>
         <h2>Spectral path tracing on the GPU.</h2>
-        <p>One renderer, from a CPU path tracer over any geometry to a wgpu compute tier.</p>
+        <p>A CPU path tracer over any geometry, and a compute tier on wgpu.</p>
       </div></div>
       <div class="step-body prose">
         <p>irys traces spectra, not RGB. Each path carries four wavelengths, and at equal paths that cuts per-pixel chroma noise 28.7 times. The CPU tracer covers BVH and TLAS scenes, analytic primitives, triangle meshes, heightfields, Gaussian splats and caustics. The GPU tier runs a WGSL integrator on wgpu 30. An OpenPBR scene kernel handles volumes, skin and hair, and an importer reads scenes exported from Blender.</p>
@@ -226,7 +226,7 @@ pre .c { color: var(--muted); }
         <p>The backward pass redraws the forward pass's paths, bit for bit.</p>
       </div></div>
       <div class="step-body prose">
-        <p>irys runs path replay backpropagation on a GPU wavefront, with next-event estimation and multiple importance sampling. Replay stores nothing per vertex: it regenerates each path from its seed through the same pipelines. Three choices make that regeneration exact. An integer SplitMix64 built from 16-bit limbs gives the GPU the CPU's random stream. Reductions run in a fixed order with no float atomics. The BVH walk depends only on the ray.</p>
+        <p>irys runs path replay backpropagation on a GPU wavefront, with next-event estimation and multiple importance sampling. Replay stores nothing per vertex. It regenerates each path from its seed through the same pipelines. Three choices make that regeneration exact. An integer SplitMix64 built from 16-bit limbs gives the GPU the CPU's random stream. Reductions run in a fixed order with no float atomics. The BVH walk depends only on the ray.</p>
         <p>Memory scales with paths, not depth. A path costs 63 f64 words at depth 2 and at depth 8 alike, and a 1024&times;1024 frame at 4 spp replays bit for bit in nine chunks.</p>
         <p class="small">Replay is bit-exact per device and driver. Another GPU or compiler may round differently, and then agrees with the CPU reference to f32 precision. Timings are from one Apple M-series machine through Metal.</p>
       </div>
@@ -259,7 +259,7 @@ pre .c { color: var(--muted); }
     <div class="container">
       <div class="step-head"><span class="step-n">04</span><div>
         <h2>Pose gradients through instanced CAD.</h2>
-        <p>Move a joint, and the gradient sees the silhouette, the shading and the shadow move.</p>
+        <p>When a joint turns, its silhouette, shading and shadow change, and the gradient includes each of them.</p>
       </div></div>
       <div class="step-body prose">
         <p>A scene is a two-level BVH of CAD parts and their instances. irys samples primary edges for silhouettes and creases, differentiates the interior by forward-mode duals with frames attached to each moving part, and samples secondary edges so that shadows and reflections contribute. The same machinery differentiates a seven-parameter camera.</p>
@@ -296,7 +296,7 @@ pre .c { color: var(--muted); }
             <tr><td>finite-difference render, h = 0.1 mm</td><td class="v">40.0144</td><td class="v">3.85e-3</td></tr>
           </tbody>
         </table></div>
-        <p class="small">The pullback has no step size. It is exact for the frozen mesh, and the irys edge sampling error is its only noise. Recovering editable CAD from photographs is built on irys and covered in a companion paper, <i>Seeing Is Measuring</i>.</p>
+        <p class="small">The pullback has no step size. It is exact for the frozen mesh, and the irys edge sampling error is its only noise. A companion paper, <i>Seeing Is Measuring</i>, uses irys to recover editable CAD from photographs.</p>
       </div>
     </div>
   </section>
@@ -324,11 +324,11 @@ cargo test -p irys</pre>
   <section>
     <div class="container">
       <h2>Limits.</h2>
-      <p class="lead">What the paper states irys does not do yet.</p>
+      <p class="lead">The paper lists these as current limits.</p>
       <div class="prov"><ul>
         <li>Replay is bit-exact per device and driver, not across them.</li>
-        <li>Splats and diffuse surfaces are rendered but not differentiated.</li>
-        <li>In the differentiable path, only the environment emits light: a sky and a sun lobe.</li>
+        <li>irys renders splats and diffuse surfaces but does not differentiate them.</li>
+        <li>In the differentiable path, the only light is the environment, a sky and a sun lobe.</li>
         <li>Poses move parts rigidly. Shape changes enter only through the vcad pullback.</li>
         <li>All recorded timings are from one Apple M-series machine through Metal.</li>
       </ul></div>
