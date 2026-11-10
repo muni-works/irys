@@ -119,8 +119,9 @@ struct Path {
 // (v1, 0), (v2, 0) — the cumulative area share light sampling picks by.
 @group(0) @binding(40) var<storage, read> lights: array<vec4<f32>>;
 // Phase 3 sampler (`qmc.rs`): Sobol's four direction matrices (32 words
-// each; the device reads dimensions 1–3 from the `SOBOL_T` byte tables instead),
-// then the wavelength CDF's 257 f32s as bits.
+// each; the device reads dimensions 1–3 from the byte tables instead),
+// the wavelength CDF's 257 f32s as bits, then `qmc::byte_tables` at
+// `SOBOL_OFF` and `qmc::value_keys` at `QKEY_OFF`.
 @group(0) @binding(56) var<storage, read> qtab: array<u32>;
 // Speed piece 2, lane compaction (`compact.wgsl`): `bounce` stages a
 // conductor vertex's two lane groups here — (cos_i, cos_o, cos_h, o·h) for
@@ -803,18 +804,17 @@ fn owen(x0: u32, seed: u32) -> u32 {
 }
 
 // Sobol dimension d of index i. Dimension 0 is van der Corput (the bits
-// reversed); the others XOR four byte-table entries of `SOBOL_T` (a module
-// constant the host splices in from `qmc::byte_tables`, the column walk's
-// integers bit for bit).
+// reversed); the others XOR four byte-table entries read from `qtab` (the
+// host uploads `qmc::byte_tables`, the column walk's integers bit for bit).
 fn sobol(i: u32, d: u32) -> u32 {
     if (d == 0u) {
         return reverseBits(i);
     }
     let t = (d - 1u) * 1024u;
-    return SOBOL_T[t + (i & 255u)]
-        ^ SOBOL_T[t + 256u + ((i >> 8u) & 255u)]
-        ^ SOBOL_T[t + 512u + ((i >> 16u) & 255u)]
-        ^ SOBOL_T[t + 768u + (i >> 24u)];
+    return qtab[SOBOL_OFF + t + (i & 255u)]
+        ^ qtab[SOBOL_OFF + t + 256u + ((i >> 8u) & 255u)]
+        ^ qtab[SOBOL_OFF + t + 512u + ((i >> 16u) & 255u)]
+        ^ qtab[SOBOL_OFF + t + 768u + (i >> 24u)];
 }
 
 // A path's generator: SplitMix64, or (Sobol) the draw counter and the
@@ -847,7 +847,7 @@ fn pdraws(s: ptr<function, vec2<u32>>, n: u32) -> vec4<f32> {
     let j = owen(index, seed);
     for (var k = 0u; k < n; k = k + 1u) {
         let d = (c & 3u) + k;
-        let x = owen(sobol(j, d), qhash(seed ^ QKEY[d]));
+        let x = owen(sobol(j, d), qhash(seed ^ qtab[QKEY_OFF + d]));
         u[k] = f32(x >> 8u) * (1.0 / 16777216.0);
     }
     return u;
@@ -895,7 +895,12 @@ fn spec_pdf(l: f32) -> f32 {
     if (params.qmc.y == 0u) {
         return 1.0;
     }
-    let b = min(u32(max((l - 380.0) / 400.0 * 256.0, 0.0)), 255u);
+    var b = min(u32(max((l - 380.0) / 400.0 * 256.0, 0.0)), 255u);
+    // `Spectral::pdf`'s rule: a zero-mass bin is only ever its lower edge,
+    // reached by rounding from the bin below.
+    if (b > 0u && spec_cdf(b + 1u) == spec_cdf(b)) {
+        b = b - 1u;
+    }
     return (spec_cdf(b + 1u) - spec_cdf(b)) * 256.0;
 }
 

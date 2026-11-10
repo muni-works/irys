@@ -83,6 +83,20 @@ pub(crate) fn sobol_const() -> String {
         keys.join(", ")
     )
 }
+/// Where `sampler_tables` puts the Sobol byte tables and scramble keys, as
+/// WGSL constants. The wavefront reads them from the `qtab` storage buffer,
+/// not from module-constant arrays: a large constant array indexed at run
+/// time is lowered to a per-invocation local copy, and inside `bounce` that
+/// made NVIDIA's Vulkan compiler fault and lose the device (RTX 3090, driver
+/// 580). The words are the same, so the stream is unchanged.
+pub(crate) fn sobol_offsets() -> String {
+    let base = 4 * 32 + crate::qmc::Spectral::get().cdf.len();
+    format!(
+        "const SOBOL_OFF: u32 = {base}u;\nconst QKEY_OFF: u32 = {}u;\n",
+        base + crate::qmc::byte_tables().len()
+    )
+}
+
 const PATH_BYTES: u64 = 80;
 const WG: u32 = 64;
 
@@ -566,6 +580,8 @@ impl Grid {
 fn sampler_tables() -> Vec<u32> {
     let mut t: Vec<u32> = crate::qmc::sobol_matrices().iter().flatten().copied().collect();
     t.extend(crate::qmc::Spectral::get().cdf.iter().map(|c| c.to_bits()));
+    t.extend(crate::qmc::byte_tables());
+    t.extend(crate::qmc::value_keys());
     t
 }
 
@@ -739,7 +755,7 @@ impl GpuPrb {
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("prb wavefront"),
             source: wgpu::ShaderSource::Wgsl(
-                wavefront_src(accel.is_some(), &format!("{RESTIR}\n{GUIDE}\n{COMPACT}\n{}", sobol_const())).into(),
+                wavefront_src(accel.is_some(), &format!("{RESTIR}\n{GUIDE}\n{COMPACT}\n{}", sobol_offsets())).into(),
             ),
         });
         let pipe = |entry: &str| {
@@ -795,6 +811,7 @@ impl GpuPrb {
             (52, &g_ok),
             (53, &g_rec),
             (54, &g_nrec),
+            (56, &qtab),
             (59, &lane_bits),
             (60, &stage),
             (71, &cold),
@@ -1701,7 +1718,7 @@ impl GpuEdges {
         let params = uni("edge scene params", std::mem::size_of::<Params>() as u64);
         // The edge sampler's visibility stays on the WGSL walk: one eye ray
         // per edge point, not a frame's worth of bounces.
-        let src = wavefront_src(false, &format!("{RESTIR}\n{GUIDE}\n{EDGES}\n{}", sobol_const()));
+        let src = wavefront_src(false, &format!("{RESTIR}\n{GUIDE}\n{EDGES}\n{}", sobol_offsets()));
         let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("edges"),
             source: wgpu::ShaderSource::Wgsl(src.into()),
