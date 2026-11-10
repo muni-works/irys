@@ -54,6 +54,7 @@ struct Params {
     gres2: vec4<u32>,     // records per path, cells, samples a cell needs, 0
     qmc: vec4<u32>,       // phase 3 sampler: (Sobol on, wavelengths by importance, 0, 0)
     rr: vec4<f32>,        // phase 3 Russian roulette: (on, first vertex, survival floor, 0)
+    dband: vec4<f32>,     // `Scene::diffuse_bands`: (d0, d1, d2, on)
 }
 
 const NONE: u32 = 0xffffffffu;
@@ -123,6 +124,10 @@ struct Path {
 // the wavelength CDF's 257 f32s as bits, then `qmc::byte_tables` at
 // `SOBOL_OFF` and `qmc::value_keys` at `QKEY_OFF`.
 @group(0) @binding(56) var<storage, read> qtab: array<u32>;
+// Spectral diffuse albedo (`Scene::diffuse_bands`): each path's own δd,
+// summed over its vertices in bounce order during the replay; the host
+// sums paths in index order. No atomics, so the replay stays exact.
+@group(0) @binding(73) var<storage, read_write> dalb: array<vec4<f32>>;
 // Speed piece 2, lane compaction (`compact.wgsl`): `bounce` stages a
 // conductor vertex's two lane groups here — (cos_i, cos_o, cos_h, o·h) for
 // the BSDF sample, then for the light sample — and says which it wrote in
@@ -1076,10 +1081,31 @@ fn bounce_at(i: u32, last: bool) {
             bounce_guided(i, &p, &s, x, n, origin, albedo, lit, ld, lcos, lpdf, lem, ldiv, lw);
             return;
         }
+        // `Scene::diffuse_bands`: the albedo per lane, and in the replay
+        // δd_k += δL (L − L⁻) b_k / A with L⁻ the radiance before this
+        // vertex (`prb.rs` derives it).
+        var alb = vec4<f32>(albedo);
+        if (params.dband.w != 0.0) {
+            let scale = albedo / params.albedo;
+            let g = params.base + i;
+            var acc = vec4<f32>(0.0);
+            for (var k = 0u; k < params.nw; k = k + 1u) {
+                let bw = band_weights(lam[k]);
+                let a = dot(bw, params.dband.xyz);
+                alb[k] = scale * a;
+                if (params.replay != 0u && a != 0.0) {
+                    let fj = g * params.nw + k;
+                    acc = acc + vec4<f32>(bw * (dl_in[fj] * (l_in[fj] - p.rad[k]) / a), 0.0);
+                }
+            }
+            if (params.replay != 0u) {
+                dalb[g] = dalb[g] + acc;
+            }
+        }
         if (lit) {
             let w = mis(lpdf, lcos / PI);
             for (var k = 0u; k < params.nw; k = k + 1u) {
-                p.rad[k] = p.rad[k] + p.tp[k] * albedo / PI * lcos * light_le(ld, lem, lam[k]) * w / ldiv * lw;
+                p.rad[k] = p.rad[k] + p.tp[k] * alb[k] / PI * lcos * light_le(ld, lem, lam[k]) * w / ldiv * lw;
             }
         }
         palign(&s);
@@ -1099,7 +1125,7 @@ fn bounce_at(i: u32, last: bool) {
         let cz = sqrt(max(1.0 - u1, 0.0));
         let wi = t * (r * cos(phi)) + b * (r * sin(phi)) + n * cz;
         for (var k = 0u; k < params.nw; k = k + 1u) {
-            p.tp[k] = p.tp[k] * albedo / q;
+            p.tp[k] = p.tp[k] * alb[k] / q;
         }
         p.pdf = cz / PI;
         p.o = vec4<f32>(origin, p.o.w + 1.0);

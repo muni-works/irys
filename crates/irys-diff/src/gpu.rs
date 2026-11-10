@@ -140,6 +140,7 @@ struct Params {
     gres2: [u32; 4],
     qmc: [u32; 4],
     rr: [f32; 4],
+    dband: [f32; 4],
 }
 
 /// The splat compositor's segment start, `EPS / 10` (phase 2b's, unchanged).
@@ -323,6 +324,8 @@ pub struct GpuPrb {
     l: wgpu::Buffer,
     l2: wgpu::Buffer,
     grad: wgpu::Buffer,
+    /// Per path `δd` for [`Scene::diffuse_bands`] (`vec4` each).
+    dalb: wgpu::Buffer,
     target: wgpu::Buffer,
     img: wgpu::Buffer,
     loss: wgpu::Buffer,
@@ -654,6 +657,7 @@ impl GpuPrb {
         let l = storage("l", lane_bytes);
         let l2 = storage("l replayed", lane_bytes);
         let grad = storage("grad", PARAMS as u64 * 4);
+        let dalb = storage("diffuse band grad", scene.paths().max(1) as u64 * 16);
         let pixels = (scene.size.0 * scene.size.1) as u64;
         let target = storage("target", pixels * 12);
         let img = storage("image", pixels * 12);
@@ -816,6 +820,9 @@ impl GpuPrb {
             (60, &stage),
             (71, &cold),
             (72, &lams),
+            (10, &l),
+            (11, &dl),
+            (73, &dalb),
         ];
         let mut scatter: Vec<(u32, &wgpu::Buffer)> = vec![
             (0, &params),
@@ -965,6 +972,7 @@ impl GpuPrb {
             l,
             l2,
             grad,
+            dalb,
             target,
             img,
             loss,
@@ -1097,6 +1105,10 @@ impl GpuPrb {
             qmc: [scene.qmc as u32, scene.spectral_is as u32, 0, 0],
             rr: match scene.roulette {
                 Some(r) => [1.0, r.start as f32, r.floor as f32, 0.0],
+                None => [0.0; 4],
+            },
+            dband: match scene.diffuse_bands {
+                Some(d) => [d[0] as f32, d[1] as f32, d[2] as f32, 1.0],
                 None => [0.0; 4],
             },
             restir: match scene.restir {
@@ -1315,12 +1327,39 @@ impl GpuPrb {
         self.ctx.queue.submit([enc.finish()]);
     }
 
+    fn clear_dalb(&self) {
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.clear_buffer(&self.dalb, 0, None);
+        self.ctx.queue.submit([enc.finish()]);
+    }
+
+    /// `∂loss/∂d` for [`Scene::diffuse_bands`] from the last replay
+    /// ([`replay`](Self::replay) or [`gradient_l2`](Self::gradient_l2)):
+    /// each path's sum, read back and added in path order in f64.
+    pub fn diffuse_grad(&self, scene: &Scene) -> [f64; 3] {
+        let v = self.read(&self.dalb, scene.paths() * 4);
+        let mut g = [0.0f64; 3];
+        for p in v.chunks_exact(4) {
+            for k in 0..3 {
+                g[k] += p[k] as f64;
+            }
+        }
+        g
+    }
+
     /// Chunks a frame is traced in.
     pub fn chunks(&self) -> u32 {
         self.chunks
     }
 
     fn check(&self, scene: &Scene) {
+        assert!(
+            !(scene.diffuse_bands.is_some() && scene.guide.is_some()),
+            "diffuse_bands with path guiding: the guided vertex is not differentiated"
+        );
         assert_eq!(
             scene.lanes(),
             self.lanes,
@@ -1361,6 +1400,7 @@ impl GpuPrb {
         let dl32: Vec<f32> = dl.iter().map(|&x| x as f32).collect();
         q.write_buffer(&self.dl, 0, bytemuck::cast_slice(&dl32));
         q.write_buffer(&self.grad, 0, bytemuck::cast_slice(&[0.0f32; PARAMS]));
+        self.clear_dalb();
         self.run(scene, theta, seed, true, Score::None);
         let g = self.read(&self.grad, PARAMS);
         let l2 = self.read(&self.l2, self.lanes);
@@ -1402,6 +1442,7 @@ impl GpuPrb {
         self.ctx
             .queue
             .write_buffer(&self.grad, 0, bytemuck::cast_slice(&[0.0f32; PARAMS]));
+        self.clear_dalb();
         self.run(scene, theta, adjoint, true, Score::None);
         let out = self.read_many(&[(&self.loss, 1), (&self.grad, PARAMS)]);
         self.timing.replay = t.elapsed();
