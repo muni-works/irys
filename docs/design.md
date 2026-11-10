@@ -2695,11 +2695,18 @@ bounce and compositing order. No float atomics anywhere.
 | splats: CPU f64 vs central differences (f32 parameters, h 3e-3) | worst 5.1e-4 (colours ~1e-5) |
 | splats: GPU f32 vs CPU f64, 16 largest | 5.0e-5, 0 records dropped |
 | splats: replay | 65 536 / 65 536 lanes bit-identical, two replays equal |
-| full `irys-diff --features gpu` suite | all pass but `look_hair_gpu` (2 tests, look renderer) |
+| full `irys-diff --features gpu` suite | all pass |
 
-Open: the look kernel still has constant Sobol tables, and its hair tests
-fail on Vulkan; splat records go through the host, which bounds a replay's
-splat crossings per path at 256.
+**Hair on Vulkan.** `strand_hit` returned the query's committed
+intersection, which on NVIDIA was a farther fibre for 5 % of hits (same
+fibre 0.9476, gate 0.999) although every candidate passed through the
+loop; Metal agreed either way. It now returns the nearest hit the loop
+kept, and the committed one only for tessellated tubes, whose triangles
+the hardware commits itself: same fibre 1.0000, `look_hair_gpu` 3/3.
+
+Open: the look kernel still has constant Sobol tables (it compiles on
+NVIDIA, unlike `bounce`); splat records go through the host, which bounds
+a replay's splat crossings per path at 256.
 
 ## Open questions
 

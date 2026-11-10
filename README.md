@@ -145,8 +145,7 @@ is a specification of which irys has built only the M1 prerequisites, and
 - The GPU wavefront in `irys-diff` uses wgpu's experimental ray queries
   where the device has them. Development and all recorded timings are on
   Apple silicon with Metal. The `irys-diff` test suite also passes on an
-  NVIDIA RTX 3090 through Vulkan (2026-11-10), except two hair tests of the
-  look renderer (`look_hair_gpu`), which is not on the differentiable path.
+  NVIDIA RTX 3090 through Vulkan (2026-11-10).
 - Replay is bit-exact per device and driver: another GPU rounds f32
   differently and agrees with the f64 reference to f32 precision.
 - Image to CAD: on synthetic renders the v0 gate passes 17 of 20 parts

@@ -80,6 +80,7 @@ fn strand_hit(o: vec3<f32>, d: vec3<f32>, tmin: f32, tmax: f32, any: bool) -> SH
     let flags = select(0u, RAY_FLAG_TERMINATE_ON_FIRST_HIT, any);
     rayQueryInitialize(&rq, strand_accel, RayDesc(flags, 0xffu, tmin, tmax, o, d));
     var best_t = tmax;
+    var best_i = 0xffffffffu;
     loop {
         if (!rayQueryProceed(&rq)) { break; }
         let c = rayQueryGetCandidateIntersection(&rq);
@@ -92,14 +93,25 @@ fn strand_hit(o: vec3<f32>, d: vec3<f32>, tmin: f32, tmax: f32, any: bool) -> SH
                 return SHit(t, c.primitive_index, vec3<f32>(0.0));
             }
             best_t = t;
+            best_i = c.primitive_index;
             rayQueryGenerateIntersection(&rq, t);
         }
     }
-    let h = rayQueryGetCommittedIntersection(&rq);
-    if (h.kind == RAY_QUERY_INTERSECTION_NONE) {
-        return SHit(tmax, 0xffffffffu, vec3<f32>(0.0));
+    // The nearest hit is the one this loop kept, not the query's committed
+    // intersection: on NVIDIA (Vulkan) the committed one was a farther
+    // fibre for 5 % of hits, while every candidate still passed through
+    // here; Metal agreed either way. `GenerateIntersection` still shortens
+    // the traversal.
+    var seg = best_i;
+    if (best_i == 0xffffffffu) {
+        // Tessellated tubes: the hardware commits their triangles itself.
+        let h = rayQueryGetCommittedIntersection(&rq);
+        if (h.kind == RAY_QUERY_INTERSECTION_NONE) {
+            return SHit(tmax, 0xffffffffu, vec3<f32>(0.0));
+        }
+        best_t = h.t;
+        seg = h.primitive_index;
     }
-    var seg = h.primitive_index;
     if (STRAND_SIDES > 0u) { seg = seg / (2u * max(STRAND_SIDES, 1u)); }
-    return SHit(h.t, seg, strand_normal(seg, o + d * h.t));
+    return SHit(best_t, seg, strand_normal(seg, o + d * best_t));
 }
