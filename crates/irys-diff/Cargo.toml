@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "irys: differentiable spectral path tracing — BSDFs as tang IR graphs, bit-exact path replay backprop on CPU f64 and a GPU wavefront"
-keywords = ["differentiable-rendering", "path-tracing", "inverse-rendering", "gpu", "graphics"]
+keywords = ["differentiable", "path-tracing", "inverse-rendering", "gpu", "graphics"]
 categories = ["graphics", "rendering", "science"]
 
 [dependencies]
