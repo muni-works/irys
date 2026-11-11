@@ -19,10 +19,9 @@ vcad-kernel = ">=0.10, <0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-# v1: tag36h11 detection (pure Rust, Apache-2.0), EXIF focal length (MIT),
+# v1: tag36h11 detection (irys-tags, pure Rust, Apache-2.0), EXIF focal length (MIT),
 # STL export (vcad's own exporter), threads for the photo renderer.
-kornia-apriltag = "0.2"
-kornia-image = "0.2"
+irys-tags.workspace = true
 kamadak-exif = "0.6"
 vcad-kernel-export = ">=0.10, <0.12"
 vcad-ir = ">=0.10, <0.12"

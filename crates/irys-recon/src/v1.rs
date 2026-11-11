@@ -79,7 +79,7 @@ pub struct Calib {
 /// has `FocalLength` but no 35 mm equivalent.
 pub fn calibrate(p: &Photo, tag_mm: f64, sensor_w_mm: Option<f64>) -> Result<Calib, String> {
     let obs = tag::detect_refined(&p.grey, &p.grey_lin, tag_mm);
-    let t = obs.iter().find(|o| o.id == tag::TAG_ID).or(obs.first()).ok_or(format!("{}: no tag36h11 found", p.name))?.clone();
+    let t = obs.iter().find(|o| o.id == tag::TAG_ID).or(obs.first()).ok_or(format!("{}: no AprilTag found (any tag36h11 id works, normal or negative print; keep it flat, in focus, and at least ~30 px across)", p.name))?.clone();
     let (w, h) = p.size;
     let (cx, cy) = (w as f64 / 2.0, h as f64 / 2.0);
     let f_exif = tag::exif_focal_px(&p.exif, w, h, sensor_w_mm);

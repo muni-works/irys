@@ -1,0 +1,21 @@
+[package]
+name = "irys-tags"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "tag36h11 AprilTag detection in pure Rust: both polarities, every decimation, small-tag upsample, sub-pixel corners on linear light"
+keywords = ["apriltag", "fiducial", "calibration", "computer-vision"]
+categories = ["computer-vision"]
+# The photo fixtures stay in the repo.
+exclude = ["tests/fixtures"]
+
+[dependencies]
+# Quad finding and the tag36h11 code table (AprilRobotics', BSD-2-Clause).
+kornia-apriltag = "0.2"
+kornia-image = "0.2"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
