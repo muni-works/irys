@@ -60,7 +60,9 @@ cargo add irys-diff --features gpu    # with the GPU wavefront
 ```
 
 The examples below run from a clone. They need Rust 1.95 or newer and a C
-compiler on your PATH (irys-diff compiles its BSDF kernels to C at run time).
+compiler on your PATH: irys-diff's CPU tier, the f64 reference the GPU is
+checked against, compiles its BSDF kernels to C at run time. The GPU tier
+runs the same kernels as WGSL.
 The first build of any `irys-diff` example is slow, because its
 dev-dependencies include vcad.
 

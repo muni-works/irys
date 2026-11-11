@@ -386,7 +386,7 @@ for it in 1..=60u64 {
 cargo add irys-render --features gpu  <span class="c"># with the wgpu tier</span>
 cargo add irys-diff                   <span class="c"># differentiable rendering</span>
 cargo add irys-diff --features gpu    <span class="c"># on the GPU wavefront</span></pre>
-      <p>To run the examples, clone the repository. That needs Rust 1.95 or newer and a C compiler on your PATH, because irys-diff compiles its BSDF kernels to C at run time.</p>
+      <p>To run the examples, clone the repository. That needs Rust 1.95 or newer and a C compiler on your PATH, because irys-diff's CPU tier, the f64 reference the GPU is checked against, compiles its BSDF kernels to C at run time. The GPU tier runs the same kernels as WGSL.</p>
 <pre>git clone https://github.com/muni-works/irys
 cd irys
 
