@@ -350,7 +350,7 @@ a.crate-tag { align-self: flex-start; font-family: var(--mono); font-size: var(-
     <div class="container">
       <h2>Ten lines to a gradient.</h2>
       <p class="lead">From <code>examples/fit.rs</code>. Render, compare, get a gradient for every material parameter, repeat until gold.</p>
-<pre><span class="c">// irys-diff, from a clone of the repository</span>
+<pre><span class="c">// cargo add irys-diff</span>
 use irys_diff::prb::{self, Kernels, L2, Scene};
 
 let scene = Scene::new(96, 96, 8);            <span class="c">// a ball on a floor, 8 spp</span>
@@ -381,10 +381,12 @@ for it in 1..=60u64 {
   <section id="start">
     <div class="container prose">
       <h2>Get it.</h2>
-      <p class="lead">The renderer is on crates.io as <code>irys-render</code>. Code still imports it as <code>irys</code>.</p>
+      <p class="lead">Everything is on crates.io. The renderer is <code>irys-render</code>, and code still imports it as <code>irys</code>.</p>
 <pre>cargo add irys-render                 <span class="c"># CPU</span>
-cargo add irys-render --features gpu  <span class="c"># with the wgpu tier</span></pre>
-      <p>The differentiable crates are not published yet, so run them from a clone. That needs Rust 1.95 or newer and a C compiler on your PATH, and the first build fetches tang from git.</p>
+cargo add irys-render --features gpu  <span class="c"># with the wgpu tier</span>
+cargo add irys-diff                   <span class="c"># differentiable rendering</span>
+cargo add irys-diff --features gpu    <span class="c"># on the GPU wavefront</span></pre>
+      <p>To run the examples, clone the repository. That needs Rust 1.95 or newer and a C compiler on your PATH, because irys-diff compiles its BSDF kernels to C at run time.</p>
 <pre>git clone https://github.com/muni-works/irys
 cd irys
 
@@ -397,7 +399,7 @@ cargo run --release -p irys-diff --features gpu --example fit_gpu -- out/fit_gpu
 
 <span class="c"># Tests. GPU tests skip when there is no adapter.</span>
 cargo test -p irys</pre>
-      <p class="small">The <code>irys</code> crate on crates.io is an unrelated project. Everything is version 0.1.0 and the API is not stable. The core crates are the most settled; <code>irys-diff</code> and the crates built on it are research code. All timings come from Apple silicon with Metal. The test suite also passes on an NVIDIA RTX 3090 through Vulkan.</p>
+      <p class="small">The <code>irys</code> crate on crates.io is an unrelated project. Everything is version 0.1.1 and the API is not stable. The core crates are the most settled; <code>irys-diff</code> and the crates built on it are research code. All timings come from Apple silicon with Metal. The test suite also passes on an NVIDIA RTX 3090 through Vulkan.</p>
     </div>
   </section>
 

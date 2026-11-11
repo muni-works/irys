@@ -65,7 +65,7 @@ e-graph canonical form. The last is the editability metric the field lacks.
 
 ## v0 results (sim-to-sim, 2026-10-18)
 
-Built in `crates/irys-recon` (publish = false; it depends on irys-diff and
+Built in `crates/irys-recon` (on crates.io since 0.1.1; it depends on irys-diff and
 vcad-kernel 0.10, nothing in irys-core/light/prims/gpu learned about vcad).
 `cargo run --release -p irys-recon --example recon_v0` runs the gate and
 writes `out/recon_v0/report.{json,md}`; `--views 1` is the single-view run;

@@ -23,7 +23,7 @@ What works today:
 - Research built on top: a 3D Gaussian splat trainer, and image-to-CAD
   recovery of a vcad program from renders or a photo with an AprilTag.
 
-Everything is version 0.1.0 and the API is not stable. See
+Everything is version 0.1.1 and the API is not stable. See
 [Status and limits](#status-and-limits).
 
 ## Crates
@@ -43,25 +43,26 @@ Everything is version 0.1.0 and the API is not stable. See
 | `irys-splat` | a 3D Gaussian splat trainer on the GPU tier: tile rasteriser forward and adjoint, Adam, densification |
 | `irys-ffi` | a C ABI that renders into an IOSurface-backed Metal texture (Apple only, a spike) |
 
-`irys-diff` and the crates below it in the table are `publish = false`
-for now; build them from this repository. Their tang dependencies all come
-from crates.io, so a project that links them needs no `[patch]`.
+`irys-diff`, `irys-tags`, `irys-recon` and `irys-splat` are on crates.io
+with the renderer crates; `irys-bench`, `irys-recon-net`, `irys-ffi` and
+`irys-wasm` are built from this repository only. Every tang dependency comes
+from crates.io, so a project that links irys needs no `[patch]`.
 
 ## Quickstart
 
-The renderer crates are on crates.io:
+Every crate below is on crates.io:
 
 ```sh
 cargo add irys-render                 # CPU; code still writes `use irys::...`
 cargo add irys-render --features gpu  # with the wgpu tier
+cargo add irys-diff                   # differentiable rendering
+cargo add irys-diff --features gpu    # with the GPU wavefront
 ```
 
-The differentiable crates are not published yet, so the examples below run
-from a clone.
-
-Requires Rust 1.95 or newer. The first build fetches
-[tang](https://github.com/muni-works/tang) from git. The first build of any
-`irys-diff` example is slow, because its dev-dependencies include vcad.
+The examples below run from a clone. They need Rust 1.95 or newer and a C
+compiler on your PATH (irys-diff compiles its BSDF kernels to C at run time).
+The first build of any `irys-diff` example is slow, because its
+dev-dependencies include vcad.
 
 ```sh
 git clone https://github.com/muni-works/irys
@@ -122,7 +123,7 @@ is a specification of which irys has built only the M1 prerequisites, and
 
 - The core crates (`irys-core`, `irys-prims`, `irys-light`, `irys-gpu`,
   `irys`) are the split of kosm-render 0.2 and are the most settled part.
-  They are on crates.io at 0.1.0. The facade is published as `irys-render`
+  They are on crates.io at 0.1.1. The facade is published as `irys-render`
   because the `irys` name there belongs to an unrelated project; its library
   is still called `irys`.
 - `irys-diff`, `irys-recon`, `irys-recon-net`, `irys-splat` and `irys-ffi`
