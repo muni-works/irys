@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "irys-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "irys-core",
  "irys-diff",
@@ -1039,14 +1039,14 @@ dependencies = [
 
 [[package]]
 name = "irys-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tang",
 ]
 
 [[package]]
 name = "irys-diff"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "gltf",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "irys-ffi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "irys-diff",
  "irys-gpu",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "irys-gpu"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "irys-core",
@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "irys-light"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "irys-core",
  "rayon",
@@ -1106,7 +1106,7 @@ dependencies = [
 
 [[package]]
 name = "irys-prims"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "irys-core",
  "tang",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "irys-recon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "irys-core",
@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "irys-recon-net"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "irys-core",
@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "irys-render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "irys-core",
@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "irys-splat"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "image",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "irys-tags"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "kornia-apriltag",
@@ -1187,7 +1187,7 @@ dependencies = [
 
 [[package]]
 name = "irys-wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "console_error_panic_hook",
  "irys-core",

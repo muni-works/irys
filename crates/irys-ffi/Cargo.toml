@@ -13,7 +13,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-irys-diff = { path = "../irys-diff", features = ["gpu", "assets"] }
+irys-diff = { workspace = true, features = ["gpu", "assets"] }
 irys-gpu.workspace = true
 irys-light.workspace = true
 

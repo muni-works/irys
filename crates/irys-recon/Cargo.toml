@@ -6,14 +6,15 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "irys: image to CAD, v0 — recover a vcad program and its dimensions from irys renders"
-publish = false
+description = "irys: image to CAD — recover an editable vcad program and its dimensions from photographs of a part beside an AprilTag"
+keywords = ["cad", "inverse-rendering", "photogrammetry", "apriltag"]
+categories = ["graphics", "science"]
 
 [dependencies]
 irys-core.workspace = true
 irys-prims.workspace = true
 irys-light.workspace = true
-irys-diff = { path = "../irys-diff", features = ["assets"] }
+irys-diff = { workspace = true, features = ["assets"] }
 # 0.10 or 0.11: a host on vcad 0.11 (the Mac app) unifies with one `[patch]`.
 vcad-kernel = ">=0.10, <0.12"
 serde = { version = "1", features = ["derive"] }

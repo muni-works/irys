@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Cam Pedersen <cam@campedersen.com>"]
@@ -42,6 +42,8 @@ irys-prims = { path = "crates/irys-prims", version = "0.1" }
 irys-gpu   = { path = "crates/irys-gpu", version = "0.1" }
 irys       = { package = "irys-render", path = "crates/irys", version = "0.1" }
 irys-tags  = { path = "crates/irys-tags", version = "0.1" }
+irys-diff  = { path = "crates/irys-diff", version = "0.1" }
+irys-recon = { path = "crates/irys-recon", version = "0.1" }
 
 [patch.crates-io]
 # irys-diff's rose_brep example builds vcad 0.11 (d10f279), whose raytracer

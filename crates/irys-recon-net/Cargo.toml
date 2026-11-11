@@ -13,7 +13,7 @@ publish = false
 irys-core.workspace = true
 irys-prims.workspace = true
 irys-recon = { path = "../irys-recon" }
-irys-diff = { path = "../irys-diff", features = ["assets"] }
+irys-diff = { workspace = true, features = ["assets"] }
 tang.workspace = true
 tang-compile.workspace = true
 tang-expr.workspace = true
