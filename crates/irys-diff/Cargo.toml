@@ -57,8 +57,8 @@ vcad-kernel = "0.10"
 # BRep seam ("Exact Gradients Through a BRep Kernel"): irys's per-vertex edge
 # gradient pulled back to a CAD dimension by vcad-kernel-diff. Pinned to the
 # vcad commit the kernel paper reports.
-vcad-kernel-next = { package = "vcad-kernel", git = "https://github.com/ecto/vcad", rev = "d10f279d9693d307c7faa7289ec6490b12f0bd77", default-features = false }
-vcad-kernel-diff = { git = "https://github.com/ecto/vcad", rev = "d10f279d9693d307c7faa7289ec6490b12f0bd77" }
+vcad-kernel-next = { package = "vcad-kernel", git = "https://github.com/muni-works/vcad", rev = "a3ad5eced5a0fbfff8373e10d81beae201c69b3d", default-features = false }
+vcad-kernel-diff = { git = "https://github.com/muni-works/vcad", rev = "a3ad5eced5a0fbfff8373e10d81beae201c69b3d" }
 
 [[example]]
 name = "rover"
