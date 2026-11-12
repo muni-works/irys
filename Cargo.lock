@@ -2529,7 +2529,7 @@ dependencies = [
 [[package]]
 name = "stepperoni"
 version = "0.1.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -2592,6 +2592,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tang-ad"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67759a0059717e6704887054248a7aa765fb9ba12ab803233be8cb3b3dfbcce"
+dependencies = [
+ "tang",
+ "tang-la",
+]
+
+[[package]]
 name = "tang-compile"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2627,6 +2637,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a1cf961cd2968a09fb079624db1eae07390acbe238fe61f075555b5302009d"
 dependencies = [
  "tang",
+]
+
+[[package]]
+name = "tang-optim"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "104ded0269929fb17c6f3aa061c123e2ea60ff93553eac091e18b1a4d6cc1ed8"
+dependencies = [
+ "tang",
+ "tang-ad",
+ "tang-la",
 ]
 
 [[package]]
@@ -2891,7 +2912,7 @@ dependencies = [
 [[package]]
 name = "vcad-ir"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "serde",
  "serde_json",
@@ -2943,9 +2964,10 @@ dependencies = [
 [[package]]
 name = "vcad-kernel"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "serde",
+ "serde_json",
  "vcad-kernel-booleans 0.11.0",
  "vcad-kernel-cam 0.11.0",
  "vcad-kernel-constraints 0.11.0",
@@ -3014,7 +3036,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-booleans"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "rayon",
  "vcad-kernel-geom 0.11.0",
@@ -3052,7 +3074,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-cam"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "geo",
  "geo-clipper",
@@ -3080,12 +3102,13 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-constraints"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "slotmap",
  "tang",
- "tang-expr 0.1.1",
+ "tang-expr 0.2.1",
  "tang-la",
+ "tang-optim",
  "thiserror 2.0.21",
  "vcad-kernel-math 0.11.0",
  "vcad-kernel-sketch 0.11.0",
@@ -3104,7 +3127,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-cost"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "serde",
  "serde_json",
@@ -3133,7 +3156,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-dfm"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "serde",
  "serde_json",
@@ -3152,9 +3175,10 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-diff"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "tang",
+ "tang-optim",
  "vcad-kernel-geom 0.11.0",
  "vcad-kernel-math 0.11.0",
  "vcad-kernel-nurbs 0.11.0",
@@ -3220,7 +3244,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-fillet"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "vcad-kernel-geom 0.11.0",
  "vcad-kernel-math 0.11.0",
@@ -3254,7 +3278,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-geom"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "tang",
  "vcad-kernel-math 0.11.0",
@@ -3272,7 +3296,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-math"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "tang",
 ]
@@ -3292,7 +3316,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-naming"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "vcad-kernel-geom 0.11.0",
  "vcad-kernel-math 0.11.0",
@@ -3324,7 +3348,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-nurbs"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "tang",
  "vcad-kernel-geom 0.11.0",
@@ -3366,7 +3390,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-primitives"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "vcad-kernel-geom 0.11.0",
  "vcad-kernel-math 0.11.0",
@@ -3410,7 +3434,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-raytrace"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "bytemuck",
  "js-sys",
@@ -3446,7 +3470,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-sheet"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "serde",
  "serde_json",
@@ -3470,7 +3494,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-shell"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "vcad-kernel-geom 0.11.0",
  "vcad-kernel-math 0.11.0",
@@ -3495,7 +3519,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-sketch"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "thiserror 2.0.21",
  "vcad-kernel-geom 0.11.0",
@@ -3522,9 +3546,9 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-step"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
- "stepperoni 0.1.0 (git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77)",
+ "stepperoni 0.1.0 (git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d)",
  "thiserror 2.0.21",
  "vcad-kernel-geom 0.11.0",
  "vcad-kernel-math 0.11.0",
@@ -3549,7 +3573,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-stocksim"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "serde",
  "serde_json",
@@ -3576,7 +3600,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-sweep"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "rustc-hash 1.1.0",
  "thiserror 2.0.21",
@@ -3606,7 +3630,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-tessellate"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "earcutr",
  "serde",
@@ -3633,7 +3657,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-text"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "thiserror 2.0.21",
  "ttf-parser",
@@ -3675,7 +3699,7 @@ dependencies = [
 [[package]]
 name = "vcad-kernel-topo"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "slotmap",
  "vcad-kernel-math 0.11.0",
@@ -3704,7 +3728,7 @@ dependencies = [
 [[package]]
 name = "vcad-receipt"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "serde",
  "serde_json",
@@ -3724,7 +3748,7 @@ dependencies = [
 [[package]]
 name = "vcad-tool-derive"
 version = "0.11.0"
-source = "git+https://github.com/ecto/vcad?rev=d10f279d9693d307c7faa7289ec6490b12f0bd77#d10f279d9693d307c7faa7289ec6490b12f0bd77"
+source = "git+https://github.com/muni-works/vcad?rev=a3ad5eced5a0fbfff8373e10d81beae201c69b3d#a3ad5eced5a0fbfff8373e10d81beae201c69b3d"
 dependencies = [
  "proc-macro2",
  "quote",
