@@ -156,9 +156,13 @@ is a specification of which irys has built only the M1 prerequisites, and
   phone photo with a tag, v1 passes 2 of 20 at 0.5 mm and 6 of 20 at 1 mm.
   The neural proposer (v2, v3) works on synthetic scenes and mostly does not
   recover the real desk photo.
-- The pose fit on the rose arm recovers three joint angles to within 0.07
-  degrees from a start about 13 to 23 degrees away, on a synthetic target
-  (design.md, phase 2d).
+- The pose fit on the rose arm converged to within 0.07 degrees of three
+  joint angles in one run on Apple silicon (design.md, phases 2d and 2f).
+  On NVIDIA GPUs through Vulkan it does not converge: in-context fits
+  diverge, and the arm-alone fit reaches the truth by iteration 100, then
+  leaves it once the material is fitted too (2026-11-12). The paper reports
+  the pose gradient's checks against central differences, including the two
+  that fall short.
 
 ![phase 2d rose](docs/phase2d-rose.png)
 

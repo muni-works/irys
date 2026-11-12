@@ -286,7 +286,7 @@ a.crate-tag { align-self: flex-start; font-family: var(--mono); font-size: var(-
       <div class="proof">
         <div class="proof-item lit"><span class="proof-val">7&ndash;26&times;</span><span class="proof-label">faster material gradients than Mitsuba 3 at equal variance</span></div>
         <div class="proof-item"><span class="proof-val">1.5&ndash;5.6&times;</span><span class="proof-label">lower error than Cycles at equal time, on irys's three benchmark scenes</span></div>
-        <div class="proof-item"><span class="proof-val">0.07&deg;</span><span class="proof-label">worst error on three robot joint angles recovered from one image, starting 13 to 23&deg; off</span></div>
+        <div class="proof-item"><span class="proof-val">100%</span><span class="proof-label">of 65,536 GPU lanes replay the forward pass bit for bit, so two runs give the same gradient</span></div>
         <div class="proof-item"><span class="proof-val">15&ndash;17&times;</span><span class="proof-label">faster gradients on the GPU than on irys's own CPU tier, same frame</span></div>
       </div>
       <details><summary>Every benchmark, wins and losses</summary><div class="tbl" style="margin-top:1rem"><table>
@@ -316,8 +316,8 @@ a.crate-tag { align-self: flex-start; font-family: var(--mono); font-size: var(-
         </div>
         <div class="card">
           <img src="/phase2d-rose.jpg" alt="The rose robot rendered by irys" loading="lazy" style="object-position:50% 30%">
-          <div class="card-body"><h3>Ask a photo how the robot is standing.</h3>
-          <p>Three joint angles of a 2.4 M-triangle arm, recovered to <b>0.07&deg;</b> from a guess 13 to 23&deg; off. The outline, the shading and even the shadow on the floor all chip in.</p></div>
+          <div class="card-body"><h3>Gradients for how a robot stands.</h3>
+          <p>The image's derivative with respect to three joint angles of a 2.4 M-triangle arm, checked against finite differences. The outline, the shading and the shadow on the floor each add a term.</p></div>
         </div>
         <div class="card">
           <img src="/plate.svg" alt="The bearing plate rendered by irys; vcad's frozen mesh fades in over it, and a tick on each bore node shows which way it moves and its share of the gradient" loading="lazy" style="object-fit:contain;background:#0b0907">
