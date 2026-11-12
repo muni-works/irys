@@ -1,5 +1,5 @@
 //! The shared rose-arm benchmark with vcad's differentiable BRep seam
-//! ("Exact Gradients Through a BRep Kernel", vcad-kernel-diff at d10f279).
+//! ("Exact Gradients Through a BRep Kernel", vcad-kernel-diff at a3ad5ec).
 //!
 //! The part is rose full's left shoulder-pitch output plate,
 //! `L_shoA_shop_out` in `full/cad/links/shoA.loon`: a 3 mm rounded plate with
